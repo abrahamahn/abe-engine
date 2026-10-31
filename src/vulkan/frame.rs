@@ -24,7 +24,7 @@ pub(super) struct Frame<'a> {
     memory: Vec<u64>,
     shaders: Vec<u64>,
     pass: u64,
-    framebuffer: u64,
+    framebuffers: Vec<u64>,
     layout: u64,
     pipeline: u64,
     pool: u64,
@@ -40,7 +40,7 @@ impl<'a> Frame<'a> {
             memory: vec![],
             shaders: vec![],
             pass: 0,
-            framebuffer: 0,
+            framebuffers: vec![],
             layout: 0,
             pipeline: 0,
             pool: 0,
@@ -64,7 +64,7 @@ impl<'a> Frame<'a> {
         self.memory.push(value);
         Ok(value)
     }
-    fn buffer(&mut self, bytes: u64, usage: u32) -> Result<(u64, u64)> {
+    pub(super) fn buffer(&mut self, bytes: u64, usage: u32) -> Result<(u64, u64)> {
         let mut ci = VkBufferCreateInfo::new();
         ci.size = bytes;
         ci.usage = usage;
@@ -82,7 +82,7 @@ impl<'a> Frame<'a> {
             Ok((buf, memory))
         }
     }
-    fn image(
+    pub(super) fn image(
         &mut self,
         width: u32,
         height: u32,
@@ -110,6 +110,13 @@ impl<'a> Frame<'a> {
             vkGetImageMemoryRequirements(dev, image, &mut req);
             let mem = self.allocate(req, 0)?;
             check(vkBindImageMemory(dev, image, mem, 0), "vkBindImageMemory")?;
+            let view = self.view(image, format, aspect)?;
+            Ok((image, view))
+        }
+    }
+    pub(super) fn view(&mut self, image: u64, format: i32, aspect: u32) -> Result<u64> {
+        let dev = self.gpu.device;
+        unsafe {
             let mut vi = VkImageViewCreateInfo::new();
             vi.image = image;
             vi.viewType = 1;
@@ -125,23 +132,28 @@ impl<'a> Frame<'a> {
                 vkCreateImageView(dev, &vi, null(), o)
             })?;
             self.views.push(view);
-            Ok((image, view))
+            Ok(view)
         }
     }
     fn targets(&mut self, width: u32, height: u32) -> Result<u64> {
         let (color, cv) = self.image(width, height, RGBA8, 0x10 | 1, 1)?; // COLOR_ATTACHMENT | TRANSFER_SRC
         let (_, dv) = self.image(width, height, self.gpu.depth_format, 0x20, 2)?; // DEPTH_STENCIL_ATTACHMENT
+        self.render_pass(RGBA8, TRANSFER_SRC_LAYOUT)?;
+        self.framebuffer(width, height, cv, dv)?;
+        Ok(color)
+    }
+    pub(super) fn render_pass(&mut self, format: i32, final_layout: i32) -> Result<()> {
         let attachments = [
             VkAttachmentDescription {
                 flags: 0,
-                format: RGBA8,
+                format,
                 samples: 1,
                 loadOp: 1,
                 storeOp: 0,
                 stencilLoadOp: 2,
                 stencilStoreOp: 1,
                 initialLayout: 0,
-                finalLayout: TRANSFER_SRC_LAYOUT,
+                finalLayout: final_layout,
             },
             VkAttachmentDescription {
                 flags: 0,
@@ -181,11 +193,31 @@ impl<'a> Frame<'a> {
         pi.pAttachments = attachments.as_ptr();
         pi.subpassCount = 1;
         pi.pSubpasses = &sub;
-        pi.dependencyCount = 1;
-        pi.pDependencies = &dep;
+        // Per-image depth is reused after its previous pass and layout transition.
+        // Synchronize both early and late depth writes before the next clear.
+        let stages = COLOR_OUTPUT | 0x100 | 0x200;
+        let reuse = VkSubpassDependency {
+            srcSubpass: u32::MAX,
+            dstSubpass: 0,
+            srcStageMask: stages,
+            dstStageMask: stages,
+            srcAccessMask: COLOR_WRITE | 0x400,
+            dstAccessMask: COLOR_WRITE | 0x200 | 0x400,
+            dependencyFlags: 0,
+        };
+        let deps = [reuse, dep];
+        pi.dependencyCount = if final_layout == TRANSFER_SRC_LAYOUT {
+            2
+        } else {
+            1
+        };
+        pi.pDependencies = deps.as_ptr();
         self.pass = create("vkCreateRenderPass", |o| unsafe {
             vkCreateRenderPass(self.gpu.device, &pi, null(), o)
         })?;
+        Ok(())
+    }
+    pub(super) fn framebuffer(&mut self, width: u32, height: u32, cv: u64, dv: u64) -> Result<u64> {
         let views = [cv, dv];
         let mut fi = VkFramebufferCreateInfo::new();
         fi.renderPass = self.pass;
@@ -194,10 +226,11 @@ impl<'a> Frame<'a> {
         fi.width = width;
         fi.height = height;
         fi.layers = 1;
-        self.framebuffer = create("vkCreateFramebuffer", |o| unsafe {
+        let framebuffer = create("vkCreateFramebuffer", |o| unsafe {
             vkCreateFramebuffer(self.gpu.device, &fi, null(), o)
         })?;
-        Ok(color)
+        self.framebuffers.push(framebuffer);
+        Ok(framebuffer)
     }
     fn shader(&mut self, words: &[u32], stage: i32) -> Result<VkPipelineShaderStageCreateInfo> {
         let mut ci = VkShaderModuleCreateInfo::new();
@@ -213,7 +246,7 @@ impl<'a> Frame<'a> {
         si.pName = c"main".as_ptr();
         Ok(si)
     }
-    fn create_pipeline(&mut self, width: u32, height: u32) -> Result<()> {
+    pub(super) fn create_pipeline(&mut self, width: u32, height: u32) -> Result<()> {
         let stages = [
             self.shader(&shaders::vertex(), 1)?,
             self.shader(&shaders::fragment(), 0x10)?,
@@ -296,18 +329,68 @@ impl<'a> Frame<'a> {
         })?;
         Ok(())
     }
-    fn commands(&mut self) -> Result<Handle> {
+    pub(super) fn commands(&mut self) -> Result<Handle> {
         let mut ci = VkCommandPoolCreateInfo::new();
         ci.queueFamilyIndex = self.gpu.family;
-        self.pool = create("vkCreateCommandPool", |o| unsafe {
-            vkCreateCommandPool(self.gpu.device, &ci, null(), o)
-        })?;
+        ci.flags = 2; // Allow individual command buffer resets.
+        if self.pool == 0 {
+            self.pool = create("vkCreateCommandPool", |o| unsafe {
+                vkCreateCommandPool(self.gpu.device, &ci, null(), o)
+            })?;
+        }
         let mut ai = VkCommandBufferAllocateInfo::new();
         ai.commandPool = self.pool;
         ai.commandBufferCount = 1;
         create("vkAllocateCommandBuffers", |o| unsafe {
             vkAllocateCommandBuffers(self.gpu.device, &ai, o)
         })
+    }
+    pub(super) fn record_draw(
+        &self,
+        cmd: Handle,
+        framebuffer: u64,
+        size: (u32, u32),
+        clear: [f32; 4],
+        vb: u64,
+        count: u32,
+    ) {
+        let (width, height) = size;
+        // Callers hold these objects alive and put cmd in the recording state.
+        unsafe {
+            let clears = [
+                VkClearValue {
+                    color: VkClearColorValue { float32: clear },
+                },
+                VkClearValue {
+                    depthStencil: VkClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                },
+            ];
+            let mut info = VkRenderPassBeginInfo::new();
+            info.renderPass = self.pass;
+            info.framebuffer = framebuffer;
+            info.renderArea = area(width, height);
+            info.clearValueCount = 2;
+            info.pClearValues = clears.as_ptr();
+            vkCmdBeginRenderPass(cmd, &info, 0);
+            if vb != 0 {
+                vkCmdBindPipeline(cmd, 0, self.pipeline);
+                vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &0);
+                vkCmdDraw(cmd, count, 1, 0, 0);
+            }
+            vkCmdEndRenderPass(cmd);
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub(super) fn release_buffer(&mut self, buffer: u64, memory: u64) {
+        self.buffers.retain(|h| *h != buffer);
+        self.memory.retain(|h| *h != memory);
+        unsafe {
+            vkDestroyBuffer(self.gpu.device, buffer, null());
+            vkFreeMemory(self.gpu.device, memory, null());
+        }
     }
     pub(super) fn draw(
         mut self,
@@ -339,30 +422,14 @@ impl<'a> Frame<'a> {
             let mut begin = VkCommandBufferBeginInfo::new();
             begin.flags = 1;
             check(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer")?;
-            let clears = [
-                VkClearValue {
-                    color: VkClearColorValue { float32: clear },
-                },
-                VkClearValue {
-                    depthStencil: VkClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                },
-            ];
-            let mut info = VkRenderPassBeginInfo::new();
-            info.renderPass = self.pass;
-            info.framebuffer = self.framebuffer;
-            info.renderArea = area(width, height);
-            info.clearValueCount = 2;
-            info.pClearValues = clears.as_ptr();
-            vkCmdBeginRenderPass(cmd, &info, 0);
-            if vb != 0 {
-                vkCmdBindPipeline(cmd, 0, self.pipeline);
-                vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &0);
-                vkCmdDraw(cmd, vertices.len() as u32, 1, 0, 0);
-            }
-            vkCmdEndRenderPass(cmd);
+            self.record_draw(
+                cmd,
+                self.framebuffers[0],
+                (width, height),
+                clear,
+                vb,
+                vertices.len() as u32,
+            );
             let region = VkBufferImageCopy {
                 bufferOffset: 0,
                 bufferRowLength: 0,
@@ -424,7 +491,9 @@ impl Drop for Frame<'_> {
                 vkDeviceWaitIdle(d);
             }
             vkDestroyCommandPool(d, self.pool, null());
-            vkDestroyFramebuffer(d, self.framebuffer, null());
+            for f in &self.framebuffers {
+                vkDestroyFramebuffer(d, *f, null());
+            }
             vkDestroyPipeline(d, self.pipeline, null());
             vkDestroyPipelineLayout(d, self.layout, null());
             vkDestroyRenderPass(d, self.pass, null());

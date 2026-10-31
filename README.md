@@ -4,7 +4,17 @@ ABE is a native Rust game engine in development. Its player, editor and build to
 
 The core has zero third-party Cargo dependencies. The Vulkan backend calls the system loader directly and builds its shader programs as SPIR-V from Rust source.
 
-## Run the reference scene
+## Run the native player
+
+```sh
+cargo run --locked --offline --release --bin abe-player
+```
+
+On Linux the player uses X11, including XWayland, and on Windows it uses Win32. Both call Vulkan directly. Click or press Space to pause, use the arrow keys to orbit, and press Escape to exit. Pass `--frames 120` after Cargo's `--` separator for a finite smoke run. The presentation path uses two reusable frame slots, per-image depth and synchronization, and a swapchain. The normal frame loop does not read pixels back to the CPU.
+
+![The native player on a Linux virtual display](docs/player.png)
+
+## Render an offscreen reference
 
 On Linux or Windows with a Vulkan loader and driver:
 
@@ -19,6 +29,7 @@ The example renders a generic 3D sculpture to a Netpbm image. It uses the same c
 ```sh
 cargo test --locked --offline
 cargo test --locked --offline --test vulkan -- --ignored
+cargo test --locked --offline --test present -- --ignored
 ```
 
-The driver test checks GPU depth occlusion and pixel readback. The Vulkan ABI declarations are adapted from [Khronos Vulkan-Headers v1.3.275](https://github.com/KhronosGroup/Vulkan-Headers/tree/v1.3.275) under the license in [docs/Vulkan-Registry-LICENSE.txt](docs/Vulkan-Registry-LICENSE.txt).
+The offscreen test checks depth and pixel readback. The desktop test needs a display and exercises resize, hide/restore, and presenter recreation. Linux presentation and keyboard input have been exercised on Mesa llvmpipe under Xvfb with synchronization validation. Windows is cross-built and still needs a native device run. Android has the offscreen backend only. Apple Metal and browser presentation are planned. The Vulkan ABI declarations are adapted from [Khronos Vulkan-Headers v1.3.275](https://github.com/KhronosGroup/Vulkan-Headers/tree/v1.3.275) under the license in [docs/Vulkan-Registry-LICENSE.txt](docs/Vulkan-Registry-LICENSE.txt).

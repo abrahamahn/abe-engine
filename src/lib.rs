@@ -2,6 +2,8 @@
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
 pub mod vulkan;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub mod window;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vec3(pub f32, pub f32, pub f32);

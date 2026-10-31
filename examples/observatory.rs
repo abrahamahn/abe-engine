@@ -1,4 +1,5 @@
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
+#[path = "../samples/observatory/scene.rs"]
 mod common;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {

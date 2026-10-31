@@ -6,6 +6,161 @@ use core::ffi::{c_char, c_void};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub(super) struct VkXlibSurfaceCreateInfoKHR {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub dpy: *mut c_void,
+    pub window: core::ffi::c_ulong,
+}
+impl VkXlibSurfaceCreateInfoKHR {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 1000004000,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkWin32SurfaceCreateInfoKHR {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub hinstance: *mut c_void,
+    pub hwnd: *mut c_void,
+}
+impl VkWin32SurfaceCreateInfoKHR {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 1000009000,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkExtent2D {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkSurfaceCapabilitiesKHR {
+    pub minImageCount: u32,
+    pub maxImageCount: u32,
+    pub currentExtent: VkExtent2D,
+    pub minImageExtent: VkExtent2D,
+    pub maxImageExtent: VkExtent2D,
+    pub maxImageArrayLayers: u32,
+    pub supportedTransforms: u32,
+    pub currentTransform: i32,
+    pub supportedCompositeAlpha: u32,
+    pub supportedUsageFlags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkSurfaceFormatKHR {
+    pub format: i32,
+    pub colorSpace: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkSwapchainCreateInfoKHR {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub surface: u64,
+    pub minImageCount: u32,
+    pub imageFormat: i32,
+    pub imageColorSpace: i32,
+    pub imageExtent: VkExtent2D,
+    pub imageArrayLayers: u32,
+    pub imageUsage: u32,
+    pub imageSharingMode: i32,
+    pub queueFamilyIndexCount: u32,
+    pub pQueueFamilyIndices: *const u32,
+    pub preTransform: i32,
+    pub compositeAlpha: i32,
+    pub presentMode: i32,
+    pub clipped: u32,
+    pub oldSwapchain: u64,
+}
+impl VkSwapchainCreateInfoKHR {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 1000001000,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkPresentInfoKHR {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub waitSemaphoreCount: u32,
+    pub pWaitSemaphores: *const u64,
+    pub swapchainCount: u32,
+    pub pSwapchains: *const u64,
+    pub pImageIndices: *const u32,
+    pub pResults: *mut i32,
+}
+impl VkPresentInfoKHR {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 1000001001,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkFenceCreateInfo {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+}
+impl VkFenceCreateInfo {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 8,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkSemaphoreCreateInfo {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+}
+impl VkSemaphoreCreateInfo {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 9,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub(super) struct VkApplicationInfo {
     pub sType: i32,
     pub pNext: *const c_void,
@@ -647,13 +802,6 @@ pub(super) struct VkOffset2D {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub(super) struct VkExtent2D {
-    pub width: u32,
-    pub height: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
 pub(super) struct VkRect2D {
     pub offset: VkOffset2D,
     pub extent: VkExtent2D,
@@ -1014,6 +1162,98 @@ impl VkBufferMemoryBarrier {
 #[cfg_attr(target_os = "android", link(name = "vulkan"))]
 #[cfg_attr(target_os = "windows", link(name = "vulkan-1", kind = "raw-dylib"))]
 unsafe extern "system" {
+    #[cfg(target_os = "linux")]
+    pub(super) fn vkCreateXlibSurfaceKHR(
+        instance: *mut c_void,
+        pCreateInfo: *const VkXlibSurfaceCreateInfoKHR,
+        pAllocator: *const c_void,
+        pSurface: *mut u64,
+    ) -> i32;
+    #[cfg(target_os = "windows")]
+    pub(super) fn vkCreateWin32SurfaceKHR(
+        instance: *mut c_void,
+        pCreateInfo: *const VkWin32SurfaceCreateInfoKHR,
+        pAllocator: *const c_void,
+        pSurface: *mut u64,
+    ) -> i32;
+    pub(super) fn vkDestroySurfaceKHR(
+        instance: *mut c_void,
+        surface: u64,
+        pAllocator: *const c_void,
+    );
+    pub(super) fn vkGetPhysicalDeviceSurfaceSupportKHR(
+        physicalDevice: *mut c_void,
+        queueFamilyIndex: u32,
+        surface: u64,
+        pSupported: *mut u32,
+    ) -> i32;
+    pub(super) fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+        physicalDevice: *mut c_void,
+        surface: u64,
+        pSurfaceCapabilities: *mut VkSurfaceCapabilitiesKHR,
+    ) -> i32;
+    pub(super) fn vkGetPhysicalDeviceSurfaceFormatsKHR(
+        physicalDevice: *mut c_void,
+        surface: u64,
+        pSurfaceFormatCount: *mut u32,
+        pSurfaceFormats: *mut VkSurfaceFormatKHR,
+    ) -> i32;
+    pub(super) fn vkCreateSwapchainKHR(
+        device: *mut c_void,
+        pCreateInfo: *const VkSwapchainCreateInfoKHR,
+        pAllocator: *const c_void,
+        pSwapchain: *mut u64,
+    ) -> i32;
+    pub(super) fn vkDestroySwapchainKHR(
+        device: *mut c_void,
+        swapchain: u64,
+        pAllocator: *const c_void,
+    );
+    pub(super) fn vkGetSwapchainImagesKHR(
+        device: *mut c_void,
+        swapchain: u64,
+        pSwapchainImageCount: *mut u32,
+        pSwapchainImages: *mut u64,
+    ) -> i32;
+    pub(super) fn vkAcquireNextImageKHR(
+        device: *mut c_void,
+        swapchain: u64,
+        timeout: u64,
+        semaphore: u64,
+        fence: u64,
+        pImageIndex: *mut u32,
+    ) -> i32;
+    pub(super) fn vkQueuePresentKHR(
+        queue: *mut c_void,
+        pPresentInfo: *const VkPresentInfoKHR,
+    ) -> i32;
+    pub(super) fn vkCreateFence(
+        device: *mut c_void,
+        pCreateInfo: *const VkFenceCreateInfo,
+        pAllocator: *const c_void,
+        pFence: *mut u64,
+    ) -> i32;
+    pub(super) fn vkDestroyFence(device: *mut c_void, fence: u64, pAllocator: *const c_void);
+    pub(super) fn vkWaitForFences(
+        device: *mut c_void,
+        fenceCount: u32,
+        pFences: *const u64,
+        waitAll: u32,
+        timeout: u64,
+    ) -> i32;
+    pub(super) fn vkResetFences(device: *mut c_void, fenceCount: u32, pFences: *const u64) -> i32;
+    pub(super) fn vkCreateSemaphore(
+        device: *mut c_void,
+        pCreateInfo: *const VkSemaphoreCreateInfo,
+        pAllocator: *const c_void,
+        pSemaphore: *mut u64,
+    ) -> i32;
+    pub(super) fn vkDestroySemaphore(
+        device: *mut c_void,
+        semaphore: u64,
+        pAllocator: *const c_void,
+    );
+    pub(super) fn vkResetCommandBuffer(commandBuffer: *mut c_void, flags: u32) -> i32;
     pub(super) fn vkCreateInstance(
         pCreateInfo: *const VkInstanceCreateInfo,
         pAllocator: *const c_void,

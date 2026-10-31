@@ -1,6 +1,8 @@
-//! Direct Vulkan 1.0 offscreen graphics. Only the system Vulkan loader is linked.
+//! Direct Vulkan 1.0 graphics. Only the system Vulkan loader is linked.
 mod ffi;
 mod frame;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub mod present;
 mod shaders;
 use crate::Vertex;
 use core::ffi::{CStr, c_void};
@@ -26,6 +28,8 @@ fn create<T: Default>(operation: &str, call: impl FnOnce(&mut T) -> i32) -> Resu
 pub struct VulkanRenderer {
     instance: Handle,
     device: Handle,
+    physical: Handle,
+    surface: u64,
     queue: Handle,
     family: u32,
     memory: VkPhysicalDeviceMemoryProperties,
@@ -35,27 +39,38 @@ pub struct VulkanRenderer {
 }
 impl VulkanRenderer {
     pub fn new() -> Result<Self> {
+        let mut ctx = Self::instance(&[])?;
+        ctx.select_device()?;
+        Ok(ctx)
+    }
+    fn instance(extensions: &[*const core::ffi::c_char]) -> Result<Self> {
         let mut app = VkApplicationInfo::new();
         app.pApplicationName = c"ABE Engine".as_ptr();
         app.apiVersion = 1 << 22; // Vulkan 1.0
         let mut ci = VkInstanceCreateInfo::new();
         ci.pApplicationInfo = &app;
+        ci.enabledExtensionCount = extensions.len() as u32;
+        ci.ppEnabledExtensionNames = if extensions.is_empty() {
+            null()
+        } else {
+            extensions.as_ptr()
+        };
         // SAFETY: all Vulkan pointers in the create structures live through each call.
         let instance = create("vkCreateInstance", |o| unsafe {
             vkCreateInstance(&ci, null(), o)
         })?;
-        let mut ctx = Self {
+        Ok(Self {
             instance,
             device: null_mut(),
+            physical: null_mut(),
+            surface: 0,
             queue: null_mut(),
             family: 0,
             memory: unsafe { core::mem::zeroed() },
             depth_format: 0,
             name: String::new(),
             max_extent: 0,
-        };
-        ctx.select_device()?;
-        Ok(ctx)
+        })
     }
     fn select_device(&mut self) -> Result<()> {
         // SAFETY: all counts are obtained from Vulkan, and output arrays are allocated to
@@ -82,10 +97,30 @@ impl VulkanRenderer {
                 let mut families =
                     vec![core::mem::zeroed::<VkQueueFamilyProperties>(); count as usize];
                 vkGetPhysicalDeviceQueueFamilyProperties(gpu, &mut count, families.as_mut_ptr());
-                let Some(family) = families
-                    .iter()
-                    .take(count as usize)
-                    .position(|q| q.queueCount > 0 && q.queueFlags & 1 != 0)
+                let Some(family) =
+                    families
+                        .iter()
+                        .take(count as usize)
+                        .enumerate()
+                        .find_map(|(i, q)| {
+                            if q.queueCount == 0 || q.queueFlags & 1 == 0 {
+                                return None;
+                            }
+                            if self.surface != 0 {
+                                let mut ok = 0;
+                                if vkGetPhysicalDeviceSurfaceSupportKHR(
+                                    gpu,
+                                    i as u32,
+                                    self.surface,
+                                    &mut ok,
+                                ) != 0
+                                    || ok == 0
+                                {
+                                    return None;
+                                }
+                            }
+                            Some(i)
+                        })
                 else {
                     continue;
                 };
@@ -104,6 +139,11 @@ impl VulkanRenderer {
                 let mut d = VkDeviceCreateInfo::new();
                 d.queueCreateInfoCount = 1;
                 d.pQueueCreateInfos = &q;
+                let swapchain_ext = c"VK_KHR_swapchain".as_ptr();
+                if self.surface != 0 {
+                    d.enabledExtensionCount = 1;
+                    d.ppEnabledExtensionNames = &swapchain_ext;
+                }
                 match create("vkCreateDevice", |o| vkCreateDevice(gpu, &d, null(), o)) {
                     Ok(device) => self.device = device,
                     Err(err) => {
@@ -111,6 +151,7 @@ impl VulkanRenderer {
                         continue;
                     }
                 }
+                self.physical = gpu;
                 self.family = family as u32;
                 self.depth_format = depth_format;
                 vkGetDeviceQueue(self.device, self.family, 0, &mut self.queue);
@@ -166,6 +207,9 @@ impl Drop for VulkanRenderer {
             if !self.device.is_null() {
                 vkDeviceWaitIdle(self.device);
                 vkDestroyDevice(self.device, null());
+            }
+            if self.surface != 0 {
+                vkDestroySurfaceKHR(self.instance, self.surface, null());
             }
             vkDestroyInstance(self.instance, null());
         }
