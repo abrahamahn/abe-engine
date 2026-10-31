@@ -1,0 +1,154 @@
+//! Render stills of a cooked scene with the stylized renderer.
+//!
+//! abe-render --scene world.abew [--look look.json] [--view NAME | --all-views]
+//!            [--time HOURS] [--weather PRESET] [--width W] [--height H] [--samples N]
+//!            [--seconds S] [--out FILE.png | --out-dir DIR]
+use abe_engine::gpu::Device;
+use abe_engine::render::{Environment, LookFile, Output, Quality, Renderer, View, Weather};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("abe-render: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    let mut args = std::env::args().skip(1);
+    let mut scene = None;
+    let mut look_path = None;
+    let mut view_name = None;
+    let mut all_views = false;
+    let mut hours = None;
+    let mut weather = None;
+    let (mut width, mut height, mut samples) = (1920u32, 1080u32, 8u32);
+    let mut seconds = 12.0f32;
+    let mut out = PathBuf::from("render.png");
+    let mut out_dir: Option<PathBuf> = None;
+    let mut realtime = false;
+    while let Some(a) = args.next() {
+        let mut val = || args.next().ok_or(format!("{a} needs a value"));
+        match a.as_str() {
+            "--scene" => scene = Some(PathBuf::from(val()?)),
+            "--look" => look_path = Some(PathBuf::from(val()?)),
+            "--view" => view_name = Some(val()?),
+            "--all-views" => all_views = true,
+            "--time" => hours = Some(val()?.parse::<f32>().map_err(|e| e.to_string())?),
+            "--weather" => weather = Some(val()?),
+            "--width" => width = val()?.parse().map_err(|e| format!("--width: {e}"))?,
+            "--height" => height = val()?.parse().map_err(|e| format!("--height: {e}"))?,
+            "--samples" => samples = val()?.parse().map_err(|e| format!("--samples: {e}"))?,
+            "--seconds" => seconds = val()?.parse().map_err(|e| format!("--seconds: {e}"))?,
+            "--out" => out = PathBuf::from(val()?),
+            "--out-dir" => out_dir = Some(PathBuf::from(val()?)),
+            "--realtime-quality" => realtime = true,
+            _ => return Err(format!("unknown argument {a}")),
+        }
+    }
+    let scene = scene.ok_or("--scene is required")?;
+    let started = Instant::now();
+    let world = abe_engine::assets::cooked::decode(&abe_engine::assets::read_asset(&scene)?)?;
+    let mut file = match &look_path {
+        Some(p) => LookFile::parse(&abe_engine::assets::read_asset(p)?)?,
+        None => LookFile::default(),
+    };
+    if let Some(h) = hours {
+        file.time.hours = h;
+    }
+    if let Some(w) = &weather {
+        file.weather = Weather::preset(w)
+            .ok_or_else(|| format!("unknown weather {w:?}; try {:?}", Weather::PRESETS))?;
+    }
+    let mut device = Device::headless()?;
+    let quality = if realtime {
+        Quality::realtime()
+    } else {
+        Quality::still()
+    };
+    let mut renderer = Renderer::new(
+        &mut device,
+        &world,
+        file.look.clone(),
+        quality,
+        (width, height),
+        Output::Still,
+    )?;
+    eprintln!(
+        "{}: {} triangles, {} lights, water at {:?}, loaded in {:.1}s on {}",
+        scene.display(),
+        renderer.triangles(),
+        renderer.lights(),
+        renderer.water_level(),
+        started.elapsed().as_secs_f32(),
+        device.name()
+    );
+    let views: Vec<View> = if all_views {
+        file.views.clone()
+    } else if let Some(name) = &view_name {
+        vec![
+            file.views
+                .iter()
+                .find(|v| &v.name == name)
+                .cloned()
+                .ok_or_else(|| format!("no view named {name:?}"))?,
+        ]
+    } else if let Some(v) = file.views.first() {
+        vec![v.clone()]
+    } else {
+        let (lo, hi) = renderer.bounds();
+        let c = [
+            (lo[0] + hi[0]) * 0.5,
+            (lo[1] + hi[1]) * 0.5,
+            (lo[2] + hi[2]) * 0.5,
+        ];
+        let r = ((hi[0] - lo[0]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt() * 0.4;
+        vec![View {
+            name: "overview".into(),
+            eye: [c[0] + r, c[1] + r * 0.6, c[2] + r],
+            target: c,
+            fov: 45.0,
+        }]
+    };
+    let env = Environment::resolve(&file.time, &file.weather, &file.look.palette, seconds);
+    for view in &views {
+        let t = Instant::now();
+        let pixels = renderer.render_still(&mut device, view, &env, samples)?;
+        let png = abe_engine::assets::png::encode(width, height, &pixels)?;
+        let path = match &out_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                let weather = weather.as_deref().unwrap_or("default");
+                dir.join(format!(
+                    "{}-{:04.1}h-{weather}.png",
+                    view.name, file.time.hours
+                ))
+            }
+            None => out.clone(),
+        };
+        write(&path, &png)?;
+        eprintln!(
+            "{} ({}x{}, {} samples) in {:.1}s -> {}",
+            view.name,
+            width,
+            height,
+            samples,
+            t.elapsed().as_secs_f32(),
+            path.display()
+        );
+    }
+    let errors = device.validation_errors();
+    if !errors.is_empty() {
+        return Err(format!(
+            "{} validation errors, first: {}",
+            errors.len(),
+            errors[0]
+        ));
+    }
+    Ok(())
+}
+
+fn write(path: &Path, data: &[u8]) -> Result<(), String> {
+    abe_engine::assets::write_asset(path, data).map_err(|e| format!("{}: {e}", path.display()))
+}

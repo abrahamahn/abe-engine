@@ -1,0 +1,197 @@
+// Shared by every stylized-renderer shader: the per-view frame block, hashing and noise, the
+// painterly sky and the aerial-perspective fog. Prepended to each shader source.
+
+struct Frame {
+  view_proj: mat4x4f,
+  inv_view_proj: mat4x4f,
+  shadow0: mat4x4f,
+  shadow1: mat4x4f,
+  camera: vec4f,        // xyz eye, w = seconds
+  key_dir: vec4f,       // xyz towards the key light (sun or moon), w = intensity
+  key_color: vec4f,     // rgb, w = unused
+  amb_sky: vec4f,       // rgb ambient from above (already scaled), w = lamp level
+  amb_ground: vec4f,    // rgb ambient from below, w = wetness
+  shadow_tint: vec4f,   // rgb tint of the shaded side, w = shadow strength
+  ramp: vec4f,          // terminator centre, softness, rim strength, rim power
+  style: vec4f,         // specular, specular size, foliage wrap, foliage translucency
+  style2: vec4f,        // texture lod bias, normal map strength, lamp light scale, lamp glow scale
+  water: vec4f,         // plane height, reflection strength, ripple scale, rain
+  water_color: vec4f,   // rgb deep water, w = 1 in the reflection pass
+  zenith: vec4f,        // rgb, w = stars
+  horizon: vec4f,       // rgb, w = cloud cover
+  glow: vec4f,          // rgb, w = sun disc visibility
+  glow_dir: vec4f,      // xyz, w = moon disc visibility
+  sun_dir: vec4f,       // xyz, w = cloud scale
+  moon_dir: vec4f,      // xyz, w = moon size
+  cloud_lit: vec4f,     // rgb, w = star density
+  cloud_shadow: vec4f,  // rgb, w = petals
+  fog: vec4f,           // rgb, w = density
+  fog2: vec4f,          // height base, height falloff, mist, fog strength
+  wind: vec4f,          // xz wind velocity in xy, z = time scale, w = unused
+  viewport: vec4f,      // width, height, 1 / width, 1 / height
+  cascades: vec4f,      // cascade 0 far distance, normal offset 0, normal offset 1, near plane
+  shadow_params: vec4f, // filter radius (uv) cascade 0, cascade 1, depth bias 0, depth bias 1
+  tiles: vec4u,         // tiles across, tiles down, tile size in pixels, light count
+};
+
+@group(0) @binding(0) var<uniform> frame: Frame;
+
+const PI = 3.14159265;
+
+fn hash_u(n: u32) -> u32 {
+  var x = n;
+  x = x ^ (x >> 16u);
+  x = x * 0x7feb352du;
+  x = x ^ (x >> 15u);
+  x = x * 0x846ca68bu;
+  x = x ^ (x >> 16u);
+  return x;
+}
+
+fn rand01(n: u32) -> f32 {
+  return f32(hash_u(n) >> 8u) / 16777216.0;
+}
+
+fn hash2(p: vec2f) -> f32 {
+  let q = bitcast<vec2u>(vec2i(floor(p)));
+  return rand01(q.x * 1973u + hash_u(q.y * 9277u + 26699u));
+}
+
+fn hash3(p: vec3f) -> f32 {
+  let q = bitcast<vec3u>(vec3i(floor(p)));
+  return rand01(hash_u(q.x * 73856093u) ^ hash_u(q.y * 19349663u + 1u) ^ hash_u(q.z * 83492791u + 7u));
+}
+
+fn noise2(p: vec2f) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (vec2f(3.0) - 2.0 * f);
+  let a = hash2(i);
+  let b = hash2(i + vec2f(1.0, 0.0));
+  let c = hash2(i + vec2f(0.0, 1.0));
+  let d = hash2(i + vec2f(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn fbm2(p: vec2f) -> f32 {
+  var sum = 0.0;
+  var amp = 0.5;
+  var q = p;
+  for (var i = 0; i < 5; i++) {
+    sum += amp * noise2(q);
+    q = vec2f(q.x * 1.6 - q.y * 1.2, q.x * 1.2 + q.y * 1.6) + vec2f(17.3, 9.1);
+    amp *= 0.5;
+  }
+  return sum;
+}
+
+fn luminance(c: vec3f) -> f32 {
+  return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+// The sky without sun, moon, stars or clouds: gradient, horizon glow towards the light, halo.
+fn sky_base(dir: vec3f) -> vec3f {
+  let h = dir.y;
+  var col = mix(frame.horizon.rgb, frame.zenith.rgb, pow(clamp(h, 0.0, 1.0), 0.5));
+  let below = frame.horizon.rgb * 0.62 + frame.zenith.rgb * 0.18;
+  col = mix(col, below, smoothstep(0.0, -0.3, h));
+  let g = frame.glow_dir.xyz;
+  let flat_dir = normalize(vec2f(dir.x, dir.z) + vec2f(1e-5, 0.0));
+  let flat_glow = normalize(vec2f(g.x, g.z) + vec2f(1e-5, 0.0));
+  let az = max(dot(flat_dir, flat_glow), 0.0);
+  let band = exp(-abs(h - max(g.y, -0.05)) * 5.0);
+  col += frame.glow.rgb * (pow(az, 3.0) * band * 0.85);
+  let mu = max(dot(dir, g), 0.0);
+  col += frame.glow.rgb * (pow(mu, 10.0) * 0.3 + pow(mu, 90.0) * 0.5);
+  return col;
+}
+
+fn clouds(dir: vec3f, base: vec3f) -> vec3f {
+  let cover = frame.horizon.w;
+  if (dir.y <= 0.0) {
+    return base;
+  }
+  let t = frame.camera.w * frame.wind.z;
+  let scale = frame.sun_dir.w;
+  let uv = dir.xz / (dir.y + 0.12) * (0.55 * scale) + frame.wind.xy * (t * 0.0015);
+  let density = fbm2(uv * 1.4);
+  let threshold = mix(0.78, 0.18, cover);
+  let c = smoothstep(threshold, threshold + 0.22, density) * smoothstep(0.0, 0.14, dir.y);
+  if (c <= 0.0) {
+    return base;
+  }
+  // Two-tone painted shading: brighter on the side facing the light.
+  let g = frame.glow_dir.xyz;
+  let towards = normalize(vec2f(g.x, g.z) + vec2f(1e-5, 0.0));
+  let ahead = fbm2(uv * 1.4 + towards * 0.18);
+  let lit = smoothstep(-0.05, 0.08, density - ahead) * 0.65 + 0.35 * smoothstep(-0.2, 0.6, g.y);
+  var col = mix(frame.cloud_shadow.rgb, frame.cloud_lit.rgb, lit);
+  let mu = max(dot(dir, g), 0.0);
+  let edge = c * (1.0 - c) * 4.0;
+  col += frame.glow.rgb * (pow(mu, 6.0) * edge * 1.2);
+  return mix(base, col, c * 0.96);
+}
+
+fn stars(dir: vec3f) -> f32 {
+  if (dir.y <= 0.0 || frame.zenith.w <= 0.0) {
+    return 0.0;
+  }
+  let p = dir * 260.0;
+  let cell = floor(p);
+  let r = hash3(cell);
+  let density = frame.cloud_lit.w;
+  if (r < 1.0 - 0.012 * density) {
+    return 0.0;
+  }
+  let off = vec3f(hash3(cell + vec3f(7.0)), hash3(cell + vec3f(13.0)), hash3(cell + vec3f(29.0)));
+  let d = length(fract(p) - off);
+  let twinkle = 0.75 + 0.25 * sin(frame.camera.w * (2.0 + r * 3.0) + r * 40.0);
+  let size = 0.06 + 0.1 * hash3(cell + vec3f(41.0));
+  return smoothstep(size, 0.0, d) * twinkle * frame.zenith.w * smoothstep(0.0, 0.2, dir.y);
+}
+
+// The full sky seen along `dir`.
+fn sky_color(dir: vec3f) -> vec3f {
+  var col = sky_base(dir);
+  col += vec3f(0.85, 0.9, 1.0) * stars(dir) * 2.5;
+  let m = frame.moon_dir.xyz;
+  let moon_r = 0.028 * frame.moon_dir.w;
+  let md = 1.0 - dot(dir, m);
+  let moon_ang = sqrt(max(2.0 * md, 0.0));
+  if (frame.glow_dir.w > 0.0) {
+    let disc = smoothstep(moon_r, moon_r * 0.92, moon_ang);
+    let surface = 0.82 + 0.18 * noise2((dir.xy - m.xy) * 220.0);
+    col = mix(col, vec3f(1.0, 0.97, 0.9) * (2.6 * surface), disc * frame.glow_dir.w);
+    col += vec3f(0.55, 0.65, 0.95) * (exp(-moon_ang * 18.0) * 0.35 * frame.glow_dir.w);
+  }
+  if (frame.glow.w > 0.0) {
+    let s = frame.sun_dir.xyz;
+    let sd = sqrt(max(2.0 * (1.0 - dot(dir, s)), 0.0));
+    col += vec3f(1.0, 0.92, 0.75) * (smoothstep(0.022, 0.017, sd) * 30.0 * frame.glow.w);
+  }
+  col = clouds(dir, col);
+  return col;
+}
+
+// Aerial perspective and height fog between the camera and a point `dist` away along `dir`.
+fn fog_amount(cam: vec3f, world: vec3f, dist: f32) -> f32 {
+  let base = frame.fog2.x;
+  let falloff = frame.fog2.y;
+  let h0 = max(cam.y - base, 0.0);
+  let h1 = max(world.y - base, 0.0);
+  // Average density of exp(-falloff * h) along the segment.
+  var avg = exp(-falloff * h0);
+  let dh = h1 - h0;
+  if (abs(dh) > 1e-3) {
+    avg = (exp(-falloff * h0) - exp(-falloff * h1)) / (falloff * dh);
+  }
+  let density = frame.fog.w * frame.fog2.w;
+  return 1.0 - exp(-density * dist * mix(0.35, 1.0, avg));
+}
+
+fn fog_color(dir: vec3f) -> vec3f {
+  let g = frame.glow_dir.xyz;
+  let mu = max(dot(dir, g), 0.0);
+  let scatter = frame.glow.rgb * (pow(mu, 6.0) * 0.55);
+  return mix(frame.fog.rgb, sky_base(dir), 0.45) + scatter;
+}
