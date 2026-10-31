@@ -268,7 +268,12 @@ fn water_normal(world: vec3f, t: f32) -> vec3f {
     out.aux = vec4f(geo_n, 0.5);
   }
   let dark = mix(vec3f(1.0), frame.shadow_tint.rgb, frame.shadow_tint.w);
-  let diffuse = key * lit + hemi * mix(dark, vec3f(1.0), lit);
+  // Thin petals and leaves also pass sky light through from behind.
+  var ambient = hemi;
+  if (foliage) {
+    ambient = hemi * (1.0 + frame.style.w);
+  }
+  let diffuse = key * lit + ambient * mix(dark, vec3f(1.0), lit);
   let metallic = draw.params.z;
   var col = albedo.rgb * (diffuse + lamps) * (1.0 - 0.5 * metallic) + glow;
 
