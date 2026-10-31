@@ -227,7 +227,7 @@ p,footer,.eyebrow,.gate b{color:black}
           <details open>
             <summary>Direct graphics backends <small class="partial">Working slice</small>
             </summary>
-            <p>First-party Vulkan graphics and depth testing draw to images and native swapchains. Add Metal and browser WebGPU behind a capability contract; DX12 and licensed console backends are separate decisions.</p>
+            <p>The <code>gpu</code> layer (pipelines, bind groups, passes, automatic barriers; shaped so Metal, WebGPU and D3D12 can implement it) runs on first-party Vulkan, offscreen and in native swapchains on Windows and X11. Add Metal and browser WebGPU behind the same interface; DX12 and licensed console backends are separate decisions.</p>
             <p class="gate">
               <b>Acceptance test</b> A representative scene draws with equivalent visibility and color on every supported backend.</p>
           </details>
@@ -239,16 +239,16 @@ p,footer,.eyebrow,.gate b{color:black}
               <b>Acceptance test</b> The graph rejects undeclared resource use and removes a pass whose output is not consumed.</p>
           </details>
           <details>
-            <summary>Materials, shaders and lighting <small class="partial">First slice</small>
+            <summary>Materials, shaders and lighting <small class="partial">Working slice</small>
             </summary>
-            <p>Rust emits the current fixed SPIR-V modules. Next come authored materials, cameras, lights, skinning, shadow maps and pipeline cache keys. Ray tracing, virtual shadows and advanced GI are optional higher tiers.</p>
+            <p>Shaders are written in a WGSL subset and compiled by ABE's own compiler (<code>abe-shader</code>) to SPIR-V; MSL, HLSL and WGSL emitters come with their backends. The stylized renderer draws cooked materials and textures with soft cel lighting, two shadow cascades, tiled lamp lights, water reflections and a time-of-day sky with weather; each game sets its style in a Look file. Next come skinning, pipeline cache keys and a physically based shading model beside the stylized one. Ray tracing, virtual shadows and advanced GI are optional higher tiers.</p>
             <p class="gate">
               <b>Acceptance test</b> Reimporting one material updates the editor and player with the same pipeline and stable cache keys.</p>
           </details>
           <details>
-            <summary>Post-processing and resolution <small class="future">Planned</small>
+            <summary>Post-processing and resolution <small class="partial">First slice</small>
             </summary>
-            <p>Separate world resolution from crisp UI. Add color management, AA, bloom and HDR, followed by optional supported reconstruction techniques. Vendor SDK features require explicit dependency and platform decisions.</p>
+            <p>HDR rendering with ambient occlusion, outlines, aerial perspective and mist, bloom, tone mapping and grading, a painterly filter, FXAA in the player and jittered accumulation for stills. Next: separate world resolution from crisp UI, temporal anti-aliasing and optional supported reconstruction techniques. Vendor SDK features require explicit dependency and platform decisions.</p>
             <p class="gate">
               <b>Acceptance test</b> Performance tiers preserve legible text and controls while adjusting expensive world passes.</p>
           </details>
@@ -319,7 +319,7 @@ p,footer,.eyebrow,.gate b{color:black}
           <details open>
             <summary>Importer, cooker and packages <small class="partial">First slice</small>
             </summary>
-            <p>The first cooker reads a bounded static GLB subset and writes a deterministic, indexed binary world. Next come dependency manifests, content hashes, texture/audio formats and incremental target packages.</p>
+            <p>The cooker reads a bounded static GLB subset (meshes, PBR material factors, PNG base-colour/normal/emissive textures, point lights) with first-party zlib/PNG codecs and writes a deterministic ABEW v2 world with mip chains. Next come dependency manifests, content hashes, GPU-compressed texture formats, audio formats and incremental target packages.</p>
             <p class="gate">
               <b>Acceptance test</b> A clean rebuild produces identical bytes; corrupt inputs and unsupported features fail explicitly.</p>
           </details>

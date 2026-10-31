@@ -24,6 +24,17 @@ cargo run --locked --offline --release --example observatory -- scene.ppm
 
 The example renders a generic 3D sculpture to a Netpbm image. It uses the same camera and renderer interfaces available to game clients.
 
+## Render with the stylized renderer
+
+```sh
+cargo run --locked --offline --release --bin abe-render -- --scene world.abew --look look.json --all-views --time 20.5 --weather clear --width 1920 --height 1080 --samples 16 --out-dir renders
+cargo run --locked --offline --release --bin abe-player -- --scene world.abew --look look.json
+```
+
+`abe_engine::render` draws cooked worlds with soft cel lighting, two shadow cascades, tiled point lights, planar water reflections, a time-of-day sky (sun and moon from the clock, latitude and date) and weather (`clear`, `cloudy`, `overcast`, `mist`, `rain`, `storm`, `petals`), then ambient occlusion, outlines, aerial perspective, bloom, grading and a painterly filter. It runs on the backend-neutral `abe_engine::gpu` layer. The style is data: a game's Look file (JSON) sets shading, post-processing, sky palette, place and time, weather and named camera views, so different games share one renderer. With a scene that has materials or a `--look` file, the player flies: W/A/S/D move, Q/E down/up, arrows or left-drag look, Shift faster, 1–9 views, T/G time, C day cycle, Y weather, P pause, Esc quit. `--high` uses still-image quality.
+
+Shaders are WGSL (a documented subset, plus `var<push_constant>`) compiled at startup by the engine's own compiler, `abe-shader`, to SPIR-V. `cargo run -p abe-shader --example abe-shaderc -- shader.wgsl fragment fs_main out.spv` compiles one entry point and prints its reflection.
+
 ## Cook a static scene
 
 ```sh
@@ -31,7 +42,7 @@ cargo run --locked --offline --release --bin abe-build -- cook source.glb scene.
 cargo run --locked --offline --release --bin abe-build -- inspect scene.abew
 ```
 
-The cooker accepts embedded glTF 2.0 triangle meshes with float positions, optional indices, base colors and scene-node transforms. ABEW v1 stores meshes once and references them from affine instances. Unsupported codecs, skins, animation and textured base colors are reported explicitly. Games can convert authored content before cooking. The portable `abe-core` and `abe-assets` crates have no external dependencies.
+The cooker accepts embedded glTF 2.0 triangle meshes (float positions, normals and UVs, indices), PBR material factors, PNG base-colour, normal and emissive textures, `KHR_materials_emissive_strength`, `KHR_lights_punctual` point lights, alpha modes, double-sidedness, `extras.abe.shading` (`standard`, `foliage`, `water`, `unlit`) and `extras.abe.emission` (`lamp`: scaled by the time of day), and scene-node transforms. ABEW v2 stores meshes once, references them from affine instances, and adds materials, mip-chained RGBA8 textures and lights; v1 files still load. Unsupported codecs, skins, animation and other image types are reported explicitly. Games convert authored content (Draco, JPEG, WebP) before cooking. The portable `abe-core` and `abe-assets` crates have no external dependencies.
 
 [Explore the six architecture layers](docs/architecture.html) (download and open the self-contained HTML to use the selectors). [Engine milestones](docs/roadmap.md).
 
@@ -41,6 +52,7 @@ The cooker accepts embedded glTF 2.0 triangle meshes with float positions, optio
 cargo test --workspace --locked --offline
 cargo test --locked --offline --test vulkan -- --ignored
 cargo test --locked --offline --test present -- --ignored
+cargo test --locked --offline --test gpu --test render -- --ignored
 ```
 
 Use `Presenter::set_static_scene` once for the environment and `draw_with_static` each frame for changing objects. The two draws share a depth buffer.
