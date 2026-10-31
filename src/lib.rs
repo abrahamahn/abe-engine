@@ -1,5 +1,6 @@
 //! ABE's portable scene data and camera. Game-specific content belongs to clients.
 
+pub mod gpu;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
 pub mod vulkan;
 #[cfg(any(target_os = "linux", target_os = "windows"))]

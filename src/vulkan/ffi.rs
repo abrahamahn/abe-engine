@@ -1191,6 +1191,396 @@ impl VkBufferMemoryBarrier {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkPhysicalDeviceFeatures {
+    pub robustBufferAccess: u32,
+    pub fullDrawIndexUint32: u32,
+    pub imageCubeArray: u32,
+    pub independentBlend: u32,
+    pub geometryShader: u32,
+    pub tessellationShader: u32,
+    pub sampleRateShading: u32,
+    pub dualSrcBlend: u32,
+    pub logicOp: u32,
+    pub multiDrawIndirect: u32,
+    pub drawIndirectFirstInstance: u32,
+    pub depthClamp: u32,
+    pub depthBiasClamp: u32,
+    pub fillModeNonSolid: u32,
+    pub depthBounds: u32,
+    pub wideLines: u32,
+    pub largePoints: u32,
+    pub alphaToOne: u32,
+    pub multiViewport: u32,
+    pub samplerAnisotropy: u32,
+    pub textureCompressionETC2: u32,
+    pub textureCompressionASTC_LDR: u32,
+    pub textureCompressionBC: u32,
+    pub occlusionQueryPrecise: u32,
+    pub pipelineStatisticsQuery: u32,
+    pub vertexPipelineStoresAndAtomics: u32,
+    pub fragmentStoresAndAtomics: u32,
+    pub shaderTessellationAndGeometryPointSize: u32,
+    pub shaderImageGatherExtended: u32,
+    pub shaderStorageImageExtendedFormats: u32,
+    pub shaderStorageImageMultisample: u32,
+    pub shaderStorageImageReadWithoutFormat: u32,
+    pub shaderStorageImageWriteWithoutFormat: u32,
+    pub shaderUniformBufferArrayDynamicIndexing: u32,
+    pub shaderSampledImageArrayDynamicIndexing: u32,
+    pub shaderStorageBufferArrayDynamicIndexing: u32,
+    pub shaderStorageImageArrayDynamicIndexing: u32,
+    pub shaderClipDistance: u32,
+    pub shaderCullDistance: u32,
+    pub shaderFloat64: u32,
+    pub shaderInt64: u32,
+    pub shaderInt16: u32,
+    pub shaderResourceResidency: u32,
+    pub shaderResourceMinLod: u32,
+    pub sparseBinding: u32,
+    pub sparseResidencyBuffer: u32,
+    pub sparseResidencyImage2D: u32,
+    pub sparseResidencyImage3D: u32,
+    pub sparseResidency2Samples: u32,
+    pub sparseResidency4Samples: u32,
+    pub sparseResidency8Samples: u32,
+    pub sparseResidency16Samples: u32,
+    pub sparseResidencyAliased: u32,
+    pub variableMultisampleRate: u32,
+    pub inheritedQueries: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkMemoryBarrier {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub srcAccessMask: u32,
+    pub dstAccessMask: u32,
+}
+impl VkMemoryBarrier {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 46,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkImageMemoryBarrier {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub srcAccessMask: u32,
+    pub dstAccessMask: u32,
+    pub oldLayout: i32,
+    pub newLayout: i32,
+    pub srcQueueFamilyIndex: u32,
+    pub dstQueueFamilyIndex: u32,
+    pub image: u64,
+    pub subresourceRange: VkImageSubresourceRange,
+}
+impl VkImageMemoryBarrier {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 45,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkSamplerCreateInfo {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub magFilter: i32,
+    pub minFilter: i32,
+    pub mipmapMode: i32,
+    pub addressModeU: i32,
+    pub addressModeV: i32,
+    pub addressModeW: i32,
+    pub mipLodBias: f32,
+    pub anisotropyEnable: u32,
+    pub maxAnisotropy: f32,
+    pub compareEnable: u32,
+    pub compareOp: i32,
+    pub minLod: f32,
+    pub maxLod: f32,
+    pub borderColor: i32,
+    pub unnormalizedCoordinates: u32,
+}
+impl VkSamplerCreateInfo {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 31,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkDescriptorSetLayoutBinding {
+    pub binding: u32,
+    pub descriptorType: i32,
+    pub descriptorCount: u32,
+    pub stageFlags: u32,
+    pub pImmutableSamplers: *const u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkDescriptorSetLayoutCreateInfo {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub bindingCount: u32,
+    pub pBindings: *const VkDescriptorSetLayoutBinding,
+}
+impl VkDescriptorSetLayoutCreateInfo {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 32,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkDescriptorPoolSize {
+    pub r#type: i32,
+    pub descriptorCount: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkDescriptorPoolCreateInfo {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub maxSets: u32,
+    pub poolSizeCount: u32,
+    pub pPoolSizes: *const VkDescriptorPoolSize,
+}
+impl VkDescriptorPoolCreateInfo {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 33,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkDescriptorSetAllocateInfo {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub descriptorPool: u64,
+    pub descriptorSetCount: u32,
+    pub pSetLayouts: *const u64,
+}
+impl VkDescriptorSetAllocateInfo {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 34,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkDescriptorImageInfo {
+    pub sampler: u64,
+    pub imageView: u64,
+    pub imageLayout: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkDescriptorBufferInfo {
+    pub buffer: u64,
+    pub offset: u64,
+    pub range: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkWriteDescriptorSet {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub dstSet: u64,
+    pub dstBinding: u32,
+    pub dstArrayElement: u32,
+    pub descriptorCount: u32,
+    pub descriptorType: i32,
+    pub pImageInfo: *const VkDescriptorImageInfo,
+    pub pBufferInfo: *const VkDescriptorBufferInfo,
+    pub pTexelBufferView: *const u64,
+}
+impl VkWriteDescriptorSet {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 35,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkComputePipelineCreateInfo {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub stage: VkPipelineShaderStageCreateInfo,
+    pub layout: u64,
+    pub basePipelineHandle: u64,
+    pub basePipelineIndex: i32,
+}
+impl VkComputePipelineCreateInfo {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 29,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkPipelineDynamicStateCreateInfo {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub dynamicStateCount: u32,
+    pub pDynamicStates: *const i32,
+}
+impl VkPipelineDynamicStateCreateInfo {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 27,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkImageBlit {
+    pub srcSubresource: VkImageSubresourceLayers,
+    pub srcOffsets: [VkOffset3D; 2],
+    pub dstSubresource: VkImageSubresourceLayers,
+    pub dstOffsets: [VkOffset3D; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkLayerProperties {
+    pub layerName: [c_char; 256],
+    pub specVersion: u32,
+    pub implementationVersion: u32,
+    pub description: [c_char; 256],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkExtensionProperties {
+    pub extensionName: [c_char; 256],
+    pub specVersion: u32,
+}
+
+// VK_EXT_debug_utils (instance extension; entry points come from vkGetInstanceProcAddr).
+pub(super) type PFN_vkVoidFunction = unsafe extern "system" fn();
+pub(super) type PFN_vkDebugUtilsMessengerCallbackEXT = unsafe extern "system" fn(
+    messageSeverity: u32,
+    messageTypes: u32,
+    pCallbackData: *const VkDebugUtilsMessengerCallbackDataEXT,
+    pUserData: *mut c_void,
+) -> u32;
+pub(super) type PFN_vkCreateDebugUtilsMessengerEXT = unsafe extern "system" fn(
+    instance: *mut c_void,
+    pCreateInfo: *const VkDebugUtilsMessengerCreateInfoEXT,
+    pAllocator: *const c_void,
+    pMessenger: *mut u64,
+) -> i32;
+pub(super) type PFN_vkDestroyDebugUtilsMessengerEXT =
+    unsafe extern "system" fn(instance: *mut c_void, messenger: u64, pAllocator: *const c_void);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkDebugUtilsMessengerCreateInfoEXT {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub messageSeverity: u32,
+    pub messageType: u32,
+    pub pfnUserCallback: Option<PFN_vkDebugUtilsMessengerCallbackEXT>,
+    pub pUserData: *mut c_void,
+}
+impl VkDebugUtilsMessengerCreateInfoEXT {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 1000128004,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkDebugUtilsMessengerCallbackDataEXT {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub pMessageIdName: *const c_char,
+    pub messageIdNumber: i32,
+    pub pMessage: *const c_char,
+    pub queueLabelCount: u32,
+    pub pQueueLabels: *const c_void,
+    pub cmdBufLabelCount: u32,
+    pub pCmdBufLabels: *const c_void,
+    pub objectCount: u32,
+    pub pObjects: *const c_void,
+}
+
+// VK_EXT_validation_features (instance extension provided by the validation layer).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkValidationFeaturesEXT {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub enabledValidationFeatureCount: u32,
+    pub pEnabledValidationFeatures: *const i32,
+    pub disabledValidationFeatureCount: u32,
+    pub pDisabledValidationFeatures: *const i32,
+}
+impl VkValidationFeaturesEXT {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 1000247000,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
 #[cfg_attr(
     target_os = "linux",
     link(name = "libvulkan.so.1", kind = "dylib", modifiers = "+verbatim")
@@ -1569,5 +1959,138 @@ unsafe extern "system" {
         pBufferMemoryBarriers: *const VkBufferMemoryBarrier,
         imageMemoryBarrierCount: u32,
         pImageMemoryBarriers: *const c_void,
+    );
+    pub(super) fn vkGetInstanceProcAddr(
+        instance: *mut c_void,
+        pName: *const c_char,
+    ) -> Option<PFN_vkVoidFunction>;
+    pub(super) fn vkEnumerateInstanceLayerProperties(
+        pPropertyCount: *mut u32,
+        pProperties: *mut VkLayerProperties,
+    ) -> i32;
+    pub(super) fn vkEnumerateInstanceExtensionProperties(
+        pLayerName: *const c_char,
+        pPropertyCount: *mut u32,
+        pProperties: *mut VkExtensionProperties,
+    ) -> i32;
+    pub(super) fn vkGetPhysicalDeviceFeatures(
+        physicalDevice: *mut c_void,
+        pFeatures: *mut VkPhysicalDeviceFeatures,
+    );
+    pub(super) fn vkGetFenceStatus(device: *mut c_void, fence: u64) -> i32;
+    pub(super) fn vkCreateSampler(
+        device: *mut c_void,
+        pCreateInfo: *const VkSamplerCreateInfo,
+        pAllocator: *const c_void,
+        pSampler: *mut u64,
+    ) -> i32;
+    pub(super) fn vkDestroySampler(device: *mut c_void, sampler: u64, pAllocator: *const c_void);
+    pub(super) fn vkCreateDescriptorSetLayout(
+        device: *mut c_void,
+        pCreateInfo: *const VkDescriptorSetLayoutCreateInfo,
+        pAllocator: *const c_void,
+        pSetLayout: *mut u64,
+    ) -> i32;
+    pub(super) fn vkDestroyDescriptorSetLayout(
+        device: *mut c_void,
+        descriptorSetLayout: u64,
+        pAllocator: *const c_void,
+    );
+    pub(super) fn vkCreateDescriptorPool(
+        device: *mut c_void,
+        pCreateInfo: *const VkDescriptorPoolCreateInfo,
+        pAllocator: *const c_void,
+        pDescriptorPool: *mut u64,
+    ) -> i32;
+    pub(super) fn vkDestroyDescriptorPool(
+        device: *mut c_void,
+        descriptorPool: u64,
+        pAllocator: *const c_void,
+    );
+    pub(super) fn vkAllocateDescriptorSets(
+        device: *mut c_void,
+        pAllocateInfo: *const VkDescriptorSetAllocateInfo,
+        pDescriptorSets: *mut u64,
+    ) -> i32;
+    pub(super) fn vkFreeDescriptorSets(
+        device: *mut c_void,
+        descriptorPool: u64,
+        descriptorSetCount: u32,
+        pDescriptorSets: *const u64,
+    ) -> i32;
+    pub(super) fn vkUpdateDescriptorSets(
+        device: *mut c_void,
+        descriptorWriteCount: u32,
+        pDescriptorWrites: *const VkWriteDescriptorSet,
+        descriptorCopyCount: u32,
+        pDescriptorCopies: *const c_void,
+    );
+    pub(super) fn vkCreateComputePipelines(
+        device: *mut c_void,
+        pipelineCache: u64,
+        createInfoCount: u32,
+        pCreateInfos: *const VkComputePipelineCreateInfo,
+        pAllocator: *const c_void,
+        pPipelines: *mut u64,
+    ) -> i32;
+    pub(super) fn vkCmdBindDescriptorSets(
+        commandBuffer: *mut c_void,
+        pipelineBindPoint: i32,
+        layout: u64,
+        firstSet: u32,
+        descriptorSetCount: u32,
+        pDescriptorSets: *const u64,
+        dynamicOffsetCount: u32,
+        pDynamicOffsets: *const u32,
+    );
+    pub(super) fn vkCmdBindIndexBuffer(
+        commandBuffer: *mut c_void,
+        buffer: u64,
+        offset: u64,
+        indexType: i32,
+    );
+    pub(super) fn vkCmdDrawIndexed(
+        commandBuffer: *mut c_void,
+        indexCount: u32,
+        instanceCount: u32,
+        firstIndex: u32,
+        vertexOffset: i32,
+        firstInstance: u32,
+    );
+    pub(super) fn vkCmdDispatch(
+        commandBuffer: *mut c_void,
+        groupCountX: u32,
+        groupCountY: u32,
+        groupCountZ: u32,
+    );
+    pub(super) fn vkCmdSetViewport(
+        commandBuffer: *mut c_void,
+        firstViewport: u32,
+        viewportCount: u32,
+        pViewports: *const VkViewport,
+    );
+    pub(super) fn vkCmdSetScissor(
+        commandBuffer: *mut c_void,
+        firstScissor: u32,
+        scissorCount: u32,
+        pScissors: *const VkRect2D,
+    );
+    pub(super) fn vkCmdCopyBufferToImage(
+        commandBuffer: *mut c_void,
+        srcBuffer: u64,
+        dstImage: u64,
+        dstImageLayout: i32,
+        regionCount: u32,
+        pRegions: *const VkBufferImageCopy,
+    );
+    pub(super) fn vkCmdBlitImage(
+        commandBuffer: *mut c_void,
+        srcImage: u64,
+        srcImageLayout: i32,
+        dstImage: u64,
+        dstImageLayout: i32,
+        regionCount: u32,
+        pRegions: *const VkImageBlit,
+        filter: i32,
     );
 }

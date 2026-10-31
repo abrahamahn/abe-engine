@@ -5,6 +5,7 @@ mod frame;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod present;
 mod resident;
+pub(crate) mod rhi;
 mod shaders;
 use crate::Vertex;
 use core::ffi::{CStr, c_void};

@@ -1,0 +1,547 @@
+//! Vulkan 1.0 implementation of the backend-neutral GPU layer in [`crate::gpu`].
+//!
+//! Ownership: [`Gpu`] owns the instance, device, queue and every object created through it.
+//! Objects live in generational pools addressed by the public `*Id` handles. Destroying an
+//! object moves its Vulkan handles to a garbage list tagged with the newest submission serial;
+//! they are freed once every submission up to that serial has signalled its fence (or when the
+//! device drops, after `vkDeviceWaitIdle`).
+//!
+//! Submissions: one graphics+compute queue, one command pool, and three command buffers with
+//! fences: one for synchronous work (`submit`, uploads, mip generation) and one per frame slot
+//! for presentation (two frames in flight). A fence is only reused after it has been waited on,
+//! so every submission that is not pending on a fence has completed.
+//!
+//! Threading: the device is single-threaded (`!Send`, `!Sync`). Every Vulkan object is
+//! externally synchronized by `&mut self`; fence waits in `&self` methods only read fences.
+//! The validation callback may run on driver threads and only touches the mutex-protected log.
+mod pipelines;
+mod record;
+mod resources;
+mod setup;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod swapchain;
+mod track;
+
+use super::ffi::*;
+use super::{Handle, check, create};
+use crate::gpu::{
+    BindGroupId, BufferDesc, BufferId, Format, Limits, PipelineId, SamplerId, TextureDesc,
+    TextureId, ValidationLog,
+};
+use abe_shader::BindingKind;
+use core::cell::Cell;
+use core::ptr::{null, null_mut};
+use std::collections::HashMap;
+use track::{State, Use};
+
+type Result<T> = std::result::Result<T, String>;
+
+/// Frames in flight for presentation.
+const FRAMES: usize = 2;
+/// Index of the synchronous submission in `Gpu::subs`; frame slot `f` uses `1 + f`.
+const IMMEDIATE: usize = 0;
+/// Longest wait for one GPU submission before reporting a hang.
+const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;
+
+const INDEX_BITS: u32 = 20;
+const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;
+const GENERATIONS: u32 = 1 << (32 - INDEX_BITS);
+
+/// Generational slots: ids are `generation << 20 | index`.
+struct Pool<T> {
+    slots: Vec<(u32, Option<T>)>,
+    free: Vec<u32>,
+}
+impl<T> Default for Pool<T> {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+        }
+    }
+}
+impl<T> Pool<T> {
+    fn insert(&mut self, value: T) -> Result<u32> {
+        if let Some(index) = self.free.pop() {
+            let slot = &mut self.slots[index as usize];
+            slot.1 = Some(value);
+            return Ok(slot.0 << INDEX_BITS | index);
+        }
+        let index = self.slots.len() as u32;
+        if index > INDEX_MASK {
+            return Err("too many live GPU objects of one kind".into());
+        }
+        self.slots.push((0, Some(value)));
+        Ok(index)
+    }
+    fn get(&self, raw: u32) -> Option<&T> {
+        let slot = self.slots.get((raw & INDEX_MASK) as usize)?;
+        (slot.0 == raw >> INDEX_BITS).then_some(slot.1.as_ref()?)
+    }
+    fn get_mut(&mut self, raw: u32) -> Option<&mut T> {
+        let slot = self.slots.get_mut((raw & INDEX_MASK) as usize)?;
+        (slot.0 == raw >> INDEX_BITS).then_some(slot.1.as_mut()?)
+    }
+    fn remove(&mut self, raw: u32) -> Option<T> {
+        let index = raw & INDEX_MASK;
+        let slot = self.slots.get_mut(index as usize)?;
+        if slot.0 != raw >> INDEX_BITS {
+            return None;
+        }
+        let value = slot.1.take()?;
+        slot.0 = (slot.0 + 1) % GENERATIONS;
+        self.free.push(index);
+        Some(value)
+    }
+    fn drain(&mut self) -> Vec<T> {
+        self.free.clear();
+        self.slots.drain(..).filter_map(|s| s.1).collect()
+    }
+}
+
+struct Buffer {
+    handle: u64,
+    memory: u64,
+    desc: BufferDesc,
+    /// Persistent mapping of host-visible memory; null for `Memory::Device`.
+    mapped: *mut u8,
+    state: State,
+    /// Serial of the newest submission that referenced the buffer.
+    last_use: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ViewKey {
+    ty: i32,
+    base_mip: u32,
+    mips: u32,
+    base_layer: u32,
+    layers: u32,
+}
+
+struct Texture {
+    image: u64,
+    /// Zero for swapchain images, which the swapchain owns.
+    memory: u64,
+    desc: TextureDesc,
+    format: i32,
+    aspect: u32,
+    /// Per subresource, indexed `layer * mips + mip`.
+    states: Vec<State>,
+    views: Vec<(ViewKey, u64)>,
+    swapchain: bool,
+    last_use: u64,
+}
+
+struct Sampler {
+    handle: u64,
+    comparison: bool,
+}
+
+/// One binding of a descriptor set layout, as reflected from the shaders.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Entry {
+    binding: u32,
+    kind: BindingKind,
+    /// VkShaderStageFlags of the stages that use the binding.
+    stages: u32,
+}
+#[derive(Clone, Debug, PartialEq)]
+struct GroupLayout {
+    set_layout: u64,
+    entries: Vec<Entry>,
+}
+
+struct Pipeline {
+    handle: u64,
+    layout: u64,
+    compute: bool,
+    /// Index = group; empty layouts fill gaps below the highest used group.
+    groups: Vec<GroupLayout>,
+    push_size: u32,
+    push_stages: u32,
+    colors: Vec<Format>,
+    depth: Option<Format>,
+    vertex_input: bool,
+}
+
+/// A resource referenced by a bind group, with the use it implies.
+#[derive(Clone, Copy, Debug)]
+enum Bound {
+    Buffer {
+        id: BufferId,
+        usage: Use,
+    },
+    Texture {
+        id: TextureId,
+        mips: (u32, u32),
+        layers: (u32, u32),
+        usage: Use,
+    },
+    Sampler(SamplerId),
+}
+
+/// Bind groups per pipeline (`@group(0)` to `@group(7)`).
+const MAX_BIND_GROUPS: usize = 8;
+/// VkDescriptorType values used by bind groups, in pool accounting order.
+const DESCRIPTOR_TYPES: [i32; 5] = [0, 2, 3, 6, 7];
+
+struct BindGroup {
+    set: u64,
+    pool: usize,
+    layout: GroupLayout,
+    bound: Vec<Bound>,
+    counts: [u32; 5],
+}
+
+struct DescriptorPool {
+    handle: u64,
+    sets: u32,
+    counts: [u32; 5],
+}
+
+enum Garbage {
+    Buffer(u64, u64),
+    Image(u64, u64, Vec<u64>),
+    Framebuffer(u64),
+    Set(usize, u64, [u32; 5]),
+}
+
+struct Submission {
+    cmd: Handle,
+    fence: u64,
+    /// Serial of the submission the fence will signal, until a wait observes it.
+    pending: Cell<Option<u64>>,
+    /// Acquire semaphore of a frame slot (unused for the synchronous submission).
+    acquire: u64,
+}
+impl Default for Submission {
+    fn default() -> Self {
+        Self {
+            cmd: null_mut(),
+            fence: 0,
+            pending: Cell::new(None),
+            acquire: 0,
+        }
+    }
+}
+
+/// Host-visible upload buffer reused by synchronous uploads.
+struct Staging {
+    buffer: u64,
+    memory: u64,
+    mapped: *mut u8,
+    size: u64,
+}
+
+/// Optional device features, enabled whenever the adapter supports them.
+#[derive(Clone, Copy, Debug, Default)]
+struct Features {
+    anisotropy: bool,
+    depth_clamp: bool,
+    /// Different blend states per colour target.
+    independent_blend: bool,
+    /// Writable storage buffers/textures in vertex or fragment shaders.
+    vertex_stores: bool,
+    fragment_stores: bool,
+    /// `Rg16Float`/`R16Float` storage textures.
+    storage_formats: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PassKey {
+    /// (VkFormat, loadOp, storeOp)
+    colors: Vec<(i32, i32, i32)>,
+    depth: Option<(i32, i32, i32)>,
+}
+
+pub(crate) struct Gpu<'w> {
+    instance: Handle,
+    physical: Handle,
+    device: Handle,
+    queue: Handle,
+    family: u32,
+    memory: VkPhysicalDeviceMemoryProperties,
+    limits: VkPhysicalDeviceLimits,
+    features: Features,
+    name: String,
+    debug: Option<setup::Debug>,
+    buffers: Pool<Buffer>,
+    textures: Pool<Texture>,
+    samplers: Pool<Sampler>,
+    pipelines: Pool<Pipeline>,
+    groups: Pool<BindGroup>,
+    sampler_cache: HashMap<[u32; 8], SamplerId>,
+    set_layouts: HashMap<Vec<(u32, i32, u32)>, u64>,
+    pipeline_layouts: HashMap<(Vec<u64>, u32, u32), u64>,
+    render_passes: HashMap<PassKey, u64>,
+    framebuffers: HashMap<(u64, Vec<u64>, u32, u32), u64>,
+    descriptor_pools: Vec<DescriptorPool>,
+    command_pool: u64,
+    subs: [Submission; 1 + FRAMES],
+    frame: usize,
+    serial: u64,
+    garbage: Vec<(u64, Garbage)>,
+    staging: Option<Staging>,
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    present: Option<swapchain::Presentation<'w>>,
+    _window: core::marker::PhantomData<&'w ()>,
+}
+
+impl Gpu<'static> {
+    pub fn headless() -> Result<Self> {
+        let mut gpu = Self::with_instance(&[])?;
+        gpu.open_device(0)?;
+        Ok(gpu)
+    }
+}
+
+/// Platforms with the offscreen backend only (Android today).
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+impl Gpu<'_> {
+    pub fn acquire(&mut self) -> Result<Option<TextureId>> {
+        Err("presentation is not available on this platform".into())
+    }
+    pub fn present(&mut self, _: crate::gpu::Encoder) -> Result<()> {
+        Err("presentation is not available on this platform".into())
+    }
+    pub fn surface_format(&self) -> Format {
+        Format::Bgra8Srgb
+    }
+    pub fn surface_size(&self) -> (u32, u32) {
+        (0, 0)
+    }
+}
+
+impl<'w> Gpu<'w> {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn limits(&self) -> Limits {
+        let l = &self.limits;
+        Limits {
+            max_texture_2d: l.maxImageDimension2D,
+            max_push_constants: l.maxPushConstantsSize,
+            max_anisotropy: if self.features.anisotropy {
+                l.maxSamplerAnisotropy
+            } else {
+                1.0
+            },
+            depth_clamp: self.features.depth_clamp,
+            uniform_offset_alignment: l.minUniformBufferOffsetAlignment,
+            storage_offset_alignment: l.minStorageBufferOffsetAlignment,
+            depth_filterable: self.format_features(126) & resources::FEATURE_LINEAR != 0,
+        }
+    }
+    pub fn validation_log(&self) -> Option<ValidationLog> {
+        self.debug.as_ref().map(|d| d.log.clone())
+    }
+    pub fn frame_slot(&self) -> usize {
+        self.frame
+    }
+
+    fn buffer(&self, id: BufferId) -> Result<&Buffer> {
+        self.buffers
+            .get(id.raw())
+            .ok_or_else(|| format!("{id:?} was destroyed or does not belong to this device"))
+    }
+    fn texture(&self, id: TextureId) -> Result<&Texture> {
+        self.textures
+            .get(id.raw())
+            .ok_or_else(|| format!("{id:?} was destroyed or does not belong to this device"))
+    }
+    fn pipeline(&self, id: PipelineId) -> Result<&Pipeline> {
+        self.pipelines
+            .get(id.raw())
+            .ok_or_else(|| format!("{id:?} does not belong to this device"))
+    }
+    fn group(&self, id: BindGroupId) -> Result<&BindGroup> {
+        self.groups
+            .get(id.raw())
+            .ok_or_else(|| format!("{id:?} was destroyed or does not belong to this device"))
+    }
+
+    /// Waits for submission `which` if it is still pending.
+    fn wait(&self, which: usize) -> Result<()> {
+        let sub = &self.subs[which];
+        if sub.pending.get().is_some() {
+            // SAFETY: the fence belongs to this device; waiting does not require external
+            // synchronization of the fence.
+            let rc = unsafe { vkWaitForFences(self.device, 1, &sub.fence, 1, FENCE_TIMEOUT_NS) };
+            if rc == 2 {
+                return Err("GPU submission did not complete within 20 s".into());
+            }
+            check(rc, "vkWaitForFences")?;
+            sub.pending.set(None);
+        }
+        Ok(())
+    }
+    /// Waits for every pending submission with a serial up to `serial`.
+    fn wait_serial(&self, serial: u64) -> Result<()> {
+        for which in 0..self.subs.len() {
+            if self.subs[which].pending.get().is_some_and(|s| s <= serial) {
+                self.wait(which)?;
+            }
+        }
+        Ok(())
+    }
+    /// Every submission with a serial up to the returned one has completed.
+    fn completed(&self) -> u64 {
+        for sub in &self.subs {
+            // SAFETY: querying a fence status needs no external synchronization.
+            if sub.pending.get().is_some()
+                && unsafe { vkGetFenceStatus(self.device, sub.fence) } == 0
+            {
+                sub.pending.set(None);
+            }
+        }
+        self.subs
+            .iter()
+            .filter_map(|s| s.pending.get())
+            .min()
+            .map_or(self.serial, |s| s - 1)
+    }
+    /// Frees garbage that no pending submission can reference.
+    fn collect(&mut self) {
+        let done = self.completed();
+        let mut i = 0;
+        while i < self.garbage.len() {
+            if self.garbage[i].0 <= done {
+                let (_, g) = self.garbage.swap_remove(i);
+                self.free(g);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    fn discard(&mut self, g: Garbage) {
+        self.garbage.push((self.serial, g));
+        self.collect();
+    }
+    fn free(&mut self, g: Garbage) {
+        let d = self.device;
+        // SAFETY: garbage is only freed after every submission that could reference it has
+        // completed (or after vkDeviceWaitIdle), and nothing else holds these handles.
+        unsafe {
+            match g {
+                Garbage::Buffer(buffer, memory) => {
+                    vkDestroyBuffer(d, buffer, null());
+                    vkFreeMemory(d, memory, null());
+                }
+                Garbage::Image(image, memory, views) => {
+                    for v in views {
+                        vkDestroyImageView(d, v, null());
+                    }
+                    if memory != 0 {
+                        vkDestroyImage(d, image, null());
+                        vkFreeMemory(d, memory, null());
+                    }
+                }
+                Garbage::Framebuffer(f) => vkDestroyFramebuffer(d, f, null()),
+                Garbage::Set(_, 0, _) => {} // an empty group owns no descriptor set
+                Garbage::Set(pool, set, counts) => {
+                    let p = &mut self.descriptor_pools[pool];
+                    vkFreeDescriptorSets(d, p.handle, 1, &set);
+                    p.sets += 1;
+                    for (free, used) in p.counts.iter_mut().zip(counts) {
+                        *free += used;
+                    }
+                }
+            }
+        }
+    }
+    /// Moves every framebuffer that references one of `views` to the garbage list.
+    fn forget_views(&mut self, views: &[u64]) {
+        let stale: Vec<_> = self
+            .framebuffers
+            .keys()
+            .filter(|k| k.1.iter().any(|v| views.contains(v)))
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(f) = self.framebuffers.remove(&key) {
+                self.garbage.push((self.serial, Garbage::Framebuffer(f)));
+            }
+        }
+    }
+}
+
+impl Drop for Gpu<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the device is idle before any object is destroyed; children are destroyed
+        // before their parents (device objects, swapchain, device, surface, messenger,
+        // instance). The validation log outlives the instance because the Arc held by
+        // `self.debug` is dropped only after this function returns.
+        unsafe {
+            let d = self.device;
+            if !d.is_null() {
+                vkDeviceWaitIdle(d);
+                for sub in &self.subs {
+                    sub.pending.set(None);
+                }
+                for (_, g) in core::mem::take(&mut self.garbage) {
+                    self.free(g);
+                }
+                for p in self.descriptor_pools.drain(..) {
+                    vkDestroyDescriptorPool(d, p.handle, null());
+                }
+                for (_, f) in self.framebuffers.drain() {
+                    vkDestroyFramebuffer(d, f, null());
+                }
+                for (_, p) in self.render_passes.drain() {
+                    vkDestroyRenderPass(d, p, null());
+                }
+                for p in self.pipelines.drain() {
+                    vkDestroyPipeline(d, p.handle, null());
+                }
+                for (_, l) in self.pipeline_layouts.drain() {
+                    vkDestroyPipelineLayout(d, l, null());
+                }
+                for (_, l) in self.set_layouts.drain() {
+                    vkDestroyDescriptorSetLayout(d, l, null());
+                }
+                for s in self.samplers.drain() {
+                    vkDestroySampler(d, s.handle, null());
+                }
+                for t in self.textures.drain() {
+                    for (_, v) in t.views {
+                        vkDestroyImageView(d, v, null());
+                    }
+                    if t.memory != 0 {
+                        vkDestroyImage(d, t.image, null());
+                        vkFreeMemory(d, t.memory, null());
+                    }
+                }
+                for b in self.buffers.drain() {
+                    vkDestroyBuffer(d, b.handle, null());
+                    vkFreeMemory(d, b.memory, null());
+                }
+                if let Some(s) = self.staging.take() {
+                    vkDestroyBuffer(d, s.buffer, null());
+                    vkFreeMemory(d, s.memory, null());
+                }
+                for sub in &self.subs {
+                    vkDestroyFence(d, sub.fence, null());
+                    vkDestroySemaphore(d, sub.acquire, null());
+                }
+                vkDestroyCommandPool(d, self.command_pool, null());
+                // Swapchain image views went with the textures above.
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                if let Some(p) = self.present.as_mut() {
+                    p.destroy_chain(d);
+                }
+                vkDestroyDevice(d, null());
+            }
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            if let Some(p) = self.present.take() {
+                vkDestroySurfaceKHR(self.instance, p.surface, null());
+            }
+            if let Some(debug) = &self.debug {
+                debug.destroy_messenger(self.instance);
+            }
+            if !self.instance.is_null() {
+                vkDestroyInstance(self.instance, null());
+            }
+        }
+    }
+}
