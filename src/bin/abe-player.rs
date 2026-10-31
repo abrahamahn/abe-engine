@@ -12,26 +12,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     use std::time::{Duration, Instant};
     let mut args = std::env::args().skip(1);
-    let limit = match args.next().as_deref() {
-        None => None,
-        Some("--frames") => {
-            let n = args.next().ok_or("missing frame count")?.parse::<u64>()?;
-            if n == 0 {
-                return Err("frame count must be positive".into());
+    let (mut limit, mut scene_path) = (None, None);
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--frames" => {
+                let n = args.next().ok_or("missing frame count")?.parse::<u64>()?;
+                if n == 0 {
+                    return Err("frame count must be positive".into());
+                }
+                limit = Some(n);
             }
-            Some(n)
+            "--scene" => scene_path = Some(args.next().ok_or("missing cooked scene path")?),
+            "--help" => {
+                println!(
+                    "abe-player [--frames N] [--scene world.abew]\nSpace or click: pause/resume animation. Arrows: orbit. Esc: close."
+                );
+                return Ok(());
+            }
+            _ => return Err(format!("unknown option {flag}").into()),
         }
-        Some("--help") => {
-            println!(
-                "abe-player [--frames N]\nSpace or click: pause/resume. Arrows: orbit. Esc: close."
-            );
-            return Ok(());
-        }
-        _ => return Err("usage: abe-player [--frames N]".into()),
-    };
-    if args.next().is_some() {
-        return Err("unexpected argument".into());
     }
+    let asset = scene_path
+        .map(|p| -> Result<_, String> {
+            let world = abe_engine::assets::cooked::decode(&abe_engine::assets::read_asset(
+                std::path::Path::new(&p),
+            )?)?;
+            let scene = world.scene()?;
+            let bounds = scene.bounds().ok_or("static scene has no finite bounds")?;
+            Ok((scene, bounds))
+        })
+        .transpose()?;
     let window = Window::new("ABE Player", 800, 480)?;
     let mut gpu = DesktopRenderer::new(&window)?;
     println!(
@@ -39,6 +49,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gpu.device_name()
     );
     let mut presenter = gpu.presenter();
+    let mut bounds = None;
+    if let Some((scene, sphere)) = asset {
+        presenter.set_static_scene(&scene)?;
+        bounds = Some(sphere);
+    }
     let mut last = Instant::now();
     let mut animation = 0.45f32;
     let mut angle = 0.4f32;
@@ -65,7 +80,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             near: 0.1,
             far: 60.0,
         };
-        let status = presenter.draw(&demo::gallery(animation), camera, [0.03, 0.045, 0.07, 1.0])?;
+        let clear = [0.03, 0.045, 0.07, 1.0];
+        let status = if let Some(bounds) = bounds {
+            presenter.draw_static(Camera::orbit(bounds, angle), clear)?
+        } else {
+            presenter.draw(&demo::gallery(animation), camera, clear)?
+        };
         if limit.is_some_and(|n| presenter.stats().frames >= n) {
             break;
         }

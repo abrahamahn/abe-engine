@@ -32,10 +32,13 @@ impl Value {
         }
     }
     pub fn integer(&self) -> Result<usize, String> {
+        usize::try_from(self.unsigned()?).map_err(|_| "integer exceeds index range".into())
+    }
+    /// Exactly representable, nonnegative JSON integer, independent of pointer width.
+    pub fn unsigned(&self) -> Result<u64, String> {
         if let Self::Number(n) = self {
-            if *n >= 0. && *n <= 9_007_199_254_740_991. && *n < usize::MAX as f64 && n.fract() == 0.
-            {
-                return Ok(*n as usize);
+            if (0.0..=9_007_199_254_740_991.0).contains(n) && n.fract() == 0.0 {
+                return Ok(*n as u64);
             }
         }
         Err("expected unsigned integer".into())

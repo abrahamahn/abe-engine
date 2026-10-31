@@ -38,14 +38,24 @@ impl Module {
     }
 }
 pub(super) fn vertex() -> Vec<u32> {
-    let mut m = Module::new(20);
+    let mut m = Module::new(28);
     m.header(0, &[8, 9, 10, 13]);
     m.op(71, &[8, LOCATION, 0]);
     m.op(71, &[9, LOCATION, 1]);
     m.op(71, &[10, LOCATION, 0]);
     m.op(71, &[11, 2]); // per-vertex block
     m.op(72, &[11, 0, 11, 0]); // member 0: BuiltIn Position
+    // Push-constant block containing one column-major 4x4 camera matrix.
+    m.op(71, &[21, 2]);
+    m.op(72, &[21, 0, 5]);
+    m.op(72, &[21, 0, 7, 16]);
+    m.op(72, &[21, 0, 35, 0]);
     m.common_types();
+    m.op(24, &[20, 5, 4]);
+    m.op(30, &[21, 20]);
+    m.op(32, &[22, 9, 21]);
+    m.op(32, &[23, 9, 20]);
+    m.op(59, &[22, 24, 9]);
     m.op(30, &[11, 5]);
     m.op(32, &[12, OUTPUT, 11]);
     m.op(21, &[14, 32, 0]);
@@ -58,7 +68,10 @@ pub(super) fn vertex() -> Vec<u32> {
     m.op(248, &[16]);
     m.op(61, &[5, 17, 8]);
     m.op(65, &[7, 18, 13, 15]);
-    m.op(62, &[18, 17]);
+    m.op(65, &[23, 25, 24, 15]);
+    m.op(61, &[20, 26, 25]);
+    m.op(145, &[5, 27, 26, 17]); // MatrixTimesVector
+    m.op(62, &[18, 27]);
     m.op(61, &[5, 19, 9]);
     m.op(62, &[10, 19]);
     m.finish()

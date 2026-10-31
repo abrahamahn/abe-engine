@@ -161,6 +161,34 @@ impl VkSemaphoreCreateInfo {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub(super) struct VkBufferCopy {
+    pub srcOffset: u64,
+    pub dstOffset: u64,
+    pub size: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct VkQueryPoolCreateInfo {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub queryType: i32,
+    pub queryCount: u32,
+    pub pipelineStatistics: u32,
+}
+impl VkQueryPoolCreateInfo {
+    pub fn new() -> Self {
+        // All other fields are C scalars, handles or pointers; callers populate required fields.
+        Self {
+            sType: 11,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub(super) struct VkApplicationInfo {
     pub sType: i32,
     pub pNext: *const c_void,
@@ -685,6 +713,14 @@ impl VkShaderModuleCreateInfo {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub(super) struct VkPushConstantRange {
+    pub stageFlags: u32,
+    pub offset: u32,
+    pub size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub(super) struct VkPipelineLayoutCreateInfo {
     pub sType: i32,
     pub pNext: *const c_void,
@@ -692,7 +728,7 @@ pub(super) struct VkPipelineLayoutCreateInfo {
     pub setLayoutCount: u32,
     pub pSetLayouts: *const u64,
     pub pushConstantRangeCount: u32,
-    pub pPushConstantRanges: *const c_void,
+    pub pPushConstantRanges: *const VkPushConstantRange,
 }
 impl VkPipelineLayoutCreateInfo {
     pub fn new() -> Self {
@@ -1254,6 +1290,54 @@ unsafe extern "system" {
         pAllocator: *const c_void,
     );
     pub(super) fn vkResetCommandBuffer(commandBuffer: *mut c_void, flags: u32) -> i32;
+    pub(super) fn vkCmdPushConstants(
+        commandBuffer: *mut c_void,
+        layout: u64,
+        stageFlags: u32,
+        offset: u32,
+        size: u32,
+        pValues: *const c_void,
+    );
+    pub(super) fn vkCmdCopyBuffer(
+        commandBuffer: *mut c_void,
+        srcBuffer: u64,
+        dstBuffer: u64,
+        regionCount: u32,
+        pRegions: *const VkBufferCopy,
+    );
+    pub(super) fn vkCreateQueryPool(
+        device: *mut c_void,
+        pCreateInfo: *const VkQueryPoolCreateInfo,
+        pAllocator: *const c_void,
+        pQueryPool: *mut u64,
+    ) -> i32;
+    pub(super) fn vkDestroyQueryPool(
+        device: *mut c_void,
+        queryPool: u64,
+        pAllocator: *const c_void,
+    );
+    pub(super) fn vkCmdWriteTimestamp(
+        commandBuffer: *mut c_void,
+        pipelineStage: i32,
+        queryPool: u64,
+        query: u32,
+    );
+    pub(super) fn vkCmdResetQueryPool(
+        commandBuffer: *mut c_void,
+        queryPool: u64,
+        firstQuery: u32,
+        queryCount: u32,
+    );
+    pub(super) fn vkGetQueryPoolResults(
+        device: *mut c_void,
+        queryPool: u64,
+        firstQuery: u32,
+        queryCount: u32,
+        dataSize: usize,
+        pData: *mut c_void,
+        stride: u64,
+        flags: u32,
+    ) -> i32;
     pub(super) fn vkCreateInstance(
         pCreateInfo: *const VkInstanceCreateInfo,
         pAllocator: *const c_void,

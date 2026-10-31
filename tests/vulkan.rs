@@ -30,3 +30,40 @@ fn rasterizes_depth_and_reads_back_repeated_frames() {
     assert!(gpu.render(0, 12, clear, &[]).is_err());
     assert!(gpu.render(w, h, clear, &near[..2]).is_err());
 }
+
+#[test]
+#[ignore = "requires a Vulkan graphics device"]
+fn resident_vertices_match_cpu_projection_and_complete_benchmark_queries() {
+    use abe_engine::{Camera, Scene, Vec3, vulkan::bench};
+    let mut scene = Scene::default();
+    scene.triangle(
+        Vec3(-0.7, 0., 0.),
+        Vec3(0.9, 0., 0.),
+        Vec3(0., 1.2, 0.),
+        [0.7, 0.4, 0.2],
+    );
+    let bounds = scene.bounds().unwrap();
+    let mut gpu = VulkanRenderer::new().unwrap();
+    for angle in [0.2, 0.65] {
+        let cam = Camera::orbit(bounds, angle);
+        let reference = gpu
+            .render(91, 59, [0.; 4], &cam.vertices(&scene, 91, 59).unwrap())
+            .unwrap();
+        let projected = gpu.render_scene(91, 59, [0.; 4], &scene, cam).unwrap();
+        assert!(reference.chunks_exact(4).filter(|px| px[0] > 0).count() > 100);
+        let mismatch = projected
+            .chunks_exact(4)
+            .zip(reference.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(mismatch <= 2, "projection differs in {mismatch} pixels");
+    }
+    let run = bench::run(&mut gpu, &scene, (91, 59), 3, 7, |i| {
+        Camera::orbit(bounds, i as f32 * 0.05)
+    })
+    .unwrap();
+    assert_eq!(run.cpu_ms.len(), 7);
+    assert_eq!(run.fence_ms.len(), 7);
+    assert!(run.gpu_ms.is_empty() || run.gpu_ms.len() == 7);
+    assert!(run.seconds > 0.);
+}

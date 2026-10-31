@@ -1,8 +1,10 @@
 //! Direct Vulkan 1.0 graphics. Only the system Vulkan loader is linked.
+pub mod bench;
 mod ffi;
 mod frame;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod present;
+mod resident;
 mod shaders;
 use crate::Vertex;
 use core::ffi::{CStr, c_void};
@@ -36,6 +38,8 @@ pub struct VulkanRenderer {
     depth_format: i32,
     name: String,
     max_extent: u32,
+    timestamp_bits: u32,
+    timestamp_period_ns: f64,
 }
 impl VulkanRenderer {
     pub fn new() -> Result<Self> {
@@ -70,6 +74,8 @@ impl VulkanRenderer {
             depth_format: 0,
             name: String::new(),
             max_extent: 0,
+            timestamp_bits: 0,
+            timestamp_period_ns: 0.0,
         })
     }
     fn select_device(&mut self) -> Result<()> {
@@ -91,7 +97,19 @@ impl VulkanRenderer {
             physical.truncate(count as usize);
             let mut last_error =
                 String::from("no graphics-capable Vulkan device with a supported depth attachment");
+            let pick = std::env::var("ABE_VULKAN_DEVICE")
+                .unwrap_or_default()
+                .to_lowercase();
+            if !pick.is_empty() {
+                last_error = format!("no compatible Vulkan device matches {pick}");
+            }
             for gpu in physical {
+                let mut props = core::mem::zeroed();
+                vkGetPhysicalDeviceProperties(gpu, &mut props);
+                let name = CStr::from_ptr(props.deviceName.as_ptr()).to_string_lossy();
+                if !name.to_lowercase().contains(&pick) {
+                    continue;
+                }
                 let mut count = 0;
                 vkGetPhysicalDeviceQueueFamilyProperties(gpu, &mut count, null_mut());
                 let mut families =
@@ -156,8 +174,8 @@ impl VulkanRenderer {
                 self.depth_format = depth_format;
                 vkGetDeviceQueue(self.device, self.family, 0, &mut self.queue);
                 vkGetPhysicalDeviceMemoryProperties(gpu, &mut self.memory);
-                let mut props = core::mem::zeroed();
-                vkGetPhysicalDeviceProperties(gpu, &mut props);
+                self.timestamp_bits = families[family].timestampValidBits;
+                self.timestamp_period_ns = f64::from(props.limits.timestampPeriod);
                 self.max_extent = props
                     .limits
                     .maxImageDimension2D
@@ -183,6 +201,28 @@ impl VulkanRenderer {
         clear: [f32; 4],
         vertices: &[Vertex],
     ) -> Result<Vec<u8>> {
+        self.check_extent(width, height)?;
+        if vertices.len() % 3 != 0 || vertices.len() > u32::MAX as usize {
+            return Err("expected a triangle list representable by one Vulkan draw".into());
+        }
+        frame::Frame::new(self).draw(width, height, clear, vertices, None)
+    }
+    /// Render world-space geometry using the same GPU vertex transform as the player.
+    /// This is a synchronous readback oracle for content tools and regression tests.
+    pub fn render_scene(
+        &mut self,
+        width: u32,
+        height: u32,
+        clear: [f32; 4],
+        scene: &crate::Scene,
+        camera: crate::Camera,
+    ) -> Result<Vec<u8>> {
+        self.check_extent(width, height)?;
+        let matrix = camera.clip_matrix(width, height)?;
+        let resident = resident::Resident::upload(self, scene)?;
+        frame::Frame::new(self).draw(width, height, clear, &[], Some(resident.draw(matrix)))
+    }
+    fn check_extent(&self, width: u32, height: u32) -> Result<()> {
         let pixels = u64::from(width) * u64::from(height);
         if width == 0
             || height == 0
@@ -195,10 +235,7 @@ impl VulkanRenderer {
                     .into(),
             );
         }
-        if vertices.len() % 3 != 0 || vertices.len() > u32::MAX as usize {
-            return Err("expected a triangle list representable by one Vulkan draw".into());
-        }
-        frame::Frame::new(self).draw(width, height, clear, vertices)
+        Ok(())
     }
 }
 impl Drop for VulkanRenderer {

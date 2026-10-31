@@ -16,6 +16,21 @@ const TRANSFER_READ: u32 = 0x800;
 const TRANSFER_WRITE: u32 = 0x1000;
 const HOST_READ: u32 = 0x2000;
 
+#[derive(Clone, Copy)]
+pub(super) struct Draw {
+    pub buffer: u64,
+    pub count: u32,
+    pub matrix: [f32; 16],
+}
+impl Draw {
+    pub fn clip_space(buffer: u64, count: u32) -> Self {
+        Self {
+            buffer,
+            count,
+            matrix: crate::world::Transform::IDENTITY.0,
+        }
+    }
+}
 pub(super) struct Frame<'a> {
     gpu: &'a VulkanRenderer,
     buffers: Vec<u64>,
@@ -304,13 +319,16 @@ impl<'a> Frame<'a> {
         let mut cb = VkPipelineColorBlendStateCreateInfo::new();
         cb.attachmentCount = 1;
         cb.pAttachments = &color;
+        let range = VkPushConstantRange {
+            stageFlags: 1,
+            offset: 0,
+            size: 64,
+        };
+        let mut layout_info = VkPipelineLayoutCreateInfo::new();
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &range;
         self.layout = create("vkCreatePipelineLayout", |o| unsafe {
-            vkCreatePipelineLayout(
-                self.gpu.device,
-                &VkPipelineLayoutCreateInfo::new(),
-                null(),
-                o,
-            )
+            vkCreatePipelineLayout(self.gpu.device, &layout_info, null(), o)
         })?;
         let mut pi = VkGraphicsPipelineCreateInfo::new();
         pi.stageCount = 2;
@@ -351,8 +369,7 @@ impl<'a> Frame<'a> {
         framebuffer: u64,
         size: (u32, u32),
         clear: [f32; 4],
-        vb: u64,
-        count: u32,
+        draw: Draw,
     ) {
         let (width, height) = size;
         // Callers hold these objects alive and put cmd in the recording state.
@@ -375,10 +392,11 @@ impl<'a> Frame<'a> {
             info.clearValueCount = 2;
             info.pClearValues = clears.as_ptr();
             vkCmdBeginRenderPass(cmd, &info, 0);
-            if vb != 0 {
+            if draw.count != 0 {
                 vkCmdBindPipeline(cmd, 0, self.pipeline);
-                vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &0);
-                vkCmdDraw(cmd, count, 1, 0, 0);
+                vkCmdPushConstants(cmd, self.layout, 1, 0, 64, draw.matrix.as_ptr().cast());
+                vkCmdBindVertexBuffers(cmd, 0, 1, &draw.buffer, &0);
+                vkCmdDraw(cmd, draw.count, 1, 0, 0);
             }
             vkCmdEndRenderPass(cmd);
         }
@@ -398,6 +416,7 @@ impl<'a> Frame<'a> {
         height: u32,
         clear: [f32; 4],
         vertices: &[Vertex],
+        resident: Option<Draw>,
     ) -> Result<Vec<u8>> {
         let bytes = u64::from(width) * u64::from(height) * 4;
         let image = self.targets(width, height)?;
@@ -427,8 +446,7 @@ impl<'a> Frame<'a> {
                 self.framebuffers[0],
                 (width, height),
                 clear,
-                vb,
-                vertices.len() as u32,
+                resident.unwrap_or_else(|| Draw::clip_space(vb, vertices.len() as u32)),
             );
             let region = VkBufferImageCopy {
                 bufferOffset: 0,

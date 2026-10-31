@@ -56,6 +56,7 @@ impl<'w> DesktopRenderer<'w> {
             gpu: &self.gpu,
             window: self.window,
             chain: None,
+            resident: None,
             dirty: true,
             poisoned: false,
             stats: Default::default(),
@@ -74,12 +75,14 @@ pub struct PresentStats {
     pub frames: u64,
     pub swapchains: u64,
     pub vertex_allocations: u64,
+    pub scene_uploads: u64,
 }
 
 pub struct Presenter<'a> {
     gpu: &'a VulkanRenderer,
     window: &'a Window,
     chain: Option<Chain<'a>>,
+    resident: Option<resident::Resident<'a>>,
     dirty: bool,
     poisoned: bool,
     stats: PresentStats,
@@ -91,6 +94,33 @@ impl Presenter<'_> {
     pub fn draw(
         &mut self,
         scene: &Scene,
+        camera: Camera,
+        clear: [f32; 4],
+    ) -> Result<PresentStatus> {
+        self.draw_inner(Some(scene), camera, clear)
+    }
+    /// Upload once, then orbit or resize without uploading the geometry again.
+    pub fn set_static_scene(&mut self, scene: &Scene) -> Result<()> {
+        let next = resident::Resident::upload(self.gpu, scene)?;
+        if self.resident.is_some() {
+            check(
+                unsafe { vkDeviceWaitIdle(self.gpu.device) },
+                "retire resident scene",
+            )?;
+        }
+        self.resident = Some(next);
+        self.stats.scene_uploads += 1;
+        Ok(())
+    }
+    pub fn draw_static(&mut self, camera: Camera, clear: [f32; 4]) -> Result<PresentStatus> {
+        if self.resident.is_none() {
+            return Err("no static scene has been uploaded".into());
+        }
+        self.draw_inner(None, camera, clear)
+    }
+    fn draw_inner(
+        &mut self,
+        scene: Option<&Scene>,
         camera: Camera,
         clear: [f32; 4],
     ) -> Result<PresentStatus> {
@@ -114,11 +144,16 @@ impl Presenter<'_> {
         }
         let chain = self.chain.as_mut().expect("chain initialized");
         let (w, h) = chain.size;
-        let vertices = camera.vertices(scene, w, h).map_err(str::to_string)?;
+        let (vertices, resident) = if let Some(scene) = scene {
+            (camera.vertices(scene, w, h)?, None)
+        } else {
+            let resident = self.resident.as_ref().ok_or("missing resident scene")?;
+            (Vec::new(), Some(resident.draw(camera.clip_matrix(w, h)?)))
+        };
         if vertices.len() > u32::MAX as usize {
             return Err("too many vertices".into());
         }
-        match chain.draw(&vertices, clear, &mut self.stats) {
+        match chain.draw(&vertices, resident, clear, &mut self.stats) {
             Ok((status, rebuild)) => {
                 self.dirty = rebuild;
                 if status == PresentStatus::Presented {
@@ -358,6 +393,7 @@ impl<'a> Chain<'a> {
     fn draw(
         &mut self,
         vertices: &[Vertex],
+        resident: Option<frame::Draw>,
         clear: [f32; 4],
         stats: &mut PresentStats,
     ) -> Result<(PresentStatus, bool)> {
@@ -426,8 +462,8 @@ impl<'a> Chain<'a> {
                 target.framebuffer,
                 self.size,
                 clear,
-                slot.buffer,
-                vertices.len() as u32,
+                resident
+                    .unwrap_or_else(|| frame::Draw::clip_space(slot.buffer, vertices.len() as u32)),
             );
             check(vkEndCommandBuffer(slot.cmd), "vkEndCommandBuffer")?;
             // Reset only after successful acquire and recording, just before submitting.
