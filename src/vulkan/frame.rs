@@ -369,7 +369,7 @@ impl<'a> Frame<'a> {
         framebuffer: u64,
         size: (u32, u32),
         clear: [f32; 4],
-        draw: Draw,
+        draws: impl IntoIterator<Item = Draw>,
     ) {
         let (width, height) = size;
         // Callers hold these objects alive and put cmd in the recording state.
@@ -392,8 +392,8 @@ impl<'a> Frame<'a> {
             info.clearValueCount = 2;
             info.pClearValues = clears.as_ptr();
             vkCmdBeginRenderPass(cmd, &info, 0);
-            if draw.count != 0 {
-                vkCmdBindPipeline(cmd, 0, self.pipeline);
+            vkCmdBindPipeline(cmd, 0, self.pipeline);
+            for draw in draws.into_iter().filter(|d| d.count != 0) {
                 vkCmdPushConstants(cmd, self.layout, 1, 0, 64, draw.matrix.as_ptr().cast());
                 vkCmdBindVertexBuffers(cmd, 0, 1, &draw.buffer, &0);
                 vkCmdDraw(cmd, draw.count, 1, 0, 0);
@@ -446,7 +446,12 @@ impl<'a> Frame<'a> {
                 self.framebuffers[0],
                 (width, height),
                 clear,
-                resident.unwrap_or_else(|| Draw::clip_space(vb, vertices.len() as u32)),
+                [
+                    resident,
+                    (!vertices.is_empty()).then(|| Draw::clip_space(vb, vertices.len() as u32)),
+                ]
+                .into_iter()
+                .flatten(),
             );
             let region = VkBufferImageCopy {
                 bufferOffset: 0,

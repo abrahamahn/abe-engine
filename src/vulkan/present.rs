@@ -97,7 +97,7 @@ impl Presenter<'_> {
         camera: Camera,
         clear: [f32; 4],
     ) -> Result<PresentStatus> {
-        self.draw_inner(Some(scene), camera, clear)
+        self.draw_inner(Some(scene), false, camera, clear)
     }
     /// Upload once, then orbit or resize without uploading the geometry again.
     pub fn set_static_scene(&mut self, scene: &Scene) -> Result<()> {
@@ -113,19 +113,29 @@ impl Presenter<'_> {
         Ok(())
     }
     pub fn draw_static(&mut self, camera: Camera, clear: [f32; 4]) -> Result<PresentStatus> {
-        if self.resident.is_none() {
-            return Err("no static scene has been uploaded".into());
-        }
-        self.draw_inner(None, camera, clear)
+        self.draw_inner(None, true, camera, clear)
+    }
+    /// Draw an immutable environment and a small changing scene in the same depth pass.
+    pub fn draw_with_static(
+        &mut self,
+        changing: &Scene,
+        camera: Camera,
+        clear: [f32; 4],
+    ) -> Result<PresentStatus> {
+        self.draw_inner(Some(changing), true, camera, clear)
     }
     fn draw_inner(
         &mut self,
         scene: Option<&Scene>,
+        use_static: bool,
         camera: Camera,
         clear: [f32; 4],
     ) -> Result<PresentStatus> {
         if self.poisoned {
             return Err("presentation failed previously; recreate the presenter".into());
+        }
+        if use_static && self.resident.is_none() {
+            return Err("no static scene has been uploaded".into());
         }
         let size = self.window.size();
         if !self.window.visible() || size.0 == 0 || size.1 == 0 {
@@ -144,11 +154,15 @@ impl Presenter<'_> {
         }
         let chain = self.chain.as_mut().expect("chain initialized");
         let (w, h) = chain.size;
-        let (vertices, resident) = if let Some(scene) = scene {
-            (camera.vertices(scene, w, h)?, None)
+        let vertices = scene
+            .map(|s| camera.vertices(s, w, h))
+            .transpose()?
+            .unwrap_or_default();
+        let resident = if use_static {
+            let mesh = self.resident.as_ref().expect("resident scene checked");
+            Some(mesh.draw(camera.clip_matrix(w, h)?))
         } else {
-            let resident = self.resident.as_ref().ok_or("missing resident scene")?;
-            (Vec::new(), Some(resident.draw(camera.clip_matrix(w, h)?)))
+            None
         };
         if vertices.len() > u32::MAX as usize {
             return Err("too many vertices".into());
@@ -462,8 +476,13 @@ impl<'a> Chain<'a> {
                 target.framebuffer,
                 self.size,
                 clear,
-                resident
-                    .unwrap_or_else(|| frame::Draw::clip_space(slot.buffer, vertices.len() as u32)),
+                [
+                    resident,
+                    (!vertices.is_empty())
+                        .then(|| frame::Draw::clip_space(slot.buffer, vertices.len() as u32)),
+                ]
+                .into_iter()
+                .flatten(),
             );
             check(vkEndCommandBuffer(slot.cmd), "vkEndCommandBuffer")?;
             // Reset only after successful acquire and recording, just before submitting.

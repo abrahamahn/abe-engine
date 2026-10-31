@@ -32,9 +32,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         times.push(line?.trim().parse()?);
     }
     let r = Pacing::analyze(&times, hz)?;
+    let worst = r
+        .worst_minute_fps
+        .map_or_else(|| "unavailable".into(), |fps| format!("{fps:.2} FPS"));
     println!(
-        "Actual presentation | {hz} Hz target | {:.1} s | {:.2} FPS overall | worst minute {:.2?} FPS",
-        r.duration_s, r.mean_fps, r.worst_minute_fps
+        "Actual presentation | {hz} Hz target | {:.1} s | {:.2} FPS overall | worst minute {worst}",
+        r.duration_s, r.mean_fps
     );
     println!(
         "intervals p50 {:.3} ms | p95 {:.3} ms | p99 {:.3} ms | {} over 1.5 frame periods",

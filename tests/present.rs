@@ -82,4 +82,14 @@ fn presents_and_recovers_after_resize_hide_and_restore() {
     drop(p);
     let mut p = gpu.presenter();
     frames(&window, &mut p, &s, 4);
+    p.set_static_scene(&s).unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    let target = p.stats().frames + 5;
+    while p.stats().frames < target {
+        assert!(Instant::now() < end);
+        while window.poll().is_some() {}
+        p.draw_with_static(&s, cam, [0.0; 4]).unwrap();
+    }
+    assert_eq!(p.stats().scene_uploads, 1);
+    assert_eq!(p.stats().vertex_allocations, 2);
 }

@@ -217,10 +217,33 @@ impl VulkanRenderer {
         scene: &crate::Scene,
         camera: crate::Camera,
     ) -> Result<Vec<u8>> {
+        self.render_with_overlay(
+            width,
+            height,
+            clear,
+            scene,
+            &crate::Scene::default(),
+            camera,
+        )
+    }
+    /// Synchronous oracle for the mixed static and changing scene path.
+    pub fn render_with_overlay(
+        &mut self,
+        width: u32,
+        height: u32,
+        clear: [f32; 4],
+        scene: &crate::Scene,
+        overlay: &crate::Scene,
+        camera: crate::Camera,
+    ) -> Result<Vec<u8>> {
         self.check_extent(width, height)?;
         let matrix = camera.clip_matrix(width, height)?;
+        let vertices = camera.vertices(overlay, width, height)?;
+        if vertices.len() > u32::MAX as usize {
+            return Err("too many overlay vertices".into());
+        }
         let resident = resident::Resident::upload(self, scene)?;
-        frame::Frame::new(self).draw(width, height, clear, &[], Some(resident.draw(matrix)))
+        frame::Frame::new(self).draw(width, height, clear, &vertices, Some(resident.draw(matrix)))
     }
     fn check_extent(&self, width: u32, height: u32) -> Result<()> {
         let pixels = u64::from(width) * u64::from(height);

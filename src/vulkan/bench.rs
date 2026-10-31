@@ -115,7 +115,7 @@ impl<'a> Slot<'a> {
                 self.framebuffer,
                 size,
                 [0.03, 0.045, 0.07, 1.0],
-                geom.draw(matrix),
+                [geom.draw(matrix)],
             );
             if self.queries != 0 {
                 vkCmdWriteTimestamp(cmd, 0x2000, self.queries, 1);

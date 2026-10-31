@@ -67,3 +67,43 @@ fn resident_vertices_match_cpu_projection_and_complete_benchmark_queries() {
     assert!(run.gpu_ms.is_empty() || run.gpu_ms.len() == 7);
     assert!(run.seconds > 0.);
 }
+
+#[test]
+#[ignore = "requires a Vulkan graphics device"]
+fn mixed_scene_shares_depth_and_preserves_both_draws() {
+    use abe_engine::{Camera, Scene, Vec3};
+    let mut base = Scene::default();
+    base.triangle(
+        Vec3(-1., -1., 0.),
+        Vec3(1., -1., 0.),
+        Vec3(0., 1., 0.),
+        [1., 0., 0.],
+    );
+    let mut overlay = Scene::default();
+    overlay.triangle(
+        Vec3(-0.4, -0.4, 0.4),
+        Vec3(0.4, -0.4, 0.4),
+        Vec3(0., 0.4, 0.4),
+        [0., 1., 0.],
+    );
+    overlay.triangle(
+        Vec3(-0.2, -0.2, -0.4),
+        Vec3(0.2, -0.2, -0.4),
+        Vec3(0., 0.2, -0.4),
+        [0., 0., 1.],
+    );
+    let camera = Camera {
+        eye: Vec3(0., 0., 3.),
+        target: Vec3(0., 0., 0.),
+        vertical_fov_degrees: 52.,
+        near: 0.1,
+        far: 20.,
+    };
+    let mut gpu = VulkanRenderer::new().unwrap();
+    let pixels = gpu
+        .render_with_overlay(100, 100, [0.; 4], &base, &overlay, camera)
+        .unwrap();
+    assert!(pixels.chunks_exact(4).any(|p| p[0] == 255));
+    assert!(pixels.chunks_exact(4).any(|p| p[1] == 255));
+    assert!(pixels.chunks_exact(4).all(|p| p[2] == 0));
+}
