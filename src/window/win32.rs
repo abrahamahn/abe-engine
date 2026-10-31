@@ -59,6 +59,7 @@ unsafe extern "system" {
         param: H,
     ) -> H;
     fn DestroyWindow(w: H) -> i32;
+    fn SetWindowTextW(w: H, text: *const u16) -> i32;
     fn ShowWindow(w: H, cmd: i32) -> i32;
     fn SetWindowPos(w: H, after: H, x: i32, y: i32, width: i32, height: i32, flags: u32) -> i32;
     fn DefWindowProcW(w: H, msg: u32, wp: usize, lp: isize) -> isize;
@@ -174,6 +175,17 @@ impl Window {
             }
         }
     }
+    pub fn set_title(&self, title: &str) {
+        let t: Vec<u16> = title
+            .encode_utf16()
+            .filter(|c| *c != 0)
+            .chain([0])
+            .collect();
+        // SAFETY: the window is owned by self and the string outlives the call.
+        unsafe {
+            SetWindowTextW(self.id, t.as_ptr());
+        }
+    }
     pub fn poll(&self) -> Option<Event> {
         loop {
             if let Some(e) = self.state.events.borrow_mut().pop_front() {
@@ -210,17 +222,35 @@ unsafe extern "system" fn wndproc(w: H, msg: u32, wp: usize, lp: isize) -> isize
                 s.visible.set(wp != 0);
                 Some(Event::Visibility(wp != 0))
             }
-            0x201 => Some(Event::Clicked(
-                (lp as u16 as i16) as i32,
-                ((lp >> 16) as u16 as i16) as i32,
-            )),
-            0x100 => match wp {
-                27 => Some(Event::Pressed(Key::Escape)),
-                32 => Some(Event::Pressed(Key::Space)),
-                37 => Some(Event::Pressed(Key::Left)),
-                39 => Some(Event::Pressed(Key::Right)),
-                _ => None,
-            },
+            0x200..=0x202 => {
+                let (x, y) = ((lp as u16 as i16) as i32, ((lp >> 16) as u16 as i16) as i32);
+                Some(match msg {
+                    0x201 => Event::Clicked(x, y),
+                    0x202 => Event::Unclicked(x, y),
+                    _ => Event::Pointer(x, y),
+                })
+            }
+            0x100 | 0x101 => {
+                let key = match wp {
+                    27 => Some(Key::Escape),
+                    32 => Some(Key::Space),
+                    37 => Some(Key::Left),
+                    38 => Some(Key::Up),
+                    39 => Some(Key::Right),
+                    40 => Some(Key::Down),
+                    0x10 => Some(Key::Shift),
+                    k @ (0x30..=0x39) => Some(Key::Char(k as u8)),
+                    k @ (0x41..=0x5a) => Some(Key::Char(k as u8 + 32)),
+                    _ => None,
+                };
+                key.map(|k| {
+                    if msg == 0x100 {
+                        Event::Pressed(k)
+                    } else {
+                        Event::Released(k)
+                    }
+                })
+            }
             _ => None,
         };
         if let Some(e) = event {

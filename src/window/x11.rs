@@ -119,7 +119,8 @@ impl Window {
                 XCloseDisplay(d);
                 return Err("XCreateSimpleWindow failed".into());
             }
-            XSelectInput(d, id, 1 | 4 | (1 << 17)); // key press, button press, structure changes
+            // Key press/release, button press/release, pointer motion, structure changes.
+            XSelectInput(d, id, 1 | 2 | 4 | 8 | (1 << 6) | (1 << 17));
             XStoreName(d, id, title.as_ptr());
             let protocols = XInternAtom(d, c"WM_PROTOCOLS".as_ptr(), 0);
             let mut delete = XInternAtom(d, c"WM_DELETE_WINDOW".as_ptr(), 0);
@@ -160,23 +161,43 @@ impl Window {
             XFlush(self.display);
         }
     }
+    pub fn set_title(&self, title: &str) {
+        if let Ok(t) = CString::new(title) {
+            // SAFETY: the display and window are owned by self; the string outlives the call.
+            unsafe {
+                XStoreName(self.display, self.id, t.as_ptr());
+                XFlush(self.display);
+            }
+        }
+    }
     pub fn poll(&self) -> Option<Event> {
         unsafe {
             while XPending(self.display) > 0 {
                 let mut e = XEvent { pad: [0; 24] };
                 XNextEvent(self.display, &mut e);
                 match e.kind {
-                    2 => {
+                    2 | 3 => {
                         let key = match XLookupKeysym(&mut e.key, 0) {
                             0xff1b => Key::Escape,
                             32 => Key::Space,
                             0xff51 => Key::Left,
+                            0xff52 => Key::Up,
                             0xff53 => Key::Right,
+                            0xff54 => Key::Down,
+                            0xffe1 | 0xffe2 => Key::Shift,
+                            k @ (0x30..=0x39 | 0x61..=0x7a) => Key::Char(k as u8),
+                            k @ 0x41..=0x5a => Key::Char(k as u8 + 32),
                             _ => continue,
                         };
-                        return Some(Event::Pressed(key));
+                        return Some(if e.kind == 2 {
+                            Event::Pressed(key)
+                        } else {
+                            Event::Released(key)
+                        });
                     }
                     4 if e.key.code == 1 => return Some(Event::Clicked(e.key.x, e.key.y)),
+                    5 if e.key.code == 1 => return Some(Event::Unclicked(e.key.x, e.key.y)),
+                    6 => return Some(Event::Pointer(e.key.x, e.key.y)),
                     18 | 19 => {
                         let shown = e.kind == 19;
                         self.mapped.set(shown);

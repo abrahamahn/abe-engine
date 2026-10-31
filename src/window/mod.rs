@@ -8,12 +8,17 @@ mod win32;
 #[cfg(target_os = "windows")]
 pub use win32::Window;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Key {
     Escape,
     Space,
     Left,
     Right,
+    Up,
+    Down,
+    Shift,
+    /// A letter (lower-case ASCII) or digit key.
+    Char(u8),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -21,5 +26,11 @@ pub enum Event {
     Resized(u32, u32),
     Visibility(bool),
     Pressed(Key),
+    Released(Key),
+    /// Left button pressed at window coordinates.
     Clicked(i32, i32),
+    /// Left button released.
+    Unclicked(i32, i32),
+    /// Pointer moved to window coordinates.
+    Pointer(i32, i32),
 }
