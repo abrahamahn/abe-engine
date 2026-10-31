@@ -19,4 +19,9 @@ version = "0.2.0"
 dependencies = [
  "abe-assets",
  "abe-core",
+ "abe-shader",
 ]
+
+[[package]]
+name = "abe-shader"
+version = "0.2.0"

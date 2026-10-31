@@ -7,9 +7,10 @@ publish = false
 description = "ABE studio's native 3D renderer"
 
 [workspace]
-members = ["crates/abe-core","crates/abe-assets"]
+members = ["crates/abe-core", "crates/abe-assets", "crates/abe-shader"]
 resolver = "3"
 
 [dependencies]
 abe-core = { path = "crates/abe-core" }
 abe-assets = { path = "crates/abe-assets" }
+abe-shader = { path = "crates/abe-shader" }
