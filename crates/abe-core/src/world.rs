@@ -1,4 +1,5 @@
-//! Mesh geometry is stored once, with affine instances for world placement.
+//! Mesh geometry is stored once, with affine instances for world placement. Materials,
+//! mip-mapped RGBA8 textures and point lights describe surfaces and lamps for shaded renderers.
 use crate::{Rgb, Scene, Vec3};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -58,39 +59,236 @@ impl Transform {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Mesh {
     pub positions: Vec<Vec3>,
+    /// Empty, or exactly one per position.
+    pub normals: Vec<Vec3>,
+    /// Empty, or exactly one per position.
+    pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
+    /// Flat colour for untextured paths. Equals the material's base colour RGB when one is set.
     pub color: Rgb,
+    /// Index into `World::materials`.
+    pub material: Option<u32>,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Instance {
     pub mesh: u32,
     pub transform: Transform,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum AlphaMode {
+    #[default]
+    Opaque,
+    /// Fragments with alpha below the cutoff are discarded.
+    Mask(f32),
+    Blend,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Shading {
+    #[default]
+    Standard,
+    Foliage,
+    Water,
+    Unlit,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Emission {
+    #[default]
+    Constant,
+    /// The renderer scales the emissive term with its lamp level (time of day).
+    Lamp,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Material {
+    pub name: String,
+    /// Linear RGBA factor.
+    pub base_color: [f32; 4],
+    /// Index into `World::textures` (an sRGB texture).
+    pub base_color_texture: Option<u32>,
+    /// Index into `World::textures` (a linear texture).
+    pub normal_texture: Option<u32>,
+    pub normal_scale: f32,
+    /// Linear: emissive factor times emissive strength.
+    pub emissive: Rgb,
+    /// Index into `World::textures` (an sRGB texture).
+    pub emissive_texture: Option<u32>,
+    pub metallic: f32,
+    pub roughness: f32,
+    pub alpha: AlphaMode,
+    pub double_sided: bool,
+    pub shading: Shading,
+    pub emission: Emission,
+}
+/// The glTF 2.0 default material.
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            base_color: [1.; 4],
+            base_color_texture: None,
+            normal_texture: None,
+            normal_scale: 1.,
+            emissive: [0.; 3],
+            emissive_texture: None,
+            metallic: 1.,
+            roughness: 1.,
+            alpha: AlphaMode::Opaque,
+            double_sided: false,
+            shading: Shading::Standard,
+            emission: Emission::Constant,
+        }
+    }
+}
+/// RGBA8 texels, level 0 first. Level `i` is `max(1, width >> i)` by `max(1, height >> i)`,
+/// and the chain is complete down to 1x1.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Texture {
+    pub width: u32,
+    pub height: u32,
+    pub srgb: bool,
+    pub levels: Vec<Vec<u8>>,
+}
+impl Texture {
+    /// Levels in a complete chain for a nonempty texture.
+    pub fn level_count(width: u32, height: u32) -> usize {
+        (u32::BITS - width.max(height).max(1).leading_zeros()) as usize
+    }
+    pub fn level_extent(width: u32, height: u32, level: usize) -> (u32, u32) {
+        let shift = |v: u32| v.checked_shr(level as u32).unwrap_or(0).max(1);
+        (shift(width), shift(height))
+    }
+    fn check(&self) -> Result<(), String> {
+        let limit = 1..=MAX_TEXTURE_SIZE;
+        if !limit.contains(&self.width) || !limit.contains(&self.height) {
+            return Err(format!(
+                "size {}x{} outside limits",
+                self.width, self.height
+            ));
+        }
+        if self.levels.len() != Self::level_count(self.width, self.height) {
+            return Err("incomplete mip chain".into());
+        }
+        for (i, level) in self.levels.iter().enumerate() {
+            let (w, h) = Self::level_extent(self.width, self.height, i);
+            if level.len() as u64 != u64::from(w) * u64::from(h) * 4 {
+                return Err(format!("level {i} is not {w}x{h} RGBA8"));
+            }
+        }
+        Ok(())
+    }
+}
+/// World-space point light. A range of 0 is unlimited.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointLight {
+    pub position: Vec3,
+    pub color: Rgb,
+    pub intensity: f32,
+    pub range: f32,
+}
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct World {
     pub meshes: Vec<Mesh>,
     pub instances: Vec<Instance>,
+    pub materials: Vec<Material>,
+    pub textures: Vec<Texture>,
+    pub lights: Vec<PointLight>,
 }
 
 // Limit expansion from many instances of one mesh before allocating output.
 pub const MAX_TRIANGLES: usize = 2_000_000;
+pub const MAX_MATERIALS: usize = 16_384;
+pub const MAX_TEXTURES: usize = 16_384;
+pub const MAX_LIGHTS: usize = 16_384;
+/// Largest texture width or height.
+pub const MAX_TEXTURE_SIZE: u32 = 16_384;
+pub const MAX_NAME_BYTES: usize = 4_096;
+
+fn finite(values: &[f32]) -> bool {
+    values.iter().all(|v| v.is_finite())
+}
+fn nonnegative(values: &[f32]) -> bool {
+    values.iter().all(|v| v.is_finite() && *v >= 0.)
+}
+impl Material {
+    fn check(&self, textures: usize) -> Result<(), String> {
+        if self.name.len() > MAX_NAME_BYTES {
+            return Err("name too long".into());
+        }
+        let cutoff = match self.alpha {
+            AlphaMode::Mask(c) => c,
+            _ => 0.,
+        };
+        if !nonnegative(&self.base_color)
+            || !nonnegative(&self.emissive)
+            || !nonnegative(&[cutoff])
+            || !finite(&[self.normal_scale])
+            || ![self.metallic, self.roughness]
+                .iter()
+                .all(|v| (0.0..=1.0).contains(v))
+        {
+            return Err("factor out of range".into());
+        }
+        let maps = [
+            self.base_color_texture,
+            self.normal_texture,
+            self.emissive_texture,
+        ];
+        if maps.into_iter().flatten().any(|t| t as usize >= textures) {
+            return Err("references missing texture".into());
+        }
+        Ok(())
+    }
+}
 impl World {
     pub fn validate(&self) -> Result<usize, String> {
+        if self.materials.len() > MAX_MATERIALS
+            || self.textures.len() > MAX_TEXTURES
+            || self.lights.len() > MAX_LIGHTS
+        {
+            return Err("too many materials, textures or lights".into());
+        }
+        for (i, t) in self.textures.iter().enumerate() {
+            t.check().map_err(|e| format!("texture {i}: {e}"))?;
+        }
+        for (i, m) in self.materials.iter().enumerate() {
+            m.check(self.textures.len())
+                .map_err(|e| format!("material {i}: {e}"))?;
+        }
         for (i, m) in self.meshes.iter().enumerate() {
             if m.indices.len() % 3 != 0
                 || m.indices.iter().any(|j| *j as usize >= m.positions.len())
             {
                 return Err(format!("invalid triangle indices in mesh {i}"));
             }
+            let n = m.positions.len();
+            if ![0, n].contains(&m.normals.len()) || ![0, n].contains(&m.uvs.len()) {
+                return Err(format!("mesh {i} needs one normal and UV per position"));
+            }
             if m.positions
                 .iter()
-                .any(|p| ![p.0, p.1, p.2].into_iter().all(f32::is_finite))
-                || !m.color.into_iter().all(f32::is_finite)
+                .chain(&m.normals)
+                .any(|p| !finite(&[p.0, p.1, p.2]))
+                || !m.uvs.iter().all(|uv| finite(uv))
+                || !finite(&m.color)
             {
                 return Err(format!("non-finite data in mesh {i}"));
+            }
+            if m.material
+                .is_some_and(|k| k as usize >= self.materials.len())
+            {
+                return Err(format!("mesh {i} references missing material"));
+            }
+        }
+        for (i, l) in self.lights.iter().enumerate() {
+            let Vec3(x, y, z) = l.position;
+            if !finite(&[x, y, z])
+                || !nonnegative(&l.color)
+                || !nonnegative(&[l.intensity, l.range])
+            {
+                return Err(format!("invalid point light {i}"));
             }
         }
         let mut count = 0usize;

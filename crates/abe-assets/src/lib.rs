@@ -2,6 +2,9 @@
 pub mod cooked;
 pub mod glb;
 pub mod json;
+pub mod mip;
+pub mod png;
+pub mod zlib;
 use std::io::Read;
 pub fn read_asset(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
