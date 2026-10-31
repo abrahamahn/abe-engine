@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ABE Engine · Architecture Explorer</title>
+    <style>
+:root{color-scheme:dark;
+    --bg:#101821;
+    --panel:#192530;
+    --fg:#eaf0ed;
+    --soft:#b4c2c9;
+    --accent:#80dbc4;
+    --gold:#ecc28b;
+    --stroke:#344652}
+*{box-sizing:border-box}
+body{margin:0;
+    background:var(--bg);
+    color:var(--fg);
+    font:16px/1.55 system-ui,sans-serif}
+header,main,footer{max-width:1120px;
+    margin:auto;
+    padding:24px clamp(16px,4vw,50px)}
+header{padding-top:44px}
+.eyebrow{color:var(--accent);
+    font-weight:700;
+    letter-spacing:.12em;
+    font-size:.72rem}
+h1,h2{line-height:1.1;
+    font-weight:620;
+    letter-spacing:-.035em}
+h1{font-size:clamp(2.1rem,6vw,4rem);
+    margin:12px 0}
+h2{font-size:1.9rem;
+    margin:.65em 0 .35em}
+p{color:var(--soft);
+    margin:.5em 0 1em}
+.frame{background:#15242d;
+    border:1px solid var(--stroke);
+    padding:14px 18px;
+    border-radius:8px;
+    font-size:.94em}
+.frame b{color:var(--fg)}
+.explorer{display:grid;
+    grid-template-columns:minmax(210px,29%) 1fr;
+    gap:16px}
+.tabs{display:grid;
+    align-content:start;
+    gap:6px}
+.tab{position:relative}
+.tab input{position:absolute;
+    width:1px;
+    height:1px;
+    opacity:0}
+.tab label{display:flex;
+    gap:13px;
+    align-items:center;
+    cursor:pointer;
+    padding:12px;
+    border-radius:6px;
+    background:#15212b;
+    color:var(--soft)}
+.tab label span{font:600 .78rem ui-monospace,monospace;
+    color:var(--accent)}
+.tab input:checked+label{background:#254139;
+    color:white}
+.tab input:focus-visible+label{outline:3px solid var(--gold)}
+.panel{display:none;
+    background:var(--panel);
+    padding:clamp(16px,3vw,30px);
+    border:1px solid var(--stroke);
+    border-radius:10px}
+.panel:first-child{display:block}
+.explorer:has(input:checked) .panel{display:none}
+.explorer:has(#foundation:checked) .p-foundation{display:block}
+
+.explorer:has(#world:checked) .p-world{display:block}
+
+.explorer:has(#render:checked) .p-render{display:block}
+
+.explorer:has(#motion:checked) .p-motion{display:block}
+
+.explorer:has(#game:checked) .p-game{display:block}
+
+.explorer:has(#tools:checked) .p-tools{display:block}
+details{border-top:1px solid var(--stroke);
+    padding:9px 0}
+summary{cursor:pointer;
+    font-weight:600;
+    line-height:1.5}
+summary small{display:inline-block;
+    padding:2px 8px;
+    margin-left:5px;
+    border-radius:8px;
+    font-size:.65rem;
+    letter-spacing:.04em;
+    vertical-align:middle}
+.partial{background:#28463d;
+    color:#a4f0d2}
+.future{background:#35414d;
+    color:#d6dfe4}
+.gate b{color:var(--gold);
+    margin-right:.4em}
+footer{font-size:.86rem;
+    color:var(--soft)}
+@media(max-width:680px){.explorer{grid-template-columns:1fr}
+.tabs{grid-template-columns:1fr 1fr}
+.tab label{font-size:.86em;
+    padding:10px;
+    gap:7px}
+}
+@media print{body{color:black;
+    background:white}
+.tabs{display:none}
+.explorer{display:block}
+.explorer .panel,.explorer:has(input:checked) .panel{display:block;
+    border:0;
+    break-inside:avoid}
+p,footer,.eyebrow,.gate b{color:black}
+}
+
+</style>
+    <header>
+      <span class="eyebrow">ABE ENGINE / STUDIO ARCHITECTURE</span>
+      <h1>Architecture explorer</h1>
+      <p>Choose a layer and expand a subsystem to see its responsibilities, current status and next proof.</p>
+      <div class="frame">
+        <b>60 Hz ≈ 16.67 ms · 120 Hz ≈ 8.33 ms.</b> These are display budgets, not measurements. CPU, GPU and background work can overlap. The editor and cooker run outside this budget.</div>
+    </header>
+    <main class="explorer">
+      <div class="tabs" role="group" aria-label="Architecture layers">
+        <div class="tab">
+          <input type="radio" name="area" id="foundation" checked>
+          <label for="foundation">
+            <span>01</span>Platform &amp; foundation</label>
+        </div>
+        <div class="tab">
+          <input type="radio" name="area" id="world">
+          <label for="world">
+            <span>02</span>World &amp; streaming</label>
+        </div>
+        <div class="tab">
+          <input type="radio" name="area" id="render">
+          <label for="render">
+            <span>03</span>Rendering</label>
+        </div>
+        <div class="tab">
+          <input type="radio" name="area" id="motion">
+          <label for="motion">
+            <span>04</span>Physics &amp; characters</label>
+        </div>
+        <div class="tab">
+          <input type="radio" name="area" id="game">
+          <label for="game">
+            <span>05</span>Gameplay services</label>
+        </div>
+        <div class="tab">
+          <input type="radio" name="area" id="tools">
+          <label for="tools">
+            <span>06</span>Studio tools &amp; assets</label>
+        </div>
+      </div>
+      <div>
+        <section class="panel p-foundation" aria-label="Platform &amp; foundation">
+          <span class="eyebrow">ENGINE SYSTEM 01 / FRAME START</span>
+          <h2>Platform &amp; foundation</h2>
+          <p>Host events and clocks feed simulation. CPU workers prepare the next frame while the GPU can still be drawing the last one.</p>
+          <details open>
+            <summary>Platform HAL <small class="partial">First slice</small>
+            </summary>
+            <p>Linux/X11 and Windows/Win32 hosts expose input, visibility and size; Vulkan owns the surface. Extend to Android lifecycle, Apple Metal hosts and browser canvas. Keep console SDK bindings in separately authorized platform modules.</p>
+            <p class="gate">
+              <b>Acceptance test</b> A window survives resize, hide/restore and repeated presentation; verify each claimed target on a real device.</p>
+          </details>
+          <details>
+            <summary>Memory &amp; resource lifetimes <small class="future">Partial</small>
+            </summary>
+            <p>Reusable GPU frame slots and a present semaphore per surface image are in place. Add measured frame arenas, generational pools and per-subsystem RAM/VRAM budgets. Use virtual-memory APIs where platforms expose them.</p>
+            <p class="gate">
+              <b>Acceptance test</b> A warmed-up scene can run and reload without monotonically growing retained resources.</p>
+          </details>
+          <details>
+            <summary>Jobs, tasks and fibers <small class="future">Planned</small>
+            </summary>
+            <p>Start with explicit dependencies, cancellation and a bounded worker pool. Add work stealing, fiber waits and priorities for profiled workloads. The web host needs a single-thread fallback.</p>
+            <p class="gate">
+              <b>Acceptance test</b> Long asset tasks cancel cleanly and never hold the input/render thread.</p>
+          </details>
+          <details>
+            <summary>Math and SIMD <small class="partial">First slice</small>
+            </summary>
+            <p>Portable vectors, perspective transforms and scalar geometry come first. Add quaternion, bounds and spline operations to shared core. Select x86 or ARM vector instructions at runtime when necessary; keep a portable WASM path.</p>
+            <p class="gate">
+              <b>Acceptance test</b> Scalar and accelerated kernels agree within documented tolerances on representative transforms.</p>
+          </details>
+        </section>
+        <section class="panel p-world" aria-label="World &amp; streaming">
+          <span class="eyebrow">ENGINE SYSTEM 02 / VISIBILITY AND REQUESTS</span>
+          <h2>World &amp; streaming</h2>
+          <p>The player camera selects visible objects and requests future content. I/O completes asynchronously and feeds later frames.</p>
+          <details open>
+            <summary>Entities, hierarchy and spatial queries <small class="partial">First slice</small>
+            </summary>
+            <p>Indexed meshes and placed instances can be validated, cooked, and expanded for the current renderer. Add stable entity generations, component stores, hierarchical transforms and spatial indices where needed.</p>
+            <p class="gate">
+              <b>Acceptance test</b> An authored mesh can be instantiated twice, transformed independently, serialized and reloaded.</p>
+          </details>
+          <details>
+            <summary>World cells and HLOD <small class="future">Planned</small>
+            </summary>
+            <p>Partition authored content into independently loadable cells. Build distant proxies offline; choose residency from view, velocity, dependencies and memory pressure.</p>
+            <p class="gate">
+              <b>Acceptance test</b> A roaming sample crosses cells without holes or unbounded memory growth.</p>
+          </details>
+          <details>
+            <summary>Streaming I/O <small class="future">Planned</small>
+            </summary>
+            <p>Provide bounded requests, cancellation, dependency ordering, cache and fallback. Use platform I/O behind the same contract; DirectStorage is an optional Windows path, HTTP/cache storage a web path.</p>
+            <p class="gate">
+              <b>Acceptance test</b> A delayed or corrupt background asset leaves the main loop responsive and produces an actionable error.</p>
+          </details>
+        </section>
+        <section class="panel p-render" aria-label="Rendering">
+          <span class="eyebrow">ENGINE SYSTEM 03 / SUBMIT AND PRESENT</span>
+          <h2>Rendering</h2>
+          <p>Gather visible instances, schedule passes and submit. A 60 Hz display gives 16.67 ms between frames; 120 Hz gives 8.33 ms.</p>
+          <details open>
+            <summary>Direct graphics backends <small class="partial">Working slice</small>
+            </summary>
+            <p>First-party Vulkan graphics and depth testing draw to images and native swapchains. Add Metal and browser WebGPU behind a capability contract; DX12 and licensed console backends are separate decisions.</p>
+            <p class="gate">
+              <b>Acceptance test</b> A representative scene draws with equivalent visibility and color on every supported backend.</p>
+          </details>
+          <details>
+            <summary>Render graph and GPU-driven geometry <small class="future">Planned</small>
+            </summary>
+            <p>Move from the current explicit passes to a graph with access declarations, barriers and temporary target reuse. Grow from instancing and culling to mesh clusters or virtual geometry only where the data pays for it.</p>
+            <p class="gate">
+              <b>Acceptance test</b> The graph rejects undeclared resource use and removes a pass whose output is not consumed.</p>
+          </details>
+          <details>
+            <summary>Materials, shaders and lighting <small class="partial">First slice</small>
+            </summary>
+            <p>Rust emits the current fixed SPIR-V modules. Next come authored materials, cameras, lights, skinning, shadow maps and pipeline cache keys. Ray tracing, virtual shadows and advanced GI are optional higher tiers.</p>
+            <p class="gate">
+              <b>Acceptance test</b> Reimporting one material updates the editor and player with the same pipeline and stable cache keys.</p>
+          </details>
+          <details>
+            <summary>Post-processing and resolution <small class="future">Planned</small>
+            </summary>
+            <p>Separate world resolution from crisp UI. Add color management, AA, bloom and HDR, followed by optional supported reconstruction techniques. Vendor SDK features require explicit dependency and platform decisions.</p>
+            <p class="gate">
+              <b>Acceptance test</b> Performance tiers preserve legible text and controls while adjusting expensive world passes.</p>
+          </details>
+        </section>
+        <section class="panel p-motion" aria-label="Physics &amp; characters">
+          <span class="eyebrow">ENGINE SYSTEM 04 / SIMULATION AND POSE</span>
+          <h2>Physics &amp; characters</h2>
+          <p>Advance simulation, sample animation, resolve attachments, and expose the pose and cue times to the renderer.</p>
+          <details open>
+            <summary>Collision and dynamics <small class="future">Planned</small>
+            </summary>
+            <p>Begin with picking, bounds, ray casts and collision layers. Extend to broad phase, narrow phase, fixed-step rigid bodies and constraints. Vehicles, cloth and destruction are later modules.</p>
+            <p class="gate">
+              <b>Acceptance test</b> A moving character collides reproducibly with a simple scene and the editor displays the contact.</p>
+          </details>
+          <details>
+            <summary>Skeletal animation and motion matching <small class="future">Planned</small>
+            </summary>
+            <p>Import skins and clips, blend poses, seek by timestamp, attach to sockets and fire discrete cues. Motion matching belongs above a validated clip database.</p>
+            <p class="gate">
+              <b>Acceptance test</b> Backward seeks and reconnects never duplicate a cue. A prop releases from the sampled socket pose.</p>
+          </details>
+          <details>
+            <summary>IK, facial animation and cinematics <small class="future">Planned</small>
+            </summary>
+            <p>Use constrained IK, morph targets, facial layers, camera cuts and timeline tracks. Extend to physical characters and phoneme-driven animation when real content requires them.</p>
+            <p class="gate">
+              <b>Acceptance test</b> The same saved timeline scrubs to the same pose in the editor and a packaged player.</p>
+          </details>
+        </section>
+        <section class="panel p-game" aria-label="Gameplay services">
+          <span class="eyebrow">ENGINE SYSTEM 05 / PLAYER AND WORLD RESPONSE</span>
+          <h2>Gameplay services</h2>
+          <p>Translate input into game-owned intent, update local presentation, and dispatch audio, navigation and UI work.</p>
+          <details open>
+            <summary>Game modules, scripting and UI <small class="future">Planned</small>
+            </summary>
+            <p>Define a Rust game-module lifecycle, events, focus/navigation, text shaping and scalable HUD layout. Keep editor scripting or a visual graph optional and isolated from game authority.</p>
+            <p class="gate">
+              <b>Acceptance test</b> Two unrelated games use the same engine APIs and register different components and actions.</p>
+          </details>
+          <details>
+            <summary>Navigation, AI and crowds <small class="future">Planned</small>
+            </summary>
+            <p>Provide spatial queries, navigation meshes, behavior scheduling and update budgets. Content determines behavior trees, utility decisions and crowd fidelity.</p>
+            <p class="gate">
+              <b>Acceptance test</b> A non-card sample can navigate around an obstacle while distant agents update less often.</p>
+          </details>
+          <details>
+            <summary>Audio <small class="future">Planned</small>
+            </summary>
+            <p>Build buses, mix, schedule time-aligned cues, spatialize emitters and stream music; later add occlusion and environmental reverb.</p>
+            <p class="gate">
+              <b>Acceptance test</b> Seek a timeline without playing a one-shot twice, and recover from audio interruption.</p>
+          </details>
+          <details>
+            <summary>Networking and replay <small class="future">Planned</small>
+            </summary>
+            <p>Expose clocks, snapshots, resource identifiers and replay hooks. Each game chooses its server authority, security policy, rollback and prediction needs.</p>
+            <p class="gate">
+              <b>Acceptance test</b> A game can reconstruct a viewer-authorized state after reconnect; a purely local game runs with no network.</p>
+          </details>
+        </section>
+        <section class="panel p-tools" aria-label="Studio tools &amp; assets">
+          <span class="eyebrow">ENGINE SYSTEM 06 / OUTSIDE THE FRAME BUDGET</span>
+          <h2>Studio tools &amp; assets</h2>
+          <p>Editors and cookers produce versioned content. The runtime consumes their outputs; offline builds do not belong in the 16.67 ms frame.</p>
+          <details open>
+            <summary>Importer, cooker and packages <small class="partial">First slice</small>
+            </summary>
+            <p>The first cooker reads a bounded static GLB subset and writes a deterministic, indexed binary world. Next come dependency manifests, content hashes, texture/audio formats and incremental target packages.</p>
+            <p class="gate">
+              <b>Acceptance test</b> A clean rebuild produces identical bytes; corrupt inputs and unsupported features fail explicitly.</p>
+          </details>
+          <details>
+            <summary>World editor and collaboration <small class="future">Planned</small>
+            </summary>
+            <p>Build hierarchy, viewport selection, gizmos, inspector, undo transactions, play-in-editor, stable references and reviewable per-object or per-cell files. World, material, particle and quest editors share the runtime.</p>
+            <p class="gate">
+              <b>Acceptance test</b> Two contributors edit different objects, merge them, and reopen a valid scene without overwriting each other.</p>
+          </details>
+          <details>
+            <summary>Timeline and material authoring <small class="future">Planned</small>
+            </summary>
+            <p>Edit camera and animation tracks, cue times, shader graphs and VFX with the same renderer used by the player. Build visual authoring on versioned data formats.</p>
+            <p class="gate">
+              <b>Acceptance test</b> Change one cue once, then see it in the editor, a headless replay and a standalone build.</p>
+          </details>
+          <details>
+            <summary>Profiling, regression and unattended tests <small class="partial">First slice</small>
+            </summary>
+            <p>Headless and presented Vulkan tests exist. Expand frame traces, resource counters, crash diagnostics, image comparisons, replay bots and long-session runs.</p>
+            <p class="gate">
+              <b>Acceptance test</b> A regression shows the failing fixture, target, driver and reproducible trace; a software-driver run is labeled as such.</p>
+          </details>
+        </section>
+      </div>
+    </main>
+    <footer>“Working slice” and “First slice” describe limited implementations. “Planned” identifies design targets. Optional platform and vendor integrations require their own SDK, authorization and device qualification. All product code and content stay in the client project.</footer>
+  </head>
+</html>

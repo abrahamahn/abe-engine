@@ -24,10 +24,21 @@ cargo run --locked --offline --release --example observatory -- scene.ppm
 
 The example renders a generic 3D sculpture to a Netpbm image. It uses the same camera and renderer interfaces available to game clients.
 
+## Cook a static scene
+
+```sh
+cargo run --locked --offline --release --bin abe-build -- cook source.glb scene.abew
+cargo run --locked --offline --release --bin abe-build -- inspect scene.abew
+```
+
+The cooker accepts embedded glTF 2.0 triangle meshes with float positions, optional indices, base colors and scene-node transforms. ABEW v1 stores meshes once and references them from affine instances. Unsupported codecs, skins, animation and textured base colors are reported explicitly. Games can convert authored content before cooking. The portable `abe-core` and `abe-assets` crates have no external dependencies.
+
+[Explore the six architecture layers](docs/architecture.html) (download and open the self-contained HTML to use the selectors). [Engine milestones](docs/roadmap.md).
+
 ## Verify
 
 ```sh
-cargo test --locked --offline
+cargo test --workspace --locked --offline
 cargo test --locked --offline --test vulkan -- --ignored
 cargo test --locked --offline --test present -- --ignored
 ```

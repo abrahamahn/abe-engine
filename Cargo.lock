@@ -3,5 +3,20 @@
 version = 4
 
 [[package]]
+name = "abe-assets"
+version = "0.2.0"
+dependencies = [
+ "abe-core",
+]
+
+[[package]]
+name = "abe-core"
+version = "0.2.0"
+
+[[package]]
 name = "abe-engine"
 version = "0.2.0"
+dependencies = [
+ "abe-assets",
+ "abe-core",
+]
