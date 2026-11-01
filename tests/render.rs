@@ -2,7 +2,10 @@
 //! `ABE_VULKAN_VALIDATION=1` to also check the Vulkan validation layers).
 use abe_engine::Vec3;
 use abe_engine::gpu::Device;
-use abe_engine::render::{Environment, Look, Output, Quality, Renderer, TimeOfDay, View, Weather};
+use abe_engine::render::{
+    DetailPreset, DetailRule, Environment, Look, Output, Quality, Renderer, TimeOfDay, View,
+    Weather,
+};
 use abe_engine::world::{
     AlphaMode, Emission, Instance, Material, Mesh, PointLight, Shading, Texture, Transform, World,
 };
@@ -296,6 +299,90 @@ fn rain_stops_under_a_roof() {
         covered < open * 0.05,
         "drops under the roof: {covered} vs {open} in the open"
     );
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}
+
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn grass_and_surface_detail() {
+    // A lawn with a tiled roof slab over part of it, seen from just above the grass.
+    let mut device = Device::headless().expect("device");
+    let (w, h) = (192, 108);
+    let roof = Mesh {
+        positions: vec![
+            Vec3(-3.0, 2.0, -9.0),
+            Vec3(3.0, 2.0, -9.0),
+            Vec3(3.0, 3.5, -12.0),
+            Vec3(-3.0, 3.5, -12.0),
+        ],
+        normals: vec![Vec3(0.0, 0.894, 0.447); 4],
+        uvs: vec![[0.0, 0.0]; 4],
+        indices: vec![0, 1, 2, 0, 2, 3],
+        color: [0.5; 3],
+        material: Some(1),
+    };
+    let meshes = vec![quad(0.0, 30.0, 0), roof];
+    let world = World {
+        instances: (0..meshes.len() as u32)
+            .map(|mesh| Instance {
+                mesh,
+                transform: Transform::IDENTITY,
+            })
+            .collect(),
+        meshes,
+        materials: vec![
+            material("lawn", [0.2, 0.3, 0.1, 1.0], Shading::Standard),
+            material("roof-tile", [0.1, 0.15, 0.3, 1.0], Shading::Standard),
+        ],
+        textures: vec![],
+        lights: vec![],
+    };
+    let view = View {
+        name: "meadow".into(),
+        eye: [0.0, 1.2, 0.0],
+        target: [0.0, 1.0, -10.0],
+        fov: 60.0,
+    };
+    let rule = |pattern: &str, preset| DetailRule {
+        patterns: vec![pattern.into()],
+        preset,
+        scale: [0.3, 0.34],
+        strength: 1.0,
+        variation: 0.1,
+        color: None,
+        gloss: 0.0,
+    };
+    let mut frame = |grass: f32, details: bool| {
+        let mut look = Look::default();
+        look.grass.density = grass;
+        if details {
+            look.details = vec![
+                rule("lawn", DetailPreset::Grass),
+                rule("roof-*", DetailPreset::RoofTiles),
+            ];
+        }
+        let mut quality = Quality::realtime();
+        quality.shadow_size = 512;
+        quality.ground_size = 256;
+        let mut r = Renderer::new(&mut device, &world, look, quality, (w, h), Output::Still)
+            .expect("renderer");
+        let time = TimeOfDay {
+            hours: 12.0,
+            ..TimeOfDay::default()
+        };
+        let env = Environment::resolve(&time, &Weather::default(), &r.look().palette, 2.0);
+        r.render_still(&mut device, &view, &env, 1).expect("render")
+    };
+    let plain = frame(0.0, false);
+    let detailed = frame(0.0, true);
+    let grassy = frame(1.0, true);
+    // Roof tiles and grassy ground change the picture; grass blades change it again.
+    let detail = difference(&plain, &detailed);
+    let blades = difference(&detailed, &grassy);
+    eprintln!("detail changes the frame by {detail:.2}, grass blades by {blades:.2}");
+    assert!(detail > 1.0, "surface detail had no effect: {detail}");
+    assert!(blades > 1.0, "no grass blades: {blades}");
     let errors = device.validation_errors();
     assert!(errors.is_empty(), "validation: {errors:?}");
 }

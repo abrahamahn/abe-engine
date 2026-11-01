@@ -36,6 +36,9 @@ pub(super) struct GpuScene {
     pub indices: BufferId,
     pub draws: Vec<DrawItem>,
     pub materials: Vec<MaterialData>,
+    /// Material names (empty for the flat materials made for meshes without one), for Look
+    /// rules that select materials by name.
+    pub names: Vec<String>,
     pub textures: Vec<TextureId>,
     /// Point lights as (position, range, colour, intensity).
     pub lights: Vec<[f32; 8]>,
@@ -99,6 +102,7 @@ impl GpuScene {
                 }
             })
             .collect();
+        let mut names: Vec<String> = world.materials.iter().map(|m| m.name.clone()).collect();
         let mut flat_materials = std::collections::HashMap::new();
         for inst in &world.instances {
             let mesh = &world.meshes[inst.mesh as usize];
@@ -144,6 +148,7 @@ impl GpuScene {
                             normal: None,
                             emission: None,
                         });
+                        names.push(String::new());
                         materials.len() - 1
                     })
                 }
@@ -237,6 +242,7 @@ impl GpuScene {
             indices: ib,
             draws,
             materials,
+            names,
             textures,
             lights,
             light_buffer,

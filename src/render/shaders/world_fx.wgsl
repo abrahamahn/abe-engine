@@ -1,4 +1,5 @@
-// Shadow depth, the sky backdrop and GPU-generated weather particles (rain, petals).
+// Shadow depth, the top-down ground map, the sky backdrop and GPU-generated weather particles
+// (rain, petals).
 
 struct ShadowPush {
   light_vp: mat4x4f,
@@ -40,6 +41,22 @@ struct MaskedOut {
   }
 }
 
+// The ground map: depth of the highest solid surface seen from above, and per texel what that
+// surface is: r = grows grass, g = solid.
+struct GroundPush {
+  vp: mat4x4f,
+  mask: vec4f,
+};
+var<push_constant> ground_push: GroundPush;
+
+@vertex fn vs_ground(@location(0) position: vec3f) -> @builtin(position) vec4f {
+  return ground_push.vp * vec4f(position, 1.0);
+}
+
+@fragment fn fs_ground() -> @location(0) vec4f {
+  return ground_push.mask;
+}
+
 struct FsOut {
   @location(0) color: vec4f,
   @location(1) aux: vec4f,
@@ -69,26 +86,23 @@ struct SkyOut {
 }
 
 // Particles: params = (kind: 0 rain / 1 petals, ground height, box size, amount), tint = rgb, a = alpha,
-// centre = the box the particles wrap around (ahead of the camera, so few are wasted behind it),
-// cover = the top-down projection of `cover_map`, the depth of the highest surface around the box.
+// centre = the box the particles wrap around (ahead of the camera, so few are wasted behind it).
 struct ParticlePush {
   params: vec4f,
   tint: vec4f,
   centre: vec4f,
-  cover: mat4x4f,
 };
 var<push_constant> particle: ParticlePush;
-@group(0) @binding(1) var cover_map: texture_depth_2d;
-@group(0) @binding(2) var cover_sampler: sampler_comparison;
+@group(0) @binding(5) var ground_sampler: sampler_comparison;
+@group(0) @binding(8) var ground_depth: texture_depth_2d;
 
-// 1 where nothing solid is above `p` (open sky), 0 under a roof.
+// 1 where nothing solid is above `p` (open sky), 0 under a roof (from the ground map).
 fn open_sky(p: vec3f) -> f32 {
-  let q = particle.cover * vec4f(p, 1.0);
-  let uv = q.xy * 0.5 + vec2f(0.5);
-  if (any(uv <= vec2f(0.0)) || any(uv >= vec2f(1.0)) || q.z <= 0.0 || q.z >= 1.0) {
+  let g = ground_texel(p);
+  if (g.z <= 0.0) {
     return 1.0;
   }
-  return textureSampleCompareLevel(cover_map, cover_sampler, uv, q.z - 0.003);
+  return textureSampleCompareLevel(ground_depth, ground_sampler, g.xy / frame.ground.z, g.z - 0.002);
 }
 
 struct ParticleOut {

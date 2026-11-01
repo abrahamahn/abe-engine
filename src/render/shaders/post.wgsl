@@ -94,7 +94,48 @@ const KERNEL = array<vec3f, 16>(
   return vec4f(ao, ao, ao, 1.0);
 }
 
-// Air: occlusion, outlines, aerial perspective, mist and light shafts' glow.
+// Light shafts: march from the pixel towards the sun (or moon) on screen and gather the open
+// sky seen past the scenery, so light streams through gaps in roofs, trees and railings.
+fn light_shafts(uv: vec2f, frag: vec2f) -> vec3f {
+  let strength = frame.paint.z;
+  let g = frame.glow_dir.xyz;
+  if (strength <= 0.0 || g.y < -0.08) {
+    return vec3f(0.0);
+  }
+  let sp = frame.view_proj * vec4f(frame.camera.xyz + g * 1000.0, 1.0);
+  if (sp.w <= 0.0) {
+    return vec3f(0.0);
+  }
+  let suv = sp.xy / sp.w * 0.5 + vec2f(0.5);
+  let delta = suv - uv;
+  let aspect = frame.viewport.x * frame.viewport.w;
+  let span = length(vec2f(delta.x * aspect, delta.y));
+  let falloff = exp(-span * 2.2);
+  if (falloff < 0.02) {
+    return vec3f(0.0);
+  }
+  let jitter = rand01(u32(frag.x) * 7919u + u32(frag.y) * 104729u + u32(frame.wind.w) * 15485863u);
+  var sum = 0.0;
+  var weight = 1.0;
+  var total = 0.0;
+  for (var i = 0; i < 20; i++) {
+    let f = (f32(i) + jitter) / 20.0;
+    let q = uv + delta * f;
+    if (all(q > vec2f(0.0)) && all(q < vec2f(1.0))) {
+      if (depth_px(vec2i(q * frame.viewport.xy)) <= 0.0) {
+        sum += weight;
+      }
+    }
+    total += weight;
+    weight *= 0.93;
+  }
+  // Strongest when the light is low (dawn, sunset, moonrise) and in mist.
+  let low = smoothstep(0.75, 0.05, g.y);
+  let haze = 0.6 + 0.8 * frame.fog2.z;
+  return frame.glow.rgb * (sum / total * falloff * low * haze * strength);
+}
+
+// Air: occlusion, outlines, aerial perspective, mist and light shafts.
 // pc.a = (ao strength, outline strength, outline width px, unused), pc.b = ao tint rgb,
 // pc.c = outline colour rgb
 @fragment fn fs_air(in: Screen) -> @location(0) vec4f {
@@ -106,11 +147,12 @@ const KERNEL = array<vec3f, 16>(
   let to = world - cam;
   let dist = length(to);
   let dir = to / max(dist, 1e-4);
+  let shafts = light_shafts(in.uv, in.clip.xy);
   if (d <= 0.0) {
     // Sky: a mist veil near the horizon.
     let mist = frame.fog2.z;
     col = mix(col, fog_color(dir), mist * 0.5 * smoothstep(0.3, 0.0, dir.y));
-    return vec4f(col, 1.0);
+    return vec4f(col + shafts * 0.5, 1.0);
   }
   let aux = textureLoad(aux_tex, px, 0);
   let ao = textureSampleLevel(extra_tex, lin_sampler, in.uv, 0.0).r;
@@ -133,7 +175,8 @@ const KERNEL = array<vec3f, 16>(
       edge = max(edge, smoothstep(0.75, 0.35, dot(normalize(nq.xyz), normalize(aux.xyz))) * 0.6);
     }
   }
-  edge *= pc.a.y * smoothstep(90.0, 15.0, dist);
+  // Grass and flowers (aux.w = 0) get no outlines.
+  edge *= pc.a.y * smoothstep(90.0, 15.0, dist) * step(0.01, aux.w);
   col = mix(col, pc.c.rgb * (0.4 + 0.6 * luminance(col)), edge);
 
   // Aerial perspective, then low mist that pools over water and low ground.
@@ -145,7 +188,7 @@ const KERNEL = array<vec3f, 16>(
     let m = mist * (1.0 - exp(-dist * 0.03)) * mix(0.35, 1.0, low);
     col = mix(col, fog_color(dir) * 1.05, clamp(m, 0.0, 0.92));
   }
-  return vec4f(col, 1.0);
+  return vec4f(col + shafts, 1.0);
 }
 
 // Bloom. pc.a = (source texel w, source texel h, threshold, first pass)
@@ -282,11 +325,21 @@ fn aces(x: vec3f) -> vec3f {
   return vec4f(pow(out, vec3f(2.2)), 1.0);
 }
 
-// Final output with FXAA-style edge smoothing. pc.a = (enable, encode sRGB, unused, unused)
+// Final output with FXAA-style edge smoothing and sharpening.
+// pc.a = (enable FXAA, encode sRGB, sharpen, unused)
 @fragment fn fs_final(in: Screen) -> @location(0) vec4f {
   let px = vec2i(in.clip.xy);
   let size = vec2i(frame.viewport.xy);
   var col = textureLoad(src_tex, px, 0).rgb;
+  if (pc.a.z > 0.0) {
+    let ring = textureLoad(src_tex, clamp(px + vec2i(0, -1), vec2i(0), size - vec2i(1)), 0).rgb
+      + textureLoad(src_tex, clamp(px + vec2i(0, 1), vec2i(0), size - vec2i(1)), 0).rgb
+      + textureLoad(src_tex, clamp(px + vec2i(1, 0), vec2i(0), size - vec2i(1)), 0).rgb
+      + textureLoad(src_tex, clamp(px + vec2i(-1, 0), vec2i(0), size - vec2i(1)), 0).rgb;
+    let detail = col - ring * 0.25;
+    // Limit the boost so edges sharpen without halos.
+    col = max(col + clamp(detail * pc.a.z, vec3f(-0.08), vec3f(0.08)), vec3f(0.0));
+  }
   if (pc.a.x > 0.5) {
     let ln = luminance(textureLoad(src_tex, clamp(px + vec2i(0, -1), vec2i(0), size - vec2i(1)), 0).rgb);
     let ls = luminance(textureLoad(src_tex, clamp(px + vec2i(0, 1), vec2i(0), size - vec2i(1)), 0).rgb);

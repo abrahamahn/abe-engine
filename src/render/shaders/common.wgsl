@@ -6,6 +6,7 @@ struct Frame {
   inv_view_proj: mat4x4f,
   shadow0: mat4x4f,
   shadow1: mat4x4f,
+  ground_vp: mat4x4f,   // top-down projection of the ground map (depth 0 at the top)
   camera: vec4f,        // xyz eye, w = seconds
   key_dir: vec4f,       // xyz towards the key light (sun or moon), w = intensity
   key_color: vec4f,     // rgb, w = unused
@@ -31,6 +32,14 @@ struct Frame {
   viewport: vec4f,      // width, height, 1 / width, 1 / height
   cascades: vec4f,      // cascade 0 far distance, normal offset 0, normal offset 1, near plane
   shadow_params: vec4f, // filter radius (uv) cascade 0, cascade 1, depth bias 0, depth bias 1
+  ground: vec4f,        // ground map: top height, depth range (m), texels per side, grass density
+  paint: vec4f,         // brush strength, brush stroke size (m), light shafts, unused
+  shallow: vec4f,       // rgb shallow water, w = foam
+  water2: vec4f,        // glitter, unused, unused, unused
+  grass: vec4f,         // blade height, blade width, flower fraction, sway
+  grass_base: vec4f,    // rgb blade root colour
+  grass_tip: vec4f,     // rgb blade tip colour
+  flowers: array<vec4f, 4>, // rgb flower colours
   tiles: vec4u,         // tiles across, tiles down, tile size in pixels, light count
 };
 
@@ -87,6 +96,22 @@ fn fbm2(p: vec2f) -> f32 {
 
 fn luminance(c: vec3f) -> f32 {
   return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+// The ground map seen from above: where `p` falls in it (xy = texel, z = depth of `p`).
+// Returns z < 0 when `p` is outside the map.
+fn ground_texel(p: vec3f) -> vec3f {
+  let q = frame.ground_vp * vec4f(p, 1.0);
+  let uv = q.xy * 0.5 + vec2f(0.5);
+  if (any(uv <= vec2f(0.0)) || any(uv >= vec2f(1.0))) {
+    return vec3f(0.0, 0.0, -1.0);
+  }
+  return vec3f(uv * frame.ground.z, clamp(q.z, 0.0, 1.0));
+}
+
+// World height of a ground-map depth value.
+fn ground_height(depth: f32) -> f32 {
+  return frame.ground.x - depth * frame.ground.y;
 }
 
 // The sky without sun, moon, stars or clouds: gradient, horizon glow towards the light, halo.

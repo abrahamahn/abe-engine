@@ -8,6 +8,6 @@ mod renderer;
 mod scene;
 pub mod sky;
 
-pub use look::{Look, LookFile, View};
+pub use look::{DetailPreset, DetailRule, Grass, Look, LookFile, View};
 pub use renderer::{Output, Quality, Renderer};
 pub use sky::{Environment, Palette, SkyKey, TimeOfDay, Weather};

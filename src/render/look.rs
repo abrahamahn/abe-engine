@@ -55,6 +55,140 @@ pub struct Look {
     pub star_density: f32,
     pub moon_size: f32,
     pub palette: Palette,
+    /// Painted brushwork: how much world-space brush strokes break up the light/shade edge and
+    /// flat colour (0 = none), and the stroke size in metres.
+    pub brush: f32,
+    pub brush_scale: f32,
+    /// Final sharpening (0 = none).
+    pub sharpen: f32,
+    /// Light bounced up from sunlit (or moonlit) ground onto eaves, ceilings and the shaded
+    /// undersides of things: the fraction of the key light added to the ground ambient.
+    pub bounce: f32,
+    /// Light shafts from the sun or moon through gaps in the scenery (0 = none).
+    pub sun_shafts: f32,
+    /// Shallow-water colour, shoreline foam strength and sun/moon glitter on water.
+    pub water_shallow: V3,
+    pub foam: f32,
+    pub sparkle: f32,
+    /// Procedural surface detail by material name; the first matching rule wins.
+    pub details: Vec<DetailRule>,
+    pub grass: Grass,
+}
+
+/// A procedural surface pattern a Look file can give materials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetailPreset {
+    None = 0,
+    /// Rows of rounded roof tiles aligned to the slope, with lapped edges.
+    RoofTiles = 1,
+    /// Planks and grain.
+    Wood = 2,
+    /// Soft mottling and streaks.
+    Plaster = 3,
+    /// Irregular stones with dark joints.
+    Stone = 4,
+    /// Polished: glossier, with a sheen.
+    Lacquer = 5,
+    /// Grassy ground: grass grows on it (see [`Grass`]) and it takes the grass colour.
+    Grass = 6,
+}
+
+impl DetailPreset {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "none" => Self::None,
+            "roof_tiles" => Self::RoofTiles,
+            "wood" => Self::Wood,
+            "plaster" => Self::Plaster,
+            "stone" => Self::Stone,
+            "lacquer" => Self::Lacquer,
+            "grass" => Self::Grass,
+            _ => return None,
+        })
+    }
+}
+
+/// Which materials get which [`DetailPreset`], and how.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DetailRule {
+    /// Material-name patterns; `*` matches any run of characters.
+    pub patterns: Vec<String>,
+    pub preset: DetailPreset,
+    /// Pattern size in metres: tile width and row length, plank width and length, stone size.
+    pub scale: [f32; 2],
+    /// How strongly the pattern shows (relief, contrast).
+    pub strength: f32,
+    /// Colour variation between tiles, planks or stones.
+    pub variation: f32,
+    /// Replaces the material's colour (linear RGB) when set.
+    pub color: Option<V3>,
+    /// Extra gloss (0..1), for lacquer and polished wood.
+    pub gloss: f32,
+}
+
+impl DetailRule {
+    /// True when one of the patterns matches `name`.
+    pub fn matches(&self, name: &str) -> bool {
+        self.patterns.iter().any(|p| glob(p, name))
+    }
+}
+
+/// `*` matches any run of characters; everything else matches itself.
+pub fn glob(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == name;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if !name.starts_with(first) || name.len() < first.len() + last.len() || !name.ends_with(last) {
+        return false;
+    }
+    let mut rest = &name[first.len()..name.len() - last.len()];
+    for part in &parts[1..parts.len() - 1] {
+        match rest.find(part) {
+            Some(i) => rest = &rest[i + part.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Grass and flowers grown on materials with the [`DetailPreset::Grass`] detail.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Grass {
+    /// Blade density (1 = the quality's default count, 0 = no grass).
+    pub density: f32,
+    /// Blade height and width in metres.
+    pub height: f32,
+    pub width: f32,
+    /// Colours at the root and the tip (linear RGB).
+    pub base: V3,
+    pub tip: V3,
+    /// Fraction of blades that carry a flower, and the flower colours.
+    pub flowers: f32,
+    pub flower_colors: [V3; 4],
+    /// How far blades bend in the wind.
+    pub sway: f32,
+}
+
+impl Default for Grass {
+    fn default() -> Self {
+        Self {
+            density: 0.0,
+            height: 0.38,
+            width: 0.045,
+            base: [0.06, 0.14, 0.03],
+            tip: [0.34, 0.52, 0.12],
+            flowers: 0.03,
+            flower_colors: [
+                [0.95, 0.95, 0.9],
+                [1.0, 0.82, 0.25],
+                [0.95, 0.5, 0.65],
+                [0.65, 0.55, 0.95],
+            ],
+            sway: 1.0,
+        }
+    }
 }
 
 impl Default for Look {
@@ -99,6 +233,16 @@ impl Default for Look {
             star_density: 1.0,
             moon_size: 1.0,
             palette: Palette::default(),
+            brush: 0.3,
+            brush_scale: 0.35,
+            sharpen: 0.2,
+            bounce: 0.1,
+            sun_shafts: 0.5,
+            water_shallow: [0.05, 0.2, 0.2],
+            foam: 0.6,
+            sparkle: 0.5,
+            details: vec![],
+            grass: Grass::default(),
         }
     }
 }
@@ -165,6 +309,12 @@ impl LookFile {
             col(s, "water_color", &mut l.water_color)?;
             num(s, "water_reflection", &mut l.water_reflection)?;
             num(s, "water_ripples", &mut l.water_ripples)?;
+            col(s, "water_shallow", &mut l.water_shallow)?;
+            num(s, "foam", &mut l.foam)?;
+            num(s, "sparkle", &mut l.sparkle)?;
+            num(s, "brush", &mut l.brush)?;
+            num(s, "bounce", &mut l.bounce)?;
+            num(s, "brush_scale", &mut l.brush_scale)?;
         }
         if let Some(p) = root.get("post") {
             let l = &mut file.look;
@@ -186,6 +336,32 @@ impl LookFile {
             num(p, "fog", &mut l.fog)?;
             num(p, "fog_height", &mut l.fog_height)?;
             num(p, "fog_falloff", &mut l.fog_falloff)?;
+            num(p, "sharpen", &mut l.sharpen)?;
+            num(p, "sun_shafts", &mut l.sun_shafts)?;
+        }
+        if let Some(rules) = root.get("details") {
+            for r in rules.array()? {
+                file.look.details.push(parse_detail(r)?);
+            }
+        }
+        if let Some(g) = root.get("grass") {
+            let grass = &mut file.look.grass;
+            num(g, "density", &mut grass.density)?;
+            num(g, "height", &mut grass.height)?;
+            num(g, "width", &mut grass.width)?;
+            col(g, "base", &mut grass.base)?;
+            col(g, "tip", &mut grass.tip)?;
+            num(g, "flowers", &mut grass.flowers)?;
+            num(g, "sway", &mut grass.sway)?;
+            if let Some(c) = g.get("flower_colors") {
+                let c = c.array()?;
+                if c.is_empty() {
+                    return Err("grass.flower_colors is empty".into());
+                }
+                for (i, slot) in grass.flower_colors.iter_mut().enumerate() {
+                    *slot = vec3(&c[i % c.len()]).map_err(|e| format!("flower_colors: {e}"))?;
+                }
+            }
         }
         if let Some(s) = root.get("sky") {
             let l = &mut file.look;
@@ -249,6 +425,47 @@ impl LookFile {
     }
 }
 
+fn parse_detail(r: &Value) -> Result<DetailRule, String> {
+    let patterns = match r.get("match").ok_or("detail rule without \"match\"")? {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a
+            .iter()
+            .map(|v| v.string().map(str::to_owned))
+            .collect::<Result<_, _>>()?,
+        _ => return Err("detail \"match\" must be a string or an array of strings".into()),
+    };
+    let name = r
+        .get("preset")
+        .ok_or("detail rule without \"preset\"")?
+        .string()?;
+    let preset =
+        DetailPreset::parse(name).ok_or_else(|| format!("unknown detail preset {name:?}"))?;
+    let mut rule = DetailRule {
+        patterns,
+        preset,
+        scale: [0.3, 0.3],
+        strength: 1.0,
+        variation: 0.1,
+        color: None,
+        gloss: 0.0,
+    };
+    match r.get("scale") {
+        Some(Value::Array(a)) if a.len() == 2 => rule.scale = [a[0].float()?, a[1].float()?],
+        Some(v) => {
+            let x = v.float().map_err(|e| format!("detail scale: {e}"))?;
+            rule.scale = [x, x];
+        }
+        None => {}
+    }
+    num(r, "strength", &mut rule.strength)?;
+    num(r, "variation", &mut rule.variation)?;
+    num(r, "gloss", &mut rule.gloss)?;
+    if let Some(c) = r.get("color") {
+        rule.color = Some(vec3(c).map_err(|e| format!("detail color: {e}"))?);
+    }
+    Ok(rule)
+}
+
 fn parse_keys(v: &Value) -> Result<Vec<SkyKey>, String> {
     let mut keys = vec![];
     let base = Palette::default();
@@ -305,5 +522,31 @@ mod tests {
         assert_eq!(f.weather.rain, Weather::preset("rain").unwrap().rain);
         assert_eq!(f.weather.wind, 2.0);
         assert_eq!(f.views[0].fov, 40.0);
+    }
+
+    #[test]
+    fn detail_rules_and_grass() {
+        let f = LookFile::parse(
+            br##"{"details": [
+                    {"match": ["roof-*", "*-tile"], "preset": "roof_tiles", "scale": [0.25, 0.3]},
+                    {"match": "lawn", "preset": "grass", "color": "#4a7a30"}],
+                  "grass": {"density": 0.8, "flower_colors": ["#ffffff"]}}"##,
+        )
+        .unwrap();
+        let d = &f.look.details;
+        assert_eq!(d[0].preset, DetailPreset::RoofTiles);
+        assert!(d[0].matches("roof-main") && d[0].matches("blue-tile") && !d[0].matches("tiles"));
+        assert_eq!(d[0].scale, [0.25, 0.3]);
+        assert!(d[1].matches("lawn") && !d[1].matches("lawns") && d[1].color.is_some());
+        assert_eq!(f.look.grass.density, 0.8);
+        assert_eq!(f.look.grass.flower_colors[3], [1.0, 1.0, 1.0]);
+        assert!(LookFile::parse(br#"{"details": [{"match": "a", "preset": "fur"}]}"#).is_err());
+    }
+
+    #[test]
+    fn glob_patterns() {
+        assert!(glob("a*", "abc") && glob("*c", "abc") && glob("a*c", "abc") && glob("*", ""));
+        assert!(glob("a*b*c", "a-b-c") && !glob("a*b*c", "a-c") && !glob("ab*ba", "aba"));
+        assert!(glob("exact", "exact") && !glob("exact", "exactly"));
     }
 }

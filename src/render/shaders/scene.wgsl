@@ -1,10 +1,16 @@
 // Stylized forward shading for world geometry: a soft two-tone key light with tinted shade,
 // hemispheric ambient, rim light, toon specular, foliage wrap and glow, tiled lamp lights,
-// lamp emission that follows the time of day, wet surfaces in rain, and reflective water.
+// lamp emission that follows the time of day, wet surfaces in rain, painted brushwork,
+// procedural surface detail (roof tiles, wood, plaster, stone, lacquer, grassy ground),
+// reflective water with shallows, foam and glitter, and instanced grass and flowers.
 // The same shader draws the mirrored reflection pass (frame.water_color.w = 1).
 
+// Vertices are already in world space.
 struct Draw {
-  model: mat4x4f,
+  detail0: vec4f,    // preset (0 none, 1 roof tiles, 2 wood, 3 plaster, 4 stone, 5 lacquer, 6 grass), size u, size v, strength
+  detail1: vec4f,    // variation, rgb replacement colour
+  detail2: vec4f,    // has replacement colour, gloss, unused, unused
+  detail3: vec4f,    // unused
   base_color: vec4f,
   emissive: vec4f,   // rgb, w = 1 for lamps (scaled by the lamp level)
   params: vec4f,     // alpha cutoff, roughness, metallic, shading (0 standard, 1 foliage, 2 water, 3 unlit)
@@ -24,6 +30,8 @@ struct Light {
 @group(0) @binding(5) var shadow_sampler: sampler_comparison;
 @group(0) @binding(6) var reflection: texture_2d<f32>;
 @group(0) @binding(7) var clamp_sampler: sampler;
+@group(0) @binding(8) var ground_depth: texture_depth_2d;
+@group(0) @binding(9) var ground_mask: texture_2d<f32>;
 @group(1) @binding(0) var base_tex: texture_2d<f32>;
 @group(1) @binding(1) var normal_tex: texture_2d<f32>;
 @group(1) @binding(2) var emissive_tex: texture_2d<f32>;
@@ -47,10 +55,9 @@ struct FsOut {
 
 @vertex fn vs_main(v: VsIn) -> VsOut {
   var o: VsOut;
-  let w = draw.model * vec4f(v.position, 1.0);
-  o.clip = frame.view_proj * w;
-  o.world = w.xyz;
-  o.normal = (draw.model * vec4f(v.normal, 0.0)).xyz;
+  o.clip = frame.view_proj * vec4f(v.position, 1.0);
+  o.world = v.position;
+  o.normal = v.normal;
   o.uv = v.uv;
   return o;
 }
@@ -62,8 +69,9 @@ const TAPS = array<vec2f, 16>(
   vec2f(0.5862, -0.7811), vec2f(-0.4836, -0.1430), vec2f(0.1052, 0.5864), vec2f(0.6528, -0.0807)
 );
 
-// Percentage-closer filtering in one cascade; returns -1 outside the cascade.
-fn shadow_cascade(world: vec3f, n: vec3f, layer: i32, m: mat4x4f, offset: f32, radius: f32, bias: f32, spin: f32) -> f32 {
+// Percentage-closer filtering in one cascade with `count` of the 16 taps; returns -1 outside
+// the cascade.
+fn shadow_cascade(world: vec3f, n: vec3f, layer: i32, m: mat4x4f, offset: f32, radius: f32, bias: f32, spin: f32, count: i32) -> f32 {
   let ndl = dot(n, frame.key_dir.xyz);
   let p = m * vec4f(world + n * (offset * (1.0 + 1.5 * (1.0 - abs(ndl)))), 1.0);
   let uv = p.xy * 0.5 + vec2f(0.5);
@@ -73,33 +81,38 @@ fn shadow_cascade(world: vec3f, n: vec3f, layer: i32, m: mat4x4f, offset: f32, r
   let cs = cos(spin);
   let sn = sin(spin);
   var sum = 0.0;
-  for (var i = 0; i < 16; i++) {
-    let t = TAPS[i];
+  let stride = 16 / count;
+  for (var i = 0; i < count; i++) {
+    let t = TAPS[i * stride];
     let o = vec2f(t.x * cs - t.y * sn, t.x * sn + t.y * cs) * radius;
     sum += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + o, layer, p.z - bias);
   }
-  return sum / 16.0;
+  return sum / f32(count);
 }
 
 fn shadow(world: vec3f, n: vec3f, dist: f32, frag: vec2f) -> f32 {
+  return shadow_taps(world, n, dist, frag, 16);
+}
+
+fn shadow_taps(world: vec3f, n: vec3f, dist: f32, frag: vec2f, count: i32) -> f32 {
   if (frame.key_dir.w <= 0.0) {
     return 1.0;
   }
   let spin = rand01(u32(frag.x) * 7919u + u32(frag.y) * 104729u + u32(frame.wind.w) * 15485863u) * 6.2831;
   let sp = frame.shadow_params;
   if (dist < frame.cascades.x) {
-    let s0 = shadow_cascade(world, n, 0, frame.shadow0, frame.cascades.y, sp.x, sp.z, spin);
+    let s0 = shadow_cascade(world, n, 0, frame.shadow0, frame.cascades.y, sp.x, sp.z, spin, count);
     if (s0 >= 0.0) {
       // Blend into the far cascade over the last 15% of the near one.
       let edge = smoothstep(frame.cascades.x * 0.85, frame.cascades.x, dist);
       if (edge <= 0.0) {
         return s0;
       }
-      let s1 = shadow_cascade(world, n, 1, frame.shadow1, frame.cascades.z, sp.y, sp.w, spin);
+      let s1 = shadow_cascade(world, n, 1, frame.shadow1, frame.cascades.z, sp.y, sp.w, spin, count);
       return mix(s0, select(s1, s0, s1 < 0.0), edge);
     }
   }
-  let s1 = shadow_cascade(world, n, 1, frame.shadow1, frame.cascades.z, sp.y, sp.w, spin);
+  let s1 = shadow_cascade(world, n, 1, frame.shadow1, frame.cascades.z, sp.y, sp.w, spin, count);
   return select(s1, 1.0, s1 < 0.0);
 }
 
@@ -173,12 +186,216 @@ fn water_normal(world: vec3f, t: f32) -> vec3f {
   return normalize(vec3f(-g.x * 0.045, 1.0, -g.y * 0.045));
 }
 
+// ---------------------------------------------------------------- painted surface detail
+
+// Coordinates on a surface's dominant plane.
+fn plane_uv(p: vec3f, n: vec3f) -> vec2f {
+  let a = abs(n);
+  if (a.x > a.y && a.x > a.z) {
+    return p.zy;
+  }
+  if (a.z > a.y) {
+    return p.xy;
+  }
+  return p.xz;
+}
+
+// Brush strokes in 0..1: long soft dabs on the surface, fixed in the world so they never swim.
+fn brush_noise(p: vec3f, n: vec3f, size: f32) -> f32 {
+  let q = plane_uv(p, n) / size;
+  let r = vec2f(q.x * 0.8 + q.y * 0.6, q.y * 0.8 - q.x * 0.6);
+  return noise2(vec2f(r.x * 0.45, r.y * 1.8)) * 0.6 + noise2(vec2f(r.x * 1.1, r.y * 4.2) + vec2f(7.3, 1.9)) * 0.4;
+}
+
+struct Detail {
+  albedo: vec3f,
+  n: vec3f,
+  cavity: f32,  // darkening in gutters, joints and seams
+  rough: f32,   // replacement roughness, or < 0 to keep the material's
+};
+
+fn no_detail(albedo: vec3f, n: vec3f) -> Detail {
+  var o: Detail;
+  o.albedo = albedo;
+  o.n = n;
+  o.cavity = 1.0;
+  o.rough = -1.0;
+  return o;
+}
+
+// How many pattern cells of `size` metres along `axis` one pixel covers.
+fn cells_per_pixel(axis: vec3f, size: f32, dpx: vec3f, dpy: vec3f) -> f32 {
+  return (abs(dot(dpx, axis)) + abs(dot(dpy, axis))) / size;
+}
+
+// Rounded roof tiles in columns running down the slope, lapped row over row.
+fn roof_tiles(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f) -> Detail {
+  var o = no_detail(albedo, n);
+  if (geo.y < 0.12) {
+    return o;
+  }
+  let h = vec2f(geo.x, geo.z);
+  let hl = length(h);
+  var down = vec3f(0.0, 0.0, 1.0);
+  if (hl > 0.03) {
+    down = vec3f(h.x / hl, 0.0, h.y / hl);
+  }
+  let e = vec3f(-down.z, 0.0, down.x);
+  var s = normalize(cross(e, geo));
+  if (s.y > 0.0) {
+    s = -s;
+  }
+  let width = draw.detail0.y;
+  let row = draw.detail0.z;
+  let fade = 1.0 - smoothstep(0.25, 0.6, max(cells_per_pixel(e, width, dpx, dpy), cells_per_pixel(s, row, dpx, dpy)));
+  let relief = draw.detail0.w * fade;
+  let u = dot(p, e) / width;
+  let v = dot(p, s) / row;
+  let x = fract(u) * 2.0 - 1.0;
+  let crest = sqrt(max(1.0 - x * x, 0.0));
+  let fv = fract(v);
+  let lap = smoothstep(0.0, 0.18, fv);
+  let lip = smoothstep(0.78, 1.0, fv);
+  o.n = normalize(n + e * (clamp(x / max(crest, 0.2), -2.5, 2.5) * 0.3 * relief) + s * ((lip * 0.5 - (1.0 - lap) * 0.35) * relief));
+  let gutter = smoothstep(0.0, 0.45, crest);
+  // Far away the pattern averages out to a slightly darker roof.
+  o.cavity = mix(0.86, mix(0.5, 1.0, lap) * mix(0.62, 1.0, gutter), fade);
+  let id = vec2f(floor(u), floor(v));
+  let r = hash2(id) - 0.5;
+  let r2 = hash2(id + vec2f(17.0, 3.0)) - 0.5;
+  o.albedo = albedo * (1.0 + r * draw.detail1.x * 2.0 * fade) * (1.0 + vec3f(r2, r2 * 0.6, -r2) * 0.12 * fade);
+  return o;
+}
+
+// Planks with staggered butt joints and grain, along world x (or z for faces looking along x).
+fn wood(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f) -> Detail {
+  var o = no_detail(albedo, n);
+  let a = abs(geo);
+  var along = vec3f(1.0, 0.0, 0.0);
+  if (a.x > a.z && a.x > a.y * 0.5) {
+    along = vec3f(0.0, 0.0, 1.0);
+  }
+  let across = normalize(cross(geo, along) + vec3f(0.0, 1e-4, 0.0));
+  let width = draw.detail0.y;
+  let length_m = draw.detail0.z;
+  let fade = 1.0 - smoothstep(0.3, 0.7, cells_per_pixel(across, width, dpx, dpy));
+  let u = dot(p, across) / width;
+  let plank = floor(u);
+  let w = dot(p, along) / length_m + hash2(vec2f(plank, 7.0));
+  let id = vec2f(plank, floor(w));
+  let r = hash2(id) - 0.5;
+  let fu = fract(u);
+  let seam = smoothstep(0.0, 0.07, fu) * smoothstep(1.0, 0.93, fu);
+  let fw = fract(w);
+  let butt = smoothstep(0.0, 0.012, fw) * smoothstep(1.0, 0.988, fw);
+  let along_m = dot(p, along);
+  let g = noise2(vec2f(along_m * 0.9 / width, fu * 7.0 + r * 31.0)) * 0.7 + noise2(vec2f(along_m * 3.1 / width, fu * 23.0 + r * 11.0)) * 0.3;
+  let relief = draw.detail0.w * fade;
+  o.cavity = mix(1.0, mix(0.55, 1.0, seam * butt), relief);
+  o.albedo = albedo * (1.0 + r * draw.detail1.x * 2.0 * fade) * (1.0 + (g - 0.5) * 0.35 * relief);
+  o.n = normalize(n + across * ((smoothstep(0.85, 1.0, fu) - smoothstep(0.15, 0.0, fu)) * 0.25 * relief));
+  return o;
+}
+
+// Soft mottling, plus faint rain streaks on walls.
+fn plaster(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f) -> Detail {
+  var o = no_detail(albedo, n);
+  let size = draw.detail0.y;
+  let m = fbm2(plane_uv(p, geo) / size);
+  var streak = 0.0;
+  if (abs(geo.y) < 0.4) {
+    let side = dot(p, normalize(vec3f(-geo.z, 0.0, geo.x) + vec3f(1e-4, 0.0, 0.0)));
+    streak = smoothstep(0.55, 0.85, noise2(vec2f(side * 3.0 / size, p.y * 0.35)));
+  }
+  let k = draw.detail0.w;
+  o.albedo = albedo * (1.0 + (m - 0.5) * draw.detail1.x * 2.0 * k - streak * 0.08 * k);
+  return o;
+}
+
+// Irregular stones (a jittered cell pattern) with dark joints.
+fn stone(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f) -> Detail {
+  var o = no_detail(albedo, n);
+  let size = draw.detail0.y;
+  let fade = 1.0 - smoothstep(0.25, 0.6, (length(dpx) + length(dpy)) / size);
+  let uv = plane_uv(p, geo) / size;
+  let c = floor(uv);
+  let f = fract(uv);
+  var d1 = 8.0;
+  var d2 = 8.0;
+  var id = vec2f(0.0);
+  for (var j = -1; j <= 1; j++) {
+    for (var i = -1; i <= 1; i++) {
+      let cell = c + vec2f(f32(i), f32(j));
+      let site = vec2f(f32(i), f32(j)) + vec2f(hash2(cell), hash2(cell + vec2f(31.0, 17.0))) * 0.8 + vec2f(0.1) - f;
+      let d = dot(site, site);
+      if (d < d1) {
+        d2 = d1;
+        d1 = d;
+        id = cell;
+      } else if (d < d2) {
+        d2 = d;
+      }
+    }
+  }
+  let edge = sqrt(d2) - sqrt(d1);
+  let joint = smoothstep(0.03, 0.14, edge);
+  let relief = draw.detail0.w * fade;
+  o.cavity = mix(1.0, mix(0.42, 1.0, joint), relief);
+  o.albedo = albedo * (1.0 + (hash2(id) - 0.5) * draw.detail1.x * 2.0 * fade);
+  return o;
+}
+
+// Grassy ground: the grass colour in large soft patches, so it meets the blades seamlessly.
+fn grass_ground(p: vec3f, n: vec3f, albedo: vec3f) -> Detail {
+  var o = no_detail(albedo, n);
+  var base = albedo;
+  if (draw.detail2.x > 0.5) {
+    // Mostly the grass colour, keeping a little of the ground texture's markings.
+    base = mix(albedo, draw.detail1.yzw, 0.75);
+  }
+  let m = fbm2(p.xz * 0.11);
+  let m2 = noise2(p.xz * 0.9);
+  let dry = vec3f(1.12, 1.06, 0.7);
+  o.albedo = base * mix(vec3f(0.78), dry, smoothstep(0.35, 0.75, m)) * (0.92 + 0.16 * m2);
+  return o;
+}
+
+fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f) -> Detail {
+  let preset = i32(draw.detail0.x + 0.5);
+  var base = albedo;
+  if (draw.detail2.x > 0.5 && preset != 6) {
+    base = draw.detail1.yzw;
+  }
+  if (preset == 1) {
+    return roof_tiles(p, geo, n, base, dpx, dpy);
+  }
+  if (preset == 2) {
+    return wood(p, geo, n, base, dpx, dpy);
+  }
+  if (preset == 3) {
+    return plaster(p, geo, n, base);
+  }
+  if (preset == 4) {
+    return stone(p, geo, n, base, dpx, dpy);
+  }
+  if (preset == 6) {
+    return grass_ground(p, n, albedo);
+  }
+  var o = no_detail(base, n);
+  if (preset == 5) {
+    o.rough = 0.12;
+  }
+  return o;
+}
+
 @fragment fn fs_main(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
   // Texture fetches and derivatives first, in uniform control flow.
   let bias = frame.style2.x;
   let base_s = textureSampleBias(base_tex, material_sampler, in.uv, bias);
   let nrm_s = textureSampleBias(normal_tex, material_sampler, in.uv, bias * 0.5);
   let emi_s = textureSampleBias(emissive_tex, material_sampler, in.uv, bias);
+  let dpx = dpdx(in.world);
+  let dpy = dpdy(in.world);
   // The mirrored reflection pass reverses winding: there the faces seen are back faces.
   let reflection_pass = frame.water_color.w > 0.5;
   var n = normalize(in.normal);
@@ -229,6 +446,24 @@ fn water_normal(world: vec3f, t: f32) -> vec3f {
     return out;
   }
 
+  // Procedural detail (tiles, planks, plaster, stone, lacquer, grassy ground) and brushwork.
+  var rough_override = -1.0;
+  var brush = 0.0;
+  if (shading == 0 && draw.detail0.x > 0.5) {
+    let d = surface_detail(in.world, geo_n, n, albedo.rgb, dpx, dpy);
+    albedo = vec4f(d.albedo * d.cavity, albedo.a);
+    n = d.n;
+    rough_override = d.rough;
+  }
+  if (shading <= 1) {
+    let footprint = (length(dpx) + length(dpy)) / max(frame.paint.y, 1e-3);
+    let amount = frame.paint.x * (1.0 - smoothstep(0.3, 0.9, footprint));
+    if (amount > 0.0) {
+      brush = (brush_noise(in.world, geo_n, frame.paint.y) - 0.5) * amount;
+      albedo = vec4f(albedo.rgb * (1.0 + brush * 0.24), albedo.a);
+    }
+  }
+
   let sh = shadow(in.world, geo_n, dist, frag.xy);
   let foliage = shading == 1;
   let lamps = lamp_light(in.world, n, frag.xy, foliage);
@@ -243,11 +478,46 @@ fn water_normal(world: vec3f, t: f32) -> vec3f {
       let uv = frag.xy * frame.viewport.zw + wn.xz * vec2f(0.06, 0.035);
       refl = textureSampleLevel(reflection, clamp_sampler, uv, 0.0).rgb;
     }
-    let deep = frame.water_color.rgb * (hemi + key * 0.25) + lamps * 0.05;
+    // Depth below the surface from the ground map: shallows turn clear and green, and foam
+    // lines the shore and anything standing in the water.
+    var below = 50.0;
+    var foam = 0.0;
+    let g = ground_texel(in.world);
+    if (g.z >= 0.0) {
+      let texel = vec2i(g.xy);
+      let size = i32(frame.ground.z);
+      let gd = textureLoad(ground_depth, clamp(texel, vec2i(0), vec2i(size - 1)), 0);
+      if (gd < 1.0) {
+        below = frame.water.x - ground_height(gd);
+      }
+      if (below > 0.02) {
+        var near = 0.0;
+        var offs = array<vec2i, 4>(vec2i(2, 0), vec2i(-2, 0), vec2i(0, 2), vec2i(0, -2));
+        for (var k = 0; k < 4; k++) {
+          let q = clamp(texel + offs[k], vec2i(0), vec2i(size - 1));
+          let qd = textureLoad(ground_depth, q, 0);
+          if (qd < 1.0 && ground_height(qd) > frame.water.x - 0.05) {
+            near = 1.0;
+          }
+        }
+        // Foam only where the water meets something: a thin, broken line.
+        let churn = 0.35 + 0.65 * smoothstep(0.3, 0.7, noise2(in.world.xz * 4.3 + vec2f(t * 0.35, -t * 0.27)));
+        foam = near * smoothstep(0.6, 0.05, below) * churn * frame.shallow.w;
+      }
+    }
+    let shallows = (1.0 - smoothstep(0.0, 1.4, max(below, 0.0))) * 0.45;
+    let water_col = mix(frame.water_color.rgb, frame.shallow.rgb, shallows);
+    let deep = water_col * (hemi + key * 0.25) + lamps * 0.05;
     var col = mix(deep, refl, clamp(fres * 1.4 + 0.3, 0.0, 1.0) * frame.water.y);
     let r = reflect(-v, wn);
     col += key * (pow(max(dot(r, l), 0.0), 600.0) * 6.0 * sh);
     col += key * (pow(max(dot(r, l), 0.0), 40.0) * 0.08 * sh);
+    // Glitter: brief sparks in the sun's (or moon's) path.
+    let cell = floor(in.world.xz * 7.0);
+    let spark = step(0.92, hash2(cell + vec2f(floor(t * 5.0) * 13.0, 0.0)));
+    col += key * (spark * pow(max(dot(r, l), 0.0), 90.0) * 9.0 * frame.water2.x * sh);
+    let foam_lit = key * (0.35 + 0.65 * sh) * 0.8 + hemi * 0.9 + lamps * 0.4;
+    col = mix(col, vec3f(0.86, 0.93, 0.92) * foam_lit, clamp(foam, 0.0, 0.7));
     out.color = vec4f(col, 1.0);
     out.aux = vec4f(wn, 0.75);
     return out;
@@ -258,7 +528,8 @@ fn water_normal(world: vec3f, t: f32) -> vec3f {
   albedo = vec4f(albedo.rgb * (1.0 - 0.38 * wet), albedo.a);
 
   let ndl = dot(n, l);
-  let half_l = ndl * 0.5 + 0.5;
+  // Brushwork also breaks up the light/shade edge.
+  let half_l = ndl * 0.5 + 0.5 + brush * 0.45;
   var lit = smoothstep(frame.ramp.x - frame.ramp.y, frame.ramp.x + frame.ramp.y, half_l) * sh;
   var glow = vec3f(0.0);
   if (foliage) {
@@ -280,7 +551,10 @@ fn water_normal(world: vec3f, t: f32) -> vec3f {
   var col = albedo.rgb * (diffuse + lamps) * (1.0 - 0.5 * metallic) + glow;
 
   // Toon specular from the key light: a soft-edged highlight that grows with gloss.
-  let rough = clamp(draw.params.y * (1.0 - 0.6 * wet), 0.05, 1.0);
+  var rough = clamp(draw.params.y * (1.0 - 0.6 * wet), 0.05, 1.0);
+  if (rough_override >= 0.0) {
+    rough = min(rough, rough_override);
+  }
   let hv = normalize(l + v);
   let nh = max(dot(n, hv), 0.0);
   let size = frame.style.y * rough;
@@ -308,5 +582,215 @@ fn water_normal(world: vec3f, t: f32) -> vec3f {
     col = mix(col, fog_color(-v), fog_amount(frame.camera.xyz, in.world, dist));
   }
   out.color = vec4f(col, 1.0);
+  return out;
+}
+
+// ---------------------------------------------------------------- grass and flowers
+// Instanced blades on a world-aligned grid around the camera, kept where the ground map says
+// grass grows (its top surface is a grassy material), thinned and widened with distance.
+
+const GRASS_SPACING = 0.13;
+// Rows of the instance grid; the renderer draws GRASS_SIDE * GRASS_SIDE instances at most.
+const GRASS_SIDE = 640u;
+
+struct GrassSite {
+  base: vec3f,
+  keep: f32,     // 0 when the blade is not drawn
+  widen: f32,    // blades grow wider where they are sparse
+  seed: u32,
+};
+
+fn grass_site(ii: u32) -> GrassSite {
+  var o: GrassSite;
+  o.keep = 0.0;
+  o.widen = 1.0;
+  let cam = frame.camera.xyz;
+  let half = i32(GRASS_SIDE / 2u);
+  let cx = i32(floor(cam.x / GRASS_SPACING)) + i32(ii % GRASS_SIDE) - half;
+  let cz = i32(floor(cam.z / GRASS_SPACING)) + i32(ii / GRASS_SIDE) - half;
+  let seed = hash_u((bitcast<u32>(cx) * 73856093u) ^ hash_u(bitcast<u32>(cz) * 19349663u + 7u));
+  o.seed = seed;
+  let jx = rand01(seed);
+  let jz = rand01(seed + 1u);
+  let x = (f32(cx) + jx) * GRASS_SPACING;
+  let z = (f32(cz) + jz) * GRASS_SPACING;
+  // Density: full near the camera, thinning with distance.
+  let g = ground_texel(vec3f(x, 0.0, z));
+  if (g.z < 0.0) {
+    return o;
+  }
+  let size = i32(frame.ground.z);
+  let texel = clamp(vec2i(g.xy), vec2i(0), vec2i(size - 1));
+  let mask = textureLoad(ground_mask, texel, 0);
+  if (mask.r < 0.5) {
+    return o;
+  }
+  let gd = textureLoad(ground_depth, texel, 0);
+  let y = ground_height(gd);
+  o.base = vec3f(x, y, z);
+  let d = length(o.base - cam);
+  let density = clamp(pow(9.0 / max(d, 1e-3), 1.5), 0.05, 1.0) * frame.ground.w;
+  if (rand01(seed + 2u) > density) {
+    return o;
+  }
+  // Skip blades well outside the view.
+  let c = frame.view_proj * vec4f(o.base + vec3f(0.0, frame.grass.x * 0.5, 0.0), 1.0);
+  if (c.w <= 0.0 || any(abs(c.xy) > vec2f(c.w * 1.15 + 0.5))) {
+    return o;
+  }
+  o.keep = 1.0;
+  o.widen = min(inverseSqrt(max(density, 0.05)), 3.0);
+  return o;
+}
+
+fn grass_wind(base: vec3f, seed: u32) -> vec3f {
+  let w = frame.wind.xy;
+  let speed = length(w);
+  var dir = vec2f(0.7, 0.7);
+  if (speed > 1e-3) {
+    dir = w / speed;
+  }
+  let t = frame.camera.w;
+  let phase = dot(base.xz, dir) * 0.45 + rand01(seed + 9u) * 1.5;
+  let gust = 0.35 + 0.65 * (0.5 + 0.5 * sin(t * 1.3 - phase));
+  let flutter = sin(t * 4.1 + rand01(seed + 10u) * 6.28) * 0.15;
+  let amount = (0.12 + min(speed * 0.09, 0.5)) * frame.grass.w;
+  return vec3f(dir.x, 0.0, dir.y) * ((gust + flutter) * amount);
+}
+
+struct GrassOut {
+  @builtin(position) clip: vec4f,
+  @location(0) world: vec3f,
+  @location(1) normal: vec3f,
+  @location(2) color: vec3f,
+  @location(3) t: f32,
+};
+
+fn hidden_grass() -> GrassOut {
+  var o: GrassOut;
+  o.clip = vec4f(0.0, 0.0, -1.0, 1.0);
+  return o;
+}
+
+// Heights along a blade and the corners of its two quads and tip triangle.
+const BLADE_T = array<f32, 4>(0.0, 0.45, 0.8, 1.0);
+const BLADE_CORNERS = array<vec2f, 15>(
+  vec2f(-1.0, 0.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0), vec2f(-1.0, 0.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0),
+  vec2f(-1.0, 1.0), vec2f(1.0, 1.0), vec2f(1.0, 2.0), vec2f(-1.0, 1.0), vec2f(1.0, 2.0), vec2f(-1.0, 2.0),
+  vec2f(-1.0, 2.0), vec2f(1.0, 2.0), vec2f(0.0, 3.0)
+);
+
+@vertex fn vs_grass(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> GrassOut {
+  let site = grass_site(ii);
+  if (site.keep <= 0.0) {
+    return hidden_grass();
+  }
+  let seed = site.seed;
+  let corner = BLADE_CORNERS[vi];
+  let t = BLADE_T[u32(corner.y)];
+  let yaw = rand01(seed + 3u) * 6.2831;
+  let face = vec3f(cos(yaw), 0.0, sin(yaw));
+  let right = vec3f(-face.z, 0.0, face.x);
+  let height = frame.grass.x * (0.55 + 0.9 * rand01(seed + 4u));
+  let width = frame.grass.y * (0.7 + 0.6 * rand01(seed + 5u)) * site.widen;
+  let lean = face * (0.25 * (rand01(seed + 6u) - 0.3) * height);
+  let bend = (lean + grass_wind(site.base, seed) * height) * (t * t);
+  var p = site.base + vec3f(0.0, height * t, 0.0) + bend;
+  p += right * (corner.x * 0.5 * width * (1.0 - 0.85 * t));
+  // Lighting normal: the blade's face, bent towards the sky so meadows read soft and bright.
+  let blade_n = normalize(cross(right, vec3f(0.0, height, 0.0) + bend * 2.0));
+  var o: GrassOut;
+  o.clip = frame.view_proj * vec4f(p, 1.0);
+  o.world = p;
+  o.normal = normalize(mix(blade_n, vec3f(0.0, 1.0, 0.0), 0.55));
+  let patch = noise2(site.base.xz * 0.12);
+  let tint = 0.85 + 0.3 * rand01(seed + 7u);
+  let dry = mix(vec3f(1.0), vec3f(1.18, 1.08, 0.62), smoothstep(0.45, 0.8, patch));
+  o.color = mix(frame.grass_base.rgb, frame.grass_tip.rgb, pow(t, 0.8)) * tint * dry;
+  o.t = t;
+  return o;
+}
+
+fn grass_light(world: vec3f, n_in: vec3f, albedo: vec3f, t: f32, frag: vec2f, front: bool) -> vec3f {
+  let to_cam = frame.camera.xyz - world;
+  let dist = length(to_cam);
+  let v = to_cam / max(dist, 1e-4);
+  var n = normalize(n_in);
+  if (dot(n, v) < 0.0 && n.y < 0.9) {
+    n = normalize(vec3f(-n.x, n.y, -n.z));
+  }
+  let l = frame.key_dir.xyz;
+  let key = frame.key_color.rgb * frame.key_dir.w;
+  let sh = shadow_taps(world, vec3f(0.0, 1.0, 0.0), dist, frag, 4);
+  let ndl = dot(n, l);
+  let lit = smoothstep(0.0, 1.0, (ndl + 0.55) / 1.55) * sh;
+  let hemi = mix(frame.amb_ground.rgb, frame.amb_sky.rgb, n.y * 0.5 + 0.5);
+  let dark = mix(vec3f(1.0), frame.shadow_tint.rgb, frame.shadow_tint.w);
+  let ao = mix(0.38, 1.0, smoothstep(0.0, 0.75, t));
+  let back = pow(clamp(dot(-l, v), 0.0, 1.0), 3.0) * frame.style.w * sh * t;
+  let lamps = lamp_light(world, n, frag, true);
+  let wet = 1.0 - 0.3 * frame.amb_ground.w;
+  return albedo * wet * (key * lit + hemi * mix(dark, vec3f(1.0), lit) * ao + lamps * ao + key * back * 0.7);
+}
+
+@fragment fn fs_grass(in: GrassOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
+  var out: FsOut;
+  out.color = vec4f(grass_light(in.world, in.normal, in.color, in.t, frag.xy, front), 1.0);
+  // aux.w = 0: no ambient occlusion or outlines on blades.
+  out.aux = vec4f(0.0, 1.0, 0.0, 0.0);
+  return out;
+}
+
+struct FlowerOut {
+  @builtin(position) clip: vec4f,
+  @location(0) world: vec3f,
+  @location(1) color: vec3f,
+  @location(2) uv: vec2f,
+};
+
+// Flower heads: small upturned discs on some of the grass sites, above the blades.
+@vertex fn vs_flower(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> FlowerOut {
+  var o: FlowerOut;
+  o.clip = vec4f(0.0, 0.0, -1.0, 1.0);
+  let site = grass_site(ii);
+  if (site.keep <= 0.0 || rand01(site.seed + 11u) > frame.grass.z) {
+    return o;
+  }
+  let seed = site.seed;
+  var corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));
+  let c = corners[vi];
+  let height = frame.grass.x * (0.75 + 0.6 * rand01(seed + 12u));
+  let centre = site.base + vec3f(0.0, height, 0.0) + grass_wind(site.base, seed) * height;
+  let to_cam = normalize(frame.camera.xyz - centre);
+  // Tilted between facing up and facing the camera, so heads read from low and high views.
+  let facing = normalize(mix(vec3f(0.0, 1.0, 0.0), to_cam, 0.5));
+  var side = cross(facing, vec3f(0.0, 0.0, 1.0));
+  if (length(side) < 1e-3) {
+    side = vec3f(1.0, 0.0, 0.0);
+  }
+  side = normalize(side);
+  let up = cross(side, facing);
+  let r = 0.035 * (0.75 + 0.5 * rand01(seed + 13u)) * min(site.widen, 2.0);
+  let p = centre + (side * c.x + up * c.y) * r;
+  o.clip = frame.view_proj * vec4f(p, 1.0);
+  o.world = p;
+  let k = min(u32(rand01(seed + 14u) * 4.0), 3u);
+  o.color = frame.flowers[k].rgb;
+  o.uv = c;
+  return o;
+}
+
+@fragment fn fs_flower(in: FlowerOut, @builtin(position) frag: vec4f) -> FsOut {
+  let r = length(in.uv);
+  let a = atan2(in.uv.y, in.uv.x);
+  let petals = 0.62 + 0.38 * abs(cos(a * 2.5));
+  if (r > petals) {
+    discard;
+  }
+  let heart = smoothstep(0.32, 0.18, r);
+  let albedo = mix(in.color, vec3f(1.0, 0.82, 0.25), heart);
+  var out: FsOut;
+  out.color = vec4f(grass_light(in.world, vec3f(0.0, 1.0, 0.0), albedo, 1.0, frag.xy, true), 1.0);
+  out.aux = vec4f(0.0, 1.0, 0.0, 0.0);
   return out;
 }

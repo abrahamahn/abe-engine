@@ -1,8 +1,10 @@
-//! The stylized renderer's frame: two shadow cascades, a top-down rain cover map, a mirrored
-//! reflection pass for water, the main forward pass (world, sky, weather particles) into HDR
-//! colour plus normals, then ambient occlusion, air (outlines, aerial perspective, mist), bloom,
-//! tone mapping and grading, the painterly filter and the final output (a swapchain image or a
-//! readback target).
+//! The stylized renderer's frame: two shadow cascades, a top-down ground map (what is highest
+//! around the view and whether grass grows there: rain cover, grass placement, water depth), a
+//! mirrored reflection pass for water, the main forward pass (world, grass and flowers, sky,
+//! weather particles) into HDR colour plus normals, then ambient occlusion, air (outlines,
+//! aerial perspective, mist, light shafts), bloom, tone mapping and grading, the optional
+//! painterly filter and the final output with sharpening (a swapchain image or a readback
+//! target).
 
 use crate::gpu::{
     Address, Attachment, BindGroupId, Blend, BufferDesc, BufferId, BufferUsage, ColorTarget,
@@ -12,7 +14,7 @@ use crate::gpu::{
 };
 use abe_shader::{Compiled, Stage};
 
-use super::look::{Look, View};
+use super::look::{DetailPreset, Look, View};
 use super::math::{
     self, M4, V3, add, cross, invert, look_at, mul, normalize, ortho, perspective, reflect_y,
     scale, sub, transform,
@@ -27,12 +29,15 @@ const POST: &str = include_str!("shaders/post.wgsl");
 const HDR: Format = Format::Rgba16Float;
 const MAX_LIGHTS_PER_TILE: usize = 96;
 const NEAR: f32 = 0.08;
-/// The rain cover map: a top-down depth map of the world around the rain, so drops stop at
-/// roofs. It reaches past the box the drops wrap around, which sits just ahead of the camera.
-const COVER_MAP_SIZE: u32 = 512;
-const COVER_REACH: f32 = 12.0;
+/// The ground map covers this far (metres) around a point just ahead of the camera.
+const GROUND_REACH: f32 = 48.0;
+/// The grass instance grid is GRASS_SIDE x GRASS_SIDE cells (see scene.wgsl).
+const GRASS_SIDE: u32 = 640;
 const RAIN_BOX: f32 = 16.0;
 const PETAL_BOX: f32 = 14.0;
+const GROUND_FORMAT: Format = Format::Rgba8Unorm;
+/// Size of the per-view uniform buffer holding the `Frame` block.
+const FRAME_BYTES: u64 = 1536;
 
 /// How much work each frame does. [`Quality::still`] is for offline images,
 /// [`Quality::realtime`] for the interactive player.
@@ -47,6 +52,10 @@ pub struct Quality {
     pub painterly: bool,
     pub fxaa: bool,
     pub particles: bool,
+    /// Texels per side of the top-down ground map.
+    pub ground_size: u32,
+    /// Fraction of the grass instance grid drawn (0 = no grass).
+    pub grass: f32,
 }
 impl Quality {
     pub fn still() -> Self {
@@ -60,6 +69,8 @@ impl Quality {
             painterly: true,
             fxaa: false,
             particles: true,
+            ground_size: 1024,
+            grass: 1.0,
         }
     }
     pub fn realtime() -> Self {
@@ -73,6 +84,8 @@ impl Quality {
             painterly: true,
             fxaa: true,
             particles: true,
+            ground_size: 1024,
+            grass: 0.6,
         }
     }
 }
@@ -91,6 +104,9 @@ struct Pipelines {
     scene: PipelineId,
     shadow: PipelineId,
     shadow_masked: PipelineId,
+    ground: PipelineId,
+    grass: PipelineId,
+    flower: PipelineId,
     sky: PipelineId,
     particle: PipelineId,
     ssao: PipelineId,
@@ -132,6 +148,8 @@ struct Slot {
     index: [BufferId; 2],
     scene: [BindGroupId; 2],
     sky: [BindGroupId; 2],
+    grass: BindGroupId,
+    flower: BindGroupId,
     particle: BindGroupId,
     ssao: BindGroupId,
     air: BindGroupId,
@@ -154,7 +172,13 @@ pub struct Renderer {
     /// Bind groups for alpha-masked materials in the masked shadow pipeline.
     shadow_materials: Vec<Option<BindGroupId>>,
     shadow_map: TextureId,
-    cover_map: TextureId,
+    ground_depth: TextureId,
+    ground_mask: TextureId,
+    /// Per material: the procedural detail block pushed with each draw (see `Draw` in
+    /// scene.wgsl), from the Look's detail rules.
+    details: Vec<[f32; 16]>,
+    /// Per material: grows grass (the ground map's mask).
+    grassy: Vec<bool>,
     dummy: TextureId,
     linear_clamp: SamplerId,
     shadow_sampler: SamplerId,
@@ -279,6 +303,44 @@ impl Pipelines {
             }),
             colors: vec![],
         })?;
+        let vs = compile(WORLD_FX, Stage::Vertex, "vs_ground")?;
+        let fs = compile(WORLD_FX, Stage::Fragment, "fs_ground")?;
+        let ground = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: Some(&fs),
+            vertex_layout: Some(VertexLayout {
+                stride: 32,
+                attributes: vec![layout.attributes[0]],
+            }),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(DepthState {
+                format: Format::Depth32Float,
+                compare: Compare::Less,
+                write: true,
+                bias_constant: 0.0,
+                bias_slope: 0.0,
+                clamp: true,
+            }),
+            colors: vec![color(GROUND_FORMAT, Blend::Replace)],
+        })?;
+        let blades = |device: &mut Device<'_>, vs: &str, fs: &str| -> Result<PipelineId> {
+            let vs = compile(SCENE, Stage::Vertex, vs)?;
+            let fs = compile(SCENE, Stage::Fragment, fs)?;
+            device.create_render_pipeline(&RenderPipelineDesc {
+                vertex: &vs,
+                fragment: Some(&fs),
+                vertex_layout: None,
+                topology: Topology::TriangleList,
+                cull: Cull::None,
+                front_ccw: true,
+                depth: Some(reverse_depth(Compare::Greater, true)),
+                colors: mrt(),
+            })
+        };
+        let grass = blades(device, "vs_grass", "fs_grass")?;
+        let flower = blades(device, "vs_flower", "fs_flower")?;
         let vs = compile(WORLD_FX, Stage::Vertex, "vs_sky")?;
         let fs = compile(WORLD_FX, Stage::Fragment, "fs_sky")?;
         let sky = device.create_render_pipeline(&RenderPipelineDesc {
@@ -315,6 +377,9 @@ impl Pipelines {
             scene,
             shadow,
             shadow_masked,
+            ground,
+            grass,
+            flower,
             sky,
             particle,
             ssao: fullscreen(device, &fsvs, "fs_ssao", Format::R16Float, Blend::Replace)?,
@@ -340,6 +405,14 @@ impl Block {
     fn f(&mut self, a: f32, b: f32, c: f32, d: f32) {
         self.0.extend_from_slice(&[a, b, c, d]);
     }
+}
+
+/// The top-down ground map for one frame.
+struct Ground {
+    vp: M4,
+    top: f32,
+    range: f32,
+    size: u32,
 }
 
 /// A camera for one frame: view-projection, its inverse and the eye.
@@ -377,6 +450,33 @@ fn f16_to_f32(h: u16) -> f32 {
         31 => f32::INFINITY,
         e => (1.0 + frac / 1024.0) * 2f32.powi(i32::from(e) - 15),
     }
+}
+
+/// The detail block of each material (its first matching Look rule) and whether grass grows on it.
+fn material_details(look: &Look, scene: &GpuScene) -> (Vec<[f32; 16]>, Vec<bool>) {
+    let mut details = Vec::with_capacity(scene.names.len());
+    let mut grassy = Vec::with_capacity(scene.names.len());
+    for name in &scene.names {
+        let rule = (!name.is_empty())
+            .then(|| look.details.iter().find(|r| r.matches(name)))
+            .flatten();
+        let mut d = [0.0f32; 16];
+        if let Some(r) = rule {
+            let c = r.color.unwrap_or([0.0; 3]);
+            d[..4].copy_from_slice(&[
+                r.preset as u32 as f32,
+                r.scale[0].max(1e-3),
+                r.scale[1].max(1e-3),
+                r.strength,
+            ]);
+            d[4..8].copy_from_slice(&[r.variation, c[0], c[1], c[2]]);
+            d[8] = if r.color.is_some() { 1.0 } else { 0.0 };
+            d[9] = r.gloss;
+        }
+        grassy.push(rule.is_some_and(|r| r.preset == DetailPreset::Grass));
+        details.push(d);
+    }
+    (details, grassy)
 }
 
 impl Renderer {
@@ -455,14 +555,24 @@ impl Renderer {
             format: Format::Depth32Float,
             usage: TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED,
         })?;
-        let cover_map = device.create_texture(&TextureDesc {
-            width: COVER_MAP_SIZE,
-            height: COVER_MAP_SIZE,
+        let ground_size = quality.ground_size.max(64);
+        let ground_depth = device.create_texture(&TextureDesc {
+            width: ground_size,
+            height: ground_size,
             layers: 1,
             mips: 1,
             format: Format::Depth32Float,
             usage: TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED,
         })?;
+        let ground_mask = device.create_texture(&TextureDesc {
+            width: ground_size,
+            height: ground_size,
+            layers: 1,
+            mips: 1,
+            format: GROUND_FORMAT,
+            usage: TextureUsage::COLOR_TARGET | TextureUsage::SAMPLED,
+        })?;
+        let (details, grassy) = material_details(&look, &scene);
         let targets = Self::create_targets(device, &quality, output, size)?;
         let mut r = Self {
             scene,
@@ -475,7 +585,10 @@ impl Renderer {
             materials,
             shadow_materials,
             shadow_map,
-            cover_map,
+            ground_depth,
+            ground_mask,
+            details,
+            grassy,
             dummy,
             linear_clamp,
             shadow_sampler,
@@ -495,6 +608,7 @@ impl Renderer {
         &self.look
     }
     pub fn set_look(&mut self, look: Look) {
+        (self.details, self.grassy) = material_details(&look, &self.scene);
         self.look = look;
     }
     pub fn size(&self) -> (u32, u32) {
@@ -601,7 +715,7 @@ impl Renderer {
         for v in 0..2 {
             let (tx, ty) = t.tiles[v];
             let n = u64::from(tx) * u64::from(ty);
-            frame.push(upload(device, 1024, BufferUsage::UNIFORM)?);
+            frame.push(upload(device, FRAME_BYTES, BufferUsage::UNIFORM)?);
             tiles.push(upload(device, n * 8, BufferUsage::STORAGE)?);
             index.push(upload(
                 device,
@@ -616,6 +730,7 @@ impl Renderer {
         };
         let mut scene = vec![];
         let mut sky = vec![];
+        let mut blades = vec![];
         for v in 0..2 {
             let reflection = if v == 0 { t.refl_hdr } else { self.dummy };
             let entries = [
@@ -627,24 +742,23 @@ impl Renderer {
                 (5, Resource::Sampler(self.shadow_sampler)),
                 (6, Resource::Texture(reflection)),
                 (7, Resource::Sampler(self.linear_clamp)),
+                (8, Resource::Texture(self.ground_depth)),
+                (9, Resource::Texture(self.ground_mask)),
             ];
             scene.push(device.create_bind_group(p.scene, 0, &entries)?);
             sky.push(device.create_bind_group(p.sky, 0, &entries[..1])?);
+            if v == 0 {
+                blades.push(device.create_bind_group(p.grass, 0, &entries)?);
+                blades.push(device.create_bind_group(p.flower, 0, &entries)?);
+                blades.push(device.create_bind_group(p.particle, 0, &entries)?);
+            }
         }
         fn pair<T: Copy>(v: Vec<T>) -> [T; 2] {
             [v[0], v[1]]
         }
         let (frame, tiles, index) = (pair(frame), pair(tiles), pair(index));
         let (scene, sky) = (pair(scene), pair(sky));
-        let particle = device.create_bind_group(
-            p.particle,
-            0,
-            &[
-                (0, buf(frame[0])),
-                (1, Resource::Texture(self.cover_map)),
-                (2, Resource::Sampler(self.shadow_sampler)),
-            ],
-        )?;
+        let (grass, flower, particle) = (blades[0], blades[1], blades[2]);
         let post = |d: &mut Device<'_>, pipe, src: Resource, extra: Resource| {
             d.create_bind_group(
                 pipe,
@@ -704,6 +818,8 @@ impl Renderer {
             index,
             scene,
             sky,
+            grass,
+            flower,
             particle,
             ssao,
             air,
@@ -729,7 +845,8 @@ impl Renderer {
                 .scene
                 .into_iter()
                 .chain(s.sky)
-                .chain([s.particle, s.ssao, s.air, s.tonemap, s.paint, s.output])
+                .chain([s.grass, s.flower, s.particle, s.ssao, s.air])
+                .chain([s.tonemap, s.paint, s.output])
             {
                 device.destroy_bind_group(g);
             }
@@ -785,20 +902,34 @@ impl Renderer {
         }
     }
 
-    /// Top-down orthographic projection of the rain cover map around `centre`: depth 0 above
-    /// the highest point of the world, 1 below the lowest. The centre snaps to whole texels so
-    /// the cover does not shimmer as the camera moves.
-    fn cover_view(&self, centre: V3) -> M4 {
-        let texel = 2.0 * COVER_REACH / COVER_MAP_SIZE as f32;
+    /// The ground map's top-down orthographic projection: centred on the view target (at most
+    /// 40 m ahead of the eye, so the camera is always inside the map), depth 0 above the
+    /// highest point of the world and 1 below the lowest. The centre snaps to whole texels so
+    /// grass, rain cover and foam do not shimmer as the camera moves.
+    fn ground_view(&self, view: &View) -> Ground {
+        let to = sub(view.target, view.eye);
+        let d = math::length(to);
+        let centre = if d <= 40.0 {
+            view.target
+        } else {
+            add(view.eye, scale(to, 40.0 / d))
+        };
+        let size = self.quality.ground_size.max(64);
+        let texel = 2.0 * GROUND_REACH / size as f32;
         let (x, z) = (
             (centre[0] / texel).round() * texel,
             (centre[2] / texel).round() * texel,
         );
         let top = self.scene.max[1] + 1.0;
-        let depth = (top - self.scene.min[1] + 1.0).max(2.0);
+        let range = (top - self.scene.min[1] + 1.0).max(2.0);
         let v = look_at([x, top, z], [x, top - 1.0, z], [0.0, 0.0, -1.0]);
-        let r = COVER_REACH;
-        mul(&ortho(-r, r, -r, r, 0.0, depth), &v)
+        let r = GROUND_REACH;
+        Ground {
+            vp: mul(&ortho(-r, r, -r, r, 0.0, range), &v),
+            top,
+            range,
+            size,
+        }
     }
 
     fn cascades(&self, view: &View, env: &Environment) -> Cascades {
@@ -970,22 +1101,29 @@ impl Renderer {
         eye: &Eye,
         env: &Environment,
         cas: &Cascades,
+        ground: &Ground,
         (w, h): (u32, u32),
         tiles: (u32, u32),
         reflection: bool,
         seed: u32,
     ) -> Vec<u8> {
         let l = &self.look;
-        let mut b = Block(Vec::with_capacity(180));
+        let mut b = Block(Vec::with_capacity(240));
         b.m(&eye.view_proj);
         b.m(&eye.inv);
         b.m(&cas.mats[0]);
         b.m(&cas.mats[1]);
+        b.m(&ground.vp);
         b.v(eye.pos, env.seconds);
         b.v(normalize(env.key_dir), env.key_intensity);
         b.v(env.key_color, 0.0);
         b.v(scale(env.ambient_sky, env.ambient), env.lamp_level);
-        b.v(scale(env.ambient_ground, env.ambient), env.wetness);
+        // Ground ambient plus the key light bounced up off sunlit ground.
+        let bounce = scale(env.key_color, env.key_intensity * l.bounce);
+        b.v(
+            add(scale(env.ambient_ground, env.ambient), bounce),
+            env.wetness,
+        );
         b.v(l.shadow_tint, l.shadow_strength);
         b.f(
             l.ramp_center,
@@ -1027,6 +1165,22 @@ impl Renderer {
         b.f(w as f32, h as f32, 1.0 / w as f32, 1.0 / h as f32);
         b.f(cas.split, cas.offset[0], cas.offset[1], NEAR);
         b.f(cas.radius[0], cas.radius[1], cas.bias[0], cas.bias[1]);
+        b.f(
+            ground.top,
+            ground.range,
+            ground.size as f32,
+            l.grass.density * self.quality.grass,
+        );
+        b.f(l.brush, l.brush_scale.max(0.01), l.sun_shafts, 0.0);
+        b.v(l.water_shallow, l.foam);
+        b.f(l.sparkle, 0.0, 0.0, 0.0);
+        let g = &l.grass;
+        b.f(g.height, g.width, g.flowers, g.sway);
+        b.v(g.base, 0.0);
+        b.v(g.tip, 0.0);
+        for c in g.flower_colors {
+            b.v(c, 0.0);
+        }
         let mut bytes = f32_bytes(&b.0);
         for u in [
             tiles.0,
@@ -1037,6 +1191,16 @@ impl Renderer {
             bytes.extend_from_slice(&u.to_le_bytes());
         }
         bytes
+    }
+
+    /// Grass instances to draw: the instance grid scaled by quality and the Look's density,
+    /// or 0 when no material grows grass.
+    fn grass_instances(&self) -> u32 {
+        let g = &self.look.grass;
+        if g.density <= 0.0 || self.quality.grass <= 0.0 || !self.grassy.iter().any(|&x| x) {
+            return 0;
+        }
+        GRASS_SIDE * GRASS_SIDE
     }
 
     fn draw_world(&self, enc: &mut Encoder, model_push: &mut [f32; 32], water: bool) {
@@ -1052,6 +1216,7 @@ impl Renderer {
                 bound = d.material;
             }
             let m = &self.scene.materials[d.material];
+            model_push[..16].copy_from_slice(&self.details[d.material]);
             model_push[16..20].copy_from_slice(&m.base_color);
             model_push[20..24].copy_from_slice(&m.emissive);
             model_push[24..28].copy_from_slice(&m.params);
@@ -1109,6 +1274,7 @@ impl Renderer {
         let size = (t.width, t.height);
         let eye = self.eye(view, jitter, size);
         let cas = self.cascades(view, env);
+        let ground = self.ground_view(view);
         let lamps_on = env.lamp_level > 0.001 && !self.scene.lights.is_empty();
         let water = self.scene.water_level;
         // Mirror camera for the water reflection.
@@ -1127,13 +1293,14 @@ impl Renderer {
             let (tiles, index) = self.tile_lights(&eye, size, t.tiles[0], lamps_on);
             device.write_buffer(slot.tiles[0], 0, &crate::gpu::u32_bytes(&tiles))?;
             device.write_buffer(slot.index[0], 0, &crate::gpu::u32_bytes(&index))?;
-            let block = self.frame_block(&eye, env, &cas, size, t.tiles[0], false, seed);
+            let block = self.frame_block(&eye, env, &cas, &ground, size, t.tiles[0], false, seed);
             device.write_buffer(slot.frame[0], 0, &block)?;
             if let Some(re) = &refl_eye {
                 let (tiles, index) = self.tile_lights(re, t.refl, t.tiles[1], lamps_on);
                 device.write_buffer(slot.tiles[1], 0, &crate::gpu::u32_bytes(&tiles))?;
                 device.write_buffer(slot.index[1], 0, &crate::gpu::u32_bytes(&index))?;
-                let block = self.frame_block(re, env, &cas, t.refl, t.tiles[1], true, seed);
+                let block =
+                    self.frame_block(re, env, &cas, &ground, t.refl, t.tiles[1], true, seed);
                 device.write_buffer(slot.frame[1], 0, &block)?;
             }
         }
@@ -1205,38 +1372,31 @@ impl Renderer {
         // Rain and petals wrap around a box just ahead of the camera.
         let fwd = normalize(sub(view.target, view.eye));
         let boxes = [RAIN_BOX, PETAL_BOX].map(|b| add(view.eye, scale(fwd, b * 0.5 - 2.0)));
-        // Rain cover: the highest surfaces around the rain, seen from above; cleared (open sky)
-        // when it is dry. Roofs and solid things stop drops; foliage, alpha-masked cut-outs and
-        // water let them through.
-        let cover = self.cover_view(boxes[0]);
-        if self.quality.particles {
-            enc.begin_pass(PassDesc {
-                colors: vec![],
-                depth: Some(Attachment {
-                    texture: self.cover_map,
-                    mip: 0,
-                    layer: 0,
-                    load: Load::Clear([1.0; 4]),
-                    store: true,
-                }),
-            });
-            if env.rain > 0.0 {
-                enc.set_pipeline(p.shadow);
-                enc.set_vertex_buffer(self.scene.vertices, 0);
-                enc.set_index_buffer(self.scene.indices, 0);
-                enc.push_constants(&f32_bytes(&cover));
-                for d in self.scene.draws.iter() {
-                    let foliage = self.scene.materials[d.material].params[3] == 1.0;
-                    if !d.water && !foliage && self.shadow_materials[d.material].is_none() {
-                        enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
-                    }
-                }
+        // The ground map: the highest solid surfaces around the view seen from above, and which
+        // of them grow grass. Roofs and solid things count; foliage, alpha-masked cut-outs and
+        // water do not (rain falls through trees, grass grows under them).
+        enc.begin_pass(PassDesc {
+            colors: vec![Attachment::clear(self.ground_mask, [0.0; 4])],
+            depth: Some(Attachment::clear(self.ground_depth, [1.0; 4])),
+        });
+        enc.set_pipeline(p.ground);
+        enc.set_vertex_buffer(self.scene.vertices, 0);
+        enc.set_index_buffer(self.scene.indices, 0);
+        let mut gp = [0.0f32; 20];
+        gp[..16].copy_from_slice(&ground.vp);
+        for d in self.scene.draws.iter() {
+            let foliage = self.scene.materials[d.material].params[3] == 1.0;
+            if d.water || foliage || self.shadow_materials[d.material].is_some() {
+                continue;
             }
-            enc.end_pass();
+            gp[16] = if self.grassy[d.material] { 1.0 } else { 0.0 };
+            gp[17] = 1.0;
+            enc.push_constants(&f32_bytes(&gp));
+            enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
         }
+        enc.end_pass();
 
         let mut push = [0.0f32; 32];
-        push[..16].copy_from_slice(&math::IDENTITY);
         let clear = [0.0, 0.0, 0.0, 0.0];
         // Water reflection.
         if refl_eye.is_some() {
@@ -1267,6 +1427,17 @@ impl Renderer {
         enc.set_pipeline(p.scene);
         enc.set_bind_group(0, slot.scene[0]);
         self.draw_world(enc, &mut push, true);
+        let blades = self.grass_instances();
+        if blades > 0 {
+            enc.set_pipeline(p.grass);
+            enc.set_bind_group(0, slot.grass);
+            enc.draw(15, blades, 0, 0);
+            if self.look.grass.flowers > 0.0 {
+                enc.set_pipeline(p.flower);
+                enc.set_bind_group(0, slot.flower);
+                enc.draw(6, blades, 0, 0);
+            }
+        }
         enc.set_pipeline(p.sky);
         enc.set_bind_group(0, slot.sky[0]);
         enc.draw(3, 1, 0, 0);
@@ -1275,11 +1446,10 @@ impl Renderer {
             enc.set_bind_group(0, slot.particle);
             let ground = self.scene.water_level.unwrap_or(self.scene.min[1]);
             let particle_push = |params: [f32; 4], tint: [f32; 4], centre: V3| {
-                let mut pp = [0.0f32; 28];
+                let mut pp = [0.0f32; 12];
                 pp[..4].copy_from_slice(&params);
                 pp[4..8].copy_from_slice(&tint);
                 pp[8..11].copy_from_slice(&centre);
-                pp[12..].copy_from_slice(&cover);
                 pp
             };
             let rain = (env.rain * 26000.0) as u32;
@@ -1395,6 +1565,7 @@ impl Renderer {
         let mut pc = [0.0f32; 16];
         pc[0] = if self.quality.fxaa { 1.0 } else { 0.0 };
         pc[1] = if encode_srgb { 1.0 } else { 0.0 };
+        pc[2] = l.sharpen.max(0.0);
         Self::post_pass(enc, dest, 0, Load::DontCare, p.output, slot.output, pc);
         if let (Output::Still, Some(still), Some(rb)) = (self.output, t.still, t.readback) {
             enc.copy_texture_to_buffer(still, 0, 0, rb, 0);
