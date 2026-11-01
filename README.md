@@ -51,11 +51,12 @@ ABE_WEB_TOOLCHAIN=build-std ABE_WEB_RUSTC=rustc-1.91 ABE_WEB_CARGO=cargo-1.91 \
   ABE_WEB_RUST_SRC=/path/to/rust-src-1.91/library scripts/build-web.sh
 ```
 
-WebGPU needs a secure context: serve the folder from localhost or over https, with the world and Look file at URLs the page can fetch (`web/dist` is not tracked):
+WebGPU needs a secure context: serve the folder from localhost or over https (a phone on the local network needs https), with the world and Look file at URLs the page can fetch. Keep game files out of this repository: build into a folder elsewhere and put them next to the page there:
 
 ```sh
-cp world.abew look.json web/dist/
-python3 -m http.server -d web/dist 8000
+scripts/build-web.sh ~/abe-site
+cp world.abew look.json ~/abe-site/
+python3 -m http.server -d ~/abe-site 8000
 # http://localhost:8000/?scene=world.abew&look=look.json
 ```
 
