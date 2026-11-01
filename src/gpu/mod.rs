@@ -63,7 +63,12 @@
 //! packed rows of `Format::texel_size` bytes.
 // Without a backend (no Vulkan on this platform yet) only the descriptions and the encoder exist.
 #![cfg_attr(
-    not(any(target_os = "linux", target_os = "windows", target_os = "android")),
+    not(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "android",
+        target_vendor = "apple"
+    )),
     allow(dead_code, unused_imports)
 )]
 mod encoder;
@@ -73,6 +78,8 @@ pub(crate) use encoder::Command;
 pub use encoder::Encoder;
 pub use types::*;
 
+#[cfg(target_vendor = "apple")]
+use crate::metal::Gpu;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
 use crate::vulkan::rhi::Gpu;
 
@@ -93,12 +100,26 @@ impl ValidationLog {
 /// `Device<'static>`. Set `ABE_VULKAN_DEVICE` to a name substring to pick an adapter and
 /// `ABE_VULKAN_VALIDATION=1` to enable the Khronos validation layer with synchronization
 /// validation (creation then fails if the layer is missing).
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
+///
+/// On macOS and iOS the device is Metal (see the `metal` module): on a Mac,
+/// `ABE_METAL_DEVICE` picks a GPU by name substring, and Metal's own validation is enabled
+/// with `MTL_DEBUG_LAYER=1` (reported on the console, not through [`ValidationLog`]).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "android",
+    target_vendor = "apple"
+))]
 pub struct Device<'w> {
     gpu: Gpu<'w>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "android",
+    target_vendor = "apple"
+))]
 impl Device<'static> {
     /// An offscreen device.
     pub fn headless() -> Result<Self> {
@@ -108,11 +129,21 @@ impl Device<'static> {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "android",
+    target_vendor = "apple"
+))]
 impl<'w> Device<'w> {
-    /// A device that can present to `window` (X11 on Linux, Win32 on Windows). The window must
-    /// outlive the device.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    /// A device that can present to `window` (X11 on Linux, Win32 on Windows, the window's
+    /// `CAMetalLayer` on macOS and iOS). The window must outlive the device.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     pub fn for_window(window: &'w crate::window::Window) -> Result<Self> {
         Ok(Self {
             gpu: Gpu::for_window(window)?,
@@ -139,7 +170,11 @@ impl<'w> Device<'w> {
     /// How long a submission may run before it is reported as lost (default 20 s). Applies to
     /// every device in the process; raise it for long offline renders on slow devices.
     pub fn set_submit_timeout(&mut self, timeout: std::time::Duration) {
+        // Metal waits with waitUntilCompleted and relies on the system's GPU watchdog.
+        #[cfg(not(target_vendor = "apple"))]
         crate::vulkan::rhi::set_fence_timeout(timeout);
+        #[cfg(target_vendor = "apple")]
+        let _ = timeout;
     }
     pub fn validation_log(&self) -> ValidationLog {
         self.gpu.validation_log().unwrap_or_default()
