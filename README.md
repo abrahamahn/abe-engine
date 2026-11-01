@@ -33,7 +33,50 @@ cargo run --locked --offline --release --bin abe-player -- --scene world.abew --
 
 `abe_engine::render` draws cooked worlds with soft cel lighting and painted brushwork, two shadow cascades, tiled point lights, planar water reflections with shallows, foam and glitter, a time-of-day sky (sun and moon from the clock, latitude and date) and weather (`clear`, `cloudy`, `overcast`, `mist`, `rain`, `storm`, `petals`; drops stop at roofs), instanced grass and flowers that sway in the wind, then ambient occlusion, outlines, aerial perspective, light shafts, bloom, grading and sharpening (an optional painterly filter remains). A Look file can give materials procedural detail by name (`roof_tiles`, `wood`, `plaster`, `stone`, `lacquer`, `grass`), and grass grows on `grass` materials. It runs on the backend-neutral `abe_engine::gpu` layer. The style is data: a game's Look file (JSON) sets shading, post-processing, sky palette, place and time, weather and named camera views, so different games share one renderer. With a scene that has materials or a `--look` file, the player flies: W/A/S/D move, Q/E down/up, arrows or left-drag look, Shift faster, 1–9 views, T/G time, C day cycle, Y weather, P pause, Esc quit. `--high` uses still-image quality. `abe-render --sequence START END FRAMES` renders a time-lapse of one view between two clock times as numbered PNGs in `--out-dir`, with water, clouds and weather moving at 24 frames a second.
 
-Shaders are WGSL (a documented subset, plus `var<push_constant>`) compiled at startup by the engine's own compiler, `abe-shader`, to SPIR-V. `cargo run -p abe-shader --example abe-shaderc -- shader.wgsl fragment fs_main out.spv` compiles one entry point and prints its reflection.
+Shaders are WGSL (a documented subset, plus `var<push_constant>`) compiled at startup by the engine's own compiler, `abe-shader`, to SPIR-V, and for WebGPU also back to standard WGSL. `cargo run -p abe-shader --example abe-shaderc -- shader.wgsl fragment fs_main out.spv` compiles one entry point and prints its reflection; an `out.wgsl` path writes the WebGPU WGSL instead.
+
+## Run in a browser (WebGPU)
+
+The web player draws a cooked world with the same stylized renderer in a canvas through WebGPU, for Chrome and Edge 113+ and Safari 26 (macOS, iPhone, iPad). It is `crates/abe-web`, a wasm32 module without third-party crates, plus `web/abe.js` and `web/index.html`, which own the WebGPU device, the canvas, input and the frame loop. Build it with rustup:
+
+```sh
+rustup target add wasm32-unknown-unknown
+scripts/build-web.sh                  # web/dist: index.html, abe.js, abe_web.wasm
+```
+
+Without bash, `cargo build --release -p abe-web --target wasm32-unknown-unknown` builds the same module (`target/wasm32-unknown-unknown/release/abe_web.wasm`); put it next to `web/index.html` and `web/abe.js`. A rustc without a wasm32 standard library (such as a distribution's `rustc-1.91`) rebuilds std from source and links with LLVM's `wasm-ld`; std's own dependencies (dlmalloc) come from crates.io on the first build:
+
+```sh
+ABE_WEB_TOOLCHAIN=build-std ABE_WEB_RUSTC=rustc-1.91 ABE_WEB_CARGO=cargo-1.91 \
+  ABE_WEB_RUST_SRC=/path/to/rust-src-1.91/library scripts/build-web.sh
+```
+
+WebGPU needs a secure context: serve the folder from localhost or over https (a phone on the local network needs https), with the world and Look file at URLs the page can fetch. Keep game files out of this repository: build into a folder elsewhere and put them next to the page there:
+
+```sh
+scripts/build-web.sh ~/abe-site
+cp world.abew look.json ~/abe-site/
+python3 -m http.server -d ~/abe-site 8000
+# http://localhost:8000/?scene=world.abew&look=look.json
+```
+
+`scene` and `look` name the files; `view=NAME`, `time=HOURS`, `weather=PRESET`, `seconds=S` and `paused=1` set the starting state; `quality=high` uses still-image quality; `dpr=N` caps the device pixel ratio (default 2, 1.5 on touch screens), `scale=F` scales the resolution and `size=WxH` fixes it. The controls are abe-player's (W/A/S/D, Q/E, arrows or drag, Shift, 1–9, T/G, C, Y, P) plus H for help. On a touch screen, drag with one finger to look and two to move; buttons change the time, weather and view. The page shows loading progress, a status line (clock, weather, frame rate, view, resolution) and every error, including WebGPU validation errors.
+
+On WebGPU, `abe_shader::compile_wgsl` (through `gpu::compile_shader`) turns each shader into standard WGSL: `var<push_constant>` becomes a uniform at `@group(3)` that the backend fills from a per-submission ring with dynamic offsets, and a generated entry point negates clip-space y because ABE uses Vulkan's convention. The browser derives barriers, `submit` and `present` do not wait, the frame is presented when the `requestAnimationFrame` callback returns, and `read_buffer` is unavailable because browsers map buffers asynchronously.
+
+The browser test serves the built page and the files from where they are, renders each case in headless Chromium, reads back the canvas, and with `--abe-render` compares it with a native render of the same view, time and weather (`NAME-web.png`, `NAME-native.png`, `NAME-diff.png`, `results.json`). Any WebGPU error fails a case:
+
+```sh
+cargo run --release --example synthetic_world -- scenes
+cargo build --release --bin abe-render
+node web/test/run.cjs --dist web/dist --out web-test --abe-render target/release/abe-render \
+  --case name=synthetic,scene=scenes/synthetic.abew,look=scenes/synthetic-look.json,view=test,time=17.5,weather=clear,size=640x360
+ABE_WGSL_DUMP=wgsl cargo test -p abe-shader --test wgsl && node web/test/validate-wgsl.cjs wgsl
+```
+
+The last line compiles every corpus entry point with the browser's WGSL compiler. One is expected to fail: `compute.wgsl`'s `splat` calls `workgroupBarrier` after a non-uniform `return`, which WebGPU's uniformity analysis rejects and abe-shader does not check.
+
+Without a GPU, Chromium runs WebGPU on SwiftShader; the scripts pass `--enable-unsafe-webgpu --enable-features=Vulkan --use-angle=vulkan --use-vulkan=swiftshader`, because with software compositing headless Chromium cannot allocate canvas images and drops the WebGPU device after a few frames. `--selftest` also runs the GPU-layer paths the renderer does not use (compute with push constants into storage textures and buffers, copies, mip generation, a blit into the canvas), and `interact=1` drives the keyboard, mouse, a two-finger touch drag, an on-screen button and a window resize. In Chromium 153 on SwiftShader, the synthetic scene matches the native Vulkan render on llvmpipe at 47–50 dB PSNR (mean difference under 0.5 of 255) across noon, dusk, night and storm, and a 694,000-triangle game world (kept outside this repository) at 34–40 dB across five views, times and weathers (night rain is the lowest), with differences only at sub-pixel edges, thin rain streaks, foliage and texture filtering. Chrome and Edge on Windows GPUs and Safari 26 still need a device run.
 
 ## Cook a static scene
 
@@ -57,7 +100,7 @@ cargo test --locked --offline --test gpu --test render -- --ignored
 
 Use `Presenter::set_static_scene` once for the environment and `draw_with_static` each frame for changing objects. The two draws share a depth buffer.
 
-The offscreen tests check depth, pixel readback, GPU camera projection and mixed static/changing geometry. The desktop test needs a display and exercises resize, hide/restore, and presenter recreation. Linux presentation and keyboard input have been exercised on Mesa llvmpipe under Xvfb with synchronization validation. Windows is cross-built and still needs a native device run. Android has the offscreen backend only. Apple Metal and browser presentation are planned. The Vulkan ABI declarations are adapted from [Khronos Vulkan-Headers v1.3.275](https://github.com/KhronosGroup/Vulkan-Headers/tree/v1.3.275) under the license in [docs/Vulkan-Registry-LICENSE.txt](docs/Vulkan-Registry-LICENSE.txt).
+The offscreen tests check depth, pixel readback, GPU camera projection and mixed static/changing geometry. The desktop test needs a display and exercises resize, hide/restore, and presenter recreation. Linux presentation and keyboard input have been exercised on Mesa llvmpipe under Xvfb with synchronization validation. Windows is cross-built and still needs a native device run. Android has the offscreen backend only. Apple Metal is planned. Browsers run the WebGPU backend (see above). The Vulkan ABI declarations are adapted from [Khronos Vulkan-Headers v1.3.275](https://github.com/KhronosGroup/Vulkan-Headers/tree/v1.3.275) under the license in [docs/Vulkan-Registry-LICENSE.txt](docs/Vulkan-Registry-LICENSE.txt).
 
 ## Measure frame time
 

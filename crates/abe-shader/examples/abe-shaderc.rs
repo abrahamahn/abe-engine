@@ -1,17 +1,21 @@
-//! Compile one entry point of a WGSL file to SPIR-V and print its reflection.
+//! Compile one entry point of a WGSL file to SPIR-V and print its reflection. An output path
+//! ending in `.wgsl` writes the WebGPU WGSL for the entry point instead.
 //!
 //! ```sh
 //! cargo run -p abe-shader --example abe-shaderc -- shader.wgsl fragment fs_main out.spv
+//! cargo run -p abe-shader --example abe-shaderc -- shader.wgsl fragment fs_main out.wgsl
 //! ```
 
 use std::process::ExitCode;
 
-use abe_shader::{Stage, compile};
+use abe_shader::{Stage, compile, compile_wgsl};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 5 {
-        eprintln!("usage: abe-shaderc <file.wgsl> <vertex|fragment|compute> <entry> <out.spv>");
+        eprintln!(
+            "usage: abe-shaderc <file.wgsl> <vertex|fragment|compute> <entry> <out.spv|out.wgsl>"
+        );
         return ExitCode::from(2);
     }
     let stage = match args[2].as_str() {
@@ -31,7 +35,13 @@ fn main() -> ExitCode {
         }
     };
     let start = std::time::Instant::now();
-    let compiled = match compile(&source, stage, &args[3]) {
+    let webgpu = args[4].ends_with(".wgsl");
+    let result = if webgpu {
+        compile_wgsl(&source, stage, &args[3])
+    } else {
+        compile(&source, stage, &args[3])
+    };
+    let compiled = match result {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{}:{e}", args[1]);
@@ -39,7 +49,11 @@ fn main() -> ExitCode {
         }
     };
     let elapsed = start.elapsed();
-    if let Err(e) = std::fs::write(&args[4], compiled.to_bytes()) {
+    let bytes = match &compiled.wgsl {
+        Some(w) if webgpu => w.source.clone().into_bytes(),
+        _ => compiled.to_bytes(),
+    };
+    if let Err(e) = std::fs::write(&args[4], bytes) {
         eprintln!("{}: {e}", args[4]);
         return ExitCode::FAILURE;
     }
@@ -69,6 +83,14 @@ fn main() -> ExitCode {
     }
     if compiled.stage == Stage::Compute {
         println!("  workgroup size {:?}", compiled.workgroup_size);
+    }
+    if let Some(w) = &compiled.wgsl {
+        println!("  WGSL entry point '{}'", w.entry);
+        if let Some((group, binding)) = w.push_constants {
+            println!(
+                "  push constants: uniform at @group({group}) @binding({binding}), dynamic offset"
+            );
+        }
     }
     ExitCode::SUCCESS
 }
