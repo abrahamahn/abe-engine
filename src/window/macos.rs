@@ -1,5 +1,5 @@
 //! AppKit window for macOS: a programmatically configured `NSApplication`, an `NSWindow` and
-//! a layer-hosting `NSView` whose layer is a `CAMetalLayer`.
+//! a layer-backed `NSView` whose backing layer is a `CAMetalLayer`.
 //!
 //! Sizes are physical pixels everywhere, as on Windows and X11: `new` and `resize` take
 //! pixels (the window is `pixels / backingScaleFactor` points), `size` reports the drawable
@@ -68,8 +68,17 @@ extern "C" fn should_close(this: Id, _: Sel, _: Id) -> i8 {
 }
 extern "C" fn did_resize(this: Id, _: Sel, notification: Id) {
     if let Some(s) = delegate_state(this) {
-        // SAFETY: the notification's object is the live NSWindow being resized.
-        let window = unsafe { send!(notification, "object"; Id) };
+        // SAFETY: the notification's object is the live NSWindow being resized; its content
+        // view is the Metal view. Moving to a screen with another scale changes the layer's.
+        let window = unsafe {
+            let window = send!(notification, "object"; Id);
+            let layer = send!(send!(window, "contentView"; Id), "layer"; Id);
+            let scale = send!(window, "backingScaleFactor"; f64).max(1.0);
+            if !layer.is_null() {
+                send!(layer, "setContentsScale:", scale => f64; ());
+            }
+            window
+        };
         let size = content_pixels(window);
         if s.size.replace(size) != size {
             s.events
@@ -118,6 +127,12 @@ extern "C" fn did_change_occlusion(this: Id, _: Sel, notification: Id) {
 extern "C" fn yes(_: Id, _: Sel) -> i8 {
     1
 }
+/// The view's backing layer: AppKit sizes it with the view.
+extern "C" fn make_backing_layer(_: Id, _: Sel) -> Id {
+    // SAFETY: +[CAMetalLayer layer] returns an autoreleased layer, as this method must.
+    unsafe { send!(class!("CAMetalLayer"), "layer"; Id) }
+}
+extern "C" fn update_layer(_: Id, _: Sel) {}
 extern "C" fn yes_with(_: Id, _: Sel, _: Id) -> i8 {
     1
 }
@@ -184,6 +199,17 @@ fn classes() -> (Id, Id) {
             Some(mut b) => {
                 // SAFETY: as above.
                 unsafe {
+                    b.method(
+                        objc::sel!("makeBackingLayer"),
+                        make_backing_layer as *const c_void,
+                        c"@@:",
+                    );
+                    b.method(objc::sel!("wantsUpdateLayer"), yes as *const c_void, c"c@:");
+                    b.method(
+                        objc::sel!("updateLayer"),
+                        update_layer as *const c_void,
+                        c"v@:",
+                    );
                     b.method(
                         objc::sel!("acceptsFirstResponder"),
                         yes as *const c_void,
@@ -338,17 +364,19 @@ impl Window {
                 send!(w, "setTitle:", t.id() => Id; ());
                 send!(w, "setAcceptsMouseMovedEvents:", true => bool; ());
 
-                let layer = Obj::retained(send!(class!("CAMetalLayer"), "layer"; Id))
-                    .ok_or("CAMetalLayer is unavailable")?;
-                let real_scale = send!(w, "backingScaleFactor"; f64).max(1.0);
-                send!(layer.id(), "setContentsScale:", real_scale => f64; ());
                 let valloc = send!(view_class, "alloc"; Id);
                 let view = Obj::owned(send!(valloc, "initWithFrame:", rect => CGRect; Id))
                     .ok_or("NSView initWithFrame failed")?;
-                // A layer-hosting view: set the layer first, then ask for layer backing.
-                send!(view.id(), "setLayer:", layer.id() => Id; ());
+                // A layer-backed view whose backing layer (makeBackingLayer) is a
+                // CAMetalLayer; AppKit keeps its geometry in step with the view.
                 send!(view.id(), "setWantsLayer:", true => bool; ());
+                // NSViewLayerContentsRedrawDuringViewResize
+                send!(view.id(), "setLayerContentsRedrawPolicy:", 2 as NSInteger => NSInteger; ());
                 send!(w, "setContentView:", view.id() => Id; ());
+                let layer = Obj::retained(send!(view.id(), "layer"; Id))
+                    .ok_or("the view has no CAMetalLayer")?;
+                let real_scale = send!(w, "backingScaleFactor"; f64).max(1.0);
+                send!(layer.id(), "setContentsScale:", real_scale => f64; ());
 
                 let state = Box::new(State {
                     events: RefCell::new(VecDeque::new()),
@@ -368,7 +396,12 @@ impl Window {
                 send!(w, "center"; ());
                 send!(w, "makeKeyAndOrderFront:", core::ptr::null_mut::<c_void>() => Id; ());
                 send!(w, "makeFirstResponder:", view.id() => Id; i8);
-                send!(app, "activateIgnoringOtherApps:", true => bool; ());
+                // macOS 14 replaced activateIgnoringOtherApps: with activate.
+                if send!(app, "respondsToSelector:", objc::sel!("activate") => Sel; i8) != 0 {
+                    send!(app, "activate"; ());
+                } else {
+                    send!(app, "activateIgnoringOtherApps:", true => bool; ());
+                }
                 state.size.set(content_pixels(w));
                 Ok(Self {
                     app,

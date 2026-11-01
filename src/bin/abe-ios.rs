@@ -78,11 +78,19 @@ mod app {
 
     pub fn setup(window: &'static Window) -> Box<dyn FnMut()> {
         match App::new(window) {
-            Ok(mut app) => Box::new(move || {
-                if let Err(e) = app.frame() {
-                    eprintln!("abe-ios: {e}");
-                }
-            }),
+            Ok(mut app) => {
+                let mut failed = false;
+                Box::new(move || {
+                    if failed {
+                        return;
+                    }
+                    if let Err(e) = app.frame() {
+                        // Stop at the first error instead of repeating it every refresh.
+                        eprintln!("abe-ios: stopped rendering: {e}");
+                        failed = true;
+                    }
+                })
+            }
             Err(e) => {
                 eprintln!("abe-ios: cannot start: {e}");
                 Box::new(|| {})
