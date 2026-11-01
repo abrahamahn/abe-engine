@@ -158,8 +158,8 @@ fn sky_color(dir: vec3f) -> vec3f {
   let moon_r = 0.028 * frame.moon_dir.w;
   let md = 1.0 - dot(dir, m);
   let moon_ang = sqrt(max(2.0 * md, 0.0));
-  if (frame.glow_dir.w > 0.0) {
-    let disc = smoothstep(moon_r, moon_r * 0.92, moon_ang);
+  if (frame.glow_dir.w > 0.0 && moon_r > 0.0) {
+    let disc = 1.0 - smoothstep(moon_r * 0.92, moon_r, moon_ang);
     let surface = 0.82 + 0.18 * noise2((dir.xy - m.xy) * 220.0);
     col = mix(col, vec3f(1.0, 0.97, 0.9) * (2.6 * surface), disc * frame.glow_dir.w);
     col += vec3f(0.55, 0.65, 0.95) * (exp(-moon_ang * 18.0) * 0.35 * frame.glow_dir.w);
@@ -182,7 +182,7 @@ fn fog_amount(cam: vec3f, world: vec3f, dist: f32) -> f32 {
   // Average density of exp(-falloff * h) along the segment.
   var avg = exp(-falloff * h0);
   let dh = h1 - h0;
-  if (abs(dh) > 1e-3) {
+  if (abs(falloff * dh) > 1e-4) {
     avg = (exp(-falloff * h0) - exp(-falloff * h1)) / (falloff * dh);
   }
   let density = frame.fog.w * frame.fog2.w;

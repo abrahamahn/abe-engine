@@ -136,6 +136,11 @@ impl<'w> Device<'w> {
             .unwrap_or_default()
     }
     /// A handle to the validation log that stays readable after the device is dropped.
+    /// How long a submission may run before it is reported as lost (default 20 s). Applies to
+    /// every device in the process; raise it for long offline renders on slow devices.
+    pub fn set_submit_timeout(&mut self, timeout: std::time::Duration) {
+        crate::vulkan::rhi::set_fence_timeout(timeout);
+    }
     pub fn validation_log(&self) -> ValidationLog {
         self.gpu.validation_log().unwrap_or_default()
     }

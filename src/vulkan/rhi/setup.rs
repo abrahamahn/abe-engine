@@ -275,6 +275,21 @@ impl<'w> Gpu<'w> {
                 }
             }
             physical.truncate(count as usize);
+            if pick.is_empty() {
+                // Discrete, then integrated, virtual, other and CPU devices.
+                let rank = |gpu: &Handle| {
+                    let mut props: VkPhysicalDeviceProperties = core::mem::zeroed();
+                    vkGetPhysicalDeviceProperties(*gpu, &mut props);
+                    match props.deviceType {
+                        2 => 0,
+                        1 => 1,
+                        3 => 2,
+                        4 => 4,
+                        _ => 3,
+                    }
+                };
+                physical.sort_by_key(rank);
+            }
             for gpu in physical {
                 let mut props: VkPhysicalDeviceProperties = core::mem::zeroed();
                 vkGetPhysicalDeviceProperties(gpu, &mut props);

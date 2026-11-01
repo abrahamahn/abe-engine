@@ -41,7 +41,15 @@ const FRAMES: usize = 2;
 /// Index of the synchronous submission in `Gpu::subs`; frame slot `f` uses `1 + f`.
 const IMMEDIATE: usize = 0;
 /// Longest wait for one GPU submission before reporting a hang.
-const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;
+/// How long a submission may take before it is reported as lost (process-wide).
+static FENCE_TIMEOUT_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(20_000_000_000);
+pub(crate) fn set_fence_timeout(timeout: std::time::Duration) {
+    let ns = u64::try_from(timeout.as_nanos())
+        .unwrap_or(u64::MAX)
+        .max(1_000_000);
+    FENCE_TIMEOUT_NS.store(ns, std::sync::atomic::Ordering::Relaxed);
+}
 
 const INDEX_BITS: u32 = 20;
 const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;
@@ -367,9 +375,13 @@ impl<'w> Gpu<'w> {
         if sub.pending.get().is_some() {
             // SAFETY: the fence belongs to this device; waiting does not require external
             // synchronization of the fence.
-            let rc = unsafe { vkWaitForFences(self.device, 1, &sub.fence, 1, FENCE_TIMEOUT_NS) };
+            let timeout = FENCE_TIMEOUT_NS.load(std::sync::atomic::Ordering::Relaxed);
+            let rc = unsafe { vkWaitForFences(self.device, 1, &sub.fence, 1, timeout) };
             if rc == 2 {
-                return Err("GPU submission did not complete within 20 s".into());
+                return Err(format!(
+                    "GPU submission did not complete within {:.0} s",
+                    timeout as f64 / 1e9
+                ));
             }
             check(rc, "vkWaitForFences")?;
             sub.pending.set(None);

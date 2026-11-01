@@ -33,4 +33,6 @@ pub enum Event {
     Unclicked(i32, i32),
     /// Pointer moved to window coordinates.
     Pointer(i32, i32),
+    /// Keyboard focus gained or lost. Keys held when focus is lost send no release.
+    Focus(bool),
 }

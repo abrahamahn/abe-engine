@@ -119,8 +119,8 @@ impl Window {
                 XCloseDisplay(d);
                 return Err("XCreateSimpleWindow failed".into());
             }
-            // Key press/release, button press/release, pointer motion, structure changes.
-            XSelectInput(d, id, 1 | 2 | 4 | 8 | (1 << 6) | (1 << 17));
+            // Key press/release, button press/release, pointer motion, structure and focus changes.
+            XSelectInput(d, id, 1 | 2 | 4 | 8 | (1 << 6) | (1 << 17) | (1 << 21));
             XStoreName(d, id, title.as_ptr());
             let protocols = XInternAtom(d, c"WM_PROTOCOLS".as_ptr(), 0);
             let mut delete = XInternAtom(d, c"WM_DELETE_WINDOW".as_ptr(), 0);
@@ -198,6 +198,7 @@ impl Window {
                     4 if e.key.code == 1 => return Some(Event::Clicked(e.key.x, e.key.y)),
                     5 if e.key.code == 1 => return Some(Event::Unclicked(e.key.x, e.key.y)),
                     6 => return Some(Event::Pointer(e.key.x, e.key.y)),
+                    9 | 10 => return Some(Event::Focus(e.kind == 9)),
                     18 | 19 => {
                         let shown = e.kind == 19;
                         self.mapped.set(shown);

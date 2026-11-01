@@ -9,6 +9,37 @@ var<push_constant> shadow_push: ShadowPush;
   return shadow_push.light_vp * vec4f(position, 1.0);
 }
 
+// Alpha-masked casters: params = (alpha cutoff, base alpha, has texture, unused).
+struct MaskedShadowPush {
+  light_vp: mat4x4f,
+  params: vec4f,
+};
+var<push_constant> masked: MaskedShadowPush;
+@group(1) @binding(0) var mask_tex: texture_2d<f32>;
+@group(1) @binding(3) var mask_sampler: sampler;
+
+struct MaskedOut {
+  @builtin(position) clip: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@vertex fn vs_shadow_masked(@location(0) position: vec3f, @location(2) uv: vec2f) -> MaskedOut {
+  var o: MaskedOut;
+  o.clip = masked.light_vp * vec4f(position, 1.0);
+  o.uv = uv;
+  return o;
+}
+
+@fragment fn fs_shadow_masked(in: MaskedOut) {
+  var a = masked.params.y;
+  if (masked.params.z > 0.5) {
+    a *= textureSampleLevel(mask_tex, mask_sampler, in.uv, 0.0).a;
+  }
+  if (a < masked.params.x) {
+    discard;
+  }
+}
+
 struct FsOut {
   @location(0) color: vec4f,
   @location(1) aux: vec4f,

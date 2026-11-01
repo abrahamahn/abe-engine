@@ -59,6 +59,9 @@ unsafe extern "system" {
         param: H,
     ) -> H;
     fn DestroyWindow(w: H) -> i32;
+    fn SetCapture(w: H) -> H;
+    fn ReleaseCapture() -> i32;
+    fn SetProcessDPIAware() -> i32;
     fn SetWindowTextW(w: H, text: *const u16) -> i32;
     fn ShowWindow(w: H, cmd: i32) -> i32;
     fn SetWindowPos(w: H, after: H, x: i32, y: i32, width: i32, height: i32, flags: u32) -> i32;
@@ -99,8 +102,19 @@ fn outer_size(w: u32, h: u32) -> Result<(i32, i32), String> {
     }
     Ok((r.right - r.left, r.bottom - r.top))
 }
+// Letter keys must arrive as virtual keys even when a Korean, Japanese or Chinese input method
+// is active, so the window has no input-method context.
+#[link(name = "imm32")]
+unsafe extern "system" {
+    fn ImmAssociateContextEx(w: H, imc: *mut core::ffi::c_void, flags: u32) -> i32;
+}
 impl Window {
     pub fn new(title: &str, width: u32, height: u32) -> Result<Self, String> {
+        // Render at physical pixels instead of being stretched by display scaling.
+        // SAFETY: a process-wide flag with no pointers.
+        unsafe {
+            SetProcessDPIAware();
+        }
         let (w, h) = outer_size(width, height)?;
         let class: Vec<_> = "ABE.Player.Window".encode_utf16().chain([0]).collect();
         if title.contains('\0') {
@@ -153,6 +167,7 @@ impl Window {
             // The Box has a stable address. It is only accessed by this window thread
             // and detached before DestroyWindow can invoke the window procedure.
             SetWindowLongPtrW(id, -21, (&*win.state as *const State) as isize);
+            ImmAssociateContextEx(id, null_mut(), 0);
             ShowWindow(id, 5);
             Ok(win)
         }
@@ -225,12 +240,21 @@ unsafe extern "system" fn wndproc(w: H, msg: u32, wp: usize, lp: isize) -> isize
             0x200..=0x202 => {
                 let (x, y) = ((lp as u16 as i16) as i32, ((lp >> 16) as u16 as i16) as i32);
                 Some(match msg {
-                    0x201 => Event::Clicked(x, y),
-                    0x202 => Event::Unclicked(x, y),
+                    0x201 => {
+                        // Keep receiving the release when it happens outside the window.
+                        unsafe { SetCapture(w) };
+                        Event::Clicked(x, y)
+                    }
+                    0x202 => {
+                        unsafe { ReleaseCapture() };
+                        Event::Unclicked(x, y)
+                    }
                     _ => Event::Pointer(x, y),
                 })
             }
-            0x100 | 0x101 => {
+            0x7 => Some(Event::Focus(true)),
+            0x8 => Some(Event::Focus(false)),
+            0x100 | 0x101 | 0x105 => {
                 let key = match wp {
                     27 => Some(Key::Escape),
                     32 => Some(Key::Space),

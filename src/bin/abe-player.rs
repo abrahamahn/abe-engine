@@ -149,10 +149,11 @@ Shift faster, 1-9 views, T/G time +/-, C day cycle, Y next weather, P pause moti
             [c * self.yaw.sin(), self.pitch.sin(), -c * self.yaw.cos()]
         }
         fn view(&self, fov: f32) -> View {
+            // The target sits 30 m ahead: the renderer sizes shadow cascades from it.
             View {
                 name: "free".into(),
                 eye: self.pos,
-                target: math::add(self.pos, self.forward()),
+                target: math::add(self.pos, math::scale(self.forward(), 30.0)),
                 fov,
             }
         }
@@ -232,7 +233,9 @@ Shift faster, 1-9 views, T/G time +/-, C day cycle, Y next weather, P pause moti
                 match event {
                     Event::Close | Event::Pressed(Key::Escape) => break 'frames,
                     Event::Pressed(k) => {
-                        held.insert(k);
+                        if !held.insert(k) {
+                            continue;
+                        }
                         match k {
                             Key::Char(d @ b'1'..=b'9') => {
                                 if let Some(v) = views.get((d - b'1') as usize) {
@@ -259,6 +262,11 @@ Shift faster, 1-9 views, T/G time +/-, C day cycle, Y next weather, P pause moti
                         last_pointer = Some((x, y));
                     }
                     Event::Unclicked(..) => dragging = false,
+                    Event::Focus(false) => {
+                        // Releases that happen while unfocused never arrive.
+                        held.clear();
+                        dragging = false;
+                    }
                     Event::Pointer(x, y) => {
                         if dragging {
                             if let Some((px, py)) = last_pointer {
@@ -338,7 +346,8 @@ Shift faster, 1-9 views, T/G time +/-, C day cycle, Y next weather, P pause moti
                 &fly.view(fov),
                 &env,
                 [0.0, 0.0],
-                frames as u32,
+                // A constant noise seed: without temporal filtering a per-frame seed flickers.
+                0,
                 Some(frame),
             )?;
             device.present(enc)?;

@@ -80,6 +80,20 @@ fn world() -> World {
         quad(-0.3, 40.0, 2),
         cube([-2.5, 1.0, -1.5], 0.9, 3),
         cube([3.0, 1.6, 1.0], 0.12, 4),
+        // An alpha-masked card: its shadow must use the texture's cut-out.
+        Mesh {
+            positions: vec![
+                Vec3(-4.0, 0.0, 2.0),
+                Vec3(-2.0, 0.0, 2.0),
+                Vec3(-2.0, 2.0, 2.0),
+                Vec3(-4.0, 2.0, 2.0),
+            ],
+            normals: vec![Vec3(0.0, 0.0, 1.0); 4],
+            uvs: vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            color: [0.5; 3],
+            material: Some(5),
+        },
     ];
     // The ground sits above the water and covers the middle; water surrounds it.
     let instances = (0..meshes.len() as u32)
@@ -97,13 +111,32 @@ fn world() -> World {
             material("water", [0.02, 0.1, 0.15, 1.0], Shading::Water),
             material("canopy", [0.9, 0.5, 0.6, 1.0], Shading::Foliage),
             lamp,
+            {
+                let mut card = material("card", [0.3, 0.6, 0.3, 1.0], Shading::Foliage);
+                card.alpha = AlphaMode::Mask(0.5);
+                card.base_color_texture = Some(1);
+                card
+            },
         ],
-        textures: vec![Texture {
-            width: 2,
-            height: 2,
-            srgb: true,
-            levels: vec![checker, vec![227, 227, 227, 255]],
-        }],
+        textures: vec![
+            Texture {
+                width: 2,
+                height: 2,
+                srgb: true,
+                levels: vec![checker, vec![227, 227, 227, 255]],
+            },
+            Texture {
+                width: 2,
+                height: 2,
+                srgb: true,
+                levels: vec![
+                    vec![
+                        255, 255, 255, 255, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 255,
+                    ],
+                    vec![255, 255, 255, 128],
+                ],
+            },
+        ],
         lights: vec![PointLight {
             position: Vec3(3.0, 1.6, 1.0),
             color: [1.0, 0.6, 0.3],

@@ -213,7 +213,7 @@ pub fn invert(m: &M4) -> Option<M4> {
 /// sRGB-encoded 8-bit hex colour (`"#rrggbb"`) to linear RGB.
 pub fn hex(s: &str) -> Option<V3> {
     let s = s.strip_prefix('#').unwrap_or(s);
-    if s.len() != 6 {
+    if s.len() != 6 || !s.is_ascii() {
         return None;
     }
     let c = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();

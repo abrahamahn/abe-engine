@@ -83,6 +83,7 @@ pub enum Output {
 struct Pipelines {
     scene: PipelineId,
     shadow: PipelineId,
+    shadow_masked: PipelineId,
     sky: PipelineId,
     particle: PipelineId,
     ssao: PipelineId,
@@ -143,6 +144,8 @@ pub struct Renderer {
     targets: Targets,
     slots: Vec<Slot>,
     materials: Vec<BindGroupId>,
+    /// Bind groups for alpha-masked materials in the masked shadow pipeline.
+    shadow_materials: Vec<Option<BindGroupId>>,
     shadow_map: TextureId,
     dummy: TextureId,
     linear_clamp: SamplerId,
@@ -246,6 +249,28 @@ impl Pipelines {
             }),
             colors: vec![],
         })?;
+        let vs = compile(WORLD_FX, Stage::Vertex, "vs_shadow_masked")?;
+        let fs = compile(WORLD_FX, Stage::Fragment, "fs_shadow_masked")?;
+        let shadow_masked = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: Some(&fs),
+            vertex_layout: Some(VertexLayout {
+                stride: 32,
+                attributes: vec![layout.attributes[0], layout.attributes[2]],
+            }),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(DepthState {
+                format: Format::Depth32Float,
+                compare: Compare::Less,
+                write: true,
+                bias_constant: 1.0,
+                bias_slope: 1.75,
+                clamp: true,
+            }),
+            colors: vec![],
+        })?;
         let vs = compile(WORLD_FX, Stage::Vertex, "vs_sky")?;
         let fs = compile(WORLD_FX, Stage::Fragment, "fs_sky")?;
         let sky = device.create_render_pipeline(&RenderPipelineDesc {
@@ -281,6 +306,7 @@ impl Pipelines {
         Ok(Self {
             scene,
             shadow,
+            shadow_masked,
             sky,
             particle,
             ssao: fullscreen(device, &fsvs, "fs_ssao", Format::R16Float, Blend::Replace)?,
@@ -384,7 +410,23 @@ impl Renderer {
             ..SamplerDesc::default()
         })?;
         let mut materials = vec![];
+        let mut shadow_materials = vec![];
         for m in &scene.materials {
+            shadow_materials.push(if m.params[0] >= 0.0 {
+                Some(device.create_bind_group(
+                    pipelines.shadow_masked,
+                    1,
+                    &[
+                        (
+                            0,
+                            Resource::Texture(m.base.map_or(white, |i| scene.textures[i])),
+                        ),
+                        (3, Resource::Sampler(material_sampler)),
+                    ],
+                )?)
+            } else {
+                None
+            });
             let tex = |i: Option<usize>, fallback| i.map_or(fallback, |i| scene.textures[i]);
             materials.push(device.create_bind_group(
                 pipelines.scene,
@@ -415,6 +457,7 @@ impl Renderer {
             targets,
             slots: vec![],
             materials,
+            shadow_materials,
             shadow_map,
             dummy,
             linear_clamp,
@@ -761,8 +804,11 @@ impl Renderer {
                 [0.0, 1.0, 0.0]
             };
             let back = 1000.0;
-            let lv = look_at(add(centre, scale(l, back)), centre, up_hint);
-            // Snap the centre to whole texels so shadows don't crawl as the camera moves.
+            // The light's view is anchored at the world origin, so it only changes when the
+            // light moves. The cascade centre is then snapped to whole texels in that frame,
+            // and the radius to a fixed step, so shadows don't crawl as the camera moves.
+            let lv = look_at(scale(l, back), [0.0; 3], up_hint);
+            let radius = (radius * 2.0).ceil() * 0.5;
             let texel = 2.0 * radius / size;
             let lc = transform(&lv, [centre[0], centre[1], centre[2], 1.0]);
             let snap = |x: f32| (x / texel).round() * texel - x;
@@ -780,7 +826,7 @@ impl Renderer {
                 zmax = zmax.max(z);
             }
             let near = (zmin - 5.0).max(1.0);
-            let farz = (zmax + 5.0).min(back + radius * 4.0).max(near + 1.0);
+            let farz = (zmax + 5.0).max(near + 1.0);
             let proj = ortho(
                 lc[0] + dx - radius,
                 lc[0] + dx + radius,
@@ -900,7 +946,12 @@ impl Renderer {
         b.v(scale(env.ambient_sky, env.ambient), env.lamp_level);
         b.v(scale(env.ambient_ground, env.ambient), env.wetness);
         b.v(l.shadow_tint, l.shadow_strength);
-        b.f(l.ramp_center, l.ramp_softness, l.rim_strength, l.rim_power);
+        b.f(
+            l.ramp_center,
+            l.ramp_softness.max(0.002),
+            l.rim_strength,
+            l.rim_power,
+        );
         b.f(
             l.specular,
             l.specular_size,
@@ -1066,7 +1117,30 @@ impl Renderer {
                 enc.set_vertex_buffer(self.scene.vertices, 0);
                 enc.set_index_buffer(self.scene.indices, 0);
                 enc.push_constants(&f32_bytes(m));
-                for d in self.scene.draws.iter().filter(|d| !d.water) {
+                let masked =
+                    |d: &&super::scene::DrawItem| self.shadow_materials[d.material].is_some();
+                for d in self.scene.draws.iter().filter(|d| !d.water && !masked(d)) {
+                    enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
+                }
+                let mut bound = false;
+                for d in self.scene.draws.iter().filter(|d| !d.water && masked(d)) {
+                    if !bound {
+                        enc.set_pipeline(p.shadow_masked);
+                        bound = true;
+                    }
+                    let mat = &self.scene.materials[d.material];
+                    if let Some(g) = self.shadow_materials[d.material] {
+                        enc.set_bind_group(1, g);
+                    }
+                    let mut push = [0.0f32; 20];
+                    push[..16].copy_from_slice(m);
+                    push[16..].copy_from_slice(&[
+                        mat.params[0],
+                        mat.base_color[3],
+                        mat.flags[0],
+                        0.0,
+                    ]);
+                    enc.push_constants(&f32_bytes(&push));
                     enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
                 }
                 enc.end_pass();
@@ -1221,8 +1295,8 @@ impl Renderer {
         if self.quality.painterly {
             let mut pc = [0.0f32; 16];
             pc[..4].copy_from_slice(&[
-                l.painterly * px_scale * 0.6,
-                l.painterly * l.painterly_far.max(0.0) * px_scale,
+                (l.painterly * px_scale * 0.6).clamp(0.0, 6.0),
+                (l.painterly * l.painterly_far.max(0.0) * px_scale).clamp(0.0, 6.0),
                 0.85,
                 0.0,
             ]);

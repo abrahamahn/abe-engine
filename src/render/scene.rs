@@ -206,7 +206,8 @@ impl GpuScene {
             .lights
             .iter()
             .map(|l| {
-                let range = if l.range > 0.0 { l.range } else { 8.0 };
+                // glTF: range 0 means unlimited; a very large range lights every tile.
+                let range = if l.range > 0.0 { l.range } else { 1.0e4 };
                 [
                     l.position.0,
                     l.position.1,

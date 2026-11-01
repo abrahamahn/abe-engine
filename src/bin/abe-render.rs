@@ -62,6 +62,8 @@ fn run() -> Result<(), String> {
             .ok_or_else(|| format!("unknown weather {w:?}; try {:?}", Weather::PRESETS))?;
     }
     let mut device = Device::headless()?;
+    // Offline stills on slow (software) devices can take minutes per submission.
+    device.set_submit_timeout(std::time::Duration::from_secs(1800));
     let quality = if realtime {
         Quality::realtime()
     } else {
@@ -124,6 +126,10 @@ fn run() -> Result<(), String> {
                     "{}-{:04.1}h-{weather}.png",
                     view.name, file.time.hours
                 ))
+            }
+            None if views.len() > 1 => {
+                let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("render");
+                out.with_file_name(format!("{stem}-{}.png", view.name))
             }
             None => out.clone(),
         };

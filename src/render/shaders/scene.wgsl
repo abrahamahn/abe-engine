@@ -179,20 +179,22 @@ fn water_normal(world: vec3f, t: f32) -> vec3f {
   let base_s = textureSampleBias(base_tex, material_sampler, in.uv, bias);
   let nrm_s = textureSampleBias(normal_tex, material_sampler, in.uv, bias * 0.5);
   let emi_s = textureSampleBias(emissive_tex, material_sampler, in.uv, bias);
+  // The mirrored reflection pass reverses winding: there the faces seen are back faces.
+  let reflection_pass = frame.water_color.w > 0.5;
   var n = normalize(in.normal);
-  if (!front) {
+  if (front == reflection_pass) {
     n = -n;
   }
   let geo_n = n;
   var mapped = n;
   if (draw.flags.y > 0.5) {
+    let mirror = select(1.0, -1.0, reflection_pass);
     var m = nrm_s.xyz * 2.0 - vec3f(1.0);
-    m = vec3f(m.xy * (draw.flags.w * frame.style2.y), max(m.z, 0.05));
+    m = vec3f(m.xy * (draw.flags.w * frame.style2.y * mirror), max(m.z, 0.05));
     mapped = perturb(n, in.world, in.uv, normalize(m));
   }
   n = mapped;
 
-  let reflection_pass = frame.water_color.w > 0.5;
   if (reflection_pass && in.world.y < frame.water.x - 0.02) {
     discard;
   }
