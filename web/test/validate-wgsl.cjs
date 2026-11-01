@@ -12,6 +12,12 @@ const http = require('http');
 const path = require('path');
 const { chromium } = require('playwright');
 
+// WebGPU in headless Chromium. Without a GPU it runs on SwiftShader; canvas presentation then
+// needs Vulkan compositing (with the default software compositing the GPU process fails to
+// allocate the canvas swap-chain images and drops the WebGPU instance after a few frames).
+const CHROMIUM_ARGS = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-angle=vulkan',
+  '--use-vulkan=swiftshader'];
+
 async function main() {
   const dirs = process.argv.slice(2);
   if (!dirs.length) {
@@ -26,7 +32,7 @@ async function main() {
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const url = `http://localhost:${server.address().port}/`;
-  const browser = await chromium.launch({ args: ['--enable-unsafe-webgpu'] });
+  const browser = await chromium.launch({ args: CHROMIUM_ARGS });
   const page = await browser.newPage();
   await page.goto(url);
   const adapter = await page.evaluate(async () => {

@@ -25,3 +25,10 @@ dependencies = [
 [[package]]
 name = "abe-shader"
 version = "0.2.0"
+
+[[package]]
+name = "abe-web"
+version = "0.2.0"
+dependencies = [
+ "abe-engine",
+]
