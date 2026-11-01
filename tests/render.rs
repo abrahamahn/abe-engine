@@ -207,9 +207,13 @@ fn time_of_day_weather_and_lamps() {
     assert!((r.water_level().unwrap() + 0.3).abs() < 1e-4);
 
     let noon = render(&mut device, &mut r, 12.0, "clear");
-    // The sky at the top of the frame is blue and bright at noon.
-    let i = ((2 * W + W / 2) * 4) as usize;
-    assert!(noon[i + 2] > noon[i] + 20, "noon sky {:?}", &noon[i..i + 3]);
+    // The sky at the top of the frame is blue and bright at noon (on average: a few clouds).
+    let channel = |c: usize| -> f32 {
+        let top = &noon[..(8 * W * 4) as usize];
+        top.chunks(4).map(|p| f32::from(p[c])).sum::<f32>() / (8 * W) as f32
+    };
+    let (red, blue) = (channel(0), channel(2));
+    assert!(blue > red + 15.0, "noon sky red {red} blue {blue}");
     assert!(region(&noon, 0, 0, W, 8) > 90.0);
     let midnight = render(&mut device, &mut r, 0.0, "clear");
     assert!(

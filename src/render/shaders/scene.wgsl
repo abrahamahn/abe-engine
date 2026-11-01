@@ -590,8 +590,6 @@ fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
 // grass grows (its top surface is a grassy material), thinned and widened with distance.
 
 const GRASS_SPACING = 0.13;
-// Rows of the instance grid; the renderer draws GRASS_SIDE * GRASS_SIDE instances at most.
-const GRASS_SIDE = 640u;
 
 struct GrassSite {
   base: vec3f,
@@ -605,9 +603,11 @@ fn grass_site(ii: u32) -> GrassSite {
   o.keep = 0.0;
   o.widen = 1.0;
   let cam = frame.camera.xyz;
-  let half = i32(GRASS_SIDE / 2u);
-  let cx = i32(floor(cam.x / GRASS_SPACING)) + i32(ii % GRASS_SIDE) - half;
-  let cz = i32(floor(cam.z / GRASS_SPACING)) + i32(ii / GRASS_SIDE) - half;
+  // The renderer draws side * side instances on a grid centred under the camera.
+  let side = max(u32(frame.water2.y), 1u);
+  let half = i32(side / 2u);
+  let cx = i32(floor(cam.x / GRASS_SPACING)) + i32(ii % side) - half;
+  let cz = i32(floor(cam.z / GRASS_SPACING)) + i32(ii / side) - half;
   let seed = hash_u((bitcast<u32>(cx) * 73856093u) ^ hash_u(bitcast<u32>(cz) * 19349663u + 7u));
   o.seed = seed;
   let jx = rand01(seed);

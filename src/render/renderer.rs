@@ -31,7 +31,8 @@ const MAX_LIGHTS_PER_TILE: usize = 96;
 const NEAR: f32 = 0.08;
 /// The ground map covers this far (metres) around a point just ahead of the camera.
 const GROUND_REACH: f32 = 48.0;
-/// The grass instance grid is GRASS_SIDE x GRASS_SIDE cells (see scene.wgsl).
+/// The grass instance grid is at most GRASS_SIDE x GRASS_SIDE cells of 13 cm around the camera
+/// (see scene.wgsl); `Quality::grass` scales its area.
 const GRASS_SIDE: u32 = 640;
 const RAIN_BOX: f32 = 16.0;
 const PETAL_BOX: f32 = 14.0;
@@ -54,7 +55,7 @@ pub struct Quality {
     pub particles: bool,
     /// Texels per side of the top-down ground map.
     pub ground_size: u32,
-    /// Fraction of the grass instance grid drawn (0 = no grass).
+    /// Fraction of the full grass area drawn around the camera (0 = no grass).
     pub grass: f32,
 }
 impl Quality {
@@ -1169,11 +1170,11 @@ impl Renderer {
             ground.top,
             ground.range,
             ground.size as f32,
-            l.grass.density * self.quality.grass,
+            l.grass.density,
         );
         b.f(l.brush, l.brush_scale.max(0.01), l.sun_shafts, 0.0);
         b.v(l.water_shallow, l.foam);
-        b.f(l.sparkle, 0.0, 0.0, 0.0);
+        b.f(l.sparkle, self.grass_side() as f32, 0.0, 0.0);
         let g = &l.grass;
         b.f(g.height, g.width, g.flowers, g.sway);
         b.v(g.base, 0.0);
@@ -1196,11 +1197,17 @@ impl Renderer {
     /// Grass instances to draw: the instance grid scaled by quality and the Look's density,
     /// or 0 when no material grows grass.
     fn grass_instances(&self) -> u32 {
+        let side = self.grass_side();
+        side * side
+    }
+
+    /// Rows of the grass instance grid this frame (0 when nothing grows grass).
+    fn grass_side(&self) -> u32 {
         let g = &self.look.grass;
         if g.density <= 0.0 || self.quality.grass <= 0.0 || !self.grassy.iter().any(|&x| x) {
             return 0;
         }
-        GRASS_SIDE * GRASS_SIDE
+        ((GRASS_SIDE as f32 * self.quality.grass.min(1.0).sqrt()).round() as u32 / 2 * 2).max(2)
     }
 
     fn draw_world(&self, enc: &mut Encoder, model_push: &mut [f32; 32], water: bool) {

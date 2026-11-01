@@ -35,7 +35,7 @@ struct Frame {
   ground: vec4f,        // ground map: top height, depth range (m), texels per side, grass density
   paint: vec4f,         // brush strength, brush stroke size (m), light shafts, unused
   shallow: vec4f,       // rgb shallow water, w = foam
-  water2: vec4f,        // glitter, unused, unused, unused
+  water2: vec4f,        // glitter, grass grid rows, unused, unused
   grass: vec4f,         // blade height, blade width, flower fraction, sway
   grass_base: vec4f,    // rgb blade root colour
   grass_tip: vec4f,     // rgb blade tip colour
