@@ -5,7 +5,8 @@
 #   scripts/apple/build-mac.sh --shaders  also compile every renderer shader's MSL with
 #                                         Apple's offline compiler (needs Xcode's Metal
 #                                         toolchain; skipped with a note otherwise)
-#   scripts/apple/build-mac.sh --test     also run the renderer driver tests on Metal
+#   scripts/apple/build-mac.sh --test     also run the backend and renderer driver tests on
+#                                         Metal (tests/backend.rs, tests/render.rs)
 #
 # Needs the Xcode command-line tools (xcode-select --install) and Rust (rustup). Shaders are
 # compiled from MSL at run time by the Metal framework, so running needs no Xcode.
@@ -19,7 +20,7 @@ for arg in "$@"; do
     --shaders) shaders=1 ;;
     --test) tests=1 ;;
     -h | --help)
-        sed -n '2,12p' "$0"
+        sed -n '2,13p' "$0"
         exit 0
         ;;
     *)
@@ -86,7 +87,9 @@ if [ "$shaders" = 1 ]; then
 fi
 
 if [ "$tests" = 1 ]; then
-    # Offscreen renders of a synthetic scene, compared against expectations, on Metal.
-    MTL_DEBUG_LAYER="${MTL_DEBUG_LAYER:-1}" cargo test --release --locked --target "$target" \
-        --test render -- --ignored --test-threads=1
+    # With Metal's API validation. First the backend tests (small WGSL programs whose results
+    # are known; the same tests pass on Vulkan), then offscreen renders of a synthetic scene.
+    export MTL_DEBUG_LAYER="${MTL_DEBUG_LAYER:-1}"
+    cargo test --release --locked --target "$target" --test backend -- --ignored --test-threads=1
+    cargo test --release --locked --target "$target" --test render -- --ignored --test-threads=1
 fi

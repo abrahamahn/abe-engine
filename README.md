@@ -68,7 +68,7 @@ macOS needs the Xcode command-line tools (`xcode-select --install`) and Rust:
 ```sh
 scripts/apple/build-mac.sh                  # release abe-player and abe-render
 scripts/apple/build-mac.sh --shaders        # also compile every renderer shader with Apple's metal compiler
-scripts/apple/build-mac.sh --test           # also render the synthetic test scene on Metal
+scripts/apple/build-mac.sh --test           # also run the backend tests and render the test scene on Metal
 target/aarch64-apple-darwin/release/abe-render --scene world.abew --look look.json --all-views --out-dir renders
 target/aarch64-apple-darwin/release/abe-player --scene world.abew --look look.json
 ```
