@@ -704,7 +704,11 @@ export async function startPlayer(options) {
   };
   canvas.addEventListener('pointerdown', (e) => {
     if (e.pointerType === 'mouse' && e.button !== 0) return;
-    canvas.setPointerCapture(e.pointerId);
+    try {
+      canvas.setPointerCapture(e.pointerId);
+    } catch (_) {
+      // Not an active pointer (for example a synthetic event); drags still work while over the canvas.
+    }
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pointers.size === 2) pinch = centroid();
     e.preventDefault();
@@ -734,8 +738,15 @@ export async function startPlayer(options) {
   let running = true;
   let captures = [];
   const capture = (texture) => readPixels(gpu, texture);
+  // At most two frames in flight: without vsync (or on a slow GPU) frames would otherwise queue
+  // up without bound and input, readbacks and resizes would wait behind them.
+  let inFlight = 0;
   const tick = (now) => {
     if (!running) return;
+    if (inFlight >= 2) {
+      requestAnimationFrame(tick);
+      return;
+    }
     if (options.sizeCanvas) options.sizeCanvas();
     const dt = Math.min(Math.max((now - last) / 1000, 0), 0.25);
     last = now;
@@ -751,6 +762,8 @@ export async function startPlayer(options) {
       if (!errors.length) fail('the engine stopped');
       return;
     }
+    inFlight++;
+    gpu.device.queue.onSubmittedWorkDone().then(() => { inFlight--; }, () => { inFlight--; });
     const texture = host.frameTexture();
     if (captures.length && texture) {
       const pending = captures;

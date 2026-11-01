@@ -15,6 +15,7 @@ const { chromium } = require('playwright');
 // WebGPU in headless Chromium. Without a GPU it runs on SwiftShader; canvas presentation then
 // needs Vulkan compositing (with the default software compositing the GPU process fails to
 // allocate the canvas swap-chain images and drops the WebGPU instance after a few frames).
+// SwiftShader is slow, so tests wait for frame counts rather than for time.
 const CHROMIUM_ARGS = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-angle=vulkan',
   '--use-vulkan=swiftshader'];
 

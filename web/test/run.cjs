@@ -17,7 +17,9 @@
 // compares the two: OUT/NAME-diff.png shows |web - native| x 4. Console messages and WebGPU
 // errors are written to OUT/NAME-console.txt; any WebGPU error fails the case, and so does a
 // mean absolute difference above `max_mean` (default 3 levels of 255). `gzip=1` serves the
-// world gzip-compressed (Content-Length then counts compressed bytes).
+// world gzip-compressed (Content-Length then counts compressed bytes). `interact=1` then drives
+// the keyboard, mouse, a two-finger touch drag, an on-screen button and (with `size=auto`, where
+// the canvas follows the window) a viewport resize, and checks that each changes the status line or the picture.
 //
 'use strict';
 const fs = require('fs');
@@ -30,6 +32,7 @@ const { chromium } = require('playwright');
 // WebGPU in headless Chromium. Without a GPU it runs on SwiftShader; canvas presentation then
 // needs Vulkan compositing (with the default software compositing the GPU process fails to
 // allocate the canvas swap-chain images and drops the WebGPU instance after a few frames).
+// SwiftShader is slow, so tests wait for frame counts rather than for time.
 const CHROMIUM_ARGS = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-angle=vulkan',
   '--use-vulkan=swiftshader'];
 
@@ -110,11 +113,14 @@ function native(opts, c, out) {
 
 async function runCase(browser, port, opts, c, assets) {
   const log = [];
-  const page = await browser.newPage({ viewport: { width: 1400, height: 900 }, deviceScaleFactor: 1 });
+  // With size=auto the canvas follows this window (one CSS pixel per device pixel).
+  const viewport = c.size === 'auto' ? { width: 640, height: 360 } : { width: 1400, height: 900 };
+  const page = await browser.newPage({ viewport, deviceScaleFactor: 1 });
   page.on('console', (m) => log.push(`[${m.type()}] ${m.text()}`));
   page.on('pageerror', (e) => log.push(`[pageerror] ${e.message}`));
-  const q = new URLSearchParams({ scene: `/assets/${c.name}.abew`, size: c.size, dpr: '1',
-    seconds: c.seconds, paused: '1' });
+  const q = new URLSearchParams({ scene: `/assets/${c.name}.abew`, dpr: '1', seconds: c.seconds,
+    paused: '1' });
+  if (c.size !== 'auto') q.set('size', c.size);
   if (c.look) q.set('look', `/assets/${c.name}.json`);
   for (const k of ['view', 'time', 'weather', 'quality']) if (c[k]) q.set(k, c[k]);
   const url = `http://localhost:${port}/index.html?${q}`;
@@ -125,6 +131,100 @@ async function runCase(browser, port, opts, c, assets) {
     fs.writeFileSync(path.join(opts.out, `${c.name}-console.txt`), `${log.join('\n')}\n`);
     await page.close();
   }
+}
+
+/**
+ * Drives the controls like a person: keyboard (Y weather, T time, W forward), a mouse drag, a
+ * synthetic two-finger touch drag, the on-screen weather button and a viewport resize. Each
+ * step must change the status line or the image, with no errors.
+ */
+async function interact(page, c) {
+  const status = () => page.evaluate(() => document.getElementById('status').textContent);
+  // Waits until `count` more frames have been presented (input acts once per frame).
+  const frames = async (count) => {
+    const n = await page.evaluate(() => window.abe.frames());
+    await page.waitForFunction(([m, k]) => window.abe.frames() >= m + k, [n, count],
+      { timeout: 300000, polling: 50 });
+  };
+  const settle = () => frames(2);
+  // Captures the next frame and keeps it for `changed`.
+  const image = () => page.evaluate(async () => {
+    window.lastInteract = await window.abe.capture();
+    return { width: window.lastInteract.width, height: window.lastInteract.height };
+  });
+  // Whether the next frame differs from the last capture: a resize, or a mean absolute
+  // difference above 1 level of 255 per channel.
+  const changed = () => page.evaluate(async () => {
+    const a = window.lastInteract;
+    const b = await window.abe.capture();
+    window.lastInteract = b;
+    if (a.width !== b.width || a.height !== b.height) return true;
+    let sum = 0;
+    for (let i = 0; i < a.rgba.length; i += 4) {
+      sum += Math.abs(a.rgba[i] - b.rgba[i]) + Math.abs(a.rgba[i + 1] - b.rgba[i + 1]) + Math.abs(a.rgba[i + 2] - b.rgba[i + 2]);
+    }
+    return sum / (a.width * a.height * 3) > 1;
+  });
+  const steps = {};
+  await page.focus('canvas');
+  const s0 = await status();
+  await image();
+  await page.keyboard.press('KeyY');
+  await settle();
+  const s1 = await status();
+  steps.weatherKey = { before: s0, after: s1, ok: s1.split(' · ')[1] !== s0.split(' · ')[1] };
+  await page.keyboard.down('KeyT');
+  await frames(8);
+  await page.keyboard.up('KeyT');
+  await settle();
+  const s2 = await status();
+  steps.timeKey = { before: s1.split(' · ')[0], after: s2.split(' · ')[0], ok: s2.split(' · ')[0] !== s1.split(' · ')[0] };
+  await image();
+  await page.keyboard.down('KeyW');
+  await frames(8);
+  await page.keyboard.up('KeyW');
+  await settle();
+  steps.flyForward = { status: await status(), ok: (await status()).includes('free') && await changed() };
+  await image();
+  const box = await page.locator('canvas').boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 + 120, box.y + box.height / 2 + 30, { steps: 6 });
+  await page.mouse.up();
+  await settle();
+  steps.mouseLook = { ok: await changed() };
+  await image();
+  await page.evaluate(() => {
+    const cv = document.querySelector('canvas');
+    const r = cv.getBoundingClientRect();
+    const at = (id, x, y, type) => cv.dispatchEvent(new PointerEvent(type, {
+      pointerId: id, pointerType: 'touch', isPrimary: id === 11, clientX: r.left + x, clientY: r.top + y, bubbles: true }));
+    at(11, 200, 200, 'pointerdown'); at(12, 260, 200, 'pointerdown');
+    for (let k = 1; k <= 5; k++) { at(11, 200, 200 - k * 12, 'pointermove'); at(12, 260, 200 - k * 12, 'pointermove'); }
+  });
+  await frames(8);
+  await page.evaluate(() => {
+    const cv = document.querySelector('canvas');
+    const r = cv.getBoundingClientRect();
+    for (const id of [11, 12]) cv.dispatchEvent(new PointerEvent('pointerup', { pointerId: id, pointerType: 'touch', clientX: r.left + 200, clientY: r.top + 140, bubbles: true }));
+  });
+  await settle();
+  steps.twoFingerMove = { ok: await changed() };
+  const s3 = await status();
+  await page.evaluate(() => document.body.classList.add('touch'));
+  await page.getByRole('button', { name: 'weather' }).click();
+  await settle();
+  const s4 = await status();
+  steps.weatherButton = { before: s3.split(' · ')[1], after: s4.split(' · ')[1], ok: s4.split(' · ')[1] !== s3.split(' · ')[1] };
+  if (c.size === 'auto') {
+    await page.setViewportSize({ width: 800, height: 450 });
+    await settle();
+    await settle();
+    const s5 = await status();
+    steps.resize = { status: s5, ok: s5.endsWith('800x450') };
+  }
+  const errors = await page.evaluate(() => window.abe.errors());
+  return { ok: Object.values(steps).every((s) => s.ok) && errors.length === 0, steps, errors };
 }
 
 async function drive(page, url, started, opts, c, assets, log) {
@@ -154,6 +254,7 @@ async function drive(page, url, started, opts, c, assets, log) {
     const webPng = path.join(opts.out, `${c.name}-web.png`);
     fs.writeFileSync(webPng, Buffer.from(png, 'base64'));
     result.web = webPng;
+    if (c.interact === '1') result.interact = await interact(page, c);
     // Software rendering can take seconds per frame; stop the loop so the page can settle.
     await page.evaluate(() => window.abe.stop());
     if (c.native) {
@@ -209,6 +310,7 @@ async function drive(page, url, started, opts, c, assets, log) {
     result.errors = await page.evaluate(() => window.abe.errors());
   }
   result.ok = !result.failed && result.frames >= Number(c.frames) && result.errors.length === 0
+    && (!result.interact || result.interact.ok)
     && (!result.compare || (!result.compare.error && result.compare.mean <= Number(c.max_mean)));
   return result;
 }
@@ -269,7 +371,7 @@ async function main() {
   for (const c of opts.cases) {
     assets.set(`${c.name}.abew`, path.resolve(c.scene));
     if (c.look) assets.set(`${c.name}.json`, path.resolve(c.look));
-    if (opts.abeRender && c.native !== '0') {
+    if (opts.abeRender && c.native !== '0' && c.size !== 'auto') {
       const out = path.join(opts.out, `${c.name}-native.png`);
       const s = native(opts, c, out);
       console.log(`${c.name}: native reference ${out} (${s.toFixed(1)} s)`);

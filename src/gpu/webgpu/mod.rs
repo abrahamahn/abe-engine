@@ -1376,6 +1376,29 @@ impl<'w> Gpu<'w> {
     }
 }
 
+impl Drop for Gpu<'_> {
+    /// Hands every remaining object back to the host. WebGPU destroys buffers and textures only
+    /// after submitted work that uses them is done, so this is safe while frames are in flight.
+    fn drop(&mut self) {
+        fn drain<T>(pool: &mut Pool<T>) -> impl Iterator<Item = T> + '_ {
+            pool.free.clear();
+            pool.slots.drain(..).filter_map(|s| s.1)
+        }
+        let mut handles: Vec<u32> = Vec::new();
+        handles.extend(drain(&mut self.buffers).map(|b| b.js));
+        handles.extend(drain(&mut self.textures).map(|t| t.js));
+        handles.extend(drain(&mut self.samplers).map(|s| s.js));
+        handles.extend(drain(&mut self.pipelines).map(|p| p.js));
+        handles.extend(drain(&mut self.groups).map(|g| g.js));
+        handles.extend(self.shader_cache.drain().map(|(_, h)| h));
+        handles.extend(self.group_layouts.drain().map(|(_, h)| h));
+        handles.extend(self.pipeline_layouts.drain().map(|(_, h)| h));
+        for h in handles {
+            ffi::release(h);
+        }
+    }
+}
+
 /// A half-open range of mips or layers.
 type Span = (u32, u32);
 
