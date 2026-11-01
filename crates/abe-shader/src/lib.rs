@@ -2,7 +2,8 @@
 //!
 //! The engine owns its shader toolchain end to end. Shaders are authored once in a documented
 //! WGSL subset, compiled here with zero third-party code, and handed to each graphics backend:
-//! SPIR-V for Vulkan today; MSL, HLSL and WGSL text emitters belong next to this one later.
+//! SPIR-V for Vulkan and Metal Shading Language for Metal ([`compile_msl`]); HLSL and WGSL
+//! text emitters belong next to these later.
 //!
 //! The public types below are the contract the GPU layer builds pipelines from. Reflection only
 //! lists resources and interface variables that the selected entry point statically uses.
