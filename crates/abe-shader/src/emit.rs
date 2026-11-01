@@ -428,6 +428,7 @@ pub fn emit(prog: &Program, stage: Stage, entry: &str) -> R<Compiled> {
         } else {
             [1, 1, 1]
         },
+        msl: None,
     })
 }
 
