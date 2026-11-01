@@ -490,54 +490,62 @@ function keyCode(e) {
   return 0;
 }
 
-/** Streams `url` into wasm memory allocated with `alloc`, reporting progress (0..1). */
+/**
+ * Streams `url` into wasm memory from `abe_alloc`, reporting progress (0..1) and bytes. With
+ * an uncompressed Content-Length the bytes go straight into wasm memory; otherwise (unknown
+ * length, or a compressed response that turns out longer) they are buffered and copied once.
+ */
 async function fetchInto(url, exports, onProgress) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url}: HTTP ${response.status} ${response.statusText}`);
-  const total = Number(response.headers.get('content-length')) || 0;
+  const encoding = response.headers.get('content-encoding');
+  const announced = Number(response.headers.get('content-length')) || 0;
   const reader = response.body.getReader();
-  if (total > 0) {
-    const ptr = exports.abe_alloc(total) >>> 0;
-    let offset = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (offset + value.length > total) throw new Error(`${url}: more data than its Content-Length`);
-      new Uint8Array(exports.memory.buffer, ptr + offset, value.length).set(value);
-      offset += value.length;
-      onProgress(offset / total, offset);
-    }
-    if (offset !== total) throw new Error(`${url}: received ${offset} of ${total} bytes`);
-    return { ptr, len: total };
+  let ptr = 0;
+  let cap = 0;
+  let offset = 0;
+  let chunks = null;
+  if (announced > 0 && (!encoding || encoding === 'identity')) {
+    cap = announced;
+    ptr = exports.abe_alloc(cap) >>> 0;
+  } else {
+    chunks = [];
   }
-  const chunks = [];
-  let received = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    chunks.push(value);
-    received += value.length;
-    onProgress(0, received);
+    if (!chunks && offset + value.length > cap) {
+      // More than announced: keep what arrived and buffer the rest.
+      chunks = [new Uint8Array(exports.memory.buffer, ptr, offset).slice()];
+      exports.abe_free(ptr, cap);
+      ptr = 0;
+    }
+    if (chunks) chunks.push(value);
+    else new Uint8Array(exports.memory.buffer, ptr + offset, value.length).set(value);
+    offset += value.length;
+    onProgress(announced ? Math.min(offset / announced, 1) : 0, offset);
   }
-  const ptr = exports.abe_alloc(received) >>> 0;
-  let offset = 0;
+  if (!chunks) {
+    if (offset !== cap) {
+      exports.abe_free(ptr, cap);
+      throw new Error(`${url}: received ${offset} of ${cap} bytes`);
+    }
+    return { ptr, len: cap };
+  }
+  ptr = exports.abe_alloc(offset) >>> 0;
+  let at = 0;
   for (const chunk of chunks) {
-    new Uint8Array(exports.memory.buffer, ptr + offset, chunk.length).set(chunk);
-    offset += chunk.length;
+    new Uint8Array(exports.memory.buffer, ptr + at, chunk.length).set(chunk);
+    at += chunk.length;
   }
-  return { ptr, len: received };
+  return { ptr, len: offset };
 }
 
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
 
-/**
- * Loads the player: WebGPU, the wasm module, the world and the Look file; then runs frames.
- * `options`: canvas, wasm (URL), scene (URL), look (URL or ''), query (string),
- * onPhase(text, progress), onLog(level, text), onStatus(text), onError(text), sizeCanvas().
- * Returns a controller for input and tests.
- */
-export async function startPlayer(options) {
-  const { canvas, onPhase = () => {}, onLog = () => {}, onStatus = () => {} } = options;
+/** WebGPU, the host and the wasm module; shared by the player and the self-test. */
+async function boot(options) {
+  const { canvas, onPhase = () => {}, onLog = () => {} } = options;
   const errors = [];
   const fail = (text) => {
     errors.push(text);
@@ -546,7 +554,7 @@ export async function startPlayer(options) {
   onPhase('Starting WebGPU', 0);
   const gpu = await createGpu(canvas);
   onLog(0, `${gpu.adapterName}; features: ${gpu.features.join(', ') || 'none'}; canvas ${gpu.format}`);
-  const host = createHost(gpu, { onLog, onStatus, onError: fail });
+  const host = createHost(gpu, { onLog, onStatus: options.onStatus || (() => {}), onError: fail });
   onPhase('Loading the engine', 0);
   const wasmResponse = await fetch(options.wasm);
   if (!wasmResponse.ok) throw new Error(`${options.wasm}: HTTP ${wasmResponse.status}`);
@@ -557,7 +565,75 @@ export async function startPlayer(options) {
     ({ instance } = await WebAssembly.instantiate(await wasmResponse.arrayBuffer(), host.imports));
   }
   host.attach(instance);
-  const x = instance.exports;
+  return { gpu, host, x: instance.exports, errors, fail };
+}
+
+/** Reads `texture` (the canvas texture of the current frame) back as RGBA8 pixels. */
+async function readPixels(gpu, texture) {
+  const width = texture.width; const height = texture.height;
+  const bytesPerRow = Math.ceil(width * 4 / 256) * 256;
+  const buffer = gpu.device.createBuffer({ size: bytesPerRow * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const enc = gpu.device.createCommandEncoder();
+  enc.copyTextureToBuffer({ texture }, { buffer, bytesPerRow }, [width, height, 1]);
+  gpu.device.queue.submit([enc.finish()]);
+  await buffer.mapAsync(GPUMapMode.READ);
+  const src = new Uint8Array(buffer.getMappedRange());
+  const rgba = new Uint8ClampedArray(width * height * 4);
+  const bgra = gpu.format.startsWith('bgra');
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const s = y * bytesPerRow + x * 4; const d = (y * width + x) * 4;
+      rgba[d] = src[s + (bgra ? 2 : 0)]; rgba[d + 1] = src[s + 1];
+      rgba[d + 2] = src[s + (bgra ? 0 : 2)]; rgba[d + 3] = 255;
+    }
+  }
+  buffer.unmap();
+  buffer.destroy();
+  return { width, height, rgba };
+}
+
+/**
+ * Runs the GPU-layer self-test of the wasm module (compute, copies, mips, a blit into the
+ * canvas) and resolves with the canvas pixels and any errors.
+ */
+export async function startSelfTest(options) {
+  const { gpu, host, x, errors, fail } = await boot(options);
+  if (options.sizeCanvas) options.sizeCanvas();
+  const pixels = await new Promise((resolve, reject) => requestAnimationFrame(() => {
+    host.nextFrame();
+    let ok = 0;
+    try {
+      ok = x.abe_selftest();
+    } catch (e) {
+      fail(`the self-test stopped: ${e.message}`);
+    }
+    const texture = host.frameTexture();
+    if (!ok || !texture) {
+      reject(new Error(errors[errors.length - 1] || 'the self-test presented nothing'));
+      return;
+    }
+    readPixels(gpu, texture).then(resolve, reject);
+  }));
+  // Let asynchronous WebGPU errors arrive.
+  await gpu.device.queue.onSubmittedWorkDone();
+  await nextFrame();
+  return {
+    adapter: gpu.adapterName,
+    format: gpu.format,
+    pixels,
+    errors: () => [...errors, ...host.errors.filter((e) => !errors.includes(e))],
+  };
+}
+
+/**
+ * Loads the player: WebGPU, the wasm module, the world and the Look file; then runs frames.
+ * `options`: canvas, wasm (URL), scene (URL), look (URL or ''), query (string),
+ * onPhase(text, progress), onLog(level, text), onStatus(text), onError(text), sizeCanvas().
+ * Returns a controller for input and tests.
+ */
+export async function startPlayer(options) {
+  const { canvas, onPhase = () => {} } = options;
+  const { gpu, host, x, errors, fail } = await boot(options);
   const call = (what, f) => {
     try {
       return f();
@@ -657,28 +733,7 @@ export async function startPlayer(options) {
   let last = performance.now();
   let running = true;
   let captures = [];
-  const capture = async (texture) => {
-    const width = texture.width; const height = texture.height;
-    const bytesPerRow = Math.ceil(width * 4 / 256) * 256;
-    const buffer = gpu.device.createBuffer({ size: bytesPerRow * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    const enc = gpu.device.createCommandEncoder();
-    enc.copyTextureToBuffer({ texture }, { buffer, bytesPerRow }, [width, height, 1]);
-    gpu.device.queue.submit([enc.finish()]);
-    await buffer.mapAsync(GPUMapMode.READ);
-    const src = new Uint8Array(buffer.getMappedRange());
-    const rgba = new Uint8ClampedArray(width * height * 4);
-    const bgra = gpu.format.startsWith('bgra');
-    for (let y = 0; y < height; y++) {
-      for (let x0 = 0; x0 < width; x0++) {
-        const s = y * bytesPerRow + x0 * 4; const d = (y * width + x0) * 4;
-        rgba[d] = src[s + (bgra ? 2 : 0)]; rgba[d + 1] = src[s + 1];
-        rgba[d + 2] = src[s + (bgra ? 0 : 2)]; rgba[d + 3] = 255;
-      }
-    }
-    buffer.unmap();
-    buffer.destroy();
-    return { width, height, rgba };
-  };
+  const capture = (texture) => readPixels(gpu, texture);
   const tick = (now) => {
     if (!running) return;
     if (options.sizeCanvas) options.sizeCanvas();

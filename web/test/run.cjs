@@ -1,8 +1,12 @@
 // Headless browser test of the ABE web player.
 //
-//   node web/test/run.cjs --dist web/dist --out OUT_DIR [--abe-render PATH] \
+//   node web/test/run.cjs --dist web/dist --out OUT_DIR [--abe-render PATH] [--selftest] \
 //     --case name=NAME,scene=WORLD.abew,look=LOOK.json,view=VIEW,time=HOURS,weather=PRESET,size=WxH
 //     [--case ...]
+//
+// --selftest first runs the module's GPU-layer self-test (compute with push constants into a
+// storage texture, copies, mip generation, a blit into the canvas, misuse reporting) and checks
+// the gradient it presents (OUT/selftest-web.png).
 //
 // For each case it serves web/dist plus the case's world and Look file (from where they are,
 // under /assets/), opens the player with the view, time and weather fixed and the animation
@@ -12,13 +16,15 @@
 // renders the same view natively (one sample, realtime quality) to OUT/NAME-native.png and
 // compares the two: OUT/NAME-diff.png shows |web - native| x 4. Console messages and WebGPU
 // errors are written to OUT/NAME-console.txt; any WebGPU error fails the case, and so does a
-// mean absolute difference above `max_mean` (default 3 levels of 255).
+// mean absolute difference above `max_mean` (default 3 levels of 255). `gzip=1` serves the
+// world gzip-compressed (Content-Length then counts compressed bytes).
 //
 'use strict';
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const zlib = require('zlib');
 const { chromium } = require('playwright');
 
 // WebGPU in headless Chromium. Without a GPU it runs on SwiftShader; canvas presentation then
@@ -28,13 +34,14 @@ const CHROMIUM_ARGS = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--
   '--use-vulkan=swiftshader'];
 
 function parseArgs(argv) {
-  const opts = { cases: [], dist: path.join(__dirname, '..', 'dist'), out: 'web-test-out', abeRender: null };
+  const opts = { cases: [], dist: path.join(__dirname, '..', 'dist'), out: 'web-test-out', abeRender: null, selftest: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const val = () => argv[++i];
     if (a === '--dist') opts.dist = val();
     else if (a === '--out') opts.out = val();
     else if (a === '--abe-render') opts.abeRender = val();
+    else if (a === '--selftest') opts.selftest = true;
     else if (a === '--case') {
       const c = { seconds: '12', frames: '3', size: '960x540', max_mean: '3' };
       for (const kv of val().split(',')) {
@@ -45,19 +52,29 @@ function parseArgs(argv) {
       opts.cases.push(c);
     } else throw new Error(`unknown argument ${a}`);
   }
-  if (!opts.cases.length) throw new Error('no --case given');
+  if (!opts.cases.length && !opts.selftest) throw new Error('no --case given');
   return opts;
 }
 
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm',
   '.json': 'application/json', '.png': 'image/png', '.abew': 'application/octet-stream' };
 
-function serve(dist, assets) {
+function serve(dist, assets, gzipped) {
   const server = http.createServer((req, res) => {
     const url = decodeURIComponent(new URL(req.url, 'http://x').pathname);
     let file = null;
-    if (url.startsWith('/assets/')) file = assets.get(url.slice('/assets/'.length));
-    else {
+    if (url.startsWith('/assets/')) {
+      const name = url.slice('/assets/'.length);
+      file = assets.get(name);
+      if (file && gzipped.has(name)) {
+        // Like a server that compresses: Content-Length is the compressed size.
+        const body = zlib.gzipSync(fs.readFileSync(file));
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-encoding': 'gzip',
+          'content-length': body.length, 'cache-control': 'no-store' });
+        res.end(body);
+        return;
+      }
+    } else {
       const rel = url === '/' ? 'index.html' : url.slice(1);
       const p = path.resolve(dist, rel);
       if (p.startsWith(path.resolve(dist))) file = p;
@@ -137,10 +154,8 @@ async function drive(page, url, started, opts, c, assets, log) {
     const webPng = path.join(opts.out, `${c.name}-web.png`);
     fs.writeFileSync(webPng, Buffer.from(png, 'base64'));
     result.web = webPng;
-    // Software rendering can take seconds per frame; stop the loop so the page settles.
+    // Software rendering can take seconds per frame; stop the loop so the page can settle.
     await page.evaluate(() => window.abe.stop());
-    await page.screenshot({ path: path.join(opts.out, `${c.name}-page.png`), timeout: 120000 });
-    result.errors = await page.evaluate(() => window.abe.errors());
     if (c.native) {
       assets.set(`${c.name}-native.png`, c.native);
       const cmp = await page.evaluate(async (src) => {
@@ -185,9 +200,65 @@ async function drive(page, url, started, opts, c, assets, log) {
       }
       result.compare = cmp;
     }
+    // The page with its overlays, for people; best effort while the GPU is still busy.
+    try {
+      await page.screenshot({ path: path.join(opts.out, `${c.name}-page.png`), timeout: 180000 });
+    } catch (e) {
+      result.screenshot = `skipped: ${e.message.split('\n')[0]}`;
+    }
+    result.errors = await page.evaluate(() => window.abe.errors());
   }
   result.ok = !result.failed && result.frames >= Number(c.frames) && result.errors.length === 0
     && (!result.compare || (!result.compare.error && result.compare.mean <= Number(c.max_mean)));
+  return result;
+}
+
+/** The GPU-layer self-test: checks the presented gradient (mip 1 of a 64x64 compute image). */
+async function runSelfTest(browser, port, opts) {
+  const log = [];
+  const page = await browser.newPage({ viewport: { width: 600, height: 400 }, deviceScaleFactor: 1 });
+  page.on('console', (m) => log.push(`[${m.type()}] ${m.text()}`));
+  page.on('pageerror', (e) => log.push(`[pageerror] ${e.message}`));
+  const result = { name: 'selftest' };
+  try {
+    await page.goto(`http://localhost:${port}/index.html?selftest=1&size=256x256&dpr=1`);
+    await page.waitForFunction(() => window.abe && (window.abe.failed || window.abe.selftest),
+      null, { timeout: 120000, polling: 100 });
+    const r = await page.evaluate(() => {
+      if (window.abe.failed) return { failed: window.abe.failed };
+      const { pixels, errors, adapter } = window.abe.selftest;
+      const px = (x, y) => Array.from(pixels.rgba.slice((y * pixels.width + x) * 4, (y * pixels.width + x) * 4 + 3));
+      const cv = document.createElement('canvas');
+      cv.width = pixels.width; cv.height = pixels.height;
+      cv.getContext('2d').putImageData(new ImageData(pixels.rgba, pixels.width, pixels.height), 0, 0);
+      return {
+        adapter, errors: errors(), size: [pixels.width, pixels.height],
+        corners: { topLeft: px(2, 2), topRight: px(253, 2), bottomLeft: px(2, 253), bottomRight: px(253, 253), centre: px(128, 128) },
+        png: cv.toDataURL('image/png').split(',')[1],
+      };
+    });
+    if (r.png) {
+      fs.writeFileSync(path.join(opts.out, 'selftest-web.png'), Buffer.from(r.png, 'base64'));
+      delete r.png;
+    }
+    Object.assign(result, r);
+    const c = r.corners || {};
+    const near = (v, want, tol) => v !== undefined && Math.abs(v - want) <= tol;
+    // Red grows to the right, green downwards, blue is 0.5 (128) everywhere.
+    result.ok = !r.failed && r.errors.length === 0
+      && [c.topLeft, c.topRight, c.bottomLeft, c.bottomRight, c.centre].every((p) => p && near(p[2], 128, 2))
+      && near(c.topLeft[0], 4, 8) && near(c.topLeft[1], 4, 8)
+      && near(c.topRight[0], 251, 8) && near(c.topRight[1], 4, 8)
+      && near(c.bottomLeft[0], 4, 8) && near(c.bottomLeft[1], 251, 8)
+      && near(c.bottomRight[0], 251, 8) && near(c.bottomRight[1], 251, 8)
+      && near(c.centre[0], 128, 8) && near(c.centre[1], 128, 8);
+  } catch (e) {
+    result.ok = false;
+    result.failed = e.message;
+  } finally {
+    fs.writeFileSync(path.join(opts.out, 'selftest-console.txt'), `${log.join('\n')}\n`);
+    await page.close();
+  }
   return result;
 }
 
@@ -209,11 +280,17 @@ async function main() {
       delete c.native;
     }
   }
-  const server = await serve(path.resolve(opts.dist), assets);
+  const gzipped = new Set(opts.cases.filter((c) => c.gzip === '1').map((c) => `${c.name}.abew`));
+  const server = await serve(path.resolve(opts.dist), assets, gzipped);
   const port = server.address().port;
   const browser = await chromium.launch({ args: CHROMIUM_ARGS });
   console.log(`browser: Chromium ${browser.version()} (headless)`);
   const results = [];
+  if (opts.selftest) {
+    const r = await runSelfTest(browser, port, opts);
+    results.push(r);
+    console.log(JSON.stringify(r, null, 2));
+  }
   for (const c of opts.cases) {
     let r;
     try {

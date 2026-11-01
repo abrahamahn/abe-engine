@@ -66,7 +66,7 @@
 <div id="touch" class="panel" aria-label="Controls"></div>
 <noscript>The ABE web player needs JavaScript and WebGPU.</noscript>
 <script type="module">
-import { startPlayer } from './abe.js';
+import { startPlayer, startSelfTest } from './abe.js';
 
 const params = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
@@ -85,9 +85,11 @@ const showError = (text) => {
 window.addEventListener('error', (e) => showError(e.message));
 window.addEventListener('unhandledrejection', (e) => showError(String(e.reason && e.reason.message || e.reason)));
 
-// Canvas size: CSS size times the device pixel ratio (capped by ?dpr=, default 2) times
-// ?scale=; ?size=WxH fixes the drawing buffer instead.
-const maxDpr = Number(params.get('dpr')) || 2;
+// Canvas size: CSS size times the device pixel ratio (capped by ?dpr=; default 2, or 1.5 on
+// touch devices, where full-resolution post-processing is costly) times ?scale=; ?size=WxH
+// fixes the drawing buffer instead.
+const coarse = matchMedia('(pointer: coarse)').matches;
+const maxDpr = Number(params.get('dpr')) || (coarse ? 1.5 : 2);
 const scale = Math.min(Math.max(Number(params.get('scale')) || 1, 0.25), 2);
 const fixed = /^(\d+)x(\d+)$/.exec(params.get('size') || '');
 if (fixed) {
@@ -113,10 +115,31 @@ $('help-toggle').addEventListener('click', () => {
   const open = $('hud').classList.toggle('open');
   $('help-toggle').setAttribute('aria-expanded', String(open));
 });
-if (matchMedia('(pointer: coarse)').matches || params.get('touch') === '1') document.body.classList.add('touch');
+if (coarse || params.get('touch') === '1') document.body.classList.add('touch');
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'KeyH' && !e.repeat) $('help-toggle').click();
+});
 
 const scene = params.get('scene');
-if (!scene) {
+if (params.get('selftest') === '1') {
+  // GPU-layer self-test (compute, copies, mips, canvas blit); see crates/abe-web/src/selftest.rs.
+  try {
+    const result = await startSelfTest({
+      canvas, wasm: params.get('wasm') || './abe_web.wasm', sizeCanvas,
+      onPhase(text) { phase.textContent = text; },
+      onLog(level, text) { (level >= 2 ? console.error : console.log)(text); if (level >= 2) showError(text); },
+      onError: showError,
+    });
+    $('loading').style.display = 'none';
+    $('status').textContent = `self-test done, ${result.errors().length} errors`;
+    $('adapter').textContent = `${result.adapter} · ${result.format}`;
+    window.abe = { selftest: result };
+  } catch (e) {
+    $('loading').style.display = 'none';
+    showError(e.message || String(e));
+    window.abe = { failed: e.message || String(e) };
+  }
+} else if (!scene) {
   showError('Give the world to show: index.html?scene=world.abew&look=look.json');
   phase.textContent = 'No scene';
 } else {

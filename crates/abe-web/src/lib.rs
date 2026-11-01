@@ -11,6 +11,8 @@
 //! (start of the animation clock), `paused=1`, `quality=high`.
 #![cfg(target_arch = "wasm32")]
 
+mod selftest;
+
 use abe_engine::gpu::Device;
 use abe_engine::render::{
     Environment, LookFile, Output, Quality, Renderer, TimeOfDay, View, Weather, math,
@@ -324,6 +326,23 @@ pub extern "C" fn abe_frame(dt: f32) -> u32 {
             0
         }
         None => 0,
+    }
+}
+
+/// Runs the GPU-layer self-test (see `selftest.rs`) and presents its image. Call it from a
+/// `requestAnimationFrame` callback. Returns 1, or 0 after logging an error.
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_selftest() -> u32 {
+    install_panic_hook();
+    match selftest::run() {
+        Ok(report) => {
+            say(0, &report);
+            1
+        }
+        Err(e) => {
+            say(2, &format!("self-test: {e}"));
+            0
+        }
     }
 }
 
