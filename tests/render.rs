@@ -225,6 +225,81 @@ fn time_of_day_weather_and_lamps() {
     assert!(errors.is_empty(), "validation: {errors:?}");
 }
 
+/// Mean absolute difference per channel between two RGBA8 images.
+fn difference(a: &[u8], b: &[u8]) -> f32 {
+    let sum: u64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| u64::from(x.abs_diff(*y)))
+        .sum();
+    sum as f32 / a.len() as f32
+}
+
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn rain_stops_under_a_roof() {
+    // A camera under a wide roof in a storm sees no drops; in the open it does. Each case
+    // compares the frame with and without particles.
+    let mut device = Device::headless().expect("device");
+    let (w, h) = (320, 180);
+    let view = View {
+        name: "under".into(),
+        eye: [0.0, 1.5, 0.0],
+        target: [0.0, 1.0, -10.0],
+        fov: 60.0,
+    };
+    let mut frame = |roof: bool, particles: bool| {
+        let mut meshes = vec![quad(0.0, 40.0, 0)];
+        if roof {
+            meshes.push(quad(3.0, 40.0, 1));
+        }
+        let world = World {
+            instances: (0..meshes.len() as u32)
+                .map(|mesh| Instance {
+                    mesh,
+                    transform: Transform::IDENTITY,
+                })
+                .collect(),
+            meshes,
+            materials: vec![
+                material("ground", [0.4, 0.5, 0.3, 1.0], Shading::Standard),
+                material("roof", [0.5, 0.3, 0.2, 1.0], Shading::Standard),
+            ],
+            textures: vec![],
+            lights: vec![],
+        };
+        let mut quality = Quality::realtime();
+        quality.shadow_size = 512;
+        quality.particles = particles;
+        let mut r = Renderer::new(
+            &mut device,
+            &world,
+            Look::default(),
+            quality,
+            (w, h),
+            Output::Still,
+        )
+        .expect("renderer");
+        let time = TimeOfDay {
+            hours: 12.0,
+            ..TimeOfDay::default()
+        };
+        let storm = Weather::preset("storm").expect("preset");
+        let env = Environment::resolve(&time, &storm, &r.look().palette, 2.0);
+        r.render_still(&mut device, &view, &env, 1).expect("render")
+    };
+    let open = difference(&frame(false, true), &frame(false, false));
+    let covered = difference(&frame(true, true), &frame(true, false));
+    eprintln!("drops change the open frame by {open:.3}, the covered one by {covered:.4}");
+    assert!(open > 0.2, "drops should show in the open: {open}");
+    assert!(
+        covered < open * 0.05,
+        "drops under the roof: {covered} vs {open} in the open"
+    );
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}
+
 #[test]
 #[ignore = "requires a Vulkan driver"]
 fn accumulated_stills_and_resize() {

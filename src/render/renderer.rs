@@ -1,7 +1,8 @@
-//! The stylized renderer's frame: two shadow cascades, a mirrored reflection pass for water,
-//! the main forward pass (world, sky, weather particles) into HDR colour plus normals, then
-//! ambient occlusion, air (outlines, aerial perspective, mist), bloom, tone mapping and grading,
-//! the painterly filter and the final output (a swapchain image or a readback target).
+//! The stylized renderer's frame: two shadow cascades, a top-down rain cover map, a mirrored
+//! reflection pass for water, the main forward pass (world, sky, weather particles) into HDR
+//! colour plus normals, then ambient occlusion, air (outlines, aerial perspective, mist), bloom,
+//! tone mapping and grading, the painterly filter and the final output (a swapchain image or a
+//! readback target).
 
 use crate::gpu::{
     Address, Attachment, BindGroupId, Blend, BufferDesc, BufferId, BufferUsage, ColorTarget,
@@ -26,6 +27,12 @@ const POST: &str = include_str!("shaders/post.wgsl");
 const HDR: Format = Format::Rgba16Float;
 const MAX_LIGHTS_PER_TILE: usize = 96;
 const NEAR: f32 = 0.08;
+/// The rain cover map: a top-down depth map of the world around the rain, so drops stop at
+/// roofs. It reaches past the box the drops wrap around, which sits just ahead of the camera.
+const COVER_MAP_SIZE: u32 = 512;
+const COVER_REACH: f32 = 12.0;
+const RAIN_BOX: f32 = 16.0;
+const PETAL_BOX: f32 = 14.0;
 
 /// How much work each frame does. [`Quality::still`] is for offline images,
 /// [`Quality::realtime`] for the interactive player.
@@ -147,6 +154,7 @@ pub struct Renderer {
     /// Bind groups for alpha-masked materials in the masked shadow pipeline.
     shadow_materials: Vec<Option<BindGroupId>>,
     shadow_map: TextureId,
+    cover_map: TextureId,
     dummy: TextureId,
     linear_clamp: SamplerId,
     shadow_sampler: SamplerId,
@@ -447,6 +455,14 @@ impl Renderer {
             format: Format::Depth32Float,
             usage: TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED,
         })?;
+        let cover_map = device.create_texture(&TextureDesc {
+            width: COVER_MAP_SIZE,
+            height: COVER_MAP_SIZE,
+            layers: 1,
+            mips: 1,
+            format: Format::Depth32Float,
+            usage: TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED,
+        })?;
         let targets = Self::create_targets(device, &quality, output, size)?;
         let mut r = Self {
             scene,
@@ -459,6 +475,7 @@ impl Renderer {
             materials,
             shadow_materials,
             shadow_map,
+            cover_map,
             dummy,
             linear_clamp,
             shadow_sampler,
@@ -619,7 +636,15 @@ impl Renderer {
         }
         let (frame, tiles, index) = (pair(frame), pair(tiles), pair(index));
         let (scene, sky) = (pair(scene), pair(sky));
-        let particle = device.create_bind_group(p.particle, 0, &[(0, buf(frame[0]))])?;
+        let particle = device.create_bind_group(
+            p.particle,
+            0,
+            &[
+                (0, buf(frame[0])),
+                (1, Resource::Texture(self.cover_map)),
+                (2, Resource::Sampler(self.shadow_sampler)),
+            ],
+        )?;
         let post = |d: &mut Device<'_>, pipe, src: Resource, extra: Resource| {
             d.create_bind_group(
                 pipe,
@@ -758,6 +783,22 @@ impl Renderer {
             inv: invert(&view_proj).unwrap_or(math::IDENTITY),
             pos: view.eye,
         }
+    }
+
+    /// Top-down orthographic projection of the rain cover map around `centre`: depth 0 above
+    /// the highest point of the world, 1 below the lowest. The centre snaps to whole texels so
+    /// the cover does not shimmer as the camera moves.
+    fn cover_view(&self, centre: V3) -> M4 {
+        let texel = 2.0 * COVER_REACH / COVER_MAP_SIZE as f32;
+        let (x, z) = (
+            (centre[0] / texel).round() * texel,
+            (centre[2] / texel).round() * texel,
+        );
+        let top = self.scene.max[1] + 1.0;
+        let depth = (top - self.scene.min[1] + 1.0).max(2.0);
+        let v = look_at([x, top, z], [x, top - 1.0, z], [0.0, 0.0, -1.0]);
+        let r = COVER_REACH;
+        mul(&ortho(-r, r, -r, r, 0.0, depth), &v)
     }
 
     fn cascades(&self, view: &View, env: &Environment) -> Cascades {
@@ -1161,6 +1202,39 @@ impl Renderer {
             }
         }
 
+        // Rain and petals wrap around a box just ahead of the camera.
+        let fwd = normalize(sub(view.target, view.eye));
+        let boxes = [RAIN_BOX, PETAL_BOX].map(|b| add(view.eye, scale(fwd, b * 0.5 - 2.0)));
+        // Rain cover: the highest surfaces around the rain, seen from above; cleared (open sky)
+        // when it is dry. Roofs and solid things stop drops; foliage, alpha-masked cut-outs and
+        // water let them through.
+        let cover = self.cover_view(boxes[0]);
+        if self.quality.particles {
+            enc.begin_pass(PassDesc {
+                colors: vec![],
+                depth: Some(Attachment {
+                    texture: self.cover_map,
+                    mip: 0,
+                    layer: 0,
+                    load: Load::Clear([1.0; 4]),
+                    store: true,
+                }),
+            });
+            if env.rain > 0.0 {
+                enc.set_pipeline(p.shadow);
+                enc.set_vertex_buffer(self.scene.vertices, 0);
+                enc.set_index_buffer(self.scene.indices, 0);
+                enc.push_constants(&f32_bytes(&cover));
+                for d in self.scene.draws.iter() {
+                    let foliage = self.scene.materials[d.material].params[3] == 1.0;
+                    if !d.water && !foliage && self.shadow_materials[d.material].is_none() {
+                        enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
+                    }
+                }
+            }
+            enc.end_pass();
+        }
+
         let mut push = [0.0f32; 32];
         push[..16].copy_from_slice(&math::IDENTITY);
         let clear = [0.0, 0.0, 0.0, 0.0];
@@ -1200,19 +1274,31 @@ impl Renderer {
             enc.set_pipeline(p.particle);
             enc.set_bind_group(0, slot.particle);
             let ground = self.scene.water_level.unwrap_or(self.scene.min[1]);
+            let particle_push = |params: [f32; 4], tint: [f32; 4], centre: V3| {
+                let mut pp = [0.0f32; 28];
+                pp[..4].copy_from_slice(&params);
+                pp[4..8].copy_from_slice(&tint);
+                pp[8..11].copy_from_slice(&centre);
+                pp[12..].copy_from_slice(&cover);
+                pp
+            };
             let rain = (env.rain * 26000.0) as u32;
             if rain > 0 {
-                let mut pp = [0.0f32; 8];
-                pp[..4].copy_from_slice(&[0.0, ground, 16.0, 1.0]);
-                pp[4..].copy_from_slice(&[0.7, 0.75, 0.85, 0.3]);
+                let pp = particle_push(
+                    [0.0, ground, RAIN_BOX, 1.0],
+                    [0.7, 0.75, 0.85, 0.3],
+                    boxes[0],
+                );
                 enc.push_constants(&f32_bytes(&pp));
                 enc.draw(6, rain, 0, 0);
             }
             let petals = (env.petals * 3500.0) as u32;
             if petals > 0 {
-                let mut pp = [0.0f32; 8];
-                pp[..4].copy_from_slice(&[1.0, ground, 14.0, 1.0]);
-                pp[4..].copy_from_slice(&[0.95, 0.5, 0.62, 0.9]);
+                let pp = particle_push(
+                    [1.0, ground, PETAL_BOX, 1.0],
+                    [0.95, 0.5, 0.62, 0.9],
+                    boxes[1],
+                );
                 enc.push_constants(&f32_bytes(&pp));
                 enc.draw(6, petals, 0, 0);
             }

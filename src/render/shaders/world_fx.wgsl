@@ -68,12 +68,28 @@ struct SkyOut {
   return out;
 }
 
-// Particles: params = (kind: 0 rain / 1 petals, ground height, box size, amount), tint = rgb, a = alpha.
+// Particles: params = (kind: 0 rain / 1 petals, ground height, box size, amount), tint = rgb, a = alpha,
+// centre = the box the particles wrap around (ahead of the camera, so few are wasted behind it),
+// cover = the top-down projection of `cover_map`, the depth of the highest surface around the box.
 struct ParticlePush {
   params: vec4f,
   tint: vec4f,
+  centre: vec4f,
+  cover: mat4x4f,
 };
 var<push_constant> particle: ParticlePush;
+@group(0) @binding(1) var cover_map: texture_depth_2d;
+@group(0) @binding(2) var cover_sampler: sampler_comparison;
+
+// 1 where nothing solid is above `p` (open sky), 0 under a roof.
+fn open_sky(p: vec3f) -> f32 {
+  let q = particle.cover * vec4f(p, 1.0);
+  let uv = q.xy * 0.5 + vec2f(0.5);
+  if (any(uv <= vec2f(0.0)) || any(uv >= vec2f(1.0)) || q.z <= 0.0 || q.z >= 1.0) {
+    return 1.0;
+  }
+  return textureSampleCompareLevel(cover_map, cover_sampler, uv, q.z - 0.003);
+}
 
 struct ParticleOut {
   @builtin(position) clip: vec4f,
@@ -104,9 +120,10 @@ struct ParticleOut {
     vel = vec3f(0.0, -0.55 - 0.3 * r.w, 0.0) + wind * 0.45;
     pos += vel * t + swirl;
   }
-  // Wrap into a box centred on the camera.
-  let rel = (pos - cam) / box + vec3f(0.5);
-  let world_c = cam + (rel - floor(rel) - vec3f(0.5)) * box;
+  // Wrap into the box.
+  let centre = particle.centre.xyz;
+  let rel = (pos - centre) / box + vec3f(0.5);
+  let world_c = centre + (rel - floor(rel) - vec3f(0.5)) * box;
   let to_cam = normalize(cam - world_c);
   var world = world_c;
   var color = particle.tint;
@@ -114,7 +131,9 @@ struct ParticleOut {
     let along = normalize(vel);
     let side = normalize(cross(along, to_cam) + vec3f(1e-5, 0.0, 0.0));
     world += side * (c.x * 0.006) + along * (c.y * 0.28);
-    color = vec4f(particle.tint.rgb * (frame.amb_sky.rgb * 1.5 + frame.key_color.rgb * frame.key_dir.w * 0.3 + vec3f(0.08)), particle.tint.a);
+    // Drops stop at roofs.
+    let open = open_sky(world_c);
+    color = vec4f(particle.tint.rgb * (frame.amb_sky.rgb * 1.5 + frame.key_color.rgb * frame.key_dir.w * 0.3 + vec3f(0.08)), particle.tint.a * open);
   } else {
     let spin = t * (1.5 + r.w * 2.0) + r.x * 6.28;
     let right = normalize(cross(vec3f(0.0, 1.0, 0.0), to_cam) + vec3f(1e-5, 0.0, 0.0));
@@ -133,6 +152,10 @@ struct ParticleOut {
   }
   var o: ParticleOut;
   o.clip = frame.view_proj * vec4f(world, 1.0);
+  if (color.a <= 0.0) {
+    // Invisible (covered, or at the lens): clip the quad away before it rasterizes.
+    o.clip = vec4f(0.0, 0.0, -1.0, 1.0);
+  }
   o.uv = c;
   o.color = color;
   return o;
