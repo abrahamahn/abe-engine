@@ -5,7 +5,10 @@
 use std::fmt::Write;
 use std::process::Command;
 
-use abe_shader::{Stage, compile};
+use abe_shader::{Stage, compile, compile_msl};
+
+#[path = "msl/check.rs"]
+mod msl_check;
 
 struct Rng(u64);
 
@@ -975,6 +978,7 @@ fn random_well_typed_programs_validate() {
             "note: spirv-val not found on PATH; random programs are compiled but not validated"
         );
     }
+    let clang = msl_check::clang();
     let mut failures = 0;
     let mut rejected = 0;
     for n in 0..count {
@@ -1002,6 +1006,27 @@ fn random_well_typed_programs_validate() {
         } else {
             Stage::Compute
         };
+        // Every program also goes through the MSL emitter; a sample is compiled with clang++
+        // against the stand-in metal_stdlib when it is available.
+        match compile_msl(&src, stage, "main") {
+            Ok(c) => {
+                if let (Some(clang), true) = (&clang, n % 3 == 0)
+                    && let Err(msg) = msl_check::clang_check(
+                        clang,
+                        &format!("random{n}"),
+                        &c.msl.expect("compile_msl fills msl").source,
+                    )
+                {
+                    failures += 1;
+                    eprintln!("program {n}: MSL rejected:\n{msg}\n{src}");
+                }
+            }
+            Err(e) if CONST_EVAL_ERRORS.iter().any(|m| e.message.contains(m)) => {}
+            Err(e) => {
+                failures += 1;
+                eprintln!("program {n}: MSL emission failed: {e}\n{src}");
+            }
+        }
         match compile(&src, stage, "main") {
             // Random constant subexpressions can legitimately overflow (`0u - 28u`) or divide
             // by zero; WGSL makes those shader-creation errors.

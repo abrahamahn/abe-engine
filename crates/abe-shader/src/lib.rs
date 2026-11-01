@@ -2,7 +2,8 @@
 //!
 //! The engine owns its shader toolchain end to end. Shaders are authored once in a documented
 //! WGSL subset, compiled here with zero third-party code, and handed to each graphics backend:
-//! SPIR-V for Vulkan today; MSL, HLSL and WGSL text emitters belong next to this one later.
+//! SPIR-V for Vulkan and Metal Shading Language for Metal ([`compile_msl`]); HLSL and WGSL
+//! text emitters belong next to these later.
 //!
 //! The public types below are the contract the GPU layer builds pipelines from. Reflection only
 //! lists resources and interface variables that the selected entry point statically uses.
@@ -125,6 +126,7 @@ mod consteval;
 mod emit;
 mod ir;
 mod lexer;
+mod msl;
 mod parser;
 mod spirv;
 mod types;
@@ -132,6 +134,10 @@ pub mod wgsl;
 
 #[cfg(test)]
 mod tests;
+
+pub use msl::{
+    MAX_RESOURCE_BUFFERS, Msl, MslIndex, MslSlot, PUSH_CONSTANT_BUFFER, SIZES_BUFFER, VERTEX_BUFFER,
+};
 
 /// Pipeline stage of the selected entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -157,6 +163,9 @@ pub struct Compiled {
     pub outputs: Vec<Interface>,
     /// `@workgroup_size` for compute entry points; `[1, 1, 1]` otherwise.
     pub workgroup_size: [u32; 3],
+    /// The same entry point as Metal Shading Language: filled by [`compile`] on Apple
+    /// targets and by [`compile_msl`] everywhere; `None` otherwise.
+    pub msl: Option<Msl>,
     /// WebGPU WGSL for the same entry point, filled by [`compile_wgsl`] (`None` from
     /// [`compile`]).
     pub wgsl: Option<wgsl::Wgsl>,
@@ -259,10 +268,24 @@ impl std::error::Error for Error {}
 /// The whole module is parsed and type-checked; only the entry point's call tree and the
 /// resources it uses are emitted and reflected.
 pub fn compile(source: &str, stage: Stage, entry: &str) -> Result<Compiled, Error> {
+    compile_targets(source, stage, entry, cfg!(target_vendor = "apple"))
+}
+
+/// Like [`compile`], and also emits the entry point as MSL into [`Compiled::msl`] on every
+/// platform (see the `msl` module documentation for the conventions).
+pub fn compile_msl(source: &str, stage: Stage, entry: &str) -> Result<Compiled, Error> {
+    compile_targets(source, stage, entry, true)
+}
+
+fn compile_targets(source: &str, stage: Stage, entry: &str, msl: bool) -> Result<Compiled, Error> {
     let tokens = lexer::tokenize(source)?;
     let module = parser::parse(tokens)?;
     let program = check::check(&module)?;
-    emit::emit(&program, stage, entry)
+    let mut compiled = emit::emit(&program, stage, entry)?;
+    if msl {
+        compiled.msl = Some(msl::emit(&program, stage, entry)?);
+    }
+    Ok(compiled)
 }
 
 /// [`compile`], plus WebGPU WGSL for the entry point in [`Compiled::wgsl`]. The reflection is

@@ -100,7 +100,32 @@ cargo test --locked --offline --test gpu --test render -- --ignored
 
 Use `Presenter::set_static_scene` once for the environment and `draw_with_static` each frame for changing objects. The two draws share a depth buffer.
 
-The offscreen tests check depth, pixel readback, GPU camera projection and mixed static/changing geometry. The desktop test needs a display and exercises resize, hide/restore, and presenter recreation. Linux presentation and keyboard input have been exercised on Mesa llvmpipe under Xvfb with synchronization validation. Windows is cross-built and still needs a native device run. Android has the offscreen backend only. Apple Metal is planned. Browsers run the WebGPU backend (see above). The Vulkan ABI declarations are adapted from [Khronos Vulkan-Headers v1.3.275](https://github.com/KhronosGroup/Vulkan-Headers/tree/v1.3.275) under the license in [docs/Vulkan-Registry-LICENSE.txt](docs/Vulkan-Registry-LICENSE.txt).
+The offscreen tests check depth, pixel readback, GPU camera projection and mixed static/changing geometry. The desktop test needs a display and exercises resize, hide/restore, and presenter recreation. Linux presentation and keyboard input have been exercised on Mesa llvmpipe under Xvfb with synchronization validation. Windows is cross-built and still needs a native device run. Android has the offscreen backend only. Browsers run the WebGPU backend (see above), and Apple Metal is described below. The Vulkan ABI declarations are adapted from [Khronos Vulkan-Headers v1.3.275](https://github.com/KhronosGroup/Vulkan-Headers/tree/v1.3.275) under the license in [docs/Vulkan-Registry-LICENSE.txt](docs/Vulkan-Registry-LICENSE.txt).
+
+## Run on a Mac or an iPhone (Metal)
+
+On macOS and iOS the same `gpu::Device` API runs on Metal, bound through the Objective-C runtime with no third-party code. `abe-shader` emits each entry point as Metal Shading Language next to its SPIR-V (`abe_shader::compile_msl`; `abe-shaderc shader.wgsl fragment fs_main out.metal` prints one), keeping WGSL's buffer layouts byte for byte, and the device compiles it when a pipeline is created. Status: compiled for `aarch64-apple-darwin`, `aarch64-apple-ios` and `aarch64-apple-ios-sim`, and every shader's MSL compiles against a stand-in Metal library with clang; nothing has run on Apple hardware yet.
+
+macOS needs the Xcode command-line tools (`xcode-select --install`) and Rust:
+
+```sh
+scripts/apple/build-mac.sh                  # release abe-player and abe-render
+scripts/apple/build-mac.sh --shaders        # also compile every renderer shader with Apple's metal compiler
+scripts/apple/build-mac.sh --test           # also run the backend tests and render the test scene on Metal
+target/aarch64-apple-darwin/release/abe-render --scene world.abew --look look.json --all-views --out-dir renders
+target/aarch64-apple-darwin/release/abe-player --scene world.abew --look look.json
+```
+
+The player's controls are those listed above. Window sizes are pixels, so `--size 1600x900` is an 800x450-point window on a Retina display. `MTL_DEBUG_LAYER=1` turns on Metal's API validation (messages go to the console) and `ABE_METAL_DEVICE` picks a GPU by name on Macs with several. The built-in observatory needs the Vulkan presenter, so the Mac player needs `--scene`.
+
+The iPhone app, `abe-ios`, renders a cooked world bundled into it. Drag one finger to look, drag two fingers to move, and tap the buttons to step the time of day, cycle the weather and cycle the Look file's views. Building it needs Xcode itself (the iOS SDK and simulators; `sudo xcode-select -s /Applications/Xcode.app`) and `rustup target add aarch64-apple-ios aarch64-apple-ios-sim`:
+
+```sh
+scripts/apple/build-ios.sh --sim --world world.abew --look look.json
+ABE_IOS_TEAM=ABCDE12345 scripts/apple/build-ios.sh --device --world world.abew --look look.json
+```
+
+Installing on a device needs an Apple ID team (a free personal team works for development) and a development provisioning profile for the app's bundle identifier, `dev.abe.player.<team id in lower case>` unless `ABE_IOS_BUNDLE_ID` sets another. To get one, once: sign in with the Apple ID in Xcode > Settings > Accounts, connect and trust the iPhone, enable Developer Mode on it, create an iOS App project in Xcode with that bundle identifier and your team, and run it on the phone. The script then finds the profile Xcode downloaded, signs with your Apple Development identity (`ABE_IOS_PROFILE` and `ABE_IOS_IDENTITY` override the choice), installs with `xcrun devicectl` and launches the app. Free-team profiles expire after seven days.
 
 ## Measure frame time
 

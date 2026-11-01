@@ -1,20 +1,22 @@
 //! Compile one entry point of a WGSL file to SPIR-V and print its reflection. An output path
-//! ending in `.wgsl` writes the WebGPU WGSL for the entry point instead.
+//! ending in `.metal` writes Metal Shading Language and its binding map instead, and one
+//! ending in `.wgsl` writes the WebGPU WGSL for the entry point.
 //!
 //! ```sh
 //! cargo run -p abe-shader --example abe-shaderc -- shader.wgsl fragment fs_main out.spv
+//! cargo run -p abe-shader --example abe-shaderc -- shader.wgsl fragment fs_main out.metal
 //! cargo run -p abe-shader --example abe-shaderc -- shader.wgsl fragment fs_main out.wgsl
 //! ```
 
 use std::process::ExitCode;
 
-use abe_shader::{Stage, compile, compile_wgsl};
+use abe_shader::{Stage, compile, compile_msl, compile_wgsl};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 5 {
         eprintln!(
-            "usage: abe-shaderc <file.wgsl> <vertex|fragment|compute> <entry> <out.spv|out.wgsl>"
+            "usage: abe-shaderc <file.wgsl> <vertex|fragment|compute> <entry> <out.spv|out.metal|out.wgsl>"
         );
         return ExitCode::from(2);
     }
@@ -35,8 +37,11 @@ fn main() -> ExitCode {
         }
     };
     let start = std::time::Instant::now();
+    let metal = args[4].ends_with(".metal");
     let webgpu = args[4].ends_with(".wgsl");
-    let result = if webgpu {
+    let result = if metal {
+        compile_msl(&source, stage, &args[3])
+    } else if webgpu {
         compile_wgsl(&source, stage, &args[3])
     } else {
         compile(&source, stage, &args[3])
@@ -49,8 +54,9 @@ fn main() -> ExitCode {
         }
     };
     let elapsed = start.elapsed();
-    let bytes = match &compiled.wgsl {
-        Some(w) if webgpu => w.source.clone().into_bytes(),
+    let bytes = match (&compiled.msl, &compiled.wgsl) {
+        (Some(msl), _) if metal => msl.source.clone().into_bytes(),
+        (_, Some(w)) if webgpu => w.source.clone().into_bytes(),
         _ => compiled.to_bytes(),
     };
     if let Err(e) = std::fs::write(&args[4], bytes) {
@@ -66,6 +72,25 @@ fn main() -> ExitCode {
         elapsed.as_secs_f64() * 1e3,
         args[4]
     );
+    if let Some(msl) = compiled.msl.as_ref().filter(|_| metal) {
+        println!("  MSL entry point {}", msl.entry_point);
+        for s in &msl.slots {
+            println!(
+                "  binding group {} binding {}: {:?}",
+                s.group, s.binding, s.index
+            );
+        }
+        if let Some(b) = msl.push_constant_buffer {
+            println!("  push constants: buffer {b}");
+        }
+        if !msl.sized_bindings.is_empty() {
+            println!(
+                "  buffer sizes (buffer {}): {:?}",
+                abe_shader::SIZES_BUFFER,
+                msl.sized_bindings
+            );
+        }
+    }
     for b in &compiled.bindings {
         println!(
             "  binding group {} binding {}: {:?}",

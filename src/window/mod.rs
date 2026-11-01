@@ -7,6 +7,14 @@ pub use x11::Window;
 mod win32;
 #[cfg(target_os = "windows")]
 pub use win32::Window;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::Window;
+#[cfg(target_os = "ios")]
+pub mod ios;
+#[cfg(target_os = "ios")]
+pub use ios::Window;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Key {

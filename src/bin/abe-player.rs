@@ -3,14 +3,8 @@
 #[path = "../../samples/observatory/scene.rs"]
 mod demo;
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use abe_engine::{
-        Camera, Vec3,
-        vulkan::present::{DesktopRenderer, PresentStatus},
-        window::{Event, Key, Window},
-    };
-    use std::time::{Duration, Instant};
     let mut args = std::env::args().skip(1);
     let (mut limit, mut scene_path) = (None, None);
     let mut look_path: Option<String> = None;
@@ -52,6 +46,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return stylized::run(world, look_path.as_deref(), limit, high, size, p);
         }
     }
+    observatory(scene_path, limit)
+}
+
+/// The built-in sculpture (or an unlit scene) through the Vulkan presenter.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn observatory(
+    scene_path: Option<String>,
+    limit: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use abe_engine::{
+        Camera, Vec3,
+        vulkan::present::{DesktopRenderer, PresentStatus},
+        window::{Event, Key, Window},
+    };
+    use std::time::{Duration, Instant};
     let asset = scene_path
         .map(|p| -> Result<_, String> {
             let world = abe_engine::assets::cooked::decode(&abe_engine::assets::read_asset(
@@ -116,8 +125,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Presentation {:?}", presenter.stats());
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+fn observatory(_: Option<String>, _: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
+    Err(
+        "on macOS the player runs the stylized renderer on Metal: pass --scene world.abew \
+         (a scene with materials, or add --look look.json); the built-in observatory needs \
+         the Vulkan presenter"
+            .into(),
+    )
+}
+
 /// The stylized renderer in a window: fly around, scrub the time of day, change the weather.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 mod stylized {
     use abe_engine::gpu::Device;
     use abe_engine::render::{
@@ -385,8 +405,8 @@ Shift faster, 1-9 views, T/G time +/-, C day cycle, Y next weather, P pause moti
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn main() {
-    eprintln!("This version of the presented player requires Windows or Linux/X11.");
+    eprintln!("This version of the presented player requires Windows, Linux/X11 or macOS.");
     std::process::exit(1);
 }

@@ -43,6 +43,7 @@ fn shader(
         inputs,
         outputs,
         workgroup_size: [1, 1, 1],
+        msl: None,
         wgsl: None,
     }
 }
