@@ -75,6 +75,19 @@ pub use types::*;
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
 use crate::vulkan::rhi::Gpu;
+#[cfg(target_arch = "wasm32")]
+mod webgpu;
+
+/// Compiles `entry` of a shader `source` for this platform's backend: SPIR-V and reflection,
+/// plus WGSL (with push constants lowered to a dynamically offset uniform) when the backend is
+/// WebGPU. Pipelines on WebGPU need shaders compiled this way.
+pub fn compile_shader(source: &str, stage: shader::Stage, entry: &str) -> Result<shader::Compiled> {
+    #[cfg(target_arch = "wasm32")]
+    let compiled = abe_shader::compile_wgsl(source, stage, entry);
+    #[cfg(not(target_arch = "wasm32"))]
+    let compiled = abe_shader::compile(source, stage, entry);
+    compiled.map_err(|e| format!("shader {entry}: {e}"))
+}
 
 /// Validation messages collected while `ABE_VULKAN_VALIDATION=1`. The log outlives the device,
 /// so it can also report errors raised while the device is torn down.
@@ -238,6 +251,139 @@ impl<'w> Device<'w> {
     }
     /// 0 or 1: which per-frame resources the next frame may overwrite. When `present` returns,
     /// the GPU has finished the earlier frame that used this slot.
+    pub fn frame_slot(&self) -> usize {
+        self.gpu.frame_slot()
+    }
+}
+
+/// A GPU device in a browser, on WebGPU (`wasm32` builds hosted by `web/abe.js`).
+///
+/// The host creates the adapter, the device and (for [`Device::for_canvas`]) the canvas
+/// context before the engine starts. The contract above holds with these differences:
+/// `submit` and `present` never wait; queue writes and submissions run in call order, so
+/// per-frame resources are not required for correctness; the frame is presented when the
+/// `requestAnimationFrame` callback returns; `read_buffer` returns an error (browsers map
+/// buffers asynchronously). WebGPU always validates: errors arrive asynchronously and
+/// [`Device::validation_errors`] returns those reported so far. Shaders must come from
+/// [`compile_shader`]. See the `webgpu` module for the remaining limits.
+#[cfg(target_arch = "wasm32")]
+pub struct Device<'w> {
+    gpu: webgpu::Gpu<'w>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Device<'static> {
+    /// The host's device, without presentation.
+    pub fn headless() -> Result<Self> {
+        Ok(Self {
+            gpu: webgpu::Gpu::open(false)?,
+        })
+    }
+    /// The host's device and its canvas: `acquire` returns the canvas texture.
+    pub fn for_canvas() -> Result<Self> {
+        Ok(Self {
+            gpu: webgpu::Gpu::open(true)?,
+        })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Device<'_> {
+    pub fn name(&self) -> &str {
+        self.gpu.name()
+    }
+    pub fn limits(&self) -> Limits {
+        self.gpu.limits()
+    }
+    /// Always true: WebGPU validates every call.
+    pub fn validation_enabled(&self) -> bool {
+        true
+    }
+    /// WebGPU errors reported so far (validation, out of memory, lost device, shader
+    /// compilation). They arrive asynchronously, after the call that caused them.
+    pub fn validation_errors(&self) -> Vec<String> {
+        self.gpu.validation_errors()
+    }
+    pub fn validation_log(&self) -> ValidationLog {
+        ValidationLog(std::sync::Arc::new(std::sync::Mutex::new(
+            self.validation_errors(),
+        )))
+    }
+    pub fn create_buffer(&mut self, d: &BufferDesc) -> Result<BufferId> {
+        self.gpu.create_buffer(d)
+    }
+    /// `queue.writeBuffer`: ordered after earlier submissions; offset and length must be
+    /// multiples of 4.
+    pub fn write_buffer(&mut self, b: BufferId, offset: u64, data: &[u8]) -> Result<()> {
+        self.gpu.write_buffer(b, offset, data)
+    }
+    /// Not available on WebGPU.
+    pub fn read_buffer(&self, b: BufferId) -> Result<Vec<u8>> {
+        self.gpu.read_buffer(b)
+    }
+    pub fn create_texture(&mut self, d: &TextureDesc) -> Result<TextureId> {
+        self.gpu.create_texture(d)
+    }
+    pub fn write_texture(&mut self, t: TextureId, mip: u32, layer: u32, data: &[u8]) -> Result<()> {
+        self.gpu.write_texture(t, mip, layer, data)
+    }
+    pub fn generate_mips(&mut self, t: TextureId) -> Result<()> {
+        self.gpu.generate_mips(t)
+    }
+    pub fn texture_desc(&self, t: TextureId) -> Result<TextureDesc> {
+        self.gpu.texture_desc(t)
+    }
+    pub fn create_sampler(&mut self, d: &SamplerDesc) -> Result<SamplerId> {
+        self.gpu.create_sampler(d)
+    }
+    pub fn create_render_pipeline(&mut self, d: &RenderPipelineDesc) -> Result<PipelineId> {
+        self.gpu.create_render_pipeline(d)
+    }
+    pub fn create_compute_pipeline(&mut self, shader: &abe_shader::Compiled) -> Result<PipelineId> {
+        self.gpu.create_compute_pipeline(shader)
+    }
+    pub fn create_bind_group(
+        &mut self,
+        pipeline: PipelineId,
+        group: u32,
+        entries: &[(u32, Resource)],
+    ) -> Result<BindGroupId> {
+        self.gpu.create_bind_group(pipeline, group, entries)
+    }
+    pub fn destroy_buffer(&mut self, b: BufferId) {
+        self.gpu.destroy_buffer(b)
+    }
+    pub fn destroy_texture(&mut self, t: TextureId) {
+        self.gpu.destroy_texture(t)
+    }
+    pub fn destroy_bind_group(&mut self, g: BindGroupId) {
+        self.gpu.destroy_bind_group(g)
+    }
+    pub fn encoder(&self) -> Encoder {
+        Encoder::new()
+    }
+    /// Records `e` and submits it without waiting.
+    pub fn submit(&mut self, e: Encoder) -> Result<()> {
+        self.gpu.submit(e)
+    }
+    /// The canvas texture at the canvas's current size, or `None` while it has no area.
+    pub fn acquire(&mut self) -> Result<Option<TextureId>> {
+        self.gpu.acquire()
+    }
+    /// The canvas format (`Bgra8Unorm` or `Rgba8Unorm`; the renderer encodes sRGB itself).
+    pub fn surface_format(&self) -> Format {
+        self.gpu.surface_format()
+    }
+    /// The canvas size in device pixels.
+    pub fn surface_size(&self) -> (u32, u32) {
+        self.gpu.surface_size()
+    }
+    /// Submits `e`, which renders into the canvas texture; the browser presents it when the
+    /// current animation frame callback returns.
+    pub fn present(&mut self, e: Encoder) -> Result<()> {
+        self.gpu.present(e)
+    }
+    /// 0 or 1, alternating with every `present`.
     pub fn frame_slot(&self) -> usize {
         self.gpu.frame_slot()
     }

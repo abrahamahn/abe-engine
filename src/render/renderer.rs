@@ -162,7 +162,7 @@ pub struct Renderer {
 
 fn compile(body: &str, stage: Stage, entry: &str) -> Result<Compiled> {
     let source = format!("{COMMON}\n{body}");
-    abe_shader::compile(&source, stage, entry).map_err(|e| format!("shader {entry}: {e}"))
+    crate::gpu::compile_shader(&source, stage, entry)
 }
 
 fn color(format: Format, blend: Blend) -> ColorTarget {
