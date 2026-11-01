@@ -380,6 +380,8 @@ impl<'w> Gpu<'w> {
             let staging = self.stage(data)?;
             self.immediate(|_, cb| {
                 // SAFETY: the staging buffer holds the tightly packed rows of one subresource.
+                // One image is copied, so its image stride is 0 (as wgpu does: a non-zero
+                // stride for a single image can fail Metal's validation).
                 unsafe {
                     let blit = send!(cb, "blitCommandEncoder"; Id);
                     send!(
@@ -388,7 +390,7 @@ impl<'w> Gpu<'w> {
                         staging => Id,
                         0usize => NSUInteger,
                         (u64::from(w) * texel) as NSUInteger => NSUInteger,
-                        expected as NSUInteger => NSUInteger,
+                        0usize => NSUInteger,
                         MTLSize { width: w as usize, height: h as usize, depth: 1 } => MTLSize,
                         dst.id() => Id,
                         layer as NSUInteger => NSUInteger,

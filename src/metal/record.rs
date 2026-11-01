@@ -803,6 +803,7 @@ impl<'w> Gpu<'w> {
             ));
         }
         // SAFETY: a blit encoder copying one whole subresource into a large enough buffer.
+        // One image is copied, so the image stride is 0 (as in write_texture).
         unsafe {
             let blit = send!(cb, "blitCommandEncoder"; Id);
             send!(
@@ -816,7 +817,7 @@ impl<'w> Gpu<'w> {
                 b.obj.id() => Id,
                 offset as NSUInteger => NSUInteger,
                 (u64::from(w) * texel) as NSUInteger => NSUInteger,
-                bytes as NSUInteger => NSUInteger;
+                0usize => NSUInteger;
                 ()
             );
             send!(blit, "endEncoding"; ());

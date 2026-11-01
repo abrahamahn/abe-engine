@@ -396,11 +396,12 @@ impl Window {
                 send!(w, "center"; ());
                 send!(w, "makeKeyAndOrderFront:", core::ptr::null_mut::<c_void>() => Id; ());
                 send!(w, "makeFirstResponder:", view.id() => Id; i8);
-                // macOS 14 replaced activateIgnoringOtherApps: with activate.
+                // A binary started from a terminal must take focus from it. macOS 14 added
+                // cooperative `activate` and deprecated (but kept) the forceful call, which
+                // winit, GLFW and SDL still use; send both where both exist.
+                send!(app, "activateIgnoringOtherApps:", true => bool; ());
                 if send!(app, "respondsToSelector:", objc::sel!("activate") => Sel; i8) != 0 {
                     send!(app, "activate"; ());
-                } else {
-                    send!(app, "activateIgnoringOtherApps:", true => bool; ());
                 }
                 state.size.set(content_pixels(w));
                 Ok(Self {
