@@ -3,6 +3,8 @@
 //! abe-render --scene world.abew [--look look.json] [--view NAME | --all-views]
 //!            [--time HOURS] [--weather PRESET] [--width W] [--height H] [--samples N]
 //!            [--seconds S] [--out FILE.png | --out-dir DIR]
+//!            [--sequence START_HOURS END_HOURS FRAMES]   (a time-lapse of one view, numbered
+//!                                                         frames in --out-dir)
 use abe_engine::gpu::Device;
 use abe_engine::render::{Environment, LookFile, Output, Quality, Renderer, View, Weather};
 use std::path::{Path, PathBuf};
@@ -28,6 +30,7 @@ fn run() -> Result<(), String> {
     let mut out = PathBuf::from("render.png");
     let mut out_dir: Option<PathBuf> = None;
     let mut realtime = false;
+    let mut sequence: Option<(f32, f32, u32)> = None;
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
         match a.as_str() {
@@ -44,10 +47,23 @@ fn run() -> Result<(), String> {
             "--out" => out = PathBuf::from(val()?),
             "--out-dir" => out_dir = Some(PathBuf::from(val()?)),
             "--realtime-quality" => realtime = true,
+            "--sequence" => {
+                let a: f32 = val()?
+                    .parse()
+                    .map_err(|e| format!("--sequence start: {e}"))?;
+                let b: f32 = val()?.parse().map_err(|e| format!("--sequence end: {e}"))?;
+                let n: u32 = val()?
+                    .parse()
+                    .map_err(|e| format!("--sequence frames: {e}"))?;
+                sequence = Some((a, b, n.max(2)));
+            }
             _ => return Err(format!("unknown argument {a}")),
         }
     }
     let scene = scene.ok_or("--scene is required")?;
+    if sequence.is_some() && (all_views || out_dir.is_none()) {
+        return Err("--sequence renders one view (--view NAME) into --out-dir".into());
+    }
     let started = Instant::now();
     let world = abe_engine::assets::cooked::decode(&abe_engine::assets::read_asset(&scene)?)?;
     let mut file = match &look_path {
@@ -113,6 +129,33 @@ fn run() -> Result<(), String> {
             fov: 45.0,
         }]
     };
+    if let Some((start, end, frames)) = sequence {
+        let dir = out_dir.clone().ok_or("--sequence needs --out-dir")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let view = &views[0];
+        for i in 0..frames {
+            let t = Instant::now();
+            let mut time = file.time;
+            time.hours = start + (end - start) * i as f32 / (frames - 1) as f32;
+            // Motion (water, clouds, rain, petals) runs at 24 frames a second.
+            let env = Environment::resolve(
+                &time,
+                &file.weather,
+                &file.look.palette,
+                seconds + i as f32 / 24.0,
+            );
+            let pixels = renderer.render_still(&mut device, view, &env, samples)?;
+            let png = abe_engine::assets::png::encode(width, height, &pixels)?;
+            write(&dir.join(format!("{}-{i:05}.png", view.name)), &png)?;
+            eprintln!(
+                "frame {}/{frames} at {:.2}h in {:.1}s",
+                i + 1,
+                time.hours,
+                t.elapsed().as_secs_f32()
+            );
+        }
+        return Ok(());
+    }
     let env = Environment::resolve(&file.time, &file.weather, &file.look.palette, seconds);
     for view in &views {
         let t = Instant::now();
