@@ -237,6 +237,7 @@ async function drive(page, url, started, opts, c, assets, log) {
     frames: window.abe.failed ? 0 : window.abe.frames(),
     errors: window.abe.failed ? [] : window.abe.errors(),
     adapter: window.abe.adapter || '',
+    wasmMemoryMB: window.abe.exports ? window.abe.exports.memory.buffer.byteLength / 1048576 : 0,
     status: document.getElementById('status').textContent,
     userAgent: navigator.userAgent,
   }));
