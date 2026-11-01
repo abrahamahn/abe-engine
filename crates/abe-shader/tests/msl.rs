@@ -167,3 +167,83 @@ fn uniform_layout_padding_matches_wgsl() {
     assert!(!m.source.contains(" main("));
     assert_eq!(m.entry_point, "abe_entry_main");
 }
+
+fn msl_of(src: &str, stage: Stage, entry: &str) -> String {
+    let m = compile_msl(src, stage, entry)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .msl
+        .unwrap();
+    if let Some(clang) = clang() {
+        clang_check(&clang, entry, &m.source).unwrap_or_else(|e| panic!("{e}\n{}", m.source));
+    }
+    m.source
+}
+
+#[test]
+fn continuing_reads_body_lets_after_a_continue() {
+    // `continue` jumps to `continuing`, which reads a `let` of the body: the MSL loop runs
+    // `continuing` at the top of the next iteration, so the `let` lives outside the loop.
+    let src = "
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(1) fn main() {
+  var i = 0u;
+  var total = 0u;
+  loop {
+    let step = i * 2u + 1u;
+    if (step > 7u) {
+      continue;
+    }
+    total += step;
+    continuing {
+      i += step;
+      break if i > 20u;
+    }
+  }
+  out[0] = total;
+}";
+    let m = msl_of(src, Stage::Compute, "main");
+    assert!(m.contains("uint step;"), "{m}");
+    assert!(m.contains("step = ((i * 2u) + 1u);"), "{m}");
+    assert!(m.contains("if (abe_continuing) {"), "{m}");
+}
+
+#[test]
+fn side_effects_keep_wgsl_evaluation_order() {
+    // `bump` writes `counter`, so `counter + bump()` must read `counter` first, and the
+    // short-circuit right operand with two such calls must only run when needed.
+    let src = "
+var<private> counter: u32;
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+fn bump() -> u32 {
+  counter += 1u;
+  return counter;
+}
+@compute @workgroup_size(1) fn main() {
+  let a = counter + bump();
+  let b = out[0] > 3u && bump() + bump() > 4u;
+  out[1] = a + u32(b);
+}";
+    let m = msl_of(src, Stage::Compute, "main");
+    let first = m.find("const uint abe_t = counter;").expect(&m);
+    let call = m.find("const uint abe_t_1 = bump(counter);").expect(&m);
+    assert!(first < call, "{m}");
+    assert!(m.contains("bool abe_cond = (out[0u] > 3u);"), "{m}");
+    assert!(m.contains("if (abe_cond) {"), "{m}");
+}
+
+#[test]
+fn packed_members_are_written_whole() {
+    // A component store into a packed vec3 member rewrites the whole vector.
+    let src = "
+struct P { v: vec3f, w: f32 };
+@group(0) @binding(0) var<storage, read_write> ps: array<P>;
+@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {
+  ps[id.x].v.y = 2.0;
+  ps[id.x].v.xz += vec2f(1.0);
+  ps[id.x].w = ps[id.x].v.z;
+}";
+    let m = msl_of(src, Stage::Compute, "main");
+    assert!(m.contains("metal::packed_float3 v;"), "{m}");
+    assert!(m.contains("device metal::packed_float3& abe_ref"), "{m}");
+    assert!(m.contains("metal::float3(ps[id.x].v).z"), "{m}");
+}
