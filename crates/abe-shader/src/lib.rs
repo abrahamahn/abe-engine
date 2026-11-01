@@ -99,7 +99,10 @@
 //! thread stack in debug builds.
 //!
 //! Besides [`compile`], [`entry_points`] lists a module's entry points and
-//! [`Compiled::to_bytes`] gives the module as little-endian bytes.
+//! [`Compiled::to_bytes`] gives the module as little-endian bytes. [`compile_wgsl`] also
+//! produces WebGPU WGSL for the entry point from the same checked program ([`wgsl`] describes
+//! the lowering: push constants become a dynamically offset uniform in
+//! [`wgsl::PUSH_CONSTANT_GROUP`], and clip-space y is flipped in a generated entry wrapper).
 //!
 //! # SPIR-V conventions
 //!
@@ -125,6 +128,7 @@ mod lexer;
 mod parser;
 mod spirv;
 mod types;
+pub mod wgsl;
 
 #[cfg(test)]
 mod tests;
@@ -153,6 +157,9 @@ pub struct Compiled {
     pub outputs: Vec<Interface>,
     /// `@workgroup_size` for compute entry points; `[1, 1, 1]` otherwise.
     pub workgroup_size: [u32; 3],
+    /// WebGPU WGSL for the same entry point, filled by [`compile_wgsl`] (`None` from
+    /// [`compile`]).
+    pub wgsl: Option<wgsl::Wgsl>,
 }
 
 /// A resource declared with `@group(g) @binding(b)`.
@@ -256,6 +263,18 @@ pub fn compile(source: &str, stage: Stage, entry: &str) -> Result<Compiled, Erro
     let module = parser::parse(tokens)?;
     let program = check::check(&module)?;
     emit::emit(&program, stage, entry)
+}
+
+/// [`compile`], plus WebGPU WGSL for the entry point in [`Compiled::wgsl`]. The reflection is
+/// the SPIR-V module's; the push-constant block, if used, is the uniform at
+/// [`wgsl::Wgsl::push_constants`].
+pub fn compile_wgsl(source: &str, stage: Stage, entry: &str) -> Result<Compiled, Error> {
+    let tokens = lexer::tokenize(source)?;
+    let module = parser::parse(tokens)?;
+    let program = check::check(&module)?;
+    let mut compiled = emit::emit(&program, stage, entry)?;
+    compiled.wgsl = Some(wgsl::emit(&program, stage, entry)?);
+    Ok(compiled)
 }
 
 /// List the entry points declared in `source` (name and stage) in declaration order, after
