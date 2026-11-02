@@ -66,6 +66,6 @@ esac
 
 mkdir -p "$out"
 cp "$target_dir/$target/release/abe_web.wasm" "$out/abe_web.wasm"
-cp web/index.html web/abe.js web/abe.d.ts "$out/"
+cp web/index.html web/abe.js web/abe.d.ts web/character-customization.{mjs,d.mts} "$out/"
 size=$(wc -c < "$out/abe_web.wasm")
 echo "build-web: $out (abe_web.wasm $((size / 1024)) KiB, $mode)"
