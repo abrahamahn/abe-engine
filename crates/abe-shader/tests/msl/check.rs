@@ -4,6 +4,11 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Tests run on parallel threads of one process and several compile an entry point of the same
+/// name, so each check writes its own file instead of sharing `<tag>.cpp` in the process's folder.
+static CHECK_FILE: AtomicUsize = AtomicUsize::new(0);
 
 /// The C++ compiler used for MSL syntax checks, if any.
 pub fn clang() -> Option<String> {
@@ -45,7 +50,11 @@ pub fn rewrite_constructors(src: &str) -> String {
 pub fn clang_check(clang: &str, tag: &str, source: &str) -> Result<(), String> {
     let dir = std::env::temp_dir().join(format!("abe-shader-msl-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!("{}.cpp", tag.replace(['/', ':', ' '], "_")));
+    let path = dir.join(format!(
+        "{}-{}.cpp",
+        tag.replace(['/', ':', ' '], "_"),
+        CHECK_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&path, rewrite_constructors(source)).map_err(|e| e.to_string())?;
     // This file is shared by abe-shader's tests and the engine's; find the header from either.
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
