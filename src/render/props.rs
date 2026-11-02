@@ -103,8 +103,9 @@ pub struct MaterialDesc {
     /// An opaque overlay that tests the scene's depth also writes it: overlays drawn after it hide
     /// behind it where it is nearer (the solid pieces of a close-up drawn wholly in overlays).
     pub depth_write: bool,
-    /// Draw order among blended and overlay props: lower first; ties draw far to near.
-    pub order: i32,
+    /// Draw order among blended and overlay props: lower first (any finite number, so one can be
+    /// slipped between two others); ties draw far to near.
+    pub order: f32,
     /// An overlay drawn by a game's prop shader instead of in its colour and texture.
     pub shader: Option<PropShader>,
     /// What the prop shader reads (`ShadeInput::p0`..`p4`); unused without one.
@@ -131,7 +132,7 @@ impl Default for MaterialDesc {
             overlay: false,
             depth_test: true,
             depth_write: false,
-            order: 0,
+            order: 0.0,
             shader: None,
             params: [0.0; PROP_SHADER_PARAMS],
         }
@@ -278,10 +279,10 @@ impl MaterialDesc {
             d.depth_write = b;
         }
         if let Some(o) = num("order")? {
-            if o.fract() != 0.0 || o.abs() > 1.0e6 {
-                return Err(field("order", "expected a whole number".into()));
+            if !o.is_finite() {
+                return Err(field("order", "expected a finite number".into()));
             }
-            d.order = o as i32;
+            d.order = o;
         }
         match v.get("shader") {
             None | Some(Value::Null) => {}
@@ -1222,8 +1223,8 @@ impl Renderer {
         let dir = math::normalize(math::sub(far, near));
         let origin = view.eye;
         // (on top, order, distance) of the best hit so far.
-        let mut best: Option<(Pick, bool, i32)> = None;
-        let better = |top: bool, order: i32, dist: f32, b: &Option<(Pick, bool, i32)>| match b {
+        let mut best: Option<(Pick, bool, f32)> = None;
+        let better = |top: bool, order: f32, dist: f32, b: &Option<(Pick, bool, f32)>| match b {
             None => true,
             Some((p, btop, border)) => match (top, *btop) {
                 (true, false) => true,
@@ -1379,7 +1380,7 @@ impl Renderer {
     ) -> Result<()> {
         struct Live<'a> {
             layer: Layer,
-            order: i32,
+            order: f32,
             /// Negative squared distance: far first.
             far: f32,
             material: u32,
@@ -1424,7 +1425,7 @@ impl Renderer {
             live.push(Live {
                 layer,
                 order: if layer == Layer::Opaque {
-                    0
+                    0.0
                 } else {
                     mat.desc.order
                 },
@@ -1439,8 +1440,9 @@ impl Renderer {
             });
         }
         live.sort_by(|a, b| {
-            (a.layer, a.order)
-                .cmp(&(b.layer, b.order))
+            a.layer
+                .cmp(&b.layer)
+                .then(a.order.total_cmp(&b.order))
                 .then(a.far.total_cmp(&b.far))
                 .then((a.material, a.mesh).cmp(&(b.material, b.mesh)))
         });
@@ -1869,6 +1871,12 @@ mod tests {
         assert_eq!(
             MaterialDesc::from_json(b"{}").unwrap(),
             MaterialDesc::default()
+        );
+        assert_eq!(
+            MaterialDesc::from_json(br#"{"order": 44.5}"#)
+                .unwrap()
+                .order,
+            44.5
         );
         let solid = MaterialDesc::from_json(br#"{"overlay": true, "depthWrite": true}"#).unwrap();
         assert!(solid.overlay && solid.depth_test && solid.depth_write);

@@ -1580,7 +1580,7 @@ fn prop_layers_blend_overlay_tint_and_pick() {
         )
         .expect("overlay")
     };
-    let green = overlay(&mut device, &mut r, [0.0, 1.0, 0.0, 1.0], false, 0);
+    let green = overlay(&mut device, &mut r, [0.0, 1.0, 0.0, 1.0], false, 0.0);
     // Behind the cube on the line of sight through the measured pixel.
     let eye = view().eye;
     let front = [0.0, 0.5, 0.5];
@@ -1629,18 +1629,31 @@ fn prop_layers_blend_overlay_tint_and_pick() {
     tested.depth_test = false;
     r.update_prop_material(&mut device, green, &tested)
         .expect("on top");
-    let blue = overlay(&mut device, &mut r, [0.0, 0.0, 1.0, 1.0], false, 1);
+    let blue = overlay(&mut device, &mut r, [0.0, 0.0, 1.0, 1.0], false, 1.0);
     let second = r
         .create_prop_instance(card_mesh, blue, &behind(1.5))
         .expect("blue");
     let order01 = px(&render(&mut device, &mut r, 15.0, "clear"));
-    tested.order = 2;
+    tested.order = 2.0;
     r.update_prop_material(&mut device, green, &tested)
         .expect("order");
     let order21 = px(&render(&mut device, &mut r, 15.0, "clear"));
     eprintln!("blue over green: {order01:?}; green over blue: {order21:?}");
     assert!(order01[2] >= 253 && order01[1] <= 2, "{order01:?}");
     assert!(order21[1] >= 253 && order21[2] <= 2, "{order21:?}");
+    // An order between two others draws between them: blue at 1.5 over green at 1.25.
+    tested.order = 1.25;
+    r.update_prop_material(&mut device, green, &tested)
+        .expect("order 1.25");
+    let mut over = r.prop_material(blue).expect("blue").clone();
+    over.order = 1.5;
+    r.update_prop_material(&mut device, blue, &over)
+        .expect("order 1.5");
+    let between = px(&render(&mut device, &mut r, 15.0, "clear"));
+    assert!(between[2] >= 253 && between[1] <= 2, "{between:?}");
+    tested.order = 2.0;
+    r.update_prop_material(&mut device, green, &tested)
+        .expect("order back");
     r.set_prop_instance_pick(badge, 1).expect("layer 1");
     let hit = r.pick(&view(), size, (cx as f32, cy as f32), u32::MAX);
     assert_eq!(
@@ -1667,8 +1680,8 @@ fn prop_layers_blend_overlay_tint_and_pick() {
         )
         .expect("solid overlay")
     };
-    let near = solid(&mut device, &mut r, [1.0, 0.0, 0.0, 1.0], 0);
-    let far = solid(&mut device, &mut r, [1.0, 1.0, 0.0, 1.0], 1);
+    let near = solid(&mut device, &mut r, [1.0, 0.0, 0.0, 1.0], 0.0);
+    let far = solid(&mut device, &mut r, [1.0, 1.0, 0.0, 1.0], 1.0);
     r.create_prop_instance(card_mesh, near, &behind(-2.0))
         .expect("near");
     r.create_prop_instance(card_mesh, far, &behind(-1.0))
@@ -1681,7 +1694,7 @@ fn prop_layers_blend_overlay_tint_and_pick() {
         near,
         &MaterialDesc {
             base_color: [1.0, 0.0, 0.0, 1.0],
-            order: 0,
+            order: 0.0,
             ..unwritten.clone()
         },
     )

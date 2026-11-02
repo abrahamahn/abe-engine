@@ -81,7 +81,7 @@ export interface AbeMaterialDesc {
    * it is nearer (the solid pieces of a close-up drawn wholly in overlays).
    */
   readonly depthWrite?: boolean;
-  /** Draw order among blended and overlay props: lower first. */
+  /** Draw order among blended and overlay props: lower first (fractions slip one between two). */
   readonly order?: number;
   /** An overlay drawn by a prop shader (`createShader`) instead of in its colour and texture. */
   readonly shader?: number | null;
