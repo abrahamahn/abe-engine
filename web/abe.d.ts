@@ -76,6 +76,11 @@ export interface AbeMaterialDesc {
   readonly overlay?: boolean;
   /** `false`: drawn on top of nearer surfaces. */
   readonly depthTest?: boolean;
+  /**
+   * An opaque overlay that tests depth also writes it: overlays drawn after it hide behind it where
+   * it is nearer (the solid pieces of a close-up drawn wholly in overlays).
+   */
+  readonly depthWrite?: boolean;
   /** Draw order among blended and overlay props: lower first. */
   readonly order?: number;
   /** An overlay drawn by a prop shader (`createShader`) instead of in its colour and texture. */

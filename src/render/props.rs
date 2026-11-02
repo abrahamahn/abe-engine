@@ -100,6 +100,9 @@ pub struct MaterialDesc {
     pub overlay: bool,
     /// Hidden behind nearer scene surfaces (`false`: always drawn on top).
     pub depth_test: bool,
+    /// An opaque overlay that tests the scene's depth also writes it: overlays drawn after it hide
+    /// behind it where it is nearer (the solid pieces of a close-up drawn wholly in overlays).
+    pub depth_write: bool,
     /// Draw order among blended and overlay props: lower first; ties draw far to near.
     pub order: i32,
     /// An overlay drawn by a game's prop shader instead of in its colour and texture.
@@ -127,6 +130,7 @@ impl Default for MaterialDesc {
             blend: BlendMode::Opaque,
             overlay: false,
             depth_test: true,
+            depth_write: false,
             order: 0,
             shader: None,
             params: [0.0; PROP_SHADER_PARAMS],
@@ -143,7 +147,7 @@ impl MaterialDesc {
     ///  "roughness": 0.8, "metallic": 0, "shading": "standard",
     ///  "alphaCutoff": 0.5, "baseTexture": 3, "normalTexture": 4, "emissiveTexture": 5,
     ///  "normalScale": 1, "castsShadow": true, "blend": "opaque", "overlay": false,
-    ///  "depthTest": true, "order": 0, "shader": 2, "params": [0.5, 1, 0, 0]}
+    ///  "depthTest": true, "depthWrite": false, "order": 0, "shader": 2, "params": [0.5, 1, 0, 0]}
     /// ```
     ///
     /// Colours are linear; `shading` is `standard`, `foliage`, `water` or `unlit`; `blend` is
@@ -151,7 +155,7 @@ impl MaterialDesc {
     /// [`PropShader`]); `params` holds up to twenty numbers (the rest are zero).
     pub fn from_json(text: &[u8]) -> Result<Self> {
         use crate::assets::json::{self, Value};
-        const KNOWN: [&str; 19] = [
+        const KNOWN: [&str; 20] = [
             "name",
             "color",
             "emissive",
@@ -168,6 +172,7 @@ impl MaterialDesc {
             "blend",
             "overlay",
             "depthTest",
+            "depthWrite",
             "order",
             "shader",
             "params",
@@ -268,6 +273,9 @@ impl MaterialDesc {
         }
         if let Some(b) = flag("depthTest")? {
             d.depth_test = b;
+        }
+        if let Some(b) = flag("depthWrite")? {
+            d.depth_write = b;
         }
         if let Some(o) = num("order")? {
             if o.fract() != 0.0 || o.abs() > 1.0e6 {
@@ -392,7 +400,7 @@ pub(super) struct Batch {
 pub(super) struct PropShaderEntry {
     /// Its fragment stage (the vertex stage is every prop's).
     fragment: abe_shader::Compiled,
-    pipelines: [[Option<crate::gpu::PipelineId>; 2]; 3],
+    pipelines: [[Option<crate::gpu::PipelineId>; 3]; 3],
 }
 
 /// The overlay pipeline index of a blend mode: opaque, alpha, additive.
@@ -401,6 +409,16 @@ fn blend_index(blend: BlendMode) -> usize {
         BlendMode::Opaque => 0,
         BlendMode::Alpha => 1,
         BlendMode::Add => 2,
+    }
+}
+
+/// The overlay pipeline index of how a material meets the scene's depth: drawn on top, tested,
+/// tested and written.
+fn depth_index(desc: &MaterialDesc) -> usize {
+    match (desc.depth_test, desc.depth_write) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
     }
 }
 
@@ -820,6 +838,15 @@ impl Renderer {
         device: &mut Device<'_>,
         desc: &MaterialDesc,
     ) -> Result<MaterialEntry> {
+        if desc.depth_write
+            && (!desc.overlay || !desc.depth_test || desc.blend != BlendMode::Opaque)
+        {
+            return Err(
+                "material: depthWrite is for an opaque overlay that tests depth (overlay, \
+                 depthTest, blend opaque)"
+                    .into(),
+            );
+        }
         if let Some(shader) = desc.shader {
             if !desc.overlay {
                 return Err("material: a prop shader draws overlays only (set overlay)".into());
@@ -917,7 +944,7 @@ impl Renderer {
         let fragment = super::renderer::prop_shader_stage(&self.pipelines, source)?;
         Ok(PropShader(self.props.shaders.insert(PropShaderEntry {
             fragment,
-            pipelines: [[None; 2]; 3],
+            pipelines: [[None; 3]; 3],
         })?))
     }
 
@@ -936,10 +963,7 @@ impl Renderer {
             let Some(shader) = mat.desc.shader else {
                 continue;
             };
-            let (blend, depth) = (
-                blend_index(mat.desc.blend),
-                usize::from(mat.desc.depth_test),
-            );
+            let (blend, depth) = (blend_index(mat.desc.blend), depth_index(&mat.desc));
             if self
                 .props
                 .shaders
@@ -959,7 +983,7 @@ impl Renderer {
                 &self.pipelines,
                 &entry.fragment,
                 blend,
-                depth == 1,
+                depth,
             )?;
             if let Some(entry) = self.props.shaders.get_mut(shader.0) {
                 entry.pipelines[blend][depth] = Some(made);
@@ -1768,10 +1792,7 @@ impl Renderer {
             ) else {
                 continue;
             };
-            let (blend, depth) = (
-                blend_index(mat.desc.blend),
-                usize::from(mat.desc.depth_test),
-            );
+            let (blend, depth) = (blend_index(mat.desc.blend), depth_index(&mat.desc));
             let p = match mat.desc.shader {
                 // Made in `prepare_props`; a pipeline that could not be made draws nothing.
                 Some(h) => match self
@@ -1849,6 +1870,9 @@ mod tests {
             MaterialDesc::from_json(b"{}").unwrap(),
             MaterialDesc::default()
         );
+        let solid = MaterialDesc::from_json(br#"{"overlay": true, "depthWrite": true}"#).unwrap();
+        assert!(solid.overlay && solid.depth_test && solid.depth_write);
+        assert_eq!(depth_index(&solid), 2);
         for bad in [
             &b"[]"[..],
             br#"{"colour": [1, 1, 1, 1]}"#,

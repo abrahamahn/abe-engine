@@ -317,6 +317,19 @@ async function run() {
   check('a prop shader that reads the frame is refused', shaderRefused.includes('reads only'), shaderRefused);
   result.sixth = png(eighth);
 
+  // Solid overlays write depth: the nearer red card, drawn first, hides the farther yellow one
+  // drawn after it, wherever they meet; a prop shader's solid overlay does too.
+  const solid = (color, order, shader) => engine.createMaterial({ name: 'check-solid', color,
+    overlay: true, depthTest: true, depthWrite: true, order, ...(shader === undefined ? {} : { shader }) });
+  const nearSolid = engine.createInstance(wide, solid([1, 0, 0, 1], 5), translate(0, 2, 6));
+  const farSolid = engine.createInstance(wide, solid([1, 1, 0, 1], 6, halves), translate(0, 2, 5));
+  const solidAt = at([0.3, 2, 6]);
+  const solidFrame = await frame(engine);
+  check('a solid overlay hides one drawn after it behind it', near(pixel(solidFrame, solidAt), [255, 0, 0], 2),
+    { rgb: pixel(solidFrame, solidAt) });
+  engine.destroyInstance(nearSolid);
+  engine.destroyInstance(farSolid);
+
   // A game's light: a spot straight down onto the ground lights it inside its cone at night, and
   // put out leaves the frame as it was.
   engine.setClock(23, 3);

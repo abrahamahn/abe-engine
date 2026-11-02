@@ -140,8 +140,9 @@ pub(super) struct Pipelines {
     pub(super) scene_prop: PipelineId,
     /// The same, blended over the scene without writing depth: alpha, additive.
     pub(super) scene_prop_blend: [PipelineId; 2],
-    /// Props over the finished image: [opaque, alpha, additive][without, with depth test].
-    pub(super) overlay: [[PipelineId; 2]; 3],
+    /// Props over the finished image: [opaque, alpha, additive][without the scene's depth, testing
+    /// it, testing and writing it (opaque only; the others repeat the test)].
+    pub(super) overlay: [[PipelineId; 3]; 3],
     /// What a game's prop shader is built against: the output format, the prop vertex layout,
     /// and the resources the built-in overlay fragment reads (a prop shader may read no others,
     /// so it takes the same bind groups).
@@ -279,14 +280,14 @@ pub(super) fn prop_shader_stage(pipelines: &Pipelines, user: &str) -> Result<Com
     Ok(fs)
 }
 
-/// One overlay pipeline of a game's prop shader: `blend` 0 opaque, 1 alpha, 2 additive; with the
-/// scene's depth test or without.
+/// One overlay pipeline of a game's prop shader: `blend` 0 opaque, 1 alpha, 2 additive; `depth` 0
+/// drawn on top, 1 testing the scene's depth, 2 testing and writing it (opaque).
 pub(super) fn prop_shader_pipeline(
     device: &mut Device<'_>,
     pipelines: &Pipelines,
     fs: &Compiled,
     blend: usize,
-    depth_test: bool,
+    depth: usize,
 ) -> Result<PipelineId> {
     let blend = [Blend::Replace, Blend::Premultiplied, Blend::Additive]
         .get(blend)
@@ -301,12 +302,12 @@ pub(super) fn prop_shader_pipeline(
         front_ccw: true,
         depth: Some(DepthState {
             format: Format::Depth32Float,
-            compare: if depth_test {
+            compare: if depth > 0 {
                 Compare::Greater
             } else {
                 Compare::Always
             },
-            write: false,
+            write: depth == 2,
             bias_constant: 0.0,
             bias_slope: 0.0,
             clamp: false,
@@ -424,12 +425,24 @@ impl Pipelines {
         }
         let overlay_fs = compile(SCENE, Stage::Fragment, "fs_overlay")?;
         let overlay_bindings = overlay_fs.bindings.clone();
-        let mut overlay = [[scene_prop; 2]; 3];
+        let mut overlay = [[scene_prop; 3]; 3];
         for (i, blend) in [Blend::Replace, Blend::Premultiplied, Blend::Additive]
             .into_iter()
             .enumerate()
         {
-            for (j, compare) in [Compare::Always, Compare::Greater].into_iter().enumerate() {
+            for (j, (compare, write)) in [
+                (Compare::Always, false),
+                (Compare::Greater, false),
+                (Compare::Greater, true),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                // Only an opaque overlay writes depth.
+                if write && i > 0 {
+                    overlay[i][j] = overlay[i][1];
+                    continue;
+                }
                 overlay[i][j] = device.create_render_pipeline(&RenderPipelineDesc {
                     vertex: &vs,
                     fragment: Some(&overlay_fs),
@@ -437,7 +450,7 @@ impl Pipelines {
                     topology: Topology::TriangleList,
                     cull: Cull::None,
                     front_ccw: true,
-                    depth: Some(reverse_depth(compare, false)),
+                    depth: Some(reverse_depth(compare, write)),
                     colors: vec![color(output, blend)],
                 })?;
             }

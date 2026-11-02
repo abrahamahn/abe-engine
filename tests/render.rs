@@ -1648,7 +1648,72 @@ fn prop_layers_blend_overlay_tint_and_pick() {
         Some(badge),
         "the last drawn overlay is picked"
     );
-    let _ = second;
+    r.destroy_prop_instance(second);
+    r.destroy_prop_instance(badge);
+    // Opaque overlays writing depth: the nearer red one, drawn first, hides the farther yellow
+    // one drawn after it; testing alone, the later one covers it.
+    let solid = |device: &mut Device<'_>, r: &mut Renderer, c: [f32; 4], order| {
+        r.create_prop_material(
+            device,
+            &MaterialDesc {
+                name: "solid".into(),
+                base_color: c,
+                overlay: true,
+                depth_test: true,
+                depth_write: true,
+                order,
+                ..MaterialDesc::default()
+            },
+        )
+        .expect("solid overlay")
+    };
+    let near = solid(&mut device, &mut r, [1.0, 0.0, 0.0, 1.0], 0);
+    let far = solid(&mut device, &mut r, [1.0, 1.0, 0.0, 1.0], 1);
+    r.create_prop_instance(card_mesh, near, &behind(-2.0))
+        .expect("near");
+    r.create_prop_instance(card_mesh, far, &behind(-1.0))
+        .expect("far");
+    let written = px(&render(&mut device, &mut r, 15.0, "clear"));
+    let mut unwritten = r.prop_material(far).expect("desc").clone();
+    unwritten.depth_write = false;
+    r.update_prop_material(
+        &mut device,
+        near,
+        &MaterialDesc {
+            base_color: [1.0, 0.0, 0.0, 1.0],
+            order: 0,
+            ..unwritten.clone()
+        },
+    )
+    .expect("near without writing");
+    let tested = px(&render(&mut device, &mut r, 15.0, "clear"));
+    eprintln!("near red over far yellow, writing depth: {written:?}; only testing: {tested:?}");
+    assert!(written[0] >= 253 && written[1] <= 2, "{written:?}");
+    assert!(tested[0] >= 253 && tested[1] >= 253, "{tested:?}");
+    // Writing depth is for opaque overlays that test it.
+    for bad in [
+        MaterialDesc {
+            depth_write: true,
+            ..MaterialDesc::default()
+        },
+        MaterialDesc {
+            overlay: true,
+            depth_test: false,
+            depth_write: true,
+            ..MaterialDesc::default()
+        },
+        MaterialDesc {
+            overlay: true,
+            depth_write: true,
+            blend: BlendMode::Alpha,
+            ..MaterialDesc::default()
+        },
+    ] {
+        assert!(
+            r.create_prop_material(&mut device, &bad).is_err(),
+            "{bad:?}"
+        );
+    }
     let errors = device.validation_errors();
     assert!(errors.is_empty(), "validation: {errors:?}");
 }

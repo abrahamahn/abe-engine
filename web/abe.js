@@ -1867,7 +1867,7 @@ export async function createEngine(options) {
     destroyMesh(mesh) { x.abe_rt_mesh_destroy(mesh); },
     /** See `MaterialDesc::from_json` (name, color, emissive, lamp, roughness, metallic,
      * shading, alphaCutoff, baseTexture, normalTexture, emissiveTexture, normalScale,
-     * castsShadow, blend: 'opaque' | 'alpha' | 'add', overlay, depthTest, order, shader,
+     * castsShadow, blend: 'opaque' | 'alpha' | 'add', overlay, depthTest, depthWrite, order, shader,
      * params). */
     createMaterial(desc) {
       const t = text(JSON.stringify(desc));
