@@ -119,10 +119,27 @@ fn abe_build_cooks_and_inspects_a_textured_lit_scene() {
         Some("image/png")
     );
 
+    // The same file as a run-time model: what `loadModel` would read.
+    let (ok, text) = build(&[Path::new("model"), &source]);
+    assert!(ok, "{text}");
+    assert!(
+        text.starts_with(
+            "model | 3 nodes | 1 meshes | 3 vertices | 1 triangles | 1 materials | 1 textures ("
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("mesh 0  primitive 0: 3 vertices, 1 triangles [material lantern, uv]"),
+        "{text}"
+    );
+
     // A JPEG texture is named in the error and leaves the previous output in place.
     std::fs::write(&source, scene("image/jpeg")).unwrap();
     let (ok, text) = build(&[Path::new("cook"), &source, &cooked_path]);
     assert!(!ok && text.contains("image/jpeg"), "{text}");
     assert!(cooked::decode(&read_asset(&cooked_path).unwrap()).is_ok());
+    // A model keeps its JPEG for the host to decode.
+    let (ok, text) = build(&[Path::new("model"), &source]);
+    assert!(ok && text.contains("1 textures ("), "{text}");
     std::fs::remove_dir_all(&dir).unwrap();
 }

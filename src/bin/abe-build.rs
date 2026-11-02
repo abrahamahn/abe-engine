@@ -58,6 +58,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             abe_engine::assets::write_asset(Path::new(dest), &data)?;
             println!("{} | {} bytes", summary(&w)?, data.len());
         }
+        [cmd, file] if cmd == "model" => {
+            // A run-time model as `createEngine().loadModel` reads it.
+            let data = read_asset(Path::new(file))?;
+            let m = abe_engine::assets::model::load_glb(&data)?;
+            let prims = m.meshes.iter().flat_map(|x| &x.primitives);
+            let triangles: usize = prims.clone().map(|p| p.indices.len() / 3).sum();
+            let vertices: usize = prims.map(|p| p.positions.len()).sum();
+            let image_bytes: usize = m.images.iter().map(|i| i.data.len()).sum();
+            println!(
+                "model | {} nodes | {} meshes | {vertices} vertices | {triangles} triangles | {} materials | {} textures ({image_bytes} image bytes) | {} skins | {} clips | {} bytes",
+                m.nodes.len(),
+                m.meshes.len(),
+                m.materials.len(),
+                m.textures.len(),
+                m.skins.len(),
+                m.clips.len(),
+                data.len(),
+            );
+            for (i, mesh) in m.meshes.iter().enumerate() {
+                for (j, p) in mesh.primitives.iter().enumerate() {
+                    let material = p
+                        .material
+                        .map_or("none".to_string(), |k| m.materials[k].name.clone());
+                    let mut traits = vec![format!("material {material}")];
+                    if !p.uvs.is_empty() {
+                        traits.push("uv".into());
+                    }
+                    if !p.joints.is_empty() {
+                        traits.push("skinned".into());
+                    }
+                    if !p.targets.is_empty() {
+                        traits.push(format!("{} targets", p.targets.len()));
+                    }
+                    println!(
+                        "  mesh {i} {} primitive {j}: {} vertices, {} triangles [{}]",
+                        mesh.name,
+                        p.positions.len(),
+                        p.indices.len() / 3,
+                        traits.join(", ")
+                    );
+                }
+            }
+            for c in &m.clips {
+                println!(
+                    "  clip {}: {:.2} s, {} channels",
+                    c.name,
+                    c.duration,
+                    c.channels.len()
+                );
+            }
+        }
         [cmd, file] if cmd == "inspect" => {
             let data = read_asset(Path::new(file))?;
             let w = cooked::decode(&data)?;
@@ -97,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {
             return Err(
                 "usage: abe-build cook [--compact] [--keep-images] source.glb output.abew \
-                        | inspect file.abew"
+                        | inspect file.abew | model file.glb"
                     .into(),
             );
         }
