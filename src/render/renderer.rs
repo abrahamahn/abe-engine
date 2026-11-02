@@ -31,6 +31,9 @@ const MAX_LIGHTS_PER_TILE: usize = 96;
 const NEAR: f32 = 0.08;
 /// The ground map covers this far (metres) around a point just ahead of the camera.
 const GROUND_REACH: f32 = 48.0;
+/// The world map covers the land's bounds plus this margin (metres) on every side, so shallows
+/// and foam reach out past the outermost shore.
+const WORLD_MARGIN: f32 = 16.0;
 /// The grass instance grid is at most GRASS_SIDE x GRASS_SIDE cells of 13 cm around the camera
 /// (see scene.wgsl); `Quality::grass` scales its area.
 const GRASS_SIDE: u32 = 640;
@@ -55,6 +58,8 @@ pub struct Quality {
     pub particles: bool,
     /// Texels per side of the top-down ground map.
     pub ground_size: u32,
+    /// Texels per side of the world map (shallows and foam beyond the ground map).
+    pub world_size: u32,
     /// Fraction of the full grass area drawn around the camera (0 = no grass).
     pub grass: f32,
 }
@@ -71,6 +76,7 @@ impl Quality {
             fxaa: false,
             particles: true,
             ground_size: 1024,
+            world_size: 2048,
             grass: 1.0,
         }
     }
@@ -86,6 +92,7 @@ impl Quality {
             fxaa: true,
             particles: true,
             ground_size: 1024,
+            world_size: 1024,
             grass: 0.6,
         }
     }
@@ -175,6 +182,12 @@ pub struct Renderer {
     shadow_map: TextureId,
     ground_depth: TextureId,
     ground_mask: TextureId,
+    /// The world map: the whole land seen from above once, for shallows and foam on shores
+    /// beyond the ground map. Drawn on the first frame and again when the Look changes.
+    world_depth: TextureId,
+    world_mask: TextureId,
+    world: Ground,
+    world_drawn: bool,
     /// Per material: the procedural detail block pushed with each draw (see `Draw` in
     /// scene.wgsl), from the Look's detail rules.
     details: Vec<[f32; 16]>,
@@ -311,7 +324,7 @@ impl Pipelines {
             fragment: Some(&fs),
             vertex_layout: Some(VertexLayout {
                 stride: 32,
-                attributes: vec![layout.attributes[0]],
+                attributes: vec![layout.attributes[0], layout.attributes[1]],
             }),
             topology: Topology::TriangleList,
             cull: Cull::None,
@@ -453,6 +466,23 @@ fn f16_to_f32(h: u16) -> f32 {
     }
 }
 
+/// The world map's top-down projection: the land's XZ bounds plus a margin (square, so texels
+/// are square), depth 0 above the highest point of the world and 1 below the lowest.
+fn world_view(scene: &GpuScene, size: u32) -> Ground {
+    let (lo, hi) = (scene.land_min, scene.land_max);
+    let (x, z) = (0.5 * (lo[0] + hi[0]), 0.5 * (lo[2] + hi[2]));
+    let r = 0.5 * (hi[0] - lo[0]).max(hi[2] - lo[2]) + WORLD_MARGIN;
+    let top = scene.max[1] + 1.0;
+    let range = (top - scene.min[1] + 1.0).max(2.0);
+    let v = look_at([x, top, z], [x, top - 1.0, z], [0.0, 0.0, -1.0]);
+    Ground {
+        vp: mul(&ortho(-r, r, -r, r, 0.0, range), &v),
+        top,
+        range,
+        size,
+    }
+}
+
 /// The detail block of each material (its first matching Look rule) and whether grass grows on it.
 fn material_details(look: &Look, scene: &GpuScene) -> (Vec<[f32; 16]>, Vec<bool>) {
     let mut details = Vec::with_capacity(scene.names.len());
@@ -474,7 +504,9 @@ fn material_details(look: &Look, scene: &GpuScene) -> (Vec<[f32; 16]>, Vec<bool>
             d[8] = if r.color.is_some() { 1.0 } else { 0.0 };
             d[9] = r.gloss;
         }
-        grassy.push(rule.is_some_and(|r| r.preset == DetailPreset::Grass));
+        grassy.push(
+            rule.is_some_and(|r| matches!(r.preset, DetailPreset::Grass | DetailPreset::Terrain)),
+        );
         details.push(d);
     }
     (details, grassy)
@@ -573,6 +605,24 @@ impl Renderer {
             format: GROUND_FORMAT,
             usage: TextureUsage::COLOR_TARGET | TextureUsage::SAMPLED,
         })?;
+        let world_size = quality.world_size.max(64);
+        let world_depth = device.create_texture(&TextureDesc {
+            width: world_size,
+            height: world_size,
+            layers: 1,
+            mips: 1,
+            format: Format::Depth32Float,
+            usage: TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED,
+        })?;
+        let world_mask = device.create_texture(&TextureDesc {
+            width: world_size,
+            height: world_size,
+            layers: 1,
+            mips: 1,
+            format: GROUND_FORMAT,
+            usage: TextureUsage::COLOR_TARGET | TextureUsage::SAMPLED,
+        })?;
+        let world = world_view(&scene, world_size);
         let (details, grassy) = material_details(&look, &scene);
         let targets = Self::create_targets(device, &quality, output, size)?;
         let mut r = Self {
@@ -588,6 +638,10 @@ impl Renderer {
             shadow_map,
             ground_depth,
             ground_mask,
+            world_depth,
+            world_mask,
+            world,
+            world_drawn: false,
             details,
             grassy,
             dummy,
@@ -611,6 +665,7 @@ impl Renderer {
     pub fn set_look(&mut self, look: Look) {
         (self.details, self.grassy) = material_details(&look, &self.scene);
         self.look = look;
+        self.world_drawn = false;
     }
     pub fn size(&self) -> (u32, u32) {
         (self.targets.width, self.targets.height)
@@ -745,6 +800,7 @@ impl Renderer {
                 (7, Resource::Sampler(self.linear_clamp)),
                 (8, Resource::Texture(self.ground_depth)),
                 (9, Resource::Texture(self.ground_mask)),
+                (10, Resource::Texture(self.world_depth)),
             ];
             scene.push(device.create_bind_group(p.scene, 0, &entries)?);
             sky.push(device.create_bind_group(p.sky, 0, &entries[..1])?);
@@ -952,7 +1008,8 @@ impl Renderer {
             radius: [0.0; 2],
             bias: [0.0; 2],
         };
-        let (smin, smax) = (self.scene.min, self.scene.max);
+        // Water casts no shadow, so a wide sea does not stretch the depth range.
+        let (smin, smax) = (self.scene.land_min, self.scene.land_max);
         for (c, (d0, d1)) in [(NEAR, split), (split * 0.85, far)].into_iter().enumerate() {
             let mut pts = vec![];
             for d in [d0, d1] {
@@ -1182,6 +1239,20 @@ impl Renderer {
         for c in g.flower_colors {
             b.v(c, 0.0);
         }
+        let w = &self.world;
+        b.m(&w.vp);
+        b.f(
+            w.top,
+            w.range,
+            w.size as f32,
+            if self.world_drawn { 1.0 } else { 0.0 },
+        );
+        let t = &l.terrain;
+        b.f(t.beach, t.rock_slope[0], t.rock_slope[1], t.patch_size);
+        b.v(t.sand, t.patches);
+        b.v(t.wet_sand, 0.0);
+        b.v(t.rock, 0.0);
+        b.v(t.meadow, 0.0);
         let mut bytes = f32_bytes(&b.0);
         for u in [
             tiles.0,
@@ -1208,6 +1279,42 @@ impl Renderer {
             return 0;
         }
         ((GRASS_SIDE as f32 * self.quality.grass.min(1.0).sqrt()).round() as u32 / 2 * 2).max(2)
+    }
+
+    /// A ground (or world) map: the highest solid surfaces seen from above through `vp`, and
+    /// which of them grow grass. Roofs and solid things count; foliage, alpha-masked cut-outs
+    /// and water do not (rain falls through trees, grass grows under them). On terrain, beach
+    /// sand and bare rock grow no grass (see `fs_ground`).
+    fn draw_ground(&self, enc: &mut Encoder, depth: TextureId, mask: TextureId, vp: &M4) {
+        enc.begin_pass(PassDesc {
+            colors: vec![Attachment::clear(mask, [0.0; 4])],
+            depth: Some(Attachment::clear(depth, [1.0; 4])),
+        });
+        enc.set_pipeline(self.pipelines.ground);
+        enc.set_vertex_buffer(self.scene.vertices, 0);
+        enc.set_index_buffer(self.scene.indices, 0);
+        let t = &self.look.terrain;
+        let mut gp = [0.0f32; 24];
+        gp[..16].copy_from_slice(vp);
+        gp[17] = 1.0;
+        gp[19] = self.scene.water_level.unwrap_or(-1.0e6);
+        gp[20..].copy_from_slice(&[t.beach, t.rock_slope[0], t.rock_slope[1], t.patch_size]);
+        let terrain = DetailPreset::Terrain as u32 as f32;
+        for d in self.scene.draws.iter() {
+            let foliage = self.scene.materials[d.material].params[3] == 1.0;
+            if d.water || foliage || self.shadow_materials[d.material].is_some() {
+                continue;
+            }
+            gp[16] = if self.grassy[d.material] { 1.0 } else { 0.0 };
+            gp[18] = if self.details[d.material][0] == terrain {
+                1.0
+            } else {
+                0.0
+            };
+            enc.push_constants(&f32_bytes(&gp));
+            enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
+        }
+        enc.end_pass();
     }
 
     fn draw_world(&self, enc: &mut Encoder, model_push: &mut [f32; 32], water: bool) {
@@ -1277,6 +1384,9 @@ impl Renderer {
             Output::Still => 0,
             Output::Surface(_) => device.frame_slot() % self.slots.len(),
         };
+        // The world map is drawn in this frame's first passes, before anything reads it.
+        let draw_world = !self.world_drawn;
+        self.world_drawn = true;
         let t = &self.targets;
         let size = (t.width, t.height);
         let eye = self.eye(view, jitter, size);
@@ -1379,29 +1489,11 @@ impl Renderer {
         // Rain and petals wrap around a box just ahead of the camera.
         let fwd = normalize(sub(view.target, view.eye));
         let boxes = [RAIN_BOX, PETAL_BOX].map(|b| add(view.eye, scale(fwd, b * 0.5 - 2.0)));
-        // The ground map: the highest solid surfaces around the view seen from above, and which
-        // of them grow grass. Roofs and solid things count; foliage, alpha-masked cut-outs and
-        // water do not (rain falls through trees, grass grows under them).
-        enc.begin_pass(PassDesc {
-            colors: vec![Attachment::clear(self.ground_mask, [0.0; 4])],
-            depth: Some(Attachment::clear(self.ground_depth, [1.0; 4])),
-        });
-        enc.set_pipeline(p.ground);
-        enc.set_vertex_buffer(self.scene.vertices, 0);
-        enc.set_index_buffer(self.scene.indices, 0);
-        let mut gp = [0.0f32; 20];
-        gp[..16].copy_from_slice(&ground.vp);
-        for d in self.scene.draws.iter() {
-            let foliage = self.scene.materials[d.material].params[3] == 1.0;
-            if d.water || foliage || self.shadow_materials[d.material].is_some() {
-                continue;
-            }
-            gp[16] = if self.grassy[d.material] { 1.0 } else { 0.0 };
-            gp[17] = 1.0;
-            enc.push_constants(&f32_bytes(&gp));
-            enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
+        // The ground map around the view, and on the first frame the world map.
+        self.draw_ground(enc, self.ground_depth, self.ground_mask, &ground.vp);
+        if draw_world {
+            self.draw_ground(enc, self.world_depth, self.world_mask, &self.world.vp);
         }
-        enc.end_pass();
 
         let mut push = [0.0f32; 32];
         let clear = [0.0, 0.0, 0.0, 0.0];

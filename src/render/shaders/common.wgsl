@@ -40,6 +40,13 @@ struct Frame {
   grass_base: vec4f,    // rgb blade root colour
   grass_tip: vec4f,     // rgb blade tip colour
   flowers: array<vec4f, 4>, // rgb flower colours
+  world_vp: mat4x4f,    // top-down projection of the world map (the whole world, drawn once)
+  world: vec4f,         // world map: top height, depth range (m), texels per side, 1 when drawn
+  terrain: vec4f,       // beach height above the water (m), rock slope start, rock slope full, patch size (m)
+  sand: vec4f,          // rgb dry sand, w = strength of the broad meadow patches
+  wet_sand: vec4f,      // rgb sand at the water line
+  rock: vec4f,          // rgb bare rock
+  meadow: vec4f,        // rgb second grass tone of the broad patches
   tiles: vec4u,         // tiles across, tiles down, tile size in pixels, light count
 };
 
@@ -112,6 +119,39 @@ fn ground_texel(p: vec3f) -> vec3f {
 // World height of a ground-map depth value.
 fn ground_height(depth: f32) -> f32 {
   return frame.ground.x - depth * frame.ground.y;
+}
+
+// The world map seen from above, as ground_texel: xy = texel, z = depth of `p` (< 0 outside the
+// map or before it is drawn).
+fn world_texel(p: vec3f) -> vec3f {
+  if (frame.world.w < 0.5) {
+    return vec3f(0.0, 0.0, -1.0);
+  }
+  let q = frame.world_vp * vec4f(p, 1.0);
+  let uv = q.xy * 0.5 + vec2f(0.5);
+  if (any(uv <= vec2f(0.0)) || any(uv >= vec2f(1.0))) {
+    return vec3f(0.0, 0.0, -1.0);
+  }
+  return vec3f(uv * frame.world.z, clamp(q.z, 0.0, 1.0));
+}
+
+// World height of a world-map depth value.
+fn world_height(depth: f32) -> f32 {
+  return frame.world.x - depth * frame.world.y;
+}
+
+// How much of a terrain surface is beach sand (x) and bare rock (y), 0..1. Sand lies within
+// t.x metres above the water at `water`, rock where the slope (1 - n.y) passes t.y..t.z; both
+// edges are broken by noise so they never run as ruled lines. The ground map uses the same
+// test to keep grass off sand and rock.
+fn terrain_cover(p: vec3f, ny: f32, water: f32, t: vec4f) -> vec2f {
+  let wobble = noise2(p.xz * 0.23) * 0.65 + noise2(p.xz * 0.97 + vec2f(3.1, 7.7)) * 0.35 - 0.5;
+  var sand = 0.0;
+  if (t.x > 0.0) {
+    sand = 1.0 - smoothstep(t.x * 0.55, t.x, p.y - water + wobble * t.x * 0.8);
+  }
+  let rock = smoothstep(t.y, t.z, 1.0 - abs(ny) + wobble * 0.16);
+  return vec2f(sand, rock);
 }
 
 // The sky without sun, moon, stars or clouds: gradient, horizon glow towards the light, halo.

@@ -1,13 +1,14 @@
 // Stylized forward shading for world geometry: a soft two-tone key light with tinted shade,
 // hemispheric ambient, rim light, toon specular, foliage wrap and glow, tiled lamp lights,
 // lamp emission that follows the time of day, wet surfaces in rain, painted brushwork,
-// procedural surface detail (roof tiles, wood, plaster, stone, lacquer, grassy ground),
-// reflective water with shallows, foam and glitter, and instanced grass and flowers.
+// procedural surface detail (roof tiles, wood, plaster, stone, lacquer, grassy ground, terrain
+// with beaches and rock), reflective water with shallows, foam and glitter (near the camera from
+// the ground map, further out from the world map), and instanced grass and flowers.
 // The same shader draws the mirrored reflection pass (frame.water_color.w = 1).
 
 // Vertices are already in world space.
 struct Draw {
-  detail0: vec4f,    // preset (0 none, 1 roof tiles, 2 wood, 3 plaster, 4 stone, 5 lacquer, 6 grass), size u, size v, strength
+  detail0: vec4f,    // preset (0 none, 1 roof tiles, 2 wood, 3 plaster, 4 stone, 5 lacquer, 6 grass, 7 terrain), size u, size v, strength
   detail1: vec4f,    // variation, rgb replacement colour
   detail2: vec4f,    // has replacement colour, gloss, unused, unused
   detail3: vec4f,    // unused
@@ -32,6 +33,7 @@ struct Light {
 @group(0) @binding(7) var clamp_sampler: sampler;
 @group(0) @binding(8) var ground_depth: texture_depth_2d;
 @group(0) @binding(9) var ground_mask: texture_2d<f32>;
+@group(0) @binding(10) var world_depth: texture_depth_2d;
 @group(1) @binding(0) var base_tex: texture_2d<f32>;
 @group(1) @binding(1) var normal_tex: texture_2d<f32>;
 @group(1) @binding(2) var emissive_tex: texture_2d<f32>;
@@ -360,10 +362,65 @@ fn grass_ground(p: vec3f, n: vec3f, albedo: vec3f) -> Detail {
   return o;
 }
 
+// Terrain: grassy ground (as grass_ground) laid in broad meadow patches, giving way to beach
+// sand near the water (wet and dark at the water line) and to bare rock in layers on steep
+// slopes. Where sand and rock begin comes from terrain_cover, as in the ground map.
+fn terrain_ground(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f) -> Detail {
+  var o = grass_ground(p, n, albedo);
+  let size = max(frame.terrain.w, 1.0);
+  let broad = smoothstep(0.36, 0.66, fbm2(p.xz / size + vec2f(41.0, 13.0)));
+  let meadow = frame.meadow.rgb * (0.9 + 0.2 * noise2(p.xz * 0.35));
+  o.albedo = mix(o.albedo, meadow, broad * frame.sand.w);
+  let c = terrain_cover(p, geo.y, frame.water.x, frame.terrain);
+  if (c.x + c.y <= 0.0) {
+    return o;
+  }
+  let above = p.y - frame.water.x;
+  let dry = smoothstep(0.0, max(frame.terrain.x * 0.45, 0.05), above);
+  let ripple = 0.94 + 0.06 * sin(dot(p.xz, vec2f(1.7, 0.6)) * 3.0 + noise2(p.xz * 0.8) * 4.0);
+  let sand = mix(frame.wet_sand.rgb, frame.sand.rgb, dry) * ripple * (0.95 + 0.1 * noise2(p.xz * 2.3));
+  // Rock: big angular facets (a jittered cell pattern on the face, stretched along it), each
+  // its own tone, warmth and tilt, with thin dark cracks between them and faint sedimentary
+  // bands; the cracks fade out where a facet is only a few pixels across.
+  let face = plane_uv(p, geo);
+  let q = vec2f(face.x / 6.5, (p.y + noise2(p.xz * 0.07) * 2.5) / 3.6);
+  let cq = floor(q);
+  let fq = fract(q);
+  var d1 = 9.0;
+  var d2 = 9.0;
+  var id = vec2f(0.0);
+  for (var j = -1; j <= 1; j++) {
+    for (var i = -1; i <= 1; i++) {
+      let cell = cq + vec2f(f32(i), f32(j));
+      let site = vec2f(f32(i), f32(j)) + vec2f(hash2(cell), hash2(cell + vec2f(31.0, 17.0))) - fq;
+      let d = dot(site, site);
+      if (d < d1) {
+        d2 = d1;
+        d1 = d;
+        id = cell;
+      } else if (d < d2) {
+        d2 = d;
+      }
+    }
+  }
+  let fade = 1.0 - smoothstep(0.08, 0.3, (length(dpx) + length(dpy)) / 3.6);
+  let crack = mix(1.0, smoothstep(0.006, 0.045, sqrt(d2) - sqrt(d1)), fade);
+  let tone = hash2(id) - 0.5;
+  let warm = hash2(id + vec2f(5.0, 9.0)) - 0.5;
+  let band = sin(p.y * 0.85 + noise2(p.xz * 0.05) * 3.0) * 0.07;
+  let grain = noise2(face * 1.7) * 0.6 + noise2(face * 5.3) * 0.4;
+  let rock = frame.rock.rgb * (1.0 + tone * 0.32 + band) * (vec3f(1.0) + vec3f(warm, warm * 0.3, -warm) * 0.14) * (0.9 + 0.2 * grain);
+  let tilt = vec3f(hash2(id + vec2f(1.3, 0.0)) - 0.5, (hash2(id + vec2f(0.0, 4.1)) - 0.5) * 0.6, hash2(id + vec2f(2.7, 0.0)) - 0.5) * 0.7;
+  o.albedo = mix(mix(o.albedo, sand, c.x), rock, c.y);
+  o.cavity = mix(1.0, mix(0.62, 1.0, crack), c.y);
+  o.n = normalize(mix(o.n, normalize(n + tilt), c.y));
+  return o;
+}
+
 fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f) -> Detail {
   let preset = i32(draw.detail0.x + 0.5);
   var base = albedo;
-  if (draw.detail2.x > 0.5 && preset != 6) {
+  if (draw.detail2.x > 0.5 && preset != 6 && preset != 7) {
     base = draw.detail1.yzw;
   }
   if (preset == 1) {
@@ -380,6 +437,9 @@ fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
   }
   if (preset == 6) {
     return grass_ground(p, n, albedo);
+  }
+  if (preset == 7) {
+    return terrain_ground(p, geo, n, albedo, dpx, dpy);
   }
   var o = no_detail(base, n);
   if (preset == 5) {
@@ -503,6 +563,30 @@ fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
         // Foam only where the water meets something: a thin, broken line.
         let churn = 0.35 + 0.65 * smoothstep(0.3, 0.7, noise2(in.world.xz * 4.3 + vec2f(t * 0.35, -t * 0.27)));
         foam = near * smoothstep(0.6, 0.05, below) * churn * frame.shallow.w;
+      }
+    } else {
+      // Beyond the ground map, the coarser world map: shallows and foam along distant shores.
+      let w = world_texel(in.world);
+      if (w.z >= 0.0) {
+        let size = i32(frame.world.z);
+        let texel = clamp(vec2i(w.xy), vec2i(0), vec2i(size - 1));
+        let wd = textureLoad(world_depth, texel, 0);
+        if (wd < 1.0) {
+          below = frame.water.x - world_height(wd);
+        }
+        if (below > 0.02) {
+          var near = 0.0;
+          var offs = array<vec2i, 4>(vec2i(1, 0), vec2i(-1, 0), vec2i(0, 1), vec2i(0, -1));
+          for (var k = 0; k < 4; k++) {
+            let q = clamp(texel + offs[k], vec2i(0), vec2i(size - 1));
+            let qd = textureLoad(world_depth, q, 0);
+            if (qd < 1.0 && world_height(qd) > frame.water.x - 0.05) {
+              near = 1.0;
+            }
+          }
+          let churn = 0.35 + 0.65 * smoothstep(0.3, 0.7, noise2(in.world.xz * 1.7 + vec2f(t * 0.3, -t * 0.22)));
+          foam = near * smoothstep(1.0, 0.1, below) * churn * frame.shallow.w;
+        }
       }
     }
     let shallows = (1.0 - smoothstep(0.0, 1.4, max(below, 0.0))) * 0.45;

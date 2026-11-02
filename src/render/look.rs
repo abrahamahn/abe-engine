@@ -73,6 +73,8 @@ pub struct Look {
     /// Procedural surface detail by material name; the first matching rule wins.
     pub details: Vec<DetailRule>,
     pub grass: Grass,
+    /// Beaches, rock and meadow patches on materials with the [`DetailPreset::Terrain`] detail.
+    pub terrain: Terrain,
 }
 
 /// A procedural surface pattern a Look file can give materials.
@@ -91,6 +93,9 @@ pub enum DetailPreset {
     Lacquer = 5,
     /// Grassy ground: grass grows on it (see [`Grass`]) and it takes the grass colour.
     Grass = 6,
+    /// Open land: grassy ground in broad meadow patches, with beach sand near the water and bare
+    /// rock on steep slopes, where no grass grows (see [`Terrain`]).
+    Terrain = 7,
 }
 
 impl DetailPreset {
@@ -103,6 +108,7 @@ impl DetailPreset {
             "stone" => Self::Stone,
             "lacquer" => Self::Lacquer,
             "grass" => Self::Grass,
+            "terrain" => Self::Terrain,
             _ => return None,
         })
     }
@@ -191,6 +197,39 @@ impl Default for Grass {
     }
 }
 
+/// How [`DetailPreset::Terrain`] ground turns to sand, rock and meadow. Colours are linear RGB.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Terrain {
+    /// Sand lies within this many metres above the water line (0 = no beaches).
+    pub beach: f32,
+    /// Bare rock where the slope (1 - normal.y) passes from the first value to the second.
+    pub rock_slope: [f32; 2],
+    pub sand: V3,
+    /// Sand at the water line, drying towards `sand` above it.
+    pub wet_sand: V3,
+    pub rock: V3,
+    /// A second grass tone laid in broad patches about `patch_size` metres across, `patches`
+    /// strong (0 = none).
+    pub meadow: V3,
+    pub patches: f32,
+    pub patch_size: f32,
+}
+
+impl Default for Terrain {
+    fn default() -> Self {
+        Self {
+            beach: 1.2,
+            rock_slope: [0.4, 0.6],
+            sand: [0.7, 0.6, 0.4],
+            wet_sand: [0.33, 0.28, 0.19],
+            rock: [0.3, 0.29, 0.27],
+            meadow: [0.24, 0.36, 0.07],
+            patches: 0.0,
+            patch_size: 45.0,
+        }
+    }
+}
+
 impl Default for Look {
     fn default() -> Self {
         Self {
@@ -243,6 +282,7 @@ impl Default for Look {
             sparkle: 0.5,
             details: vec![],
             grass: Grass::default(),
+            terrain: Terrain::default(),
         }
     }
 }
@@ -362,6 +402,23 @@ impl LookFile {
                     *slot = vec3(&c[i % c.len()]).map_err(|e| format!("flower_colors: {e}"))?;
                 }
             }
+        }
+        if let Some(t) = root.get("terrain") {
+            let terrain = &mut file.look.terrain;
+            num(t, "beach", &mut terrain.beach)?;
+            match t.get("rock_slope") {
+                Some(Value::Array(a)) if a.len() == 2 => {
+                    terrain.rock_slope = [a[0].float()?, a[1].float()?];
+                }
+                Some(_) => return Err("terrain.rock_slope: expected [start, full]".into()),
+                None => {}
+            }
+            col(t, "sand", &mut terrain.sand)?;
+            col(t, "wet_sand", &mut terrain.wet_sand)?;
+            col(t, "rock", &mut terrain.rock)?;
+            col(t, "meadow", &mut terrain.meadow)?;
+            num(t, "patches", &mut terrain.patches)?;
+            num(t, "patch_size", &mut terrain.patch_size)?;
         }
         if let Some(s) = root.get("sky") {
             let l = &mut file.look;
@@ -541,6 +598,22 @@ mod tests {
         assert_eq!(f.look.grass.density, 0.8);
         assert_eq!(f.look.grass.flower_colors[3], [1.0, 1.0, 1.0]);
         assert!(LookFile::parse(br#"{"details": [{"match": "a", "preset": "fur"}]}"#).is_err());
+    }
+
+    #[test]
+    fn terrain_block() {
+        let f = LookFile::parse(
+            br##"{"details": [{"match": "land", "preset": "terrain"}],
+                  "terrain": {"beach": 0.8, "rock_slope": [0.3, 0.5], "rock": "#808080",
+                              "patches": 0.4}}"##,
+        )
+        .unwrap();
+        assert_eq!(f.look.details[0].preset, DetailPreset::Terrain);
+        let t = &f.look.terrain;
+        assert_eq!((t.beach, t.rock_slope, t.patches), (0.8, [0.3, 0.5], 0.4));
+        assert!((t.rock[0] - 0.2158).abs() < 1e-3);
+        assert_eq!(t.sand, Terrain::default().sand);
+        assert!(LookFile::parse(br#"{"terrain": {"rock_slope": 0.5}}"#).is_err());
     }
 
     #[test]

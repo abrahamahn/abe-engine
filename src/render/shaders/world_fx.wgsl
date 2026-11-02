@@ -41,20 +41,40 @@ struct MaskedOut {
   }
 }
 
-// The ground map: depth of the highest solid surface seen from above, and per texel what that
-// surface is: r = grows grass, g = solid.
+// The ground map (and the world map, drawn the same way): depth of the highest solid surface
+// seen from above, and per texel what that surface is: r = grows grass, g = solid. On terrain,
+// beach sand and bare rock grow none.
 struct GroundPush {
   vp: mat4x4f,
-  mask: vec4f,
+  mask: vec4f,     // grows grass, solid, 1 for terrain, water height
+  terrain: vec4f,  // as frame.terrain
 };
 var<push_constant> ground_push: GroundPush;
 
-@vertex fn vs_ground(@location(0) position: vec3f) -> @builtin(position) vec4f {
-  return ground_push.vp * vec4f(position, 1.0);
+struct GroundOut {
+  @builtin(position) clip: vec4f,
+  @location(0) world: vec3f,
+  @location(1) normal: vec3f,
+};
+
+@vertex fn vs_ground(@location(0) position: vec3f, @location(1) normal: vec3f) -> GroundOut {
+  var o: GroundOut;
+  o.clip = ground_push.vp * vec4f(position, 1.0);
+  o.world = position;
+  o.normal = normal;
+  return o;
 }
 
-@fragment fn fs_ground() -> @location(0) vec4f {
-  return ground_push.mask;
+@fragment fn fs_ground(in: GroundOut) -> @location(0) vec4f {
+  let m = ground_push.mask;
+  var grass = m.x;
+  if (m.z > 0.5 && grass > 0.5) {
+    let c = terrain_cover(in.world, normalize(in.normal).y, m.w, ground_push.terrain);
+    if (max(c.x, c.y) > 0.5) {
+      grass = 0.0;
+    }
+  }
+  return vec4f(grass, m.y, 0.0, 0.0);
 }
 
 struct FsOut {

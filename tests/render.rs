@@ -3,8 +3,8 @@
 use abe_engine::Vec3;
 use abe_engine::gpu::Device;
 use abe_engine::render::{
-    DetailPreset, DetailRule, Environment, Look, Output, Quality, Renderer, TimeOfDay, View,
-    Weather,
+    DetailPreset, DetailRule, Environment, Look, Output, Quality, Renderer, Terrain, TimeOfDay,
+    View, Weather,
 };
 use abe_engine::world::{
     AlphaMode, Emission, Instance, Material, Mesh, PointLight, Shading, Texture, Transform, World,
@@ -387,6 +387,141 @@ fn grass_and_surface_detail() {
     eprintln!("detail changes the frame by {detail:.2}, grass blades by {blades:.2}");
     assert!(detail > 1.0, "surface detail had no effect: {detail}");
     assert!(blades > 1.0, "no grass blades: {blades}");
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}
+
+/// Land sloping from 3 m down to a seabed 4 m under a sea at 0 m: flat to z = -60, the water
+/// line at z = -10, 1.4 m deep at z = 13.
+fn shore() -> World {
+    let mut land = Mesh {
+        material: Some(0),
+        ..Mesh::default()
+    };
+    let height = |z: f32| (3.0 - (z + 60.0) * 0.06).clamp(-4.0, 3.0);
+    let (cols, rows) = (31u32, 81u32);
+    for j in 0..rows {
+        for i in 0..cols {
+            let (x, z) = (-60.0 + 4.0 * i as f32, -100.0 + 2.0 * j as f32);
+            land.positions.push(Vec3(x, height(z), z));
+            // d(height)/dz = -0.06 on the slope.
+            let n = if (-60.0..56.0).contains(&z) {
+                0.06
+            } else {
+                0.0
+            };
+            let l = (1.0f32 + n * n).sqrt();
+            land.normals.push(Vec3(0.0, 1.0 / l, n / l));
+            land.uvs.push([0.0, 0.0]);
+        }
+    }
+    for j in 0..rows - 1 {
+        for i in 0..cols - 1 {
+            let k = j * cols + i;
+            land.indices
+                .extend([k, k + cols, k + 1, k + 1, k + cols, k + cols + 1]);
+        }
+    }
+    let meshes = vec![land, quad(0.0, 400.0, 1)];
+    World {
+        instances: (0..meshes.len() as u32)
+            .map(|mesh| Instance {
+                mesh,
+                transform: Transform::IDENTITY,
+            })
+            .collect(),
+        meshes,
+        materials: vec![
+            material("land", [0.2, 0.3, 0.1, 1.0], Shading::Standard),
+            material("sea", [0.1, 0.2, 0.3, 1.0], Shading::Water),
+        ],
+        textures: vec![],
+        lights: vec![],
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn terrain_beaches_and_distant_shallows() {
+    // Terrain turns to sand above the water line, and 200 m away, well past the ground map,
+    // the world map still tints the shallows (red here, so they can be counted).
+    let mut device = Device::headless().expect("device");
+    let (w, h) = (256, 144);
+    let world = shore();
+    let rule = |preset| DetailRule {
+        patterns: vec!["land".into()],
+        preset,
+        scale: [0.3, 0.3],
+        strength: 1.0,
+        variation: 0.1,
+        color: None,
+        gloss: 0.0,
+    };
+    let mut frame = |preset, view: &View, shallow| {
+        let look = Look {
+            details: vec![rule(preset)],
+            fog: 0.0,
+            water_reflection: 0.0,
+            water_shallow: shallow,
+            terrain: Terrain {
+                sand: [0.2, 0.2, 0.9],
+                wet_sand: [0.1, 0.1, 0.6],
+                ..Terrain::default()
+            },
+            ..Look::default()
+        };
+        let mut quality = Quality::realtime();
+        quality.shadow_size = 512;
+        quality.ground_size = 256;
+        quality.world_size = 512;
+        let mut r = Renderer::new(&mut device, &world, look, quality, (w, h), Output::Still)
+            .expect("renderer");
+        let time = TimeOfDay {
+            hours: 12.0,
+            ..TimeOfDay::default()
+        };
+        let env = Environment::resolve(&time, &Weather::default(), &r.look().palette, 2.0);
+        r.render_still(&mut device, view, &env, 1).expect("render")
+    };
+    let count = |image: &[u8], test: &dyn Fn(f32, f32, f32) -> bool| {
+        image
+            .chunks(4)
+            .filter(|p| test(f32::from(p[0]), f32::from(p[1]), f32::from(p[2])))
+            .count()
+    };
+    // Sand (blue here) along the beach, seen from just above it.
+    let near = View {
+        name: "beach".into(),
+        eye: [0.0, 10.0, 10.0],
+        target: [0.0, 0.0, -20.0],
+        fov: 60.0,
+    };
+    let blue = |r: f32, g: f32, b: f32| b > 1.5 * r + 10.0 && b > 1.5 * g + 10.0;
+    let red_shallows = [1.0, 0.0, 0.0];
+    let grassy = count(&frame(DetailPreset::Grass, &near, red_shallows), &blue);
+    let sandy = count(&frame(DetailPreset::Terrain, &near, red_shallows), &blue);
+    // Red shallows along the far shore.
+    let far = View {
+        name: "offshore".into(),
+        eye: [0.0, 25.0, 190.0],
+        target: [0.0, 0.0, 0.0],
+        fov: 40.0,
+    };
+    let red = |r: f32, g: f32, b: f32| r > 1.4 * g + 8.0 && r > 1.4 * b + 8.0;
+    let shallows = count(&frame(DetailPreset::Terrain, &far, red_shallows), &red);
+    let plain = count(
+        &frame(DetailPreset::Terrain, &far, Look::default().water_shallow),
+        &red,
+    );
+    eprintln!(
+        "sand pixels: {grassy} with grass, {sandy} with terrain; \
+         far red pixels: {shallows} with red shallows, {plain} without"
+    );
+    assert!(sandy > grassy + 1000, "no beach: {grassy} / {sandy}");
+    assert!(
+        shallows > 40 && plain < 5,
+        "no shallows past the ground map: {shallows} / {plain}"
+    );
     let errors = device.validation_errors();
     assert!(errors.is_empty(), "validation: {errors:?}");
 }

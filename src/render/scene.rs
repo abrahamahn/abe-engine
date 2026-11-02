@@ -44,9 +44,12 @@ pub(super) struct GpuScene {
     pub lights: Vec<[f32; 8]>,
     pub light_buffer: BufferId,
     pub water_level: Option<f32>,
-    /// Bounds of everything, and of the dense centre used to frame shadow depth ranges.
+    /// Bounds of everything drawn, and of everything but water (what casts shadows and what
+    /// the world map covers; the same as all when there is no water).
     pub min: V3,
     pub max: V3,
+    pub land_min: V3,
+    pub land_max: V3,
     pub triangles: usize,
 }
 
@@ -60,6 +63,8 @@ impl GpuScene {
         let mut draws = vec![];
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
+        let mut land_min = [f32::INFINITY; 3];
+        let mut land_max = [f32::NEG_INFINITY; 3];
         let mut water_sum = 0.0f64;
         let mut water_n = 0usize;
         // A default material for meshes without one: their flat colour, matte.
@@ -112,6 +117,9 @@ impl GpuScene {
             let m = inst.transform.0;
             let base = u32::try_from(vertices.len() / FLOATS_PER_VERTEX)
                 .map_err(|_| "too many vertices")?;
+            let water = mesh
+                .material
+                .is_some_and(|m| world.materials[m as usize].shading == Shading::Water);
             for (i, p) in mesh.positions.iter().enumerate() {
                 let w = [
                     m[0] * p.0 + m[4] * p.1 + m[8] * p.2 + m[12],
@@ -130,6 +138,10 @@ impl GpuScene {
                 for k in 0..3 {
                     min[k] = min[k].min(w[k]);
                     max[k] = max[k].max(w[k]);
+                    if !water {
+                        land_min[k] = land_min[k].min(w[k]);
+                        land_max[k] = land_max[k].max(w[k]);
+                    }
                 }
             }
             let first_index = indices.len() as u32;
@@ -153,9 +165,6 @@ impl GpuScene {
                     })
                 }
             };
-            let water = mesh
-                .material
-                .is_some_and(|m| world.materials[m as usize].shading == Shading::Water);
             if water {
                 for p in &mesh.positions {
                     water_sum += f64::from(m[1] * p.0 + m[5] * p.1 + m[9] * p.2 + m[13]);
@@ -171,6 +180,9 @@ impl GpuScene {
         }
         if draws.is_empty() {
             return Err("the world has no triangles to draw".into());
+        }
+        if land_min[0] > land_max[0] {
+            (land_min, land_max) = (min, max);
         }
         // Water last, so the opaque world is already in the depth buffer.
         draws.sort_by_key(|d| d.water);
@@ -249,6 +261,8 @@ impl GpuScene {
             water_level: (water_n > 0).then(|| (water_sum / water_n as f64) as f32),
             min,
             max,
+            land_min,
+            land_max,
             triangles: indices.len() / 3,
         })
     }
