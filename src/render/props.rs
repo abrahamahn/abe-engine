@@ -66,6 +66,18 @@ pub struct MeshData<'a> {
     pub indices: &'a [u32],
 }
 
+/// How a prop's colour combines with what is behind it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlendMode {
+    /// Covers what is behind it and writes depth.
+    #[default]
+    Opaque,
+    /// Mixed by its alpha; sorted, and writes no depth.
+    Alpha,
+    /// Added, scaled by its alpha (glows, sparks); sorted, and writes no depth.
+    Add,
+}
+
 /// How a prop material looks. Colours are linear.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MaterialDesc {
@@ -84,7 +96,16 @@ pub struct MaterialDesc {
     pub normal_texture: Option<PropTexture>,
     pub emissive_texture: Option<PropTexture>,
     pub normal_scale: f32,
+    /// Only opaque scene materials cast shadows.
     pub casts_shadow: bool,
+    pub blend: BlendMode,
+    /// Drawn after grading, over the finished image, in exactly its colour and texture (unlit):
+    /// labels, badges, rings. Overlays are never reflected and cast no shadows.
+    pub overlay: bool,
+    /// Hidden behind nearer scene surfaces (`false`: always drawn on top).
+    pub depth_test: bool,
+    /// Draw order among blended and overlay props: lower first; ties draw far to near.
+    pub order: i32,
 }
 
 impl Default for MaterialDesc {
@@ -103,6 +124,10 @@ impl Default for MaterialDesc {
             emissive_texture: None,
             normal_scale: 1.0,
             casts_shadow: true,
+            blend: BlendMode::Opaque,
+            overlay: false,
+            depth_test: true,
+            order: 0,
         }
     }
 }
@@ -115,14 +140,15 @@ impl MaterialDesc {
     /// {"name": "felt", "color": [0.1, 0.3, 0.2, 1], "emissive": [0, 0, 0], "lamp": false,
     ///  "roughness": 0.8, "metallic": 0, "shading": "standard",
     ///  "alphaCutoff": 0.5, "baseTexture": 3, "normalTexture": 4, "emissiveTexture": 5,
-    ///  "normalScale": 1, "castsShadow": true}
+    ///  "normalScale": 1, "castsShadow": true, "blend": "opaque", "overlay": false,
+    ///  "depthTest": true, "order": 0}
     /// ```
     ///
-    /// Colours are linear; `shading` is `standard`, `foliage`, `water` or `unlit`; textures are
-    /// raw [`PropTexture`] handles.
+    /// Colours are linear; `shading` is `standard`, `foliage`, `water` or `unlit`; `blend` is
+    /// `opaque`, `alpha` or `add`; textures are raw [`PropTexture`] handles.
     pub fn from_json(text: &[u8]) -> Result<Self> {
         use crate::assets::json::{self, Value};
-        const KNOWN: [&str; 13] = [
+        const KNOWN: [&str; 17] = [
             "name",
             "color",
             "emissive",
@@ -136,6 +162,10 @@ impl MaterialDesc {
             "emissiveTexture",
             "normalScale",
             "castsShadow",
+            "blend",
+            "overlay",
+            "depthTest",
+            "order",
         ];
         let v = json::parse(text).map_err(|e| format!("material: {e}"))?;
         let Value::Object(map) = &v else {
@@ -220,12 +250,32 @@ impl MaterialDesc {
         if let Some(b) = flag("castsShadow")? {
             d.casts_shadow = b;
         }
+        if let Some(b) = v.get("blend") {
+            d.blend = match b.string().map_err(|e| field("blend", e))? {
+                "opaque" => BlendMode::Opaque,
+                "alpha" => BlendMode::Alpha,
+                "add" => BlendMode::Add,
+                other => return Err(field("blend", format!("unknown {other:?}"))),
+            };
+        }
+        if let Some(b) = flag("overlay")? {
+            d.overlay = b;
+        }
+        if let Some(b) = flag("depthTest")? {
+            d.depth_test = b;
+        }
+        if let Some(o) = num("order")? {
+            if o.fract() != 0.0 || o.abs() > 1.0e6 {
+                return Err(field("order", "expected a whole number".into()));
+            }
+            d.order = o as i32;
+        }
         Ok(d)
     }
 }
 
-/// Bytes per instance in the instance buffer (`Prop` in common.wgsl: two matrices).
-const PROP_BYTES: u64 = 128;
+/// Bytes per instance in the instance buffer (`Prop` in common.wgsl: two matrices, a tint).
+const PROP_BYTES: u64 = 144;
 const MIN_CAPACITY: u32 = 64;
 
 pub(super) struct MeshEntry {
@@ -242,9 +292,30 @@ pub(super) struct MeshEntry {
 pub(super) struct MaterialEntry {
     desc: MaterialDesc,
     data: MaterialData,
+    /// `@group(1)` of the scene pipelines, or of the overlay pipelines for an overlay.
     group: BindGroupId,
     shadow_group: Option<BindGroupId>,
     detail: [f32; 16],
+}
+
+impl MaterialEntry {
+    fn layer(&self) -> Layer {
+        if self.desc.overlay {
+            Layer::Overlay
+        } else if self.desc.blend == BlendMode::Opaque {
+            Layer::Opaque
+        } else {
+            Layer::Blended
+        }
+    }
+}
+
+/// Where a prop is drawn: in the scene (opaque, batched, or blended, sorted) or over the image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Layer {
+    Opaque,
+    Blended,
+    Overlay,
 }
 
 struct InstanceEntry {
@@ -252,7 +323,10 @@ struct InstanceEntry {
     material: PropMaterial,
     model: M4,
     normal: M4,
+    tint: [f32; 4],
     visible: bool,
+    /// Pick layers (bits); 0 is never picked.
+    pick: u32,
 }
 
 /// One instanced draw of this frame: instances `first..first + count` of the buffer.
@@ -262,6 +336,7 @@ pub(super) struct Batch {
     material: u32,
     first: u32,
     count: u32,
+    layer: Layer,
 }
 
 /// A frame slot's instance buffer and the bind groups that read it.
@@ -270,6 +345,8 @@ pub(super) struct PropSlot {
     /// Main view and reflection (`@group(0)` of the prop scene pipeline).
     scene: [BindGroupId; 2],
     shadow: BindGroupId,
+    /// `@group(0)` of the overlay pipelines.
+    overlay: BindGroupId,
 }
 
 #[derive(Default)]
@@ -588,17 +665,29 @@ impl Renderer {
         let normal = self.prop_texture_id(desc.normal_texture, self.flat)?;
         let emissive = self.prop_texture_id(desc.emissive_texture, self.white)?;
         let p = &self.pipelines;
-        let group = device.create_bind_group(
-            p.scene_prop,
-            1,
-            &[
-                (0, Resource::Texture(base)),
-                (1, Resource::Texture(normal)),
-                (2, Resource::Texture(emissive)),
-                (3, Resource::Sampler(self.material_sampler)),
-            ],
-        )?;
-        let shadow_group = if desc.alpha_cutoff.is_some() {
+        let group = if desc.overlay {
+            device.create_bind_group(
+                p.overlay[0][0],
+                1,
+                &[
+                    (0, Resource::Texture(base)),
+                    (3, Resource::Sampler(self.material_sampler)),
+                ],
+            )?
+        } else {
+            device.create_bind_group(
+                p.scene_prop,
+                1,
+                &[
+                    (0, Resource::Texture(base)),
+                    (1, Resource::Texture(normal)),
+                    (2, Resource::Texture(emissive)),
+                    (3, Resource::Sampler(self.material_sampler)),
+                ],
+            )?
+        };
+        let opaque = !desc.overlay && desc.blend == BlendMode::Opaque;
+        let shadow_group = if opaque && desc.casts_shadow && desc.alpha_cutoff.is_some() {
             Some(device.create_bind_group(
                 p.shadow_prop_masked,
                 1,
@@ -696,7 +785,9 @@ impl Renderer {
             material,
             model: *model,
             normal: normal_matrix(model),
+            tint: [1.0; 4],
             visible: true,
+            pick: 1,
         };
         Ok(PropInstance(self.props.instances.insert(entry)?))
     }
@@ -739,6 +830,31 @@ impl Renderer {
         Ok(())
     }
 
+    /// Multiplies an instance's material colour and alpha (fades, greying, highlights) without
+    /// a material of its own.
+    pub fn set_prop_instance_tint(&mut self, instance: PropInstance, tint: [f32; 4]) -> Result<()> {
+        if tint.iter().any(|x| !x.is_finite()) {
+            return Err("set_prop_instance_tint: values must be finite".into());
+        }
+        self.props
+            .instances
+            .get_mut(instance.0)
+            .ok_or_else(|| format!("{instance:?} was destroyed"))?
+            .tint = tint;
+        Ok(())
+    }
+
+    /// The pick layers an instance answers to (bits; 0: never picked). New instances are on
+    /// layer 1.
+    pub fn set_prop_instance_pick(&mut self, instance: PropInstance, layers: u32) -> Result<()> {
+        self.props
+            .instances
+            .get_mut(instance.0)
+            .ok_or_else(|| format!("{instance:?} was destroyed"))?
+            .pick = layers;
+        Ok(())
+    }
+
     pub fn destroy_prop_instance(&mut self, instance: PropInstance) {
         self.props.instances.remove(instance.0);
     }
@@ -748,9 +864,17 @@ impl Renderer {
         self.props.instances.iter().count()
     }
 
-    /// The nearest visible prop under pixel `(x, y)` of a `size` image of `view` (top-left
-    /// origin), tested against its triangles.
-    pub fn pick(&self, view: &View, size: (u32, u32), (x, y): (f32, f32)) -> Option<Pick> {
+    /// The visible prop under pixel `(x, y)` of a `size` image of `view` (top-left origin) on
+    /// one of the pick `layers`, tested against its triangles. Like the image: an overlay drawn
+    /// on top of everything (no depth test) wins, the last drawn of them (highest order, then
+    /// nearest); otherwise the nearest hit.
+    pub fn pick(
+        &self,
+        view: &View,
+        size: (u32, u32),
+        (x, y): (f32, f32),
+        layers: u32,
+    ) -> Option<Pick> {
         let eye = self.eye(view, [0.0, 0.0], size);
         let ndc = [
             2.0 * x / size.0.max(1) as f32 - 1.0,
@@ -765,14 +889,29 @@ impl Renderer {
         let far = unproject(0.5);
         let dir = math::normalize(math::sub(far, near));
         let origin = view.eye;
-        let mut best: Option<Pick> = None;
+        // (on top, order, distance) of the best hit so far.
+        let mut best: Option<(Pick, bool, i32)> = None;
+        let better = |top: bool, order: i32, dist: f32, b: &Option<(Pick, bool, i32)>| match b {
+            None => true,
+            Some((p, btop, border)) => match (top, *btop) {
+                (true, false) => true,
+                (false, true) => false,
+                (true, true) => order > *border || (order == *border && dist < p.distance),
+                (false, false) => dist < p.distance,
+            },
+        };
         for (id, inst) in self.props.instances.iter() {
-            if !inst.visible {
+            if !inst.visible || inst.pick & layers == 0 {
                 continue;
             }
-            let Some(mesh) = self.props.meshes.get(inst.mesh.0) else {
+            let (Some(mesh), Some(mat)) = (
+                self.props.meshes.get(inst.mesh.0),
+                self.props.materials.get(inst.material.0),
+            ) else {
                 continue;
             };
+            let top = mat.desc.overlay && !mat.desc.depth_test;
+            let order = mat.desc.order;
             // Into model space: the ray's origin and direction through the inverse transform.
             let Some(inv) = math::invert(&inst.model) else {
                 continue;
@@ -783,7 +922,7 @@ impl Renderer {
             let Some(enter) = ray_box(o, d, mesh.min, mesh.max) else {
                 continue;
             };
-            if best.is_some_and(|b| enter > b.distance) {
+            if !better(top, order, enter, &best) {
                 continue;
             }
             let mut hit: Option<f32> = None;
@@ -801,16 +940,17 @@ impl Renderer {
             }
             // `d` is the unit world direction mapped into model space, so `s` is in world metres.
             if let Some(s) = hit
-                && best.is_none_or(|b| s < b.distance)
+                && better(top, order, s, &best)
             {
-                best = Some(Pick {
+                let pick = Pick {
                     instance: PropInstance(id),
                     distance: s,
                     point: math::add(origin, math::scale(dir, s)),
-                });
+                };
+                best = Some((pick, top, order));
             }
         }
-        best
+        best.map(|b| b.0)
     }
 
     /// Where a world point lands in a `size` image of `view`: pixel x and y (top-left origin)
@@ -847,58 +987,119 @@ impl Renderer {
     /// Forgets the per-slot bind groups (after the frame slots were rebuilt).
     pub(super) fn reset_prop_slots(&mut self, device: &mut Device<'_>) {
         for s in std::mem::take(&mut self.props.slots).into_iter().flatten() {
-            for g in s.scene.into_iter().chain([s.shadow]) {
+            for g in s.scene.into_iter().chain([s.shadow, s.overlay]) {
                 device.destroy_bind_group(g);
             }
             device.destroy_buffer(s.buffer);
         }
     }
 
-    /// Batches this frame's visible instances and writes their transforms to the slot's
-    /// instance buffer (growing it, and rebuilding its bind groups, when needed).
-    pub(super) fn prepare_props(&mut self, device: &mut Device<'_>, slot: usize) -> Result<()> {
-        let mut live: Vec<(u32, u32, &InstanceEntry)> = self
-            .props
-            .instances
-            .iter()
-            .filter(|(_, i)| i.visible)
-            .map(|(_, i)| (i.material.0, i.mesh.0, i))
-            .collect();
-        live.sort_by_key(|(material, mesh, _)| (*material, *mesh));
-        let mut batches: Vec<Batch> = Vec::new();
-        let mut data: Vec<f32> = Vec::with_capacity(live.len() * 32);
+    /// Orders this frame's visible instances and writes them to the slot's instance buffer
+    /// (growing it, and rebuilding its bind groups, when needed): opaque ones batched by
+    /// (material, mesh), then blended ones and then overlays one by one, each sorted by order
+    /// and far to near from `eye`.
+    pub(super) fn prepare_props(
+        &mut self,
+        device: &mut Device<'_>,
+        slot: usize,
+        eye: V3,
+    ) -> Result<()> {
+        struct Live<'a> {
+            layer: Layer,
+            order: i32,
+            /// Negative squared distance: far first.
+            far: f32,
+            material: u32,
+            mesh: u32,
+            inst: &'a InstanceEntry,
+        }
         let mut lo = [f32::INFINITY; 3];
         let mut hi = [f32::NEG_INFINITY; 3];
-        for (n, (material, mesh, inst)) in live.iter().enumerate() {
-            if let Some(m) = self.props.meshes.get(*mesh) {
-                for corner in 0..8 {
-                    let p = [
-                        if corner & 1 == 0 { m.min[0] } else { m.max[0] },
-                        if corner & 2 == 0 { m.min[1] } else { m.max[1] },
-                        if corner & 4 == 0 { m.min[2] } else { m.max[2] },
-                    ];
-                    let w = math::transform_point(&inst.model, p);
-                    for k in 0..3 {
-                        lo[k] = lo[k].min(w[k]);
-                        hi[k] = hi[k].max(w[k]);
-                    }
+        let mut live: Vec<Live> = Vec::new();
+        for (_, inst) in self.props.instances.iter() {
+            let (Some(m), Some(mat)) = (
+                self.props.meshes.get(inst.mesh.0),
+                self.props.materials.get(inst.material.0),
+            ) else {
+                continue;
+            };
+            if !inst.visible {
+                continue;
+            }
+            let layer = mat.layer();
+            let (mut blo, mut bhi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+            for corner in 0..8 {
+                let p = [
+                    if corner & 1 == 0 { m.min[0] } else { m.max[0] },
+                    if corner & 2 == 0 { m.min[1] } else { m.max[1] },
+                    if corner & 4 == 0 { m.min[2] } else { m.max[2] },
+                ];
+                let w = math::transform_point(&inst.model, p);
+                for k in 0..3 {
+                    blo[k] = blo[k].min(w[k]);
+                    bhi[k] = bhi[k].max(w[k]);
                 }
             }
+            if layer != Layer::Overlay {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(blo[k]);
+                    hi[k] = hi[k].max(bhi[k]);
+                }
+            }
+            let centre = math::scale(math::add(blo, bhi), 0.5);
+            let to = math::sub(centre, eye);
+            live.push(Live {
+                layer,
+                order: if layer == Layer::Opaque {
+                    0
+                } else {
+                    mat.desc.order
+                },
+                far: if layer == Layer::Opaque {
+                    0.0
+                } else {
+                    -math::dot(to, to)
+                },
+                material: inst.material.0,
+                mesh: inst.mesh.0,
+                inst,
+            });
+        }
+        live.sort_by(|a, b| {
+            (a.layer, a.order)
+                .cmp(&(b.layer, b.order))
+                .then(a.far.total_cmp(&b.far))
+                .then((a.material, a.mesh).cmp(&(b.material, b.mesh)))
+        });
+        let mut batches: Vec<Batch> = Vec::new();
+        let mut data: Vec<f32> = Vec::with_capacity(live.len() * 36);
+        for (n, l) in live.iter().enumerate() {
             match batches.last_mut() {
-                Some(b) if b.material == *material && b.mesh == *mesh => b.count += 1,
+                Some(b)
+                    if l.layer == Layer::Opaque
+                        && b.layer == Layer::Opaque
+                        && b.material == l.material
+                        && b.mesh == l.mesh =>
+                {
+                    b.count += 1;
+                }
                 _ => batches.push(Batch {
-                    mesh: *mesh,
-                    material: *material,
+                    mesh: l.mesh,
+                    material: l.material,
                     first: n as u32,
                     count: 1,
+                    layer: l.layer,
                 }),
             }
-            data.extend_from_slice(&inst.model);
-            data.extend_from_slice(&inst.normal);
+            data.extend_from_slice(&l.inst.model);
+            data.extend_from_slice(&l.inst.normal);
+            data.extend_from_slice(&l.inst.tint);
         }
+        let count = live.len() as u32;
+        drop(live);
         self.props.batches = batches;
         self.props.bounds = (lo[0] <= hi[0]).then_some((lo, hi));
-        let needed = (live.len() as u32).max(MIN_CAPACITY);
+        let needed = count.max(MIN_CAPACITY);
         if needed > self.props.capacity {
             self.reset_prop_slots(device);
             self.props.capacity = needed.next_power_of_two();
@@ -915,6 +1116,11 @@ impl Renderer {
             device.write_buffer(s.buffer, 0, &f32_bytes(&data))?;
         }
         Ok(())
+    }
+
+    /// Whether this frame has props to draw over the image.
+    pub(super) fn has_overlays(&self) -> bool {
+        self.props.batches.iter().any(|b| b.layer == Layer::Overlay)
     }
 
     fn create_prop_slot(&self, device: &mut Device<'_>, slot: usize) -> Result<PropSlot> {
@@ -954,10 +1160,16 @@ impl Renderer {
             )?);
         }
         let shadow = device.create_bind_group(p.shadow_prop, 0, &[(11, buf(buffer))])?;
+        let overlay = device.create_bind_group(
+            p.overlay[0][0],
+            0,
+            &[(0, buf(s.frame[0])), (11, buf(buffer))],
+        )?;
         Ok(PropSlot {
             buffer,
             scene: [scene[0], scene[1]],
             shadow,
+            overlay,
         })
     }
 
@@ -980,7 +1192,7 @@ impl Renderer {
             ) else {
                 continue;
             };
-            if !mat.desc.casts_shadow {
+            if b.layer != Layer::Opaque || !mat.desc.casts_shadow {
                 continue;
             }
             let masked = mat.shadow_group.is_some();
@@ -1012,19 +1224,46 @@ impl Renderer {
         }
     }
 
-    /// Draws this frame's prop batches with the scene shading (`view` 0 main, 1 reflection).
+    /// The `Draw` push constants of a prop batch.
+    fn prop_push(mat: &MaterialEntry, first: u32, encode_srgb: bool) -> [f32; 32] {
+        let mut push = [0.0f32; 32];
+        push[..16].copy_from_slice(&mat.detail);
+        let mut base = mat.data.base_color;
+        if mat.detail[0] == 0.0 && mat.detail[8] > 0.5 {
+            base[..3].copy_from_slice(&mat.detail[5..8]);
+        }
+        push[12] = first as f32;
+        push[13] = if encode_srgb { 1.0 } else { 0.0 };
+        push[14] = if mat.layer() == Layer::Opaque {
+            0.0
+        } else {
+            1.0
+        };
+        push[16..20].copy_from_slice(&base);
+        push[20..24].copy_from_slice(&mat.data.emissive);
+        push[24..28].copy_from_slice(&mat.data.params);
+        push[28..32].copy_from_slice(&mat.data.flags);
+        push
+    }
+
+    /// Draws this frame's opaque prop batches with the scene shading (`view` 0 main, 1
+    /// reflection).
     pub(super) fn draw_props(&self, enc: &mut crate::gpu::Encoder, slot: usize, view: usize) {
         let Some(Some(s)) = self.props.slots.get(slot) else {
             return;
         };
-        if self.props.batches.is_empty() {
+        if !self.props.batches.iter().any(|b| b.layer == Layer::Opaque) {
             return;
         }
         enc.set_pipeline(self.pipelines.scene_prop);
         enc.set_bind_group(0, s.scene[view]);
-        let mut push = [0.0f32; 32];
         let mut bound = None;
-        for b in &self.props.batches {
+        for b in self
+            .props
+            .batches
+            .iter()
+            .filter(|b| b.layer == Layer::Opaque)
+        {
             let (Some(mesh), Some(mat)) = (
                 self.props.meshes.get(b.mesh),
                 self.props.materials.get(b.material),
@@ -1038,17 +1277,82 @@ impl Renderer {
                 enc.set_bind_group(1, mat.group);
                 bound = Some(b.material);
             }
-            push[..16].copy_from_slice(&mat.detail);
-            let mut base = mat.data.base_color;
-            if mat.detail[0] == 0.0 && mat.detail[8] > 0.5 {
-                base[..3].copy_from_slice(&mat.detail[5..8]);
+            enc.push_constants(&f32_bytes(&Self::prop_push(mat, b.first, false)));
+            enc.set_vertex_buffer(mesh.vertices, 0);
+            enc.set_index_buffer(mesh.indices, 0);
+            enc.draw_indexed(mesh.index_count, b.count, 0, 0, 0);
+        }
+    }
+
+    /// Draws this frame's blended scene props, sorted, after the opaque scene (main view).
+    pub(super) fn draw_blended_props(&self, enc: &mut crate::gpu::Encoder, slot: usize) {
+        let Some(Some(s)) = self.props.slots.get(slot) else {
+            return;
+        };
+        let mut pipeline = None;
+        for b in self
+            .props
+            .batches
+            .iter()
+            .filter(|b| b.layer == Layer::Blended)
+        {
+            let (Some(mesh), Some(mat)) = (
+                self.props.meshes.get(b.mesh),
+                self.props.materials.get(b.material),
+            ) else {
+                continue;
+            };
+            let p = self.pipelines.scene_prop_blend[usize::from(mat.desc.blend == BlendMode::Add)];
+            if pipeline != Some(p) {
+                enc.set_pipeline(p);
+                enc.set_bind_group(0, s.scene[0]);
+                pipeline = Some(p);
             }
-            push[12] = b.first as f32;
-            push[16..20].copy_from_slice(&base);
-            push[20..24].copy_from_slice(&mat.data.emissive);
-            push[24..28].copy_from_slice(&mat.data.params);
-            push[28..32].copy_from_slice(&mat.data.flags);
-            enc.push_constants(&f32_bytes(&push));
+            enc.set_bind_group(1, mat.group);
+            enc.push_constants(&f32_bytes(&Self::prop_push(mat, b.first, false)));
+            enc.set_vertex_buffer(mesh.vertices, 0);
+            enc.set_index_buffer(mesh.indices, 0);
+            enc.draw_indexed(mesh.index_count, b.count, 0, 0, 0);
+        }
+    }
+
+    /// Draws this frame's overlays into the finished image (a pass over the output target and
+    /// the scene depth); `encode_srgb` when the target does not encode sRGB itself.
+    pub(super) fn draw_overlays(
+        &self,
+        enc: &mut crate::gpu::Encoder,
+        slot: usize,
+        encode_srgb: bool,
+    ) {
+        let Some(Some(s)) = self.props.slots.get(slot) else {
+            return;
+        };
+        let mut pipeline = None;
+        for b in self
+            .props
+            .batches
+            .iter()
+            .filter(|b| b.layer == Layer::Overlay)
+        {
+            let (Some(mesh), Some(mat)) = (
+                self.props.meshes.get(b.mesh),
+                self.props.materials.get(b.material),
+            ) else {
+                continue;
+            };
+            let blend = match mat.desc.blend {
+                BlendMode::Opaque => 0,
+                BlendMode::Alpha => 1,
+                BlendMode::Add => 2,
+            };
+            let p = self.pipelines.overlay[blend][usize::from(mat.desc.depth_test)];
+            if pipeline != Some(p) {
+                enc.set_pipeline(p);
+                enc.set_bind_group(0, s.overlay);
+                pipeline = Some(p);
+            }
+            enc.set_bind_group(1, mat.group);
+            enc.push_constants(&f32_bytes(&Self::prop_push(mat, b.first, encode_srgb)));
             enc.set_vertex_buffer(mesh.vertices, 0);
             enc.set_index_buffer(mesh.indices, 0);
             enc.draw_indexed(mesh.index_count, b.count, 0, 0, 0);

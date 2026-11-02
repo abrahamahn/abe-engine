@@ -1804,7 +1804,7 @@ export async function createEngine(options) {
     destroyMesh(mesh) { x.abe_rt_mesh_destroy(mesh); },
     /** See `MaterialDesc::from_json` (name, color, emissive, lamp, roughness, metallic,
      * shading, alphaCutoff, baseTexture, normalTexture, emissiveTexture, normalScale,
-     * castsShadow). */
+     * castsShadow, blend: 'opaque' | 'alpha' | 'add', overlay, depthTest, order). */
     createMaterial(desc) {
       const t = text(JSON.stringify(desc));
       const [p] = place(t);
@@ -1840,6 +1840,14 @@ export async function createEngine(options) {
     setInstanceMaterial(instance, material) {
       ok('setInstanceMaterial', x.abe_rt_instance_material(instance, material));
     },
+    /** Multiplies an instance's material colour and alpha: `[r, g, b, a]`. */
+    setInstanceTint(instance, tint) {
+      ok('setInstanceTint', x.abe_rt_instance_tint(instance, tint[0], tint[1], tint[2], tint[3] ?? 1));
+    },
+    /** The pick layers (bit mask) an instance answers to; 0: never picked. New ones: 1. */
+    setInstancePick(instance, layers) {
+      ok('setInstancePick', x.abe_rt_instance_pick(instance, layers >>> 0));
+    },
     destroyInstance(instance) { x.abe_rt_instance_destroy(instance); },
     /** Where a world point lands, in CSS pixels of the canvas (and depth in metres), or null
      * behind the camera. */
@@ -1850,12 +1858,13 @@ export async function createEngine(options) {
       const [px, py, depth] = new Float32Array(x.memory.buffer, p, 3);
       return { x: px * sx, y: py * sy, depth };
     },
-    /** The nearest visible prop under a CSS pixel of the canvas: `{instance, distance, point}`
-     * or null. */
-    pick(cssX, cssY) {
+    /** The visible prop under a CSS pixel of the canvas on one of the pick `layers`:
+     * `{instance, distance, point}` or null. Overlays drawn on top win (the last drawn), then
+     * the nearest hit. */
+    pick(cssX, cssY, layers = 0xFFFFFFFF) {
       const { sx, sy } = cssScale();
       const p = out(4).byteOffset;
-      const instance = x.abe_rt_pick(cssX / sx, cssY / sy, p);
+      const instance = x.abe_rt_pick(cssX / sx, cssY / sy, layers >>> 0, p);
       if (!instance) return null;
       const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
       return { instance, distance, point: [px, py, pz] };

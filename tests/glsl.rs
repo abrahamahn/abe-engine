@@ -16,6 +16,7 @@ const POST: &str = include_str!("../src/render/shaders/post.wgsl");
 const PAIRS: &[(&str, &str, Option<&str>)] = &[
     (SCENE, "vs_main", Some("fs_main")),
     (SCENE, "vs_prop", Some("fs_main")),
+    (SCENE, "vs_prop", Some("fs_overlay")),
     (WORLD_FX, "vs_shadow", None),
     (WORLD_FX, "vs_shadow_masked", Some("fs_shadow_masked")),
     (WORLD_FX, "vs_shadow_prop", None),

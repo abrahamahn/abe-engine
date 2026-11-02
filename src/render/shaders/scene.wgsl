@@ -11,7 +11,7 @@ struct Draw {
   detail0: vec4f,    // preset (0 none, 1 roof tiles, 2 wood, 3 plaster, 4 stone, 5 lacquer, 6 grass, 7 terrain, 8 lattice), size u, size v, strength
   detail1: vec4f,    // variation, rgb replacement colour
   detail2: vec4f,    // has replacement colour, gloss, unused, unused
-  detail3: vec4f,    // first prop instance (props only: vs_prop), unused, unused, unused
+  detail3: vec4f,    // props only: first instance, encode sRGB (overlays), premultiply alpha (blended), unused
   base_color: vec4f,
   emissive: vec4f,   // rgb, w = 1 for lamps (scaled by the lamp level)
   params: vec4f,     // alpha cutoff, roughness, metallic, shading (0 standard, 1 foliage, 2 water, 3 unlit)
@@ -49,6 +49,7 @@ struct VsOut {
   @location(0) world: vec3f,
   @location(1) normal: vec3f,
   @location(2) uv: vec2f,
+  @location(3) tint: vec4f,
 };
 struct FsOut {
   @location(0) color: vec4f,
@@ -61,6 +62,7 @@ struct FsOut {
   o.world = v.position;
   o.normal = v.normal;
   o.uv = v.uv;
+  o.tint = vec4f(1.0);
   return o;
 }
 
@@ -73,7 +75,28 @@ struct FsOut {
   o.world = world.xyz;
   o.normal = normalize((p.normal * vec4f(v.normal, 0.0)).xyz);
   o.uv = v.uv;
+  o.tint = p.tint;
   return o;
+}
+
+// Overlays: props drawn after grading, over the finished image (labels, badges, rings) in their
+// material's exact colour and texture, tinted per instance and unlit. Output is premultiplied;
+// detail3.y = 1 encodes sRGB for an 8-bit target that does not.
+@fragment fn fs_overlay(in: VsOut) -> @location(0) vec4f {
+  var c = draw.base_color * in.tint;
+  let t = textureSample(base_tex, material_sampler, in.uv);
+  if (draw.flags.x > 0.5) {
+    c *= t;
+  }
+  if (c.a < draw.params.x) {
+    discard;
+  }
+  var rgb = clamp(c.rgb, vec3f(0.0), vec3f(1.0));
+  if (draw.detail3.y > 0.5) {
+    rgb = select(1.055 * pow(rgb, vec3f(1.0 / 2.4)) - vec3f(0.055), rgb * 12.92, rgb <= vec3f(0.0031308));
+  }
+  let a = clamp(c.a, 0.0, 1.0);
+  return vec4f(rgb * a, a);
 }
 
 const TAPS = array<vec2f, 16>(
@@ -492,6 +515,15 @@ fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
   return o;
 }
 
+// Blended props (detail3.z = 1) write premultiplied colour; opaque draws keep alpha unused.
+fn blended(c: vec4f) -> vec4f {
+  if (draw.detail3.z > 0.5) {
+    let a = clamp(c.a, 0.0, 1.0);
+    return vec4f(c.rgb * a, a);
+  }
+  return c;
+}
+
 @fragment fn fs_main(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
   // Texture fetches and derivatives first, in uniform control flow.
   let bias = frame.style2.x;
@@ -519,7 +551,7 @@ fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
   if (reflection_pass && in.world.y < frame.water.x - 0.02) {
     discard;
   }
-  var albedo = draw.base_color;
+  var albedo = draw.base_color * in.tint;
   if (draw.flags.x > 0.5) {
     albedo *= base_s;
   }
@@ -546,7 +578,7 @@ fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
   }
 
   if (shading == 3) {
-    out.color = vec4f(albedo.rgb + emissive, 1.0);
+    out.color = blended(vec4f(albedo.rgb + emissive, albedo.a));
     return out;
   }
 
@@ -719,7 +751,7 @@ fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
   if (reflection_pass) {
     col = mix(col, fog_color(-v), fog_amount(frame.camera.xyz, in.world, dist));
   }
-  out.color = vec4f(col, 1.0);
+  out.color = blended(vec4f(col, albedo.a));
   return out;
 }
 

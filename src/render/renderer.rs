@@ -130,6 +130,10 @@ pub(super) struct Pipelines {
     pub(super) scene: PipelineId,
     /// The scene shading for props (model-space vertices placed per instance).
     pub(super) scene_prop: PipelineId,
+    /// The same, blended over the scene without writing depth: alpha, additive.
+    pub(super) scene_prop_blend: [PipelineId; 2],
+    /// Props over the finished image: [opaque, alpha, additive][without, with depth test].
+    pub(super) overlay: [[PipelineId; 2]; 3],
     shadow: PipelineId,
     shadow_masked: PipelineId,
     pub(super) shadow_prop: PipelineId,
@@ -312,6 +316,49 @@ impl Pipelines {
             depth: Some(reverse_depth(Compare::Greater, true)),
             colors: mrt(),
         })?;
+        // Blended props leave the aux target (normals for outlines and occlusion) alone.
+        let mut scene_prop_blend = [scene_prop; 2];
+        for (i, blend) in [Blend::Premultiplied, Blend::Additive]
+            .into_iter()
+            .enumerate()
+        {
+            scene_prop_blend[i] = device.create_render_pipeline(&RenderPipelineDesc {
+                vertex: &vs,
+                fragment: Some(&fs),
+                vertex_layout: Some(layout.clone()),
+                topology: Topology::TriangleList,
+                cull: Cull::None,
+                front_ccw: true,
+                depth: Some(reverse_depth(Compare::Greater, false)),
+                colors: vec![
+                    color(HDR, blend),
+                    ColorTarget {
+                        format: HDR,
+                        blend: Blend::Replace,
+                        write_mask: 0,
+                    },
+                ],
+            })?;
+        }
+        let overlay_fs = compile(SCENE, Stage::Fragment, "fs_overlay")?;
+        let mut overlay = [[scene_prop; 2]; 3];
+        for (i, blend) in [Blend::Replace, Blend::Premultiplied, Blend::Additive]
+            .into_iter()
+            .enumerate()
+        {
+            for (j, compare) in [Compare::Always, Compare::Greater].into_iter().enumerate() {
+                overlay[i][j] = device.create_render_pipeline(&RenderPipelineDesc {
+                    vertex: &vs,
+                    fragment: Some(&overlay_fs),
+                    vertex_layout: Some(layout.clone()),
+                    topology: Topology::TriangleList,
+                    cull: Cull::None,
+                    front_ccw: true,
+                    depth: Some(reverse_depth(compare, false)),
+                    colors: vec![color(output, blend)],
+                })?;
+            }
+        }
         let shadow_depth = DepthState {
             format: Format::Depth32Float,
             compare: Compare::Less,
@@ -465,6 +512,8 @@ impl Pipelines {
         Ok(Self {
             scene,
             scene_prop,
+            scene_prop_blend,
+            overlay,
             shadow,
             shadow_masked,
             shadow_prop,
@@ -1517,7 +1566,7 @@ impl Renderer {
         let draw_world = !self.world_drawn;
         self.world_drawn = true;
         // Props first: their bounds widen the shadow cascades' depth range.
-        self.prepare_props(device, slot_index)?;
+        self.prepare_props(device, slot_index, view.eye)?;
         let t = &self.targets;
         let size = (t.width, t.height);
         let eye = self.eye(view, jitter, size);
@@ -1707,6 +1756,7 @@ impl Renderer {
                 enc.draw(6, petals, 0, 0);
             }
         }
+        self.draw_blended_props(enc, slot_index);
         enc.end_pass();
 
         let l = &self.look;
@@ -1801,6 +1851,26 @@ impl Renderer {
         pc[1] = if encode_srgb { 1.0 } else { 0.0 };
         pc[2] = l.sharpen.max(0.0);
         Self::post_pass(enc, dest, 0, Load::DontCare, p.output, slot.output, pc);
+        if self.has_overlays() {
+            enc.begin_pass(PassDesc {
+                colors: vec![Attachment {
+                    texture: dest,
+                    mip: 0,
+                    layer: 0,
+                    load: Load::Load,
+                    store: true,
+                }],
+                depth: Some(Attachment {
+                    texture: t.depth,
+                    mip: 0,
+                    layer: 0,
+                    load: Load::Load,
+                    store: false,
+                }),
+            });
+            self.draw_overlays(enc, slot_index, encode_srgb);
+            enc.end_pass();
+        }
         if let (Output::Still, Some(still), Some(rb)) = (self.output, t.still, t.readback) {
             enc.copy_texture_to_buffer(still, 0, 0, rb, 0);
         }

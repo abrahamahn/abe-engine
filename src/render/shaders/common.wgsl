@@ -59,6 +59,7 @@ struct Frame {
 struct Prop {
   model: mat4x4f,
   normal: mat4x4f,  // inverse transpose of the model matrix (upper 3x3 used)
+  tint: vec4f,      // multiplies the material's colour and alpha
 };
 @group(0) @binding(11) var<storage, read> props: array<Prop>;
 

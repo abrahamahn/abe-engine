@@ -8,7 +8,8 @@
 //
 // --engine WORLD.abew runs web/test/engine.html: library mode (createEngine) with the world plus
 // props, checking drawing, texture orientation, projection, picking, hiding, batch moves,
-// texture updates and error reporting (OUT/engine-first.png, OUT/engine-second.png).
+// texture updates, overlays, blending, tints, pick layers and error reporting
+// (OUT/engine-first.png, -second.png, -third.png).
 //
 // --selftest first runs the module's GPU-layer self-test (compute with push constants into a
 // storage texture, copies, mip generation, a blit into the canvas, misuse reporting) and checks
@@ -389,7 +390,7 @@ async function runEngineCheck(browser, port, opts) {
     await page.goto(`http://localhost:${port}/test/engine.html?${query}`);
     await page.waitForFunction(() => window.engineCheck, null, { timeout: 300000, polling: 200 });
     const r = await page.evaluate(() => window.engineCheck);
-    for (const k of ['first', 'second']) {
+    for (const k of ['first', 'second', 'third']) {
       if (r[k]) {
         fs.writeFileSync(path.join(opts.out, `engine-${k}.png`), Buffer.from(r[k], 'base64'));
         delete r[k];

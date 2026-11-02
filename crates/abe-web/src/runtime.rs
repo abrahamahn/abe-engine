@@ -597,6 +597,26 @@ pub extern "C" fn abe_rt_instance_material(instance: u32, material: u32) -> u32 
     })
 }
 
+/// Multiplies an instance's material colour and alpha by (`r`, `g`, `b`, `a`).
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_instance_tint(instance: u32, r: f32, g: f32, b: f32, a: f32) -> u32 {
+    with(0, |rt| {
+        rt.renderer
+            .set_prop_instance_tint(PropInstance::from_raw(instance), [r, g, b, a])?;
+        Ok(1)
+    })
+}
+
+/// The pick layers (bits) an instance answers to; 0: never picked.
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_instance_pick(instance: u32, layers: u32) -> u32 {
+    with(0, |rt| {
+        rt.renderer
+            .set_prop_instance_pick(PropInstance::from_raw(instance), layers)?;
+        Ok(1)
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn abe_rt_instance_destroy(instance: u32) -> u32 {
     with(0, |rt| {
@@ -625,17 +645,17 @@ pub unsafe extern "C" fn abe_rt_project(x: f32, y: f32, z: f32, out: *mut u8) ->
     })
 }
 
-/// The nearest visible prop under device pixel (`x`, `y`): returns its instance and writes the
-/// distance in metres and the world point (4 floats) at `out`; returns 0 (without logging)
-/// when no prop is there.
+/// The visible prop under device pixel (`x`, `y`) on one of the pick `layers` (as
+/// `Renderer::pick` chooses it): returns its instance and writes the distance in metres and
+/// the world point (4 floats) at `out`; returns 0 (without logging) when no prop is there.
 ///
 /// # Safety
 /// `out` must address 16 writable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn abe_rt_pick(x: f32, y: f32, out: *mut u8) -> u32 {
+pub unsafe extern "C" fn abe_rt_pick(x: f32, y: f32, layers: u32, out: *mut u8) -> u32 {
     with(0, |rt| {
         let size = rt.renderer.size();
-        let Some(hit) = rt.renderer.pick(&rt.view, size, (x, y)) else {
+        let Some(hit) = rt.renderer.pick(&rt.view, size, (x, y), layers) else {
             return Ok(0);
         };
         let p = hit.point;

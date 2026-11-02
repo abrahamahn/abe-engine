@@ -142,6 +142,35 @@ async function run() {
   check('picking skips hidden props', engine.pick(c.x, c.y) === null);
   result.second = png(second);
 
+  // Layers: an overlay over the finished image in its exact colour (sRGB-encoded on the 8-bit
+  // canvas), tinted per instance; a half-transparent red pane in the scene; pick layers.
+  const grey = engine.createMaterial({ name: 'check-badge', color: [0.5, 0.5, 0.5, 1], overlay: true,
+    blend: 'alpha', depthTest: false, order: 1 });
+  const badge = engine.createInstance(card, grey, translate(-3.5, 3.4, 0));
+  const pane = engine.createMaterial({ name: 'check-pane', color: [0.8, 0.02, 0.02, 1], shading: 'unlit',
+    blend: 'alpha' });
+  const glass = engine.createInstance(card, pane, translate(1.5, 0.7, 1.5));
+  engine.setInstanceTint(glass, [1, 1, 1, 0.5]);
+  engine.setInstancePick(badge, 2);
+  const third = await frame(engine);
+  const badgeAt = at([-3.5, 3.4, 0]);
+  const near = (p, want, tol) => p.every((v, i) => Math.abs(v - want[i]) <= tol);
+  const pixel = (px, p) => {
+    const i = ((Math.round(p.y) * px.width) + Math.round(p.x)) * 4;
+    return [px.rgba[i], px.rgba[i + 1], px.rgba[i + 2]];
+  };
+  check('overlay keeps its exact colour', near(pixel(third, badgeAt), [188, 188, 188], 3),
+    { at: badgeAt, rgb: pixel(third, badgeAt) });
+  const glassAt = at([1.5, 0.7, 1.5]);
+  const half = pixel(third, glassAt);
+  check('a blended pane mixes with the scene', half[0] > half[1] + 30 && half[1] > 40, { rgb: half });
+  check('pick layers', engine.pick(badgeAt.x, badgeAt.y, 1) === null
+    && engine.pick(badgeAt.x, badgeAt.y, 2)?.instance === badge);
+  engine.setInstanceTint(badge, [0, 1, 0, 1]);
+  const fourth = await frame(engine);
+  check('instance tint', near(pixel(fourth, badgeAt), [0, 188, 0], 3), { rgb: pixel(fourth, badgeAt) });
+  result.third = png(third);
+
   // Errors are reported, not thrown away: a stale handle and a bad material.
   engine.destroyInstance(left);
   let refused = 0;

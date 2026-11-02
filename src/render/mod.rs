@@ -10,6 +10,8 @@ mod scene;
 pub mod sky;
 
 pub use look::{DetailPreset, DetailRule, Grass, Look, LookFile, Terrain, View};
-pub use props::{MaterialDesc, MeshData, Pick, PropInstance, PropMaterial, PropMesh, PropTexture};
+pub use props::{
+    BlendMode, MaterialDesc, MeshData, Pick, PropInstance, PropMaterial, PropMesh, PropTexture,
+};
 pub use renderer::{Output, Quality, Renderer};
 pub use sky::{Environment, Palette, SkyKey, TimeOfDay, Weather};

@@ -927,14 +927,16 @@ fn props_draw_move_pick_and_cast_shadows() {
         "the cube is under its projection: {:?}",
         &both[i..i + 4]
     );
-    let hit = r.pick(&view(), size, (p[0], p[1])).expect("a pick");
+    let hit = r
+        .pick(&view(), size, (p[0], p[1]), u32::MAX)
+        .expect("a pick");
     assert_eq!(hit.instance, right);
     assert!(
         (hit.point[0] - 2.0).abs() < 0.6 && hit.distance > 5.0,
         "{hit:?}"
     );
     assert!(
-        r.pick(&view(), size, (2.0, 2.0)).is_none(),
+        r.pick(&view(), size, (2.0, 2.0), u32::MAX).is_none(),
         "sky has no prop"
     );
     // Hide one, move the other far left: the right half has no red.
@@ -963,7 +965,7 @@ fn props_draw_move_pick_and_cast_shadows() {
     );
     r.destroy_props(&mut device);
     assert_eq!(r.prop_instances(), 0);
-    assert!(r.pick(&view(), size, (p[0], p[1])).is_none());
+    assert!(r.pick(&view(), size, (p[0], p[1]), u32::MAX).is_none());
     let errors = device.validation_errors();
     assert!(errors.is_empty(), "validation: {errors:?}");
 }
@@ -1192,6 +1194,257 @@ fn empty_world_with_props() {
         .count();
     eprintln!("pixels darkened by the prop's shadow on the prop floor: {darker}");
     assert!(darker > 25, "the cube shades the floor: {darker}");
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}
+
+/// Prop layers: blended props mix with the scene by alpha (tinted per instance), additive
+/// ones add, overlays land over the finished image in their exact colour (on top of
+/// everything without a depth test, hidden behind nearer surfaces with one) in draw order,
+/// and picking follows what is drawn on top.
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn prop_layers_blend_overlay_tint_and_pick() {
+    use abe_engine::render::BlendMode;
+    let mut device = Device::headless().expect("device");
+    let world = World {
+        instances: vec![Instance {
+            mesh: 0,
+            transform: Transform::IDENTITY,
+        }],
+        meshes: vec![quad(0.0, 20.0, 0)],
+        materials: vec![material(
+            "ground",
+            [0.15, 0.15, 0.15, 1.0],
+            Shading::Standard,
+        )],
+        textures: vec![],
+        lights: vec![],
+    };
+    let mut quality = Quality::realtime();
+    quality.shadow_size = 512;
+    let mut r = Renderer::new(
+        &mut device,
+        &world,
+        Look::default(),
+        quality,
+        (W, H),
+        Output::Still,
+    )
+    .expect("renderer");
+    let mesh_of = |device: &mut Device<'_>, r: &mut Renderer, m: &Mesh| {
+        let positions: Vec<[f32; 3]> = m.positions.iter().map(|p| [p.0, p.1, p.2]).collect();
+        let normals: Vec<[f32; 3]> = m.normals.iter().map(|n| [n.0, n.1, n.2]).collect();
+        r.create_prop_mesh(
+            device,
+            &MeshData {
+                positions: &positions,
+                normals: &normals,
+                uvs: &m.uvs,
+                indices: &m.indices,
+            },
+        )
+        .expect("mesh")
+    };
+    let cube_mesh = mesh_of(&mut device, &mut r, &cube([0.0, 0.0, 0.0], 0.5, 0));
+    // A 1.2 m card facing +z (the camera).
+    let card = Mesh {
+        positions: vec![
+            Vec3(-0.6, -0.6, 0.0),
+            Vec3(0.6, -0.6, 0.0),
+            Vec3(0.6, 0.6, 0.0),
+            Vec3(-0.6, 0.6, 0.0),
+        ],
+        normals: vec![Vec3(0.0, 0.0, 1.0); 4],
+        uvs: vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        indices: vec![0, 1, 2, 0, 2, 3],
+        color: [0.5; 3],
+        material: Some(0),
+    };
+    let card_mesh = mesh_of(&mut device, &mut r, &card);
+    let at = |x: f32, y: f32, z: f32| {
+        let mut m = [0.0f32; 16];
+        for i in [0, 5, 10, 15] {
+            m[i] = 1.0;
+        }
+        m[12] = x;
+        m[13] = y;
+        m[14] = z;
+        m
+    };
+    let new_material = |device: &mut Device<'_>, r: &mut Renderer, d: MaterialDesc| {
+        r.create_prop_material(device, &d).expect("material")
+    };
+    let white = new_material(
+        &mut device,
+        &mut r,
+        MaterialDesc {
+            name: "white".into(),
+            base_color: [0.2, 0.2, 0.2, 1.0],
+            ..MaterialDesc::default()
+        },
+    );
+    let cube_at = r
+        .create_prop_instance(cube_mesh, white, &at(0.0, 0.5, 0.0))
+        .expect("cube");
+    let size = (W, H);
+    let centre = r.project(&view(), size, [0.0, 0.5, 0.5]).expect("in front");
+    let (cx, cy) = (centre[0] as u32, centre[1] as u32);
+    let px = |img: &[u8]| {
+        let i = ((cy * W + cx) * 4) as usize;
+        [img[i], img[i + 1], img[i + 2]]
+    };
+    let plain = render(&mut device, &mut r, 15.0, "clear");
+    let base = px(&plain);
+    eprintln!("grey cube: {base:?}");
+    assert!(base.iter().all(|&c| c < 230), "not saturated: {base:?}");
+
+    // Blended: a red card in front of the cube, faded by its instance tint.
+    let glass = new_material(
+        &mut device,
+        &mut r,
+        MaterialDesc {
+            name: "glass".into(),
+            base_color: [0.6, 0.02, 0.02, 1.0],
+            shading: Shading::Unlit,
+            blend: BlendMode::Alpha,
+            ..MaterialDesc::default()
+        },
+    );
+    let pane = r
+        .create_prop_instance(card_mesh, glass, &at(0.0, 0.5, 1.0))
+        .expect("pane");
+    let mut seen = vec![];
+    for a in [1.0, 0.5, 0.0] {
+        r.set_prop_instance_tint(pane, [1.0, 1.0, 1.0, a])
+            .expect("tint");
+        seen.push(px(&render(&mut device, &mut r, 15.0, "clear")));
+    }
+    eprintln!("red pane at alpha 1, 0.5, 0: {seen:?}");
+    let redness = |p: [u8; 3]| i32::from(p[0]) - i32::from(p[1]);
+    assert!(redness(seen[0]) > 100, "opaque red: {:?}", seen[0]);
+    assert!(
+        redness(seen[1]) > 30 && redness(seen[1]) < redness(seen[0]) - 30,
+        "half red: {:?}",
+        seen[1]
+    );
+    assert!(
+        seen[2].iter().zip(base).all(|(a, b)| a.abs_diff(b) <= 2),
+        "invisible: {:?} vs {base:?}",
+        seen[2]
+    );
+    r.set_prop_instance(pane, &at(0.0, 0.5, 1.0), false)
+        .expect("hide");
+
+    // Additive: adds blue.
+    let glow = new_material(
+        &mut device,
+        &mut r,
+        MaterialDesc {
+            name: "glow".into(),
+            base_color: [0.0, 0.0, 0.3, 1.0],
+            shading: Shading::Unlit,
+            blend: BlendMode::Add,
+            ..MaterialDesc::default()
+        },
+    );
+    let flare = r
+        .create_prop_instance(card_mesh, glow, &at(0.0, 0.5, 1.0))
+        .expect("flare");
+    let added = px(&render(&mut device, &mut r, 15.0, "clear"));
+    eprintln!("blue glow over the cube: {added:?}");
+    assert!(
+        added[2] > base[2].saturating_add(2) || base[2] >= 250,
+        "{added:?} vs {base:?}"
+    );
+    assert!(added[0].abs_diff(base[0]) <= 3, "only blue is added");
+    r.destroy_prop_instance(flare);
+
+    // Overlays behind the cube: on top without a depth test, hidden with one; exact colour.
+    let overlay = |device: &mut Device<'_>, r: &mut Renderer, c: [f32; 4], depth_test, order| {
+        r.create_prop_material(
+            device,
+            &MaterialDesc {
+                name: "badge".into(),
+                base_color: c,
+                overlay: true,
+                blend: BlendMode::Alpha,
+                depth_test,
+                order,
+                ..MaterialDesc::default()
+            },
+        )
+        .expect("overlay")
+    };
+    let green = overlay(&mut device, &mut r, [0.0, 1.0, 0.0, 1.0], false, 0);
+    // Behind the cube on the line of sight through the measured pixel.
+    let eye = view().eye;
+    let front = [0.0, 0.5, 0.5];
+    let ray = [front[0] - eye[0], front[1] - eye[1], front[2] - eye[2]];
+    let len = (ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]).sqrt();
+    let behind = |d: f32| {
+        at(
+            front[0] + ray[0] / len * d,
+            front[1] + ray[1] / len * d,
+            front[2] + ray[2] / len * d,
+        )
+    };
+    let badge = r
+        .create_prop_instance(card_mesh, green, &behind(2.0))
+        .expect("badge");
+    let full = render(&mut device, &mut r, 15.0, "clear");
+    let on_top = px(&full);
+    eprintln!("green overlay behind the cube, no depth test: {on_top:?}");
+    assert!(
+        on_top[0] <= 2 && on_top[1] >= 253 && on_top[2] <= 2,
+        "exact colour on top: {on_top:?}"
+    );
+    let hit = r.pick(&view(), size, (cx as f32, cy as f32), u32::MAX);
+    assert_eq!(
+        hit.map(|h| h.instance),
+        Some(badge),
+        "the overlay on top is picked"
+    );
+    r.set_prop_instance_pick(badge, 2).expect("layer 2");
+    let hit = r.pick(&view(), size, (cx as f32, cy as f32), 1);
+    assert_eq!(
+        hit.map(|h| h.instance),
+        Some(cube_at),
+        "layer 1 skips the badge"
+    );
+    let mut tested = r.prop_material(green).expect("desc").clone();
+    tested.depth_test = true;
+    r.update_prop_material(&mut device, green, &tested)
+        .expect("depth test");
+    let hidden = px(&render(&mut device, &mut r, 15.0, "clear"));
+    assert!(
+        hidden.iter().zip(base).all(|(a, b)| a.abs_diff(b) <= 2),
+        "hidden behind the cube: {hidden:?} vs {base:?}"
+    );
+    // Draw order: blue (order 1) over green (order 0), then the other way round.
+    tested.depth_test = false;
+    r.update_prop_material(&mut device, green, &tested)
+        .expect("on top");
+    let blue = overlay(&mut device, &mut r, [0.0, 0.0, 1.0, 1.0], false, 1);
+    let second = r
+        .create_prop_instance(card_mesh, blue, &behind(1.5))
+        .expect("blue");
+    let order01 = px(&render(&mut device, &mut r, 15.0, "clear"));
+    tested.order = 2;
+    r.update_prop_material(&mut device, green, &tested)
+        .expect("order");
+    let order21 = px(&render(&mut device, &mut r, 15.0, "clear"));
+    eprintln!("blue over green: {order01:?}; green over blue: {order21:?}");
+    assert!(order01[2] >= 253 && order01[1] <= 2, "{order01:?}");
+    assert!(order21[1] >= 253 && order21[2] <= 2, "{order21:?}");
+    r.set_prop_instance_pick(badge, 1).expect("layer 1");
+    let hit = r.pick(&view(), size, (cx as f32, cy as f32), u32::MAX);
+    assert_eq!(
+        hit.map(|h| h.instance),
+        Some(badge),
+        "the last drawn overlay is picked"
+    );
+    let _ = second;
     let errors = device.validation_errors();
     assert!(errors.is_empty(), "validation: {errors:?}");
 }
