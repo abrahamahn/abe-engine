@@ -99,6 +99,10 @@ pub enum DetailPreset {
     /// Open land: grassy ground in broad meadow patches, with beach sand near the water and bare
     /// rock on steep slopes, where no grass grows (see [`Terrain`]).
     Terrain = 7,
+    /// A lattice of thin bars (a lantern's wooden frame, paper ribs): `scale` is the cell's
+    /// width and height, `strength` the bar width as a fraction of a cell, `color` the bars'
+    /// (dark wood by default). Bars also shade the material's glow.
+    Lattice = 8,
 }
 
 impl DetailPreset {
@@ -112,6 +116,7 @@ impl DetailPreset {
             "lacquer" => Self::Lacquer,
             "grass" => Self::Grass,
             "terrain" => Self::Terrain,
+            "lattice" => Self::Lattice,
             _ => return None,
         })
     }
@@ -593,7 +598,8 @@ mod tests {
         let f = LookFile::parse(
             br##"{"details": [
                     {"match": ["roof-*", "*-tile"], "preset": "roof_tiles", "scale": [0.25, 0.3]},
-                    {"match": "lawn", "preset": "grass", "color": "#4a7a30"}],
+                    {"match": "lawn", "preset": "grass", "color": "#4a7a30"},
+                    {"match": "lamp", "preset": "lattice", "scale": [0.1, 0.05]}],
                   "grass": {"density": 0.8, "flower_colors": ["#ffffff"]}}"##,
         )
         .unwrap();
@@ -602,6 +608,10 @@ mod tests {
         assert!(d[0].matches("roof-main") && d[0].matches("blue-tile") && !d[0].matches("tiles"));
         assert_eq!(d[0].scale, [0.25, 0.3]);
         assert!(d[1].matches("lawn") && !d[1].matches("lawns") && d[1].color.is_some());
+        assert_eq!(
+            (d[2].preset, d[2].scale),
+            (DetailPreset::Lattice, [0.1, 0.05])
+        );
         assert_eq!(f.look.grass.density, 0.8);
         assert_eq!(f.look.grass.flower_colors[3], [1.0, 1.0, 1.0]);
         assert!(LookFile::parse(br#"{"details": [{"match": "a", "preset": "fur"}]}"#).is_err());

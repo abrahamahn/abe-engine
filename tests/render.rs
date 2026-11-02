@@ -462,6 +462,73 @@ fn colour_rules_recolour_any_material() {
     );
 }
 
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn lattice_bars_shade_a_lamp() {
+    // A glowing paper box; a lattice rule draws dark bars across it, glow included.
+    let mut device = Device::headless().expect("device");
+    let (w, h) = (96, 54);
+    let mut paper = material("paper-lamp", [0.9, 0.85, 0.7, 1.0], Shading::Standard);
+    paper.emissive = [2.0, 1.6, 1.0];
+    let meshes = vec![quad(0.0, 30.0, 0), cube([0.0, 1.0, -4.0], 0.8, 1)];
+    let world = World {
+        instances: (0..meshes.len() as u32)
+            .map(|mesh| Instance {
+                mesh,
+                transform: Transform::IDENTITY,
+            })
+            .collect(),
+        meshes,
+        materials: vec![
+            material("ground", [0.2, 0.2, 0.2, 1.0], Shading::Standard),
+            paper,
+        ],
+        textures: vec![],
+        lights: vec![],
+    };
+    let view = View {
+        name: "lamp".into(),
+        eye: [0.0, 1.2, -1.0],
+        target: [0.0, 1.0, -4.0],
+        fov: 50.0,
+    };
+    let mut frame = |rules: Vec<DetailRule>| {
+        let look = Look {
+            details: rules,
+            ..Look::default()
+        };
+        let mut quality = Quality::realtime();
+        quality.shadow_size = 512;
+        quality.ground_size = 256;
+        quality.world_size = 256;
+        let mut r = Renderer::new(&mut device, &world, look, quality, (w, h), Output::Still)
+            .expect("renderer");
+        let time = TimeOfDay {
+            hours: 22.0,
+            ..TimeOfDay::default()
+        };
+        let env = Environment::resolve(&time, &Weather::default(), &r.look().palette, 2.0);
+        r.render_still(&mut device, &view, &env, 1).expect("render")
+    };
+    let bright = |image: &[u8]| image.chunks(4).filter(|p| p[0] > 200 && p[1] > 160).count();
+    let plain = frame(vec![]);
+    let barred = frame(vec![DetailRule {
+        patterns: vec!["paper-*".into()],
+        preset: DetailPreset::Lattice,
+        scale: [0.2, 0.2],
+        strength: 0.25,
+        variation: 0.0,
+        color: None,
+        gloss: 0.0,
+    }]);
+    let (before, after) = (bright(&plain), bright(&barred));
+    eprintln!("bright pixels: {before} plain, {after} with a lattice");
+    assert!(
+        before > 500 && after < before * 9 / 10,
+        "no bars: {before} / {after}"
+    );
+}
+
 /// Land sloping from 3 m down to a seabed 4 m under a sea at 0 m: flat to z = -60, the water
 /// line at z = -10, 1.4 m deep at z = 13.
 fn shore() -> World {

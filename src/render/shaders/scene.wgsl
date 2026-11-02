@@ -8,7 +8,7 @@
 
 // Vertices are already in world space.
 struct Draw {
-  detail0: vec4f,    // preset (0 none, 1 roof tiles, 2 wood, 3 plaster, 4 stone, 5 lacquer, 6 grass, 7 terrain), size u, size v, strength
+  detail0: vec4f,    // preset (0 none, 1 roof tiles, 2 wood, 3 plaster, 4 stone, 5 lacquer, 6 grass, 7 terrain, 8 lattice), size u, size v, strength
   detail1: vec4f,    // variation, rgb replacement colour
   detail2: vec4f,    // has replacement colour, gloss, unused, unused
   detail3: vec4f,    // unused
@@ -417,10 +417,35 @@ fn terrain_ground(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
   return o;
 }
 
+// A lattice of thin bars over the surface (a lantern's frame, paper ribs): cells `size u` wide
+// and `size v` tall on the face's plane, bars `strength` of a cell wide in the rule's colour
+// (dark wood by default). The cavity term carries the bars, so they also shade a lamp's glow.
+// Bars thinner than a pixel fade to a faint tint rather than shimmer.
+fn lattice(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f) -> Detail {
+  var o = no_detail(albedo, n);
+  let size = vec2f(draw.detail0.y, draw.detail0.z);
+  let q = plane_uv(p, geo) / size;
+  let f = abs(fract(q) - vec2f(0.5));
+  let half = 0.5 - draw.detail0.w * 0.5;
+  // The pattern's footprint per pixel, from the world-space derivatives taken up front.
+  let aa = max((abs(plane_uv(dpx, geo)) + abs(plane_uv(dpy, geo))) / size * 0.75, vec2f(1e-4));
+  let bars = vec2f(smoothstep(half - aa.x, half + aa.x, f.x), smoothstep(half - aa.y, half + aa.y, f.y));
+  // Where cells shrink under a few pixels the pattern averages to its coverage.
+  let fade = 1.0 - smoothstep(0.15, 0.4, max(aa.x, aa.y));
+  let cover = mix(draw.detail0.w * 0.6, max(bars.x, bars.y), fade);
+  var wood = vec3f(0.06, 0.035, 0.02);
+  if (draw.detail2.x > 0.5) {
+    wood = draw.detail1.yzw;
+  }
+  o.albedo = mix(albedo, wood, cover);
+  o.cavity = 1.0 - cover * 0.92;
+  return o;
+}
+
 fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f) -> Detail {
   let preset = i32(draw.detail0.x + 0.5);
   var base = albedo;
-  if (draw.detail2.x > 0.5 && preset != 6 && preset != 7) {
+  if (draw.detail2.x > 0.5 && preset != 6 && preset != 7 && preset != 8) {
     base = draw.detail1.yzw;
   }
   if (preset == 1) {
@@ -440,6 +465,9 @@ fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
   }
   if (preset == 7) {
     return terrain_ground(p, geo, n, albedo, dpx, dpy);
+  }
+  if (preset == 8) {
+    return lattice(p, geo, n, albedo, dpx, dpy);
   }
   var o = no_detail(base, n);
   if (preset == 5) {
@@ -514,6 +542,8 @@ fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
     albedo = vec4f(d.albedo * d.cavity, albedo.a);
     n = d.n;
     rough_override = d.rough;
+    // Joints, seams and lattice bars also shade a surface's own glow.
+    emissive *= d.cavity;
   }
   if (shading <= 1) {
     let footprint = (length(dpx) + length(dpy)) / max(frame.paint.y, 1e-3);
