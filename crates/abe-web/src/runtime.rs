@@ -754,8 +754,8 @@ fn json_string(s: &str) -> String {
 }
 
 /// A model's contents as JSON, for the host: images to decode (type, colour or data, size),
-/// nodes (name, parent, mesh), meshes (name, morph target names), clips (name, duration) and
-/// material names. Indices are positions in these lists.
+/// nodes (name, parent, mesh), meshes (name, morph target names), clips (name, duration and the
+/// nodes they animate) and material names. Indices are positions in these lists.
 fn describe(m: &Model) -> String {
     let list = |items: Vec<String>| format!("[{}]", items.join(","));
     let opt = |o: Option<usize>| o.map_or("null".to_string(), |v| v.to_string());
@@ -801,10 +801,18 @@ fn describe(m: &Model) -> String {
         .clips
         .iter()
         .map(|c| {
+            // Each node a channel moves, once, in the order first met.
+            let mut nodes: Vec<usize> = Vec::new();
+            for channel in &c.channels {
+                if !nodes.contains(&channel.node) {
+                    nodes.push(channel.node);
+                }
+            }
             format!(
-                r#"{{"name":{},"duration":{}}}"#,
+                r#"{{"name":{},"duration":{},"nodes":{}}}"#,
                 json_string(&c.name),
-                c.duration
+                c.duration,
+                list(nodes.iter().map(usize::to_string).collect())
             )
         })
         .collect();

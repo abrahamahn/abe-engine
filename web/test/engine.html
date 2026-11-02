@@ -257,6 +257,8 @@ async function run() {
   check('model drawn with its decoded texture', count(fifth, boxAround(upright, 3), magenta) > 10,
     { at: upright, rgb: pixel(fifth, upright) });
   const bend = info.clips.findIndex((c) => c.name === 'bend');
+  check('a clip lists the nodes it moves', info.clips[bend].nodes.length > 0
+    && info.clips[bend].nodes.every((nd) => nd >= 0 && nd < info.nodes.length), info.clips[bend]);
   engine.modelClip(bar, bend, 1.0, 1);
   engine.updateModel(bar);
   const sixth = await frame(engine);

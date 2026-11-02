@@ -93,7 +93,12 @@ export interface AbeModelInfo {
     readonly skin: number | null;
   }[];
   readonly meshes: readonly { readonly name: string; readonly targets: number; readonly targetNames: readonly string[] }[];
-  readonly clips: readonly { readonly name: string; readonly duration: number }[];
+  /** Each clip: its name, its length in seconds and the nodes its channels move. */
+  readonly clips: readonly {
+    readonly name: string;
+    readonly duration: number;
+    readonly nodes: readonly number[];
+  }[];
   /** Material names by glTF index. */
   readonly materials: readonly string[];
 }
