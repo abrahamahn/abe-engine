@@ -150,6 +150,8 @@ export interface AbeEngine {
   setView(view: AbeView): void;
   /** Time of day in hours and the animation clock in seconds. */
   setClock(hours: number, seconds?: number): void;
+  /** The world's lamps `boost` times as bright as the hour lights them, glow and light alike (1: as it does). */
+  setLampBoost(boost: number): void;
   setWeather(preset: string): void;
   /** Draws and presents a frame; false when it skipped (GPU busy). */
   render(): boolean;

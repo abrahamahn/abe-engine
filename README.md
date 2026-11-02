@@ -77,6 +77,7 @@ engine.fitCanvas();                                   // canvas size = CSS box x
 engine.setView({ eye: [0, 4, 10], target: [0, 0.5, 0], fov: 45, shift: [0, 0.1] });
 engine.setClock(18.5, performance.now() / 1000);     // time of day, animation clock
 engine.setWeather('clear');
+engine.setLampBoost(1.9);                             // the lamps swell for a moment (1: as the hour has them)
 const mesh = engine.createMesh({ positions, normals, uvs, indices });
 const art = engine.createTexture(canvasOrImageBitmap);
 const felt = engine.createMaterial({ name: 'felt', color: [0.1, 0.3, 0.2, 1], baseTexture: art });

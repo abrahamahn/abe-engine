@@ -350,6 +350,20 @@ async function run() {
   const putOut = await frame(engine);
   check('a light put out is gone', Math.abs(brightness(putOut, lightAt) - brightness(unlit, lightAt)) < 12,
     { before: pixel(unlit, lightAt), after: pixel(putOut, lightAt) });
+  // The world's lamps swell with a boost (their glow and the light they cast), and settle back.
+  const byLamp = at([3.4, 0, 2.2]);
+  const lampLit = await frame(engine);
+  engine.setLampBoost(2.5);
+  const lampBoosted = await frame(engine);
+  engine.setLampBoost(1);
+  const lampSettled = await frame(engine);
+  check('a lamp boost swells the lamps\' light, and settles back', brightness(lampBoosted, byLamp) > brightness(lampLit, byLamp) + 15
+    && Math.abs(brightness(lampSettled, byLamp) - brightness(lampLit, byLamp)) < 6,
+    { lit: pixel(lampLit, byLamp), boosted: pixel(lampBoosted, byLamp), settled: pixel(lampSettled, byLamp) });
+  let boostRefused = '';
+  try { engine.setLampBoost(-1); } catch (e) { boostRefused = e.message; }
+  check('a negative lamp boost is refused', boostRefused.includes('set_lamp_boost'), boostRefused);
+
   // A spot casting shadows from a box's left takes its light off the ground behind the box, and
   // nowhere else; two lights cast at most.
   const caster = engine.createInstance(box, paint, translate(-2, 0.5, 2.5));

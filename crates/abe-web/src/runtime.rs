@@ -30,6 +30,8 @@ struct Runtime {
     time: TimeOfDay,
     weather: Weather,
     seconds: f32,
+    /// The world's lamps, brighter (or dimmer) than the time of day lights them.
+    lamp_boost: f32,
     frames: u32,
     /// Parsed models waiting for their textures (handle = index + 1).
     pending: Vec<Option<Model>>,
@@ -185,6 +187,7 @@ fn start(world: &World, look: &[u8], quality: u32) -> Result<Runtime, String> {
         time: file.time,
         weather: file.weather,
         seconds: 0.0,
+        lamp_boost: 1.0,
         frames: 0,
         pending: vec![],
     })
@@ -262,6 +265,19 @@ pub extern "C" fn abe_rt_set_clock(hours: f32, seconds: f32) -> u32 {
     })
 }
 
+/// Lights the world's lamps `boost` times as brightly as the time of day does, their glow and the
+/// light they cast alike (1: as the hour has them; a game's flare swells them for a moment).
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_set_lamp_boost(boost: f32) -> u32 {
+    with(0, |rt| {
+        if !boost.is_finite() || boost < 0.0 {
+            return Err("set_lamp_boost: a finite boost of 0 or more".into());
+        }
+        rt.lamp_boost = boost;
+        Ok(1)
+    })
+}
+
 /// Sets the weather to a preset (`clear`, `cloudy`, `overcast`, `mist`, `rain`, `storm`,
 /// `petals`) named by the UTF-8 text at `ptr`.
 ///
@@ -289,12 +305,13 @@ pub extern "C" fn abe_rt_render() -> u32 {
         if size != rt.renderer.size() && size.0 > 0 && size.1 > 0 {
             rt.renderer.resize(&mut rt.device, size)?;
         }
-        let env = Environment::resolve(
+        let mut env = Environment::resolve(
             &rt.time,
             &rt.weather,
             &rt.renderer.look().palette,
             rt.seconds,
         );
+        env.lamp_level *= rt.lamp_boost;
         let mut enc = rt.device.encoder();
         rt.renderer.encode(
             &mut rt.device,

@@ -1807,6 +1807,8 @@ export async function createEngine(options) {
     },
     /** Time of day in hours and the animation clock in seconds. */
     setClock(hours, seconds = 0) { ok('setClock', x.abe_rt_set_clock(hours, seconds)); },
+    /** The world's lamps this many times as bright as the hour lights them (1: as it does). */
+    setLampBoost(boost) { ok('setLampBoost', x.abe_rt_set_lamp_boost(boost)); },
     setWeather(preset) {
       const t = text(preset);
       const [p] = place(t);
