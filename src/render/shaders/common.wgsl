@@ -60,8 +60,46 @@ struct Prop {
   model: mat4x4f,
   normal: mat4x4f,  // inverse transpose of the model matrix (upper 3x3 used)
   tint: vec4f,      // multiplies the material's colour and alpha
+  skin: vec4f,      // skinned: x = its first joint matrix in `joints`, y = its mesh's first record
+                    // in `skins`, z = 1 (0: not skinned)
 };
 @group(0) @binding(11) var<storage, read> props: array<Prop>;
+// A skinned prop's joints this frame (joint world-from-bind matrices, in the model's space), and
+// each skinned mesh's vertices' four joints and their weights (two records a vertex).
+@group(0) @binding(12) var<storage, read> joints: array<mat4x4f>;
+@group(0) @binding(13) var<storage, read> skins: array<vec4f>;
+
+struct Skinned {
+  position: vec3f,
+  normal: vec3f,
+};
+
+// A prop's vertex moved by its joints (linear blend skinning), in the model's space; as it is for
+// a prop that is not skinned.
+fn skin_vertex(p: Prop, vertex: u32, position: vec3f, normal: vec3f) -> Skinned {
+  var o: Skinned;
+  o.position = position;
+  o.normal = normal;
+  if (p.skin.z < 0.5) {
+    return o;
+  }
+  let at = u32(p.skin.y) + vertex * 2u;
+  let j = skins[at];
+  let w = skins[at + 1u];
+  if (w.x + w.y + w.z + w.w < 1e-6) {
+    return o;
+  }
+  let first = u32(p.skin.x);
+  let a = joints[first + u32(j.x)];
+  let b = joints[first + u32(j.y)];
+  let c = joints[first + u32(j.z)];
+  let d = joints[first + u32(j.w)];
+  let v = vec4f(position, 1.0);
+  let n = vec4f(normal, 0.0);
+  o.position = ((a * v) * w.x + (b * v) * w.y + (c * v) * w.z + (d * v) * w.w).xyz;
+  o.normal = ((a * n) * w.x + (b * n) * w.y + (c * n) * w.z + (d * n) * w.w).xyz;
+  return o;
+}
 
 const PI = 3.14159265;
 

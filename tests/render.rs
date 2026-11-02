@@ -1789,6 +1789,23 @@ fn models_pose_skin_and_place() {
         red(colour_at(&two, [2.0, 1.6, 0.15], &r)),
         "the second is upright"
     );
+    // The first goes, and with it its mesh's skin: the second still bends on its own joints.
+    r.destroy_model_instance(&mut device, inst);
+    {
+        let (pose, model) = r.model_pose_and_model(second).expect("pose");
+        pose.apply(model, 0, 1.0, 1.0);
+    }
+    r.update_model_instance(&mut device, second)
+        .expect("update");
+    let alone = render(&mut device, &mut r, 15.0, "clear");
+    assert!(
+        red(colour_at(&alone, [1.4, 1.0, 0.15], &r)),
+        "the second bends"
+    );
+    assert!(
+        !red(colour_at(&alone, [-2.6, 1.0, 0.15], &r)),
+        "the first is gone"
+    );
     r.destroy_model(&mut device, id);
     assert!(r.model_node_world(second, 0).is_err());
     assert_eq!(r.prop_instances(), 0);

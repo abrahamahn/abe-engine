@@ -181,7 +181,10 @@ export interface AbeEngine {
   modelNode(instance: number, node: number): AbeNodeTransform;
   setModelNode(instance: number, node: number, transform: AbeNodeTransform): void;
   modelMorph(instance: number, node: number, target: number, weight: number): void;
-  /** Applies the pose (node transforms, skinning, morphs) to what is drawn. */
+  /**
+   * Applies the pose to what is drawn: node transforms, the joints its skinned meshes follow (on
+   * the GPU) and morphs (on the CPU, where a mesh's morph weights changed).
+   */
   updateModel(instance: number): void;
   /** A node's world matrix as of the last update. */
   modelNodeWorld(instance: number, node: number): Float32Array;

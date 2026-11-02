@@ -71,6 +71,16 @@ impl<T> Pool<T> {
                 v.as_ref().map(|v| (generation << INDEX_BITS | i as u32, v))
             })
     }
+    /// Live values with their ids, mutable.
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (u32, &mut T)> + '_ {
+        self.slots
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, (generation, v))| {
+                v.as_mut()
+                    .map(|v| (*generation << INDEX_BITS | i as u32, v))
+            })
+    }
     /// Removes every value. Ids handed out before stay stale.
     pub(crate) fn drain(&mut self) -> Vec<T> {
         let mut out = Vec::new();

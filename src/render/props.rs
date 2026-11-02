@@ -9,6 +9,11 @@
 //! reads `props[first + instance_index]` (see `Prop` in common.wgsl). Meshes keep a CPU copy of
 //! their triangles for [`Renderer::pick`].
 //!
+//! A skinned mesh ([`Renderer::set_prop_mesh_skin`]) keeps its vertices' joints and weights in
+//! one buffer shared by every skinned mesh; each instance of it carries its joint matrices
+//! ([`Renderer::set_prop_instance_joints`]), which go to the frame slot's joint buffer, and the
+//! vertex stages move its vertices on the GPU (`skin_vertex` in common.wgsl).
+//!
 //! Handles are generational: using one after its object was destroyed is an error, never a
 //! different object.
 use super::View;
@@ -298,9 +303,16 @@ impl MaterialDesc {
     }
 }
 
-/// Bytes per instance in the instance buffer (`Prop` in common.wgsl: two matrices, a tint).
-const PROP_BYTES: u64 = 144;
+/// Bytes per instance in the instance buffer (`Prop` in common.wgsl: two matrices, a tint and
+/// its skin).
+const PROP_BYTES: u64 = 160;
 const MIN_CAPACITY: u32 = 64;
+/// Bytes per joint matrix in a slot's joint buffer, and the fewest matrices it holds.
+const JOINT_BYTES: u64 = 64;
+const MIN_JOINTS: u32 = 64;
+/// Bytes per skin record (a vertex has two: its joints, its weights), and the fewest held.
+const SKIN_RECORD_BYTES: u64 = 16;
+const MIN_SKIN_RECORDS: u32 = 64;
 
 pub(super) struct MeshEntry {
     vertices: BufferId,
@@ -311,6 +323,17 @@ pub(super) struct MeshEntry {
     triangles: Vec<u32>,
     min: V3,
     max: V3,
+    /// A skinned mesh's records in the shared skin buffer.
+    skin: Option<SkinRange>,
+}
+
+/// Where a skinned mesh's vertices' joints and weights lie in the shared skin records.
+#[derive(Clone, Copy, Debug)]
+struct SkinRange {
+    first: u32,
+    count: u32,
+    /// The highest joint its vertices use: an instance needs more matrices than this.
+    max_joint: u16,
 }
 
 pub(super) struct MaterialEntry {
@@ -351,6 +374,8 @@ struct InstanceEntry {
     visible: bool,
     /// Pick layers (bits); 0 is never picked.
     pick: u32,
+    /// A skinned mesh's joint matrices for this instance (empty: drawn as modelled).
+    joints: Vec<M4>,
 }
 
 /// One instanced draw of this frame: instances `first..first + count` of the buffer.
@@ -363,9 +388,10 @@ pub(super) struct Batch {
     layer: Layer,
 }
 
-/// A frame slot's instance buffer and the bind groups that read it.
+/// A frame slot's instance and joint buffers and the bind groups that read them.
 pub(super) struct PropSlot {
     buffer: BufferId,
+    joints: BufferId,
     /// Main view and reflection (`@group(0)` of the prop scene pipeline).
     scene: [BindGroupId; 2],
     shadow: BindGroupId,
@@ -383,6 +409,13 @@ pub(super) struct Props {
     instances: Pool<InstanceEntry>,
     slots: Vec<Option<PropSlot>>,
     capacity: u32,
+    /// Joint matrices each slot's joint buffer holds.
+    joint_capacity: u32,
+    /// Every skinned mesh's vertices' joints and weights, packed in mesh order of creation.
+    skin_records: Vec<[f32; 4]>,
+    /// Their GPU copy (and how many records it holds), rewritten when `skin_dirty`.
+    skin_buffer: Option<(BufferId, u32)>,
+    skin_dirty: bool,
     batches: Vec<Batch>,
     /// World bounds of this frame's visible instances.
     bounds: Option<(V3, V3)>,
@@ -604,8 +637,84 @@ impl Renderer {
             triangles: mesh.indices.to_vec(),
             min,
             max,
+            skin: None,
         };
         Ok(PropMesh(self.props.meshes.insert(entry)?))
+    }
+
+    /// Skins a mesh: each vertex follows up to four of an instance's joints (`joints`, indices
+    /// into the matrices [`Renderer::set_prop_instance_joints`] gives it) by `weights`, which
+    /// are normalized here (a vertex weighing nothing stays as modelled). The GPU moves the
+    /// vertices each frame; the mesh keeps its own positions for picking and bounds.
+    pub fn set_prop_mesh_skin(
+        &mut self,
+        mesh: PropMesh,
+        joints: &[[u16; 4]],
+        weights: &[[f32; 4]],
+    ) -> Result<()> {
+        let m = self
+            .props
+            .meshes
+            .get(mesh.0)
+            .ok_or_else(|| format!("{mesh:?} was destroyed"))?;
+        let n = m.positions.len();
+        if joints.len() != n || weights.len() != n {
+            return Err(format!(
+                "set_prop_mesh_skin: {} joints and {} weights for {n} vertices",
+                joints.len(),
+                weights.len()
+            ));
+        }
+        if weights.iter().flatten().any(|w| !w.is_finite() || *w < 0.0) {
+            return Err("set_prop_mesh_skin: weights must be finite and not negative".into());
+        }
+        let mut records = Vec::with_capacity(n * 2);
+        let mut max_joint = 0u16;
+        for (js, ws) in joints.iter().zip(weights) {
+            let total: f32 = ws.iter().sum();
+            let norm = if total > 1e-6 { 1.0 / total } else { 0.0 };
+            records.push(js.map(f32::from));
+            records.push(ws.map(|w| w * norm));
+            for (&j, &w) in js.iter().zip(ws) {
+                if w * norm > 0.0 {
+                    max_joint = max_joint.max(j);
+                }
+            }
+        }
+        self.drop_prop_mesh_skin(mesh);
+        let first = self.props.skin_records.len() as u32;
+        self.props.skin_records.extend(records);
+        if let Some(m) = self.props.meshes.get_mut(mesh.0) {
+            m.skin = Some(SkinRange {
+                first,
+                count: (n * 2) as u32,
+                max_joint,
+            });
+        }
+        self.props.skin_dirty = true;
+        Ok(())
+    }
+
+    /// Takes a mesh's records out of the shared skin records, closing the gap.
+    fn drop_prop_mesh_skin(&mut self, mesh: PropMesh) {
+        let Some(range) = self
+            .props
+            .meshes
+            .get_mut(mesh.0)
+            .and_then(|m| m.skin.take())
+        else {
+            return;
+        };
+        let (start, end) = (range.first as usize, (range.first + range.count) as usize);
+        self.props.skin_records.drain(start..end);
+        for (_, m) in self.props.meshes.iter_mut() {
+            if let Some(s) = &mut m.skin
+                && s.first >= range.first + range.count
+            {
+                s.first -= range.count;
+            }
+        }
+        self.props.skin_dirty = true;
     }
 
     /// New vertex positions and normals for a mesh (a skinned or morphed character each frame);
@@ -636,6 +745,7 @@ impl Renderer {
 
     /// Destroys a mesh and every instance of it.
     pub fn destroy_prop_mesh(&mut self, device: &mut Device<'_>, mesh: PropMesh) {
+        self.drop_prop_mesh_skin(mesh);
         if let Some(m) = self.props.meshes.remove(mesh.0) {
             let users: Vec<u32> = self
                 .props
@@ -849,8 +959,41 @@ impl Renderer {
             tint: [1.0; 4],
             visible: true,
             pick: 1,
+            joints: vec![],
         };
         Ok(PropInstance(self.props.instances.insert(entry)?))
+    }
+
+    /// An instance's joint matrices (each a joint's world-from-bind transform in the model's
+    /// space, its global matrix times its inverse bind matrix): its skinned mesh's vertices
+    /// follow them from the next frame. Empty draws the mesh as modelled. There must be more
+    /// matrices than the highest joint the mesh's vertices use.
+    pub fn set_prop_instance_joints(
+        &mut self,
+        instance: PropInstance,
+        joints: &[M4],
+    ) -> Result<()> {
+        if joints.iter().flatten().any(|x| !x.is_finite()) {
+            return Err("set_prop_instance_joints: values must be finite".into());
+        }
+        let i = self
+            .props
+            .instances
+            .get_mut(instance.0)
+            .ok_or_else(|| format!("{instance:?} was destroyed"))?;
+        if !joints.is_empty()
+            && let Some(skin) = self.props.meshes.get(i.mesh.0).and_then(|m| m.skin)
+            && joints.len() <= usize::from(skin.max_joint)
+        {
+            return Err(format!(
+                "set_prop_instance_joints: {} matrices for joint {}",
+                joints.len(),
+                skin.max_joint
+            ));
+        }
+        i.joints.clear();
+        i.joints.extend_from_slice(joints);
+        Ok(())
     }
 
     /// Moves an instance and shows or hides it.
@@ -980,7 +1123,13 @@ impl Renderer {
             let o = math::transform_point(&inv, origin);
             let tip = math::transform_point(&inv, math::add(origin, dir));
             let d = math::sub(tip, o);
-            let Some(enter) = ray_box(o, d, mesh.min, mesh.max) else {
+            // A skinned prop is tested where its joints have moved it, as it is drawn.
+            let skinned = self.skinned_positions(mesh, &inst.joints);
+            let (positions, (min, max)) = match &skinned {
+                Some(p) => (&p[..], bounds(p)),
+                None => (&mesh.positions[..], (mesh.min, mesh.max)),
+            };
+            let Some(enter) = ray_box(o, d, min, max) else {
                 continue;
             };
             if !better(top, order, enter, &best) {
@@ -989,9 +1138,9 @@ impl Renderer {
             let mut hit: Option<f32> = None;
             for t in mesh.triangles.chunks_exact(3) {
                 let (a, b, c) = (
-                    mesh.positions[t[0] as usize],
-                    mesh.positions[t[1] as usize],
-                    mesh.positions[t[2] as usize],
+                    positions[t[0] as usize],
+                    positions[t[1] as usize],
+                    positions[t[2] as usize],
                 );
                 if let Some(s) = ray_triangle(o, d, a, b, c)
                     && hit.is_none_or(|h| s < h)
@@ -1012,6 +1161,40 @@ impl Renderer {
             }
         }
         best.map(|b| b.0)
+    }
+
+    /// A skinned mesh's vertices moved by `joints` as the vertex stages move them, or `None`
+    /// when it is not skinned or `joints` cannot move it.
+    fn skinned_positions(&self, mesh: &MeshEntry, joints: &[M4]) -> Option<Vec<V3>> {
+        let skin = mesh.skin?;
+        if joints.len() <= usize::from(skin.max_joint) {
+            return None;
+        }
+        let records = self
+            .props
+            .skin_records
+            .get(skin.first as usize..(skin.first + skin.count) as usize)?;
+        let moved = mesh
+            .positions
+            .iter()
+            .zip(records.chunks_exact(2))
+            .map(|(&p, r)| {
+                let (j, w) = (r[0], r[1]);
+                if w.iter().sum::<f32>() < 1e-6 {
+                    return p;
+                }
+                let mut out = [0.0f32; 3];
+                for k in 0..4 {
+                    if let Some(m) = joints.get(j[k] as usize)
+                        && w[k] != 0.0
+                    {
+                        out = math::add(out, math::scale(math::transform_point(m, p), w[k]));
+                    }
+                }
+                out
+            })
+            .collect();
+        Some(moved)
     }
 
     /// Where a world point lands in a `size` image of `view`: pixel x and y (top-left origin)
@@ -1052,6 +1235,7 @@ impl Renderer {
                 device.destroy_bind_group(g);
             }
             device.destroy_buffer(s.buffer);
+            device.destroy_buffer(s.joints);
         }
     }
 
@@ -1133,7 +1317,8 @@ impl Renderer {
                 .then((a.material, a.mesh).cmp(&(b.material, b.mesh)))
         });
         let mut batches: Vec<Batch> = Vec::new();
-        let mut data: Vec<f32> = Vec::with_capacity(live.len() * 36);
+        let mut data: Vec<f32> = Vec::with_capacity(live.len() * 40);
+        let mut joint_data: Vec<f32> = Vec::new();
         for (n, l) in live.iter().enumerate() {
             match batches.last_mut() {
                 Some(b)
@@ -1155,15 +1340,60 @@ impl Renderer {
             data.extend_from_slice(&l.inst.model);
             data.extend_from_slice(&l.inst.normal);
             data.extend_from_slice(&l.inst.tint);
+            let skin = self.props.meshes.get(l.mesh).and_then(|m| m.skin);
+            match skin {
+                Some(range) if l.inst.joints.len() > usize::from(range.max_joint) => {
+                    let first = (joint_data.len() / 16) as f32;
+                    for j in &l.inst.joints {
+                        joint_data.extend_from_slice(j);
+                    }
+                    data.extend_from_slice(&[first, range.first as f32, 1.0, 0.0]);
+                }
+                _ => data.extend_from_slice(&[0.0; 4]),
+            }
         }
         let count = live.len() as u32;
         drop(live);
         self.props.batches = batches;
         self.props.bounds = (lo[0] <= hi[0]).then_some((lo, hi));
+        // The shared skin records: rewritten when a skinned mesh came or went, and grown (with
+        // every slot's bind groups) when they outgrow their buffer.
+        if self.props.skin_dirty || self.props.skin_buffer.is_none() {
+            let records = (self.props.skin_records.len() as u32).max(MIN_SKIN_RECORDS);
+            if self
+                .props
+                .skin_buffer
+                .is_none_or(|(_, held)| records > held)
+            {
+                self.reset_prop_slots(device);
+                if let Some((old, _)) = self.props.skin_buffer.take() {
+                    device.destroy_buffer(old);
+                }
+                let held = records.next_power_of_two();
+                let buffer = device.create_buffer(&BufferDesc {
+                    size: u64::from(held) * SKIN_RECORD_BYTES,
+                    usage: BufferUsage::STORAGE | BufferUsage::COPY_DST,
+                    memory: Memory::Device,
+                })?;
+                self.props.skin_buffer = Some((buffer, held));
+            }
+            if let Some((buffer, _)) = self.props.skin_buffer
+                && !self.props.skin_records.is_empty()
+            {
+                let flat: Vec<f32> = self.props.skin_records.iter().flatten().copied().collect();
+                device.write_buffer(buffer, 0, &f32_bytes(&flat))?;
+            }
+            self.props.skin_dirty = false;
+        }
         let needed = count.max(MIN_CAPACITY);
-        if needed > self.props.capacity {
+        let joints_needed = ((joint_data.len() / 16) as u32).max(MIN_JOINTS);
+        if needed > self.props.capacity || joints_needed > self.props.joint_capacity {
             self.reset_prop_slots(device);
-            self.props.capacity = needed.next_power_of_two();
+            self.props.capacity = self.props.capacity.max(needed.next_power_of_two());
+            self.props.joint_capacity = self
+                .props
+                .joint_capacity
+                .max(joints_needed.next_power_of_two());
         }
         if self.props.slots.len() <= slot {
             self.props.slots.resize_with(slot + 1, || None);
@@ -1171,10 +1401,13 @@ impl Renderer {
         if self.props.slots[slot].is_none() {
             self.props.slots[slot] = Some(self.create_prop_slot(device, slot)?);
         }
-        if !data.is_empty()
-            && let Some(s) = &self.props.slots[slot]
-        {
-            device.write_buffer(s.buffer, 0, &f32_bytes(&data))?;
+        if let Some(s) = &self.props.slots[slot] {
+            if !data.is_empty() {
+                device.write_buffer(s.buffer, 0, &f32_bytes(&data))?;
+            }
+            if !joint_data.is_empty() {
+                device.write_buffer(s.joints, 0, &f32_bytes(&joint_data))?;
+            }
         }
         Ok(())
     }
@@ -1190,6 +1423,16 @@ impl Renderer {
             usage: BufferUsage::STORAGE,
             memory: Memory::Upload,
         })?;
+        let joints = device.create_buffer(&BufferDesc {
+            size: u64::from(self.props.joint_capacity) * JOINT_BYTES,
+            usage: BufferUsage::STORAGE,
+            memory: Memory::Upload,
+        })?;
+        let skins = self
+            .props
+            .skin_buffer
+            .map(|(b, _)| b)
+            .ok_or("create_prop_slot: no skin buffer")?;
         let buf = |id| Resource::Buffer {
             id,
             offset: 0,
@@ -1217,17 +1460,29 @@ impl Renderer {
                     (9, Resource::Texture(self.ground_mask)),
                     (10, Resource::Texture(self.world_depth)),
                     (11, buf(buffer)),
+                    (12, buf(joints)),
+                    (13, buf(skins)),
                 ],
             )?);
         }
-        let shadow = device.create_bind_group(p.shadow_prop, 0, &[(11, buf(buffer))])?;
+        let shadow = device.create_bind_group(
+            p.shadow_prop,
+            0,
+            &[(11, buf(buffer)), (12, buf(joints)), (13, buf(skins))],
+        )?;
         let overlay = device.create_bind_group(
             p.overlay[0][0],
             0,
-            &[(0, buf(s.frame[0])), (11, buf(buffer))],
+            &[
+                (0, buf(s.frame[0])),
+                (11, buf(buffer)),
+                (12, buf(joints)),
+                (13, buf(skins)),
+            ],
         )?;
         Ok(PropSlot {
             buffer,
+            joints,
             scene: [scene[0], scene[1]],
             shadow,
             overlay,
@@ -1436,6 +1691,10 @@ impl Renderer {
     pub fn destroy_props(&mut self, device: &mut Device<'_>) {
         self.drop_models();
         self.reset_prop_slots(device);
+        if let Some((buffer, _)) = self.props.skin_buffer.take() {
+            device.destroy_buffer(buffer);
+        }
+        self.props.skin_records.clear();
         for m in self.props.meshes.drain() {
             device.destroy_buffer(m.vertices);
             device.destroy_buffer(m.indices);

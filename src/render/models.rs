@@ -1,8 +1,10 @@
 //! Models: run-time glTF models ([`crate::assets::model`]) drawn as props. A model's
 //! materials and static primitives become shared prop materials and meshes; each placed
 //! instance has a pose ([`crate::anim::Pose`]) and one prop instance per primitive of every mesh
-//! node, and skinned or morphed primitives get meshes of their own that
-//! [`Renderer::update_model_instance`] deforms on the CPU.
+//! node, and skinned or morphed primitives get meshes of their own. A skinned primitive follows
+//! its joints on the GPU ([`Renderer::set_prop_mesh_skin`]): [`Renderer::update_model_instance`]
+//! hands it the pose's joint matrices, and morphs a primitive's vertices on the CPU only when
+//! its morph weights changed.
 //!
 //! Textures are the host's: it decodes the model's images (browsers decode PNG, JPEG and WebP
 //! natively) into prop textures and passes them in, one per image.
@@ -41,6 +43,8 @@ struct Part {
     instance: PropInstance,
     /// This instance's own mesh for a skinned or morphed primitive.
     own: Option<PropMesh>,
+    /// The morph weights its own mesh's vertices were last morphed with.
+    morphed: Vec<f32>,
 }
 
 pub(super) struct InstanceEntry {
@@ -246,22 +250,24 @@ impl Renderer {
             primitive: usize,
             shared: Option<PropMesh>,
             material: PropMaterial,
-            /// Positions and normals of a primitive deformed per instance.
+            /// Positions and normals of a primitive deformed per instance: morphed, not
+            /// skinned (the GPU skins it).
             deformed: Option<Deformed>,
+            /// A skinned primitive's vertices' joints and weights.
+            skin: Option<Skin>,
+            morphed: Vec<f32>,
         }
         type Deformed = (Vec<[f32; 3]>, Vec<[f32; 3]>);
+        type Skin = (Vec<[u16; 4]>, Vec<[f32; 4]>);
         let mut plans = vec![];
         for n in drawn_nodes(model) {
             let mesh = model.nodes[n].mesh.unwrap_or(0);
             for (pi, p) in model.meshes[mesh].primitives.iter().enumerate() {
                 let material = p.material.map_or(default_material, |m| entry.materials[m]);
-                let deformed = deformable(model, n, mesh, pi).then(|| {
-                    let joints = model.nodes[n]
-                        .skin
-                        .filter(|_| !p.joints.is_empty())
-                        .map(|s| anim::joint_matrices(model, s, &globals));
-                    anim::deform(p, &pose.weights[n], joints.as_deref())
-                });
+                let deformed =
+                    deformable(model, n, mesh, pi).then(|| anim::deform(p, &pose.weights[n], None));
+                let skin = (model.nodes[n].skin.is_some() && !p.joints.is_empty())
+                    .then(|| (p.joints.clone(), p.weights.clone()));
                 plans.push(Plan {
                     node: n,
                     mesh,
@@ -269,6 +275,8 @@ impl Renderer {
                     shared: entry.meshes[mesh][pi],
                     material,
                     deformed,
+                    skin,
+                    morphed: pose.weights[n].clone(),
                 });
             }
         }
@@ -294,7 +302,19 @@ impl Renderer {
                             indices: &indices,
                         },
                     );
-                    match made {
+                    let skinned = made.and_then(|m| match &plan.skin {
+                        Some((joints, weights)) => {
+                            match self.set_prop_mesh_skin(m, joints, weights) {
+                                Ok(()) => Ok(m),
+                                Err(e) => {
+                                    self.destroy_prop_mesh(device, m);
+                                    Err(e)
+                                }
+                            }
+                        }
+                        None => Ok(m),
+                    });
+                    match skinned {
                         Ok(m) => (m, Some(m)),
                         Err(e) => {
                             self.release_parts(device, parts);
@@ -311,6 +331,7 @@ impl Renderer {
                     primitive: plan.primitive,
                     instance,
                     own,
+                    morphed: plan.morphed,
                 }),
                 Err(e) => {
                     if let Some(m) = own {
@@ -422,7 +443,8 @@ impl Renderer {
         Ok(())
     }
 
-    /// Applies the pose: node transforms, skinning and morphing.
+    /// Applies the pose: node transforms, the joints of skinned primitives (skinned on the
+    /// GPU) and morphing (on the CPU, for a primitive whose morph weights changed).
     pub fn update_model_instance(
         &mut self,
         device: &mut Device<'_>,
@@ -440,19 +462,37 @@ impl Renderer {
             .ok_or("the instance's model was destroyed")?
             .model;
         let globals = e.pose.globals(model);
-        let mut updates = vec![];
-        for part in &e.parts {
+        // Each skin's joint matrices once, however many primitives follow them.
+        let mut skins: Vec<(usize, Vec<M4>)> = vec![];
+        let mut joints = vec![];
+        let mut morphs = vec![];
+        for (k, part) in e.parts.iter().enumerate() {
             let Some(own) = part.own else { continue };
             let p = &model.meshes[part.mesh].primitives[part.primitive];
-            let joints = model.nodes[part.node]
-                .skin
-                .filter(|_| !p.joints.is_empty())
-                .map(|s| anim::joint_matrices(model, s, &globals));
-            let (pos, nrm) = anim::deform(p, &e.pose.weights[part.node], joints.as_deref());
-            updates.push((own, pos, nrm));
+            if let Some(s) = model.nodes[part.node].skin.filter(|_| !p.joints.is_empty()) {
+                let at = match skins.iter().position(|(skin, _)| *skin == s) {
+                    Some(at) => at,
+                    None => {
+                        skins.push((s, anim::joint_matrices(model, s, &globals)));
+                        skins.len() - 1
+                    }
+                };
+                joints.push((part.instance, at));
+            }
+            let weights = &e.pose.weights[part.node];
+            if !p.targets.is_empty() && part.morphed != *weights {
+                let (pos, nrm) = anim::deform(p, weights, None);
+                morphs.push((k, own, pos, nrm, weights.clone()));
+            }
         }
-        for (mesh, pos, nrm) in updates {
+        for (k, mesh, pos, nrm, weights) in morphs {
             self.update_prop_mesh(device, mesh, &pos, &nrm)?;
+            if let Some(part) = self.model_instance_entry(i)?.parts.get_mut(k) {
+                part.morphed = weights;
+            }
+        }
+        for (instance, at) in joints {
+            self.set_prop_instance_joints(instance, &skins[at].1)?;
         }
         self.model_instance_entry(i)?.globals = globals;
         self.place_model_parts(i)

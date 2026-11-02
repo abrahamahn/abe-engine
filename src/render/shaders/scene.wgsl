@@ -66,14 +66,16 @@ struct FsOut {
   return o;
 }
 
-// Props: model-space vertices placed by their instance's transform.
-@vertex fn vs_prop(v: VsIn, @builtin(instance_index) ii: u32) -> VsOut {
+// Props: model-space vertices (moved by their joints when skinned) placed by their instance's
+// transform.
+@vertex fn vs_prop(v: VsIn, @builtin(instance_index) ii: u32, @builtin(vertex_index) vi: u32) -> VsOut {
   let p = props[u32(draw.detail3.x) + ii];
-  let world = p.model * vec4f(v.position, 1.0);
+  let s = skin_vertex(p, vi, v.position, v.normal);
+  let world = p.model * vec4f(s.position, 1.0);
   var o: VsOut;
   o.clip = frame.view_proj * world;
   o.world = world.xyz;
-  o.normal = normalize((p.normal * vec4f(v.normal, 0.0)).xyz);
+  o.normal = normalize((p.normal * vec4f(s.normal, 0.0)).xyz);
   o.uv = v.uv;
   o.tint = p.tint;
   return o;

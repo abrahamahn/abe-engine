@@ -18,15 +18,17 @@ struct PropShadowPush {
 };
 var<push_constant> prop_shadow: PropShadowPush;
 
-@vertex fn vs_shadow_prop(@location(0) position: vec3f, @builtin(instance_index) ii: u32) -> @builtin(position) vec4f {
+@vertex fn vs_shadow_prop(@location(0) position: vec3f, @builtin(instance_index) ii: u32, @builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
   let p = props[u32(prop_shadow.index.x) + ii];
-  return prop_shadow.light_vp * (p.model * vec4f(position, 1.0));
+  let s = skin_vertex(p, vi, position, vec3f(0.0, 1.0, 0.0));
+  return prop_shadow.light_vp * (p.model * vec4f(s.position, 1.0));
 }
 
-@vertex fn vs_shadow_prop_masked(@location(0) position: vec3f, @location(2) uv: vec2f, @builtin(instance_index) ii: u32) -> MaskedOut {
+@vertex fn vs_shadow_prop_masked(@location(0) position: vec3f, @location(2) uv: vec2f, @builtin(instance_index) ii: u32, @builtin(vertex_index) vi: u32) -> MaskedOut {
   let p = props[u32(prop_shadow.index.x) + ii];
+  let s = skin_vertex(p, vi, position, vec3f(0.0, 1.0, 0.0));
   var o: MaskedOut;
-  o.clip = prop_shadow.light_vp * (p.model * vec4f(position, 1.0));
+  o.clip = prop_shadow.light_vp * (p.model * vec4f(s.position, 1.0));
   o.uv = uv;
   return o;
 }
