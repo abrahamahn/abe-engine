@@ -529,6 +529,59 @@ fn lattice_bars_shade_a_lamp() {
     );
 }
 
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn tide_marks_stain_what_stands_in_water() {
+    // A pale block standing in a sea at 0 m: with tide marks on, its foot is darker.
+    let mut device = Device::headless().expect("device");
+    let (w, h) = (96, 54);
+    let meshes = vec![quad(0.0, 200.0, 0), cube([0.0, 0.5, -4.0], 1.0, 1)];
+    let world = World {
+        instances: (0..meshes.len() as u32)
+            .map(|mesh| Instance {
+                mesh,
+                transform: Transform::IDENTITY,
+            })
+            .collect(),
+        meshes,
+        materials: vec![
+            material("sea", [0.1, 0.2, 0.3, 1.0], Shading::Water),
+            material("pier", [0.8, 0.8, 0.8, 1.0], Shading::Standard),
+        ],
+        textures: vec![],
+        lights: vec![],
+    };
+    let view = View {
+        name: "pier".into(),
+        eye: [0.0, 0.8, -1.0],
+        target: [0.0, 0.4, -4.0],
+        fov: 50.0,
+    };
+    let mut frame = |tide: f32| {
+        let look = Look {
+            tide,
+            tide_color: [0.2, 0.25, 0.15],
+            ..Look::default()
+        };
+        let mut quality = Quality::realtime();
+        quality.shadow_size = 512;
+        quality.ground_size = 256;
+        quality.world_size = 256;
+        let mut r = Renderer::new(&mut device, &world, look, quality, (w, h), Output::Still)
+            .expect("renderer");
+        let time = TimeOfDay {
+            hours: 12.0,
+            ..TimeOfDay::default()
+        };
+        let env = Environment::resolve(&time, &Weather::default(), &r.look().palette, 2.0);
+        r.render_still(&mut device, &view, &env, 1).expect("render")
+    };
+    let luma = |image: &[u8]| image.chunks(4).map(|p| u64::from(p[1])).sum::<u64>();
+    let (dry, marked) = (luma(&frame(0.0)), luma(&frame(0.8)));
+    eprintln!("green sum: {dry} without tide marks, {marked} with");
+    assert!(marked * 100 < dry * 97, "no tide marks: {dry} / {marked}");
+}
+
 /// Land sloping from 3 m down to a seabed 4 m under a sea at 0 m: flat to z = -60, the water
 /// line at z = -10, 1.4 m deep at z = 13.
 fn shore() -> World {

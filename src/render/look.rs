@@ -69,6 +69,10 @@ pub struct Look {
     pub bounce: f32,
     /// Light shafts from the sun or moon through gaps in the scenery (0 = none).
     pub sun_shafts: f32,
+    /// Tide marks: surfaces standing in the water are wet and stained up to `tide` metres above
+    /// it, their colour multiplied by `tide_color` (0 = no marks).
+    pub tide: f32,
+    pub tide_color: V3,
     /// Shallow-water colour, shoreline foam strength and sun/moon glitter on water.
     pub water_shallow: V3,
     pub foam: f32,
@@ -287,6 +291,8 @@ impl Default for Look {
             sharpen: 0.2,
             bounce: 0.1,
             sun_shafts: 0.5,
+            tide: 0.0,
+            tide_color: [0.35, 0.4, 0.3],
             water_shallow: [0.05, 0.2, 0.2],
             foam: 0.6,
             sparkle: 0.5,
@@ -361,6 +367,8 @@ impl LookFile {
             num(s, "water_reflection", &mut l.water_reflection)?;
             num(s, "water_ripples", &mut l.water_ripples)?;
             col(s, "water_shallow", &mut l.water_shallow)?;
+            num(s, "tide", &mut l.tide)?;
+            col(s, "tide_color", &mut l.tide_color)?;
             num(s, "foam", &mut l.foam)?;
             num(s, "sparkle", &mut l.sparkle)?;
             num(s, "brush", &mut l.brush)?;
@@ -578,14 +586,15 @@ mod tests {
     #[test]
     fn parses_overrides_and_views() {
         let f = LookFile::parse(
-            br##"{"shading": {"rim_strength": 0.7, "shadow_tint": "#808080", "lamp_foliage": 0.5},
+            br##"{"shading": {"rim_strength": 0.7, "shadow_tint": "#808080", "lamp_foliage": 0.5,
+                             "tide": 0.6},
                  "time": {"hours": 6.5, "north": [0, 0, 1]},
                  "weather": {"preset": "rain", "wind": 2},
                  "views": [{"name": "a", "eye": [0, 1, 2], "target": [0, 0, 0], "fov": 40}]}"##,
         )
         .unwrap();
         assert_eq!(f.look.rim_strength, 0.7);
-        assert_eq!(f.look.lamp_foliage, 0.5);
+        assert_eq!((f.look.lamp_foliage, f.look.tide), (0.5, 0.6));
         assert!((f.look.shadow_tint[0] - 0.2158).abs() < 1e-3);
         assert_eq!(f.time.hours, 6.5);
         assert_eq!(f.weather.rain, Weather::preset("rain").unwrap().rain);

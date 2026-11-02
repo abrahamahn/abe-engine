@@ -1265,6 +1265,13 @@ impl Renderer {
         b.v(t.rock, 0.0);
         b.v(t.meadow, 0.0);
         b.f(l.lamp_foliage, 0.0, 0.0, 0.0);
+        let tide = if self.scene.water_level.is_some() {
+            l.tide
+        } else {
+            0.0
+        };
+        let [r, g, bl] = l.tide_color;
+        b.f(tide, r, g, bl);
         let mut bytes = f32_bytes(&b.0);
         for u in [
             tiles.0,

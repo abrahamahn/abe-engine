@@ -48,6 +48,7 @@ struct Frame {
   rock: vec4f,          // rgb bare rock
   meadow: vec4f,        // rgb second grass tone of the broad patches
   lamps: vec4f,         // lamp light on foliage (scale), unused, unused, unused
+  tide: vec4f,          // tide-mark height above the water (m, 0 = none), rgb stain multiplier
   tiles: vec4u,         // tiles across, tiles down, tile size in pixels, light count
 };
 

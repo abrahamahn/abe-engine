@@ -637,6 +637,14 @@ fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
     return out;
   }
 
+  // Tide marks: what stands in the water is wet and stained just above it, the line broken.
+  let preset = i32(draw.detail0.x + 0.5);
+  if (frame.tide.x > 0.0 && shading == 0 && preset != 6 && preset != 7) {
+    let above = in.world.y - frame.water.x + (noise2(in.world.xz * 0.9 + vec2f(in.world.y * 0.3)) - 0.5) * frame.tide.x * 0.35;
+    let band = (1.0 - smoothstep(frame.tide.x * 0.55, frame.tide.x, above)) * step(-1.5, above);
+    albedo = vec4f(albedo.rgb * mix(vec3f(1.0), frame.tide.yzw, band), albedo.a);
+  }
+
   // Rain darkens and glosses upward-facing surfaces.
   let wet = frame.amb_ground.w * smoothstep(0.5, 0.9, geo_n.y);
   albedo = vec4f(albedo.rgb * (1.0 - 0.38 * wet), albedo.a);
