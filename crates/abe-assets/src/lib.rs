@@ -34,7 +34,7 @@ pub fn write_asset(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut f = match std::fs::OpenOptions::new()
+        let f = match std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&tmp)
@@ -46,8 +46,11 @@ pub fn write_asset(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
             }
             Err(e) => return Err(e),
         };
-        let res = f.write_all(data).and_then(|()| f.sync_all());
-        drop(f);
+        // The file closes at the end of this block, before the rename.
+        let res = {
+            let mut f = f;
+            f.write_all(data).and_then(|()| f.sync_all())
+        };
         let res = res.and_then(|()| std::fs::rename(&tmp, path));
         if res.is_err() {
             let _ = std::fs::remove_file(tmp);

@@ -107,3 +107,36 @@ fn renderer_shaders_compile_and_link_as_glsl_es() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+const PROP_SHADER_INPUT: &str = include_str!("../src/render/shaders/prop_shader_input.wgsl");
+const PROP_SHADER: &str = include_str!("../src/render/shaders/prop_shader.wgsl");
+
+/// A game's prop shader (here a ring whose sweep and colour come from its parameters, over the
+/// base texture sampled softer) assembled as the renderer assembles one, compiled to GLSL ES and
+/// linked with the prop vertex shader.
+#[test]
+fn prop_shaders_compile_and_link_as_glsl_es() {
+    let user = "fn shade(in: ShadeInput) -> vec4f {
+        let d = in.uv - vec2f(0.5);
+        let r = length(d) * 2.0;
+        let ring = 1.0 - smoothstep(0.0, 0.08, abs(r - 0.8));
+        let angle = atan2(d.x, d.y) / 6.2831853 + 0.5;
+        let lit = step(angle, in.p0.x);
+        let soft = textureSampleBias(base_tex, material_sampler, in.uv, 2.0);
+        return vec4f(mix(in.p1.rgb, soft.rgb, 0.25), ring * lit * in.tint.a);
+    }";
+    let source = format!("{COMMON}\n{SCENE}\n{PROP_SHADER_INPUT}\n{user}\n{PROP_SHADER}");
+    let vs = compile_glsl(&source, Stage::Vertex, "vs_prop")
+        .unwrap_or_else(|e| panic!("vs_prop: {e}"))
+        .glsl
+        .expect("glsl");
+    let fs = compile_glsl(&source, Stage::Fragment, "fs_prop_shader")
+        .unwrap_or_else(|e| panic!("fs_prop_shader: {e}"))
+        .glsl
+        .expect("glsl");
+    if glslang() {
+        link(&vs.source, &fs.source, "prop-shader").unwrap_or_else(|e| panic!("{e}"));
+    } else {
+        eprintln!("note: glslangValidator not found on PATH; the GLSL is not validated");
+    }
+}

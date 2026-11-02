@@ -1851,7 +1851,8 @@ export async function createEngine(options) {
     destroyMesh(mesh) { x.abe_rt_mesh_destroy(mesh); },
     /** See `MaterialDesc::from_json` (name, color, emissive, lamp, roughness, metallic,
      * shading, alphaCutoff, baseTexture, normalTexture, emissiveTexture, normalScale,
-     * castsShadow, blend: 'opaque' | 'alpha' | 'add', overlay, depthTest, order). */
+     * castsShadow, blend: 'opaque' | 'alpha' | 'add', overlay, depthTest, order, shader,
+     * params). */
     createMaterial(desc) {
       const t = text(JSON.stringify(desc));
       const [p] = place(t);
@@ -1863,6 +1864,21 @@ export async function createEngine(options) {
       ok('updateMaterial', x.abe_rt_material_update(material, p, t.length));
     },
     destroyMaterial(material) { x.abe_rt_material_destroy(material); },
+    /** A game's prop shader: WGSL defining `fn shade(in: ShadeInput) -> vec4f` (see
+     * src/render/shaders/prop_shader_input.wgsl). Overlay materials draw with it through their
+     * `shader` and read their `params` (sixteen numbers). It lasts as long as the engine. */
+    createShader(source) {
+      const t = text(source);
+      const [p] = place(t);
+      return ok('createShader', x.abe_rt_shader_create(p, t.length));
+    },
+    /** New `params` for a material drawn by a prop shader, cheaply (every frame if need be). */
+    setMaterialParams(material, params) {
+      const v = new Float32Array(16);
+      v.set(params.slice(0, 16));
+      const [p] = place(v);
+      ok('setMaterialParams', x.abe_rt_material_params(material, p));
+    },
     createInstance(mesh, material, matrix) {
       const [p] = place(f32(matrix));
       return ok('createInstance', x.abe_rt_instance_create(mesh, material, p));

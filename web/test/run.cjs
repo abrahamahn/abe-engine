@@ -390,7 +390,7 @@ async function runEngineCheck(browser, port, opts) {
     await page.goto(`http://localhost:${port}/test/engine.html?${query}`);
     await page.waitForFunction(() => window.engineCheck, null, { timeout: 300000, polling: 200 });
     const r = await page.evaluate(() => window.engineCheck);
-    for (const k of ['first', 'second', 'third', 'fifth']) {
+    for (const k of ['first', 'second', 'third', 'fifth', 'sixth']) {
       if (r[k]) {
         fs.writeFileSync(path.join(opts.out, `engine-${k}.png`), Buffer.from(r[k], 'base64'));
         delete r[k];

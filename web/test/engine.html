@@ -272,6 +272,33 @@ async function run() {
   engine.destroyModel(model);
   result.fifth = png(sixth);
 
+  // A prop shader: the card's left half in its first parameter's colour, its right half in the
+  // second's (exact, as overlays are), then new parameters without a rebuild.
+  const halves = engine.createShader(`fn shade(in: ShadeInput) -> vec4f {
+    let c = select(in.p1.rgb, in.p0.rgb, in.uv.x < 0.5);
+    return vec4f(c, 1.0);
+  }`);
+  const halvesMaterial = engine.createMaterial({ name: 'check-halves', overlay: true, blend: 'alpha',
+    depthTest: false, order: 3, shader: halves, params: [1, 0, 0, 0, 0, 0, 1, 0] });
+  const wide = engine.createMesh({ positions: [-1.2, -0.6, 0, 1.2, -0.6, 0, 1.2, 0.6, 0, -1.2, 0.6, 0],
+    uvs: [0, 1, 1, 1, 1, 0, 0, 0], indices: [0, 1, 2, 0, 2, 3] });
+  engine.createInstance(wide, halvesMaterial, translate(0, 5, 0));
+  const shaderLeft = at([-0.6, 5, 0]);
+  const shaderRight = at([0.6, 5, 0]);
+  const seventh = await frame(engine);
+  check('a prop shader colours its overlay', near(pixel(seventh, shaderLeft), [255, 0, 0], 2)
+    && near(pixel(seventh, shaderRight), [0, 0, 255], 2),
+    { left: pixel(seventh, shaderLeft), right: pixel(seventh, shaderRight) });
+  engine.setMaterialParams(halvesMaterial, [0, 1, 0, 0, 0, 0, 1, 0]);
+  const eighth = await frame(engine);
+  check('prop shader params change without a rebuild', near(pixel(eighth, shaderLeft), [0, 255, 0], 2),
+    { left: pixel(eighth, shaderLeft) });
+  let shaderRefused = '';
+  try { engine.createShader('fn shade(in: ShadeInput) -> vec4f { return vec4f(frame.camera.xyz, 1.0); }'); }
+  catch (e) { shaderRefused = e.message; }
+  check('a prop shader that reads the frame is refused', shaderRefused.includes('reads only'), shaderRefused);
+  result.sixth = png(eighth);
+
   // Errors are reported, not thrown away: a stale handle and a bad material.
   engine.destroyInstance(left);
   let refused = 0;

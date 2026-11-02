@@ -26,6 +26,8 @@ const COMMON: &str = include_str!("shaders/common.wgsl");
 const SCENE: &str = include_str!("shaders/scene.wgsl");
 const WORLD_FX: &str = include_str!("shaders/world_fx.wgsl");
 const POST: &str = include_str!("shaders/post.wgsl");
+const PROP_SHADER_INPUT: &str = include_str!("shaders/prop_shader_input.wgsl");
+const PROP_SHADER: &str = include_str!("shaders/prop_shader.wgsl");
 const HDR: Format = Format::Rgba16Float;
 const MAX_LIGHTS_PER_TILE: usize = 96;
 /// The near clip distance of `view`, kept positive.
@@ -134,6 +136,12 @@ pub(super) struct Pipelines {
     pub(super) scene_prop_blend: [PipelineId; 2],
     /// Props over the finished image: [opaque, alpha, additive][without, with depth test].
     pub(super) overlay: [[PipelineId; 2]; 3],
+    /// What a game's prop shader is built against: the output format, the prop vertex layout,
+    /// and the resources the built-in overlay fragment reads (a prop shader may read no others,
+    /// so it takes the same bind groups).
+    pub(super) output_format: Format,
+    pub(super) prop_layout: VertexLayout,
+    pub(super) overlay_bindings: Vec<abe_shader::Binding>,
     shadow: PipelineId,
     shadow_masked: PipelineId,
     pub(super) shadow_prop: PipelineId,
@@ -233,6 +241,59 @@ pub struct Renderer {
 fn compile(body: &str, stage: Stage, entry: &str) -> Result<Compiled> {
     let source = format!("{COMMON}\n{body}");
     crate::gpu::compile_shader(&source, stage, entry)
+}
+
+/// The scene shader with a game's prop shader (`shade`) and the overlay entry point that calls it.
+pub(super) fn prop_shader_source(user: &str) -> String {
+    format!(
+        "{COMMON}\n{SCENE}\n{PROP_SHADER_INPUT}\n// --- prop shader\n{user}\n// --- prop shader \
+         entry\n{PROP_SHADER}"
+    )
+}
+
+/// Overlay pipelines for a game's prop shader: [opaque, alpha, additive][without, with depth].
+pub(super) fn prop_shader_pipelines(
+    device: &mut Device<'_>,
+    pipelines: &Pipelines,
+    user: &str,
+) -> Result<[[PipelineId; 2]; 3]> {
+    let source = prop_shader_source(user);
+    let vs = crate::gpu::compile_shader(&source, Stage::Vertex, "vs_prop")?;
+    let fs = crate::gpu::compile_shader(&source, Stage::Fragment, "fs_prop_shader")?;
+    if fs.bindings != pipelines.overlay_bindings {
+        return Err(
+            "a prop shader reads only its material's base texture and the draw's parameters \
+             (`ShadeInput`); pass anything else, the time among it, in `params`"
+                .into(),
+        );
+    }
+    let depth = |compare| DepthState {
+        format: Format::Depth32Float,
+        compare,
+        write: false,
+        bias_constant: 0.0,
+        bias_slope: 0.0,
+        clamp: false,
+    };
+    let mut out = pipelines.overlay;
+    for (i, blend) in [Blend::Replace, Blend::Premultiplied, Blend::Additive]
+        .into_iter()
+        .enumerate()
+    {
+        for (j, compare) in [Compare::Always, Compare::Greater].into_iter().enumerate() {
+            out[i][j] = device.create_render_pipeline(&RenderPipelineDesc {
+                vertex: &vs,
+                fragment: Some(&fs),
+                vertex_layout: Some(pipelines.prop_layout.clone()),
+                topology: Topology::TriangleList,
+                cull: Cull::None,
+                front_ccw: true,
+                depth: Some(depth(compare)),
+                colors: vec![color(pipelines.output_format, blend)],
+            })?;
+        }
+    }
+    Ok(out)
 }
 
 fn color(format: Format, blend: Blend) -> ColorTarget {
@@ -342,6 +403,7 @@ impl Pipelines {
             })?;
         }
         let overlay_fs = compile(SCENE, Stage::Fragment, "fs_overlay")?;
+        let overlay_bindings = overlay_fs.bindings.clone();
         let mut overlay = [[scene_prop; 2]; 3];
         for (i, blend) in [Blend::Replace, Blend::Premultiplied, Blend::Additive]
             .into_iter()
@@ -515,6 +577,9 @@ impl Pipelines {
             scene_prop,
             scene_prop_blend,
             overlay,
+            output_format: output,
+            prop_layout: layout,
+            overlay_bindings,
             shadow,
             shadow_masked,
             shadow_prop,

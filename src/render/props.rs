@@ -38,6 +38,10 @@ handle!(
     /// A placed prop: one mesh with one material.
     PropInstance
 );
+handle!(
+    /// A game's prop shader: its own colour for overlay props (`MaterialDesc::shader`).
+    PropShader
+);
 
 /// Vertices in model space and triangles (counter-clockwise front faces, like world meshes).
 #[derive(Clone, Copy, Debug)]
@@ -90,6 +94,10 @@ pub struct MaterialDesc {
     pub depth_test: bool,
     /// Draw order among blended and overlay props: lower first; ties draw far to near.
     pub order: i32,
+    /// An overlay drawn by a game's prop shader instead of in its colour and texture.
+    pub shader: Option<PropShader>,
+    /// What the prop shader reads (`ShadeInput::p0`..`p3`); unused without one.
+    pub params: [f32; 16],
 }
 
 impl Default for MaterialDesc {
@@ -112,6 +120,8 @@ impl Default for MaterialDesc {
             overlay: false,
             depth_test: true,
             order: 0,
+            shader: None,
+            params: [0.0; 16],
         }
     }
 }
@@ -125,14 +135,15 @@ impl MaterialDesc {
     ///  "roughness": 0.8, "metallic": 0, "shading": "standard",
     ///  "alphaCutoff": 0.5, "baseTexture": 3, "normalTexture": 4, "emissiveTexture": 5,
     ///  "normalScale": 1, "castsShadow": true, "blend": "opaque", "overlay": false,
-    ///  "depthTest": true, "order": 0}
+    ///  "depthTest": true, "order": 0, "shader": 2, "params": [0.5, 1, 0, 0]}
     /// ```
     ///
     /// Colours are linear; `shading` is `standard`, `foliage`, `water` or `unlit`; `blend` is
-    /// `opaque`, `alpha` or `add`; textures are raw [`PropTexture`] handles.
+    /// `opaque`, `alpha` or `add`; textures and the shader are raw handles ([`PropTexture`],
+    /// [`PropShader`]); `params` holds up to sixteen numbers (the rest are zero).
     pub fn from_json(text: &[u8]) -> Result<Self> {
         use crate::assets::json::{self, Value};
-        const KNOWN: [&str; 17] = [
+        const KNOWN: [&str; 19] = [
             "name",
             "color",
             "emissive",
@@ -150,6 +161,8 @@ impl MaterialDesc {
             "overlay",
             "depthTest",
             "order",
+            "shader",
+            "params",
         ];
         let v = json::parse(text).map_err(|e| format!("material: {e}"))?;
         let Value::Object(map) = &v else {
@@ -254,6 +267,27 @@ impl MaterialDesc {
             }
             d.order = o as i32;
         }
+        match v.get("shader") {
+            None | Some(Value::Null) => {}
+            Some(x) => {
+                let n = x
+                    .unsigned()
+                    .ok()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|&n| n != 0)
+                    .ok_or_else(|| field("shader", "expected a shader handle".into()))?;
+                d.shader = Some(PropShader(n));
+            }
+        }
+        if let Some(x) = v.get("params") {
+            let a = x.array().map_err(|e| field("params", e))?;
+            if a.len() > 16 {
+                return Err(field("params", "expected at most 16 numbers".into()));
+            }
+            for (out, x) in d.params.iter_mut().zip(a) {
+                *out = x.float().map_err(|e| field("params", e))?;
+            }
+        }
         Ok(d)
     }
 }
@@ -337,6 +371,8 @@ pub(super) struct PropSlot {
 pub(super) struct Props {
     meshes: Pool<MeshEntry>,
     materials: Pool<MaterialEntry>,
+    /// A game's prop shaders: their overlay pipelines, [opaque, alpha, additive][depth test].
+    shaders: Pool<[[crate::gpu::PipelineId; 2]; 3]>,
     textures: Pool<TextureId>,
     instances: Pool<InstanceEntry>,
     slots: Vec<Option<PropSlot>>,
@@ -615,6 +651,14 @@ impl Renderer {
         device: &mut Device<'_>,
         desc: &MaterialDesc,
     ) -> Result<MaterialEntry> {
+        if let Some(shader) = desc.shader {
+            if !desc.overlay {
+                return Err("material: a prop shader draws overlays only (set overlay)".into());
+            }
+            if self.props.shaders.get(shader.0).is_none() {
+                return Err(format!("{shader:?} does not exist"));
+            }
+        }
         let shading = match desc.shading {
             Shading::Standard => 0.0,
             Shading::Foliage => 1.0,
@@ -690,6 +734,33 @@ impl Renderer {
             shadow_group,
             detail: super::renderer::detail_block(&self.look, &desc.name).0,
         })
+    }
+
+    /// Compiles a game's prop shader: WGSL that defines `fn shade(in: ShadeInput) -> vec4f`
+    /// (render/shaders/prop_shader_input.wgsl) and may call the scene shader's functions. Its
+    /// pipelines live as long as the renderer.
+    pub fn create_prop_shader(
+        &mut self,
+        device: &mut Device<'_>,
+        source: &str,
+    ) -> Result<PropShader> {
+        let pipelines = super::renderer::prop_shader_pipelines(device, &self.pipelines, source)?;
+        Ok(PropShader(self.props.shaders.insert(pipelines)?))
+    }
+
+    /// Replaces a material's prop-shader parameters, without rebuilding anything (per frame).
+    pub fn set_prop_material_params(
+        &mut self,
+        material: PropMaterial,
+        params: &[f32; 16],
+    ) -> Result<()> {
+        let m = self
+            .props
+            .materials
+            .get_mut(material.0)
+            .ok_or_else(|| format!("{material:?} was destroyed"))?;
+        m.desc.params = *params;
+        Ok(())
     }
 
     pub fn create_prop_material(
@@ -1227,6 +1298,11 @@ impl Renderer {
         push[20..24].copy_from_slice(&mat.data.emissive);
         push[24..28].copy_from_slice(&mat.data.params);
         push[28..32].copy_from_slice(&mat.data.flags);
+        if mat.desc.shader.is_some() {
+            // A prop shader's parameters: detail0..2 and emissive (prop_shader.wgsl).
+            push[..12].copy_from_slice(&mat.desc.params[..12]);
+            push[20..24].copy_from_slice(&mat.desc.params[12..]);
+        }
         push
     }
 
@@ -1329,7 +1405,12 @@ impl Renderer {
                 BlendMode::Alpha => 1,
                 BlendMode::Add => 2,
             };
-            let p = self.pipelines.overlay[blend][usize::from(mat.desc.depth_test)];
+            let pipelines = mat
+                .desc
+                .shader
+                .and_then(|h| self.props.shaders.get(h.0))
+                .unwrap_or(&self.pipelines.overlay);
+            let p = pipelines[blend][usize::from(mat.desc.depth_test)];
             if pipeline != Some(p) {
                 enc.set_pipeline(p);
                 enc.set_bind_group(0, s.overlay);

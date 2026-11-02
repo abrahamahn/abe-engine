@@ -516,6 +516,41 @@ pub unsafe extern "C" fn abe_rt_material_create(ptr: *const u8, len: usize) -> u
     })
 }
 
+/// Compiles a game's prop shader: WGSL defining `fn shade(in: ShadeInput) -> vec4f` (UTF-8,
+/// `len` bytes at `ptr`). Returns its handle; 0 with the compiler's message on failure.
+///
+/// # Safety
+/// `ptr` must address `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_shader_create(ptr: *const u8, len: usize) -> u32 {
+    // SAFETY: the caller passes a readable range.
+    let text = unsafe { bytes(ptr, len) };
+    with(0, |rt| {
+        let source = std::str::from_utf8(text).map_err(|e| format!("shader: {e}"))?;
+        Ok(rt
+            .renderer
+            .create_prop_shader(&mut rt.device, source)?
+            .raw())
+    })
+}
+
+/// A material's sixteen prop-shader parameters (floats at `ptr`), without a rebuild.
+///
+/// # Safety
+/// `ptr` must address 64 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_material_params(material: u32, ptr: *const u8) -> u32 {
+    // SAFETY: the caller passes sixteen floats.
+    let v = unsafe { floats(ptr, 16) };
+    with(0, |rt| {
+        let mut params = [0.0f32; 16];
+        params.copy_from_slice(&v);
+        rt.renderer
+            .set_prop_material_params(PropMaterial::from_raw(material), &params)?;
+        Ok(1)
+    })
+}
+
 /// Changes a material in place (every instance that uses it changes with it).
 ///
 /// # Safety

@@ -78,6 +78,10 @@ export interface AbeMaterialDesc {
   readonly depthTest?: boolean;
   /** Draw order among blended and overlay props: lower first. */
   readonly order?: number;
+  /** An overlay drawn by a prop shader (`createShader`) instead of in its colour and texture. */
+  readonly shader?: number | null;
+  /** Up to sixteen numbers the prop shader reads (`ShadeInput.p0`..`p3`). */
+  readonly params?: readonly number[];
 }
 
 export interface AbeModelInfo {
@@ -133,6 +137,15 @@ export interface AbeEngine {
   /** Replaces the whole description. */
   updateMaterial(material: number, desc: AbeMaterialDesc): void;
   destroyMaterial(material: number): void;
+  /**
+   * Compiles a prop shader: WGSL defining `fn shade(in: ShadeInput) -> vec4f`, returning straight
+   * linear colour and alpha, which may call the engine's shader functions but reads nothing
+   * besides its input (uv, world, normal, tint, color, the base texture's sample `base`, and the
+   * material's params as `p0`..`p3`). It lasts as long as the engine.
+   */
+  createShader(source: string): number;
+  /** New params for a material drawn by a prop shader, without a rebuild. */
+  setMaterialParams(material: number, params: readonly number[]): void;
   createInstance(mesh: number, material: number, matrix: Matrix4): number;
   setInstance(instance: number, matrix: Matrix4, visible?: boolean): void;
   setInstances(list: readonly { readonly instance: number; readonly matrix: Matrix4; readonly visible?: boolean }[]): void;

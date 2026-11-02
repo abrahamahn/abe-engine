@@ -1451,6 +1451,131 @@ fn prop_layers_blend_overlay_tint_and_pick() {
     assert!(errors.is_empty(), "validation: {errors:?}");
 }
 
+/// A game's prop shader colours an overlay by its own rule from its parameters (left half the
+/// first colour, right half the second), takes new parameters without a rebuild, and is refused
+/// when it reads anything but its input, or draws anything but an overlay.
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn prop_shaders_colour_overlays_from_their_params() {
+    use abe_engine::render::BlendMode;
+    let mut device = Device::headless().expect("device");
+    let world = World {
+        instances: vec![Instance {
+            mesh: 0,
+            transform: Transform::IDENTITY,
+        }],
+        meshes: vec![quad(0.0, 20.0, 0)],
+        materials: vec![material(
+            "ground",
+            [0.15, 0.15, 0.15, 1.0],
+            Shading::Standard,
+        )],
+        textures: vec![],
+        lights: vec![],
+    };
+    let mut quality = Quality::realtime();
+    quality.shadow_size = 512;
+    let mut r = Renderer::new(
+        &mut device,
+        &world,
+        Look::default(),
+        quality,
+        (W, H),
+        Output::Still,
+    )
+    .expect("renderer");
+    let card = r
+        .create_prop_mesh(
+            &mut device,
+            &MeshData {
+                positions: &[
+                    [-1.2, -0.6, 0.0],
+                    [1.2, -0.6, 0.0],
+                    [1.2, 0.6, 0.0],
+                    [-1.2, 0.6, 0.0],
+                ],
+                normals: &[[0.0, 0.0, 1.0]; 4],
+                uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                indices: &[0, 1, 2, 0, 2, 3],
+            },
+        )
+        .expect("card");
+    let halves = r
+        .create_prop_shader(
+            &mut device,
+            "fn shade(in: ShadeInput) -> vec4f {
+               let c = select(in.p1.rgb, in.p0.rgb, in.uv.x < 0.5);
+               return vec4f(c * in.tint.rgb, 1.0);
+             }",
+        )
+        .expect("shader");
+    let mut params = [0.0f32; 16];
+    params[..3].copy_from_slice(&[1.0, 0.0, 0.0]);
+    params[4..7].copy_from_slice(&[0.0, 0.0, 1.0]);
+    let desc = MaterialDesc {
+        name: "halves".into(),
+        overlay: true,
+        depth_test: false,
+        blend: BlendMode::Alpha,
+        shader: Some(halves),
+        params,
+        ..MaterialDesc::default()
+    };
+    let material = r
+        .create_prop_material(&mut device, &desc)
+        .expect("material");
+    let mut at = [0.0f32; 16];
+    for i in [0, 5, 10, 15] {
+        at[i] = 1.0;
+    }
+    at[13] = 1.0;
+    at[14] = 2.0;
+    r.create_prop_instance(card, material, &at)
+        .expect("instance");
+    let size = (W, H);
+    let spot = |r: &Renderer, p: [f32; 3]| {
+        let s = r.project(&view(), size, p).expect("in front");
+        ((s[1] as u32 * W + s[0] as u32) * 4) as usize
+    };
+    let (at_left, at_right) = (spot(&r, [-0.6, 1.0, 2.0]), spot(&r, [0.6, 1.0, 2.0]));
+    let pixel = |img: &[u8], i: usize| [img[i], img[i + 1], img[i + 2]];
+    let img = render(&mut device, &mut r, 15.0, "clear");
+    let (left, right) = (pixel(&img, at_left), pixel(&img, at_right));
+    eprintln!("prop shader halves: {left:?} {right:?}");
+    assert_eq!((left, right), ([255, 0, 0], [0, 0, 255]));
+
+    // New parameters, no rebuild: green on the left now.
+    params[..3].copy_from_slice(&[0.0, 1.0, 0.0]);
+    r.set_prop_material_params(material, &params)
+        .expect("params");
+    let img = render(&mut device, &mut r, 15.0, "clear");
+    assert_eq!(pixel(&img, at_left), [0, 255, 0]);
+
+    // Refused: a shader that reads the frame block, one that does not compile, and a prop
+    // shader on a material drawn in the scene.
+    let reads_frame = r
+        .create_prop_shader(
+            &mut device,
+            "fn shade(in: ShadeInput) -> vec4f { return vec4f(frame.camera.xyz, 1.0); }",
+        )
+        .expect_err("reads the frame");
+    assert!(reads_frame.contains("reads only"), "{reads_frame}");
+    assert!(
+        r.create_prop_shader(&mut device, "fn shade(in: ShadeInput) -> vec4f { oops }")
+            .is_err()
+    );
+    let in_scene = r
+        .create_prop_material(
+            &mut device,
+            &MaterialDesc {
+                overlay: false,
+                ..desc.clone()
+            },
+        )
+        .expect_err("not an overlay");
+    assert!(in_scene.contains("overlays only"), "{in_scene}");
+}
+
 /// A run-time model: a static box on a node and a skinned bar bent by a clip; poses move what
 /// is drawn, node visibility hides parts, and a node's world transform follows the pose.
 #[test]
