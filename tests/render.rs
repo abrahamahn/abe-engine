@@ -1452,8 +1452,9 @@ fn prop_layers_blend_overlay_tint_and_pick() {
 }
 
 /// A game's prop shader colours an overlay by its own rule from its parameters (left half the
-/// first colour, right half the second), takes new parameters without a rebuild, and is refused
-/// when it reads anything but its input, or draws anything but an overlay.
+/// first colour, right half the second plus the last four), takes new parameters without a
+/// rebuild, and is refused when it reads anything but its input, or draws anything but an
+/// overlay.
 #[test]
 #[ignore = "requires a Vulkan driver"]
 fn prop_shaders_colour_overlays_from_their_params() {
@@ -1504,12 +1505,12 @@ fn prop_shaders_colour_overlays_from_their_params() {
         .create_prop_shader(
             &mut device,
             "fn shade(in: ShadeInput) -> vec4f {
-               let c = select(in.p1.rgb, in.p0.rgb, in.uv.x < 0.5);
+               let c = select(in.p1.rgb + in.p4.rgb, in.p0.rgb, in.uv.x < 0.5);
                return vec4f(c * in.tint.rgb, 1.0);
              }",
         )
         .expect("shader");
-    let mut params = [0.0f32; 16];
+    let mut params = [0.0f32; abe_engine::render::PROP_SHADER_PARAMS];
     params[..3].copy_from_slice(&[1.0, 0.0, 0.0]);
     params[4..7].copy_from_slice(&[0.0, 0.0, 1.0]);
     let desc = MaterialDesc {
@@ -1544,12 +1545,17 @@ fn prop_shaders_colour_overlays_from_their_params() {
     eprintln!("prop shader halves: {left:?} {right:?}");
     assert_eq!((left, right), ([255, 0, 0], [0, 0, 255]));
 
-    // New parameters, no rebuild: green on the left now.
+    // New parameters, no rebuild: green on the left now, and the last four (`p4`) add red on
+    // the right.
     params[..3].copy_from_slice(&[0.0, 1.0, 0.0]);
+    params[16..19].copy_from_slice(&[1.0, 0.0, 0.0]);
     r.set_prop_material_params(material, &params)
         .expect("params");
     let img = render(&mut device, &mut r, 15.0, "clear");
-    assert_eq!(pixel(&img, at_left), [0, 255, 0]);
+    assert_eq!(
+        (pixel(&img, at_left), pixel(&img, at_right)),
+        ([0, 255, 0], [255, 0, 255])
+    );
 
     // Refused: a shader that reads the frame block, one that does not compile, and a prop
     // shader on a material drawn in the scene.

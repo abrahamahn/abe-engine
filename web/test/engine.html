@@ -273,9 +273,9 @@ async function run() {
   result.fifth = png(sixth);
 
   // A prop shader: the card's left half in its first parameter's colour, its right half in the
-  // second's (exact, as overlays are), then new parameters without a rebuild.
+  // second's plus the last four (exact, as overlays are), then new parameters without a rebuild.
   const halves = engine.createShader(`fn shade(in: ShadeInput) -> vec4f {
-    let c = select(in.p1.rgb, in.p0.rgb, in.uv.x < 0.5);
+    let c = select(in.p1.rgb + in.p4.rgb, in.p0.rgb, in.uv.x < 0.5);
     return vec4f(c, 1.0);
   }`);
   const halvesMaterial = engine.createMaterial({ name: 'check-halves', overlay: true, blend: 'alpha',
@@ -289,10 +289,26 @@ async function run() {
   check('a prop shader colours its overlay', near(pixel(seventh, shaderLeft), [255, 0, 0], 2)
     && near(pixel(seventh, shaderRight), [0, 0, 255], 2),
     { left: pixel(seventh, shaderLeft), right: pixel(seventh, shaderRight) });
-  engine.setMaterialParams(halvesMaterial, [0, 1, 0, 0, 0, 0, 1, 0]);
+  engine.setMaterialParams(halvesMaterial, [0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]);
   const eighth = await frame(engine);
-  check('prop shader params change without a rebuild', near(pixel(eighth, shaderLeft), [0, 255, 0], 2),
-    { left: pixel(eighth, shaderLeft) });
+  check('prop shader params change without a rebuild', near(pixel(eighth, shaderLeft), [0, 255, 0], 2)
+    && near(pixel(eighth, shaderRight), [255, 0, 255], 2),
+    { left: pixel(eighth, shaderLeft), right: pixel(eighth, shaderRight) });
+  // A prop shader samples its base texture where it likes: mirrored, red | blue reads blue | red.
+  const mirror = engine.createShader(`fn shade(in: ShadeInput) -> vec4f {
+    return textureSampleBias(base_tex, material_sampler, vec2f(1.0 - in.uv.x, in.uv.y), 0.0);
+  }`);
+  // Two texels of each, so a sample a pixel off a texel's centre still filters within its half.
+  const redBlue = engine.createTexture({ width: 4, height: 1,
+    data: new Uint8Array([255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255]) });
+  const mirrorMaterial = engine.createMaterial({ name: 'check-mirror', overlay: true, blend: 'alpha',
+    depthTest: false, order: 4, shader: mirror, baseTexture: redBlue });
+  const mirrored = engine.createInstance(wide, mirrorMaterial, translate(0, 5, 0));
+  const ninth = await frame(engine);
+  check('a prop shader samples its texture at its own uv', near(pixel(ninth, shaderLeft), [0, 0, 255], 2)
+    && near(pixel(ninth, shaderRight), [255, 0, 0], 2),
+    { left: pixel(ninth, shaderLeft), right: pixel(ninth, shaderRight) });
+  engine.destroyInstance(mirrored);
   let shaderRefused = '';
   try { engine.createShader('fn shade(in: ShadeInput) -> vec4f { return vec4f(frame.camera.xyz, 1.0); }'); }
   catch (e) { shaderRefused = e.message; }

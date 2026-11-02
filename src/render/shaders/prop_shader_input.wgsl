@@ -13,11 +13,12 @@ struct ShadeInput {
   tint: vec4f,
   color: vec4f,
   // The material's base texture at `uv` (white without one); `base_tex` with `material_sampler`
-  // samples it elsewhere.
+  // samples it elsewhere (another uv, a mip bias), in uniform control flow.
   base: vec4f,
-  // The material's sixteen `params`, four at a time.
+  // The material's twenty `params`, four at a time.
   p0: vec4f,
   p1: vec4f,
   p2: vec4f,
   p3: vec4f,
+  p4: vec4f,
 };

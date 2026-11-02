@@ -16,8 +16,8 @@ use abe_engine::anim::normalize_q;
 use abe_engine::assets::model::{self, Model};
 use abe_engine::gpu::Device;
 use abe_engine::render::{
-    Environment, LookFile, MaterialDesc, MeshData, Output, PropInstance, PropMaterial, PropMesh,
-    PropTexture, Quality, Renderer, TimeOfDay, View, Weather,
+    Environment, LookFile, MaterialDesc, MeshData, Output, PROP_SHADER_PARAMS, PropInstance,
+    PropMaterial, PropMesh, PropTexture, Quality, Renderer, TimeOfDay, View, Weather,
 };
 use abe_engine::render::{ModelId, ModelInstance};
 use abe_engine::world::World;
@@ -534,16 +534,16 @@ pub unsafe extern "C" fn abe_rt_shader_create(ptr: *const u8, len: usize) -> u32
     })
 }
 
-/// A material's sixteen prop-shader parameters (floats at `ptr`), without a rebuild.
+/// A material's twenty prop-shader parameters (floats at `ptr`), without a rebuild.
 ///
 /// # Safety
-/// `ptr` must address 64 readable bytes.
+/// `ptr` must address 80 readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn abe_rt_material_params(material: u32, ptr: *const u8) -> u32 {
-    // SAFETY: the caller passes sixteen floats.
-    let v = unsafe { floats(ptr, 16) };
+    // SAFETY: the caller passes twenty floats.
+    let v = unsafe { floats(ptr, PROP_SHADER_PARAMS) };
     with(0, |rt| {
-        let mut params = [0.0f32; 16];
+        let mut params = [0.0f32; PROP_SHADER_PARAMS];
         params.copy_from_slice(&v);
         rt.renderer
             .set_prop_material_params(PropMaterial::from_raw(material), &params)?;

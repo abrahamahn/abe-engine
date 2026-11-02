@@ -123,7 +123,7 @@ fn prop_shaders_compile_and_link_as_glsl_es() {
         let angle = atan2(d.x, d.y) / 6.2831853 + 0.5;
         let lit = step(angle, in.p0.x);
         let soft = textureSampleBias(base_tex, material_sampler, in.uv, 2.0);
-        return vec4f(mix(in.p1.rgb, soft.rgb, 0.25), ring * lit * in.tint.a);
+        return vec4f(mix(in.p1.rgb, soft.rgb, in.p4.x), ring * lit * in.tint.a);
     }";
     let source = format!("{COMMON}\n{SCENE}\n{PROP_SHADER_INPUT}\n{user}\n{PROP_SHADER}");
     let vs = compile_glsl(&source, Stage::Vertex, "vs_prop")

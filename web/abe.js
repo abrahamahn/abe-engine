@@ -1866,7 +1866,7 @@ export async function createEngine(options) {
     destroyMaterial(material) { x.abe_rt_material_destroy(material); },
     /** A game's prop shader: WGSL defining `fn shade(in: ShadeInput) -> vec4f` (see
      * src/render/shaders/prop_shader_input.wgsl). Overlay materials draw with it through their
-     * `shader` and read their `params` (sixteen numbers). It lasts as long as the engine. */
+     * `shader` and read their `params` (twenty numbers). It lasts as long as the engine. */
     createShader(source) {
       const t = text(source);
       const [p] = place(t);
@@ -1874,8 +1874,8 @@ export async function createEngine(options) {
     },
     /** New `params` for a material drawn by a prop shader, cheaply (every frame if need be). */
     setMaterialParams(material, params) {
-      const v = new Float32Array(16);
-      v.set(params.slice(0, 16));
+      const v = new Float32Array(20);
+      v.set(params.slice(0, 20));
       const [p] = place(v);
       ok('setMaterialParams', x.abe_rt_material_params(material, p));
     },

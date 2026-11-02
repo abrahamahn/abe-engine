@@ -43,6 +43,9 @@ handle!(
     PropShader
 );
 
+/// How many numbers a material hands its prop shader (`ShadeInput::p0`..`p4`).
+pub const PROP_SHADER_PARAMS: usize = 20;
+
 /// Vertices in model space and triangles (counter-clockwise front faces, like world meshes).
 #[derive(Clone, Copy, Debug)]
 pub struct MeshData<'a> {
@@ -96,8 +99,8 @@ pub struct MaterialDesc {
     pub order: i32,
     /// An overlay drawn by a game's prop shader instead of in its colour and texture.
     pub shader: Option<PropShader>,
-    /// What the prop shader reads (`ShadeInput::p0`..`p3`); unused without one.
-    pub params: [f32; 16],
+    /// What the prop shader reads (`ShadeInput::p0`..`p4`); unused without one.
+    pub params: [f32; PROP_SHADER_PARAMS],
 }
 
 impl Default for MaterialDesc {
@@ -121,7 +124,7 @@ impl Default for MaterialDesc {
             depth_test: true,
             order: 0,
             shader: None,
-            params: [0.0; 16],
+            params: [0.0; PROP_SHADER_PARAMS],
         }
     }
 }
@@ -140,7 +143,7 @@ impl MaterialDesc {
     ///
     /// Colours are linear; `shading` is `standard`, `foliage`, `water` or `unlit`; `blend` is
     /// `opaque`, `alpha` or `add`; textures and the shader are raw handles ([`PropTexture`],
-    /// [`PropShader`]); `params` holds up to sixteen numbers (the rest are zero).
+    /// [`PropShader`]); `params` holds up to twenty numbers (the rest are zero).
     pub fn from_json(text: &[u8]) -> Result<Self> {
         use crate::assets::json::{self, Value};
         const KNOWN: [&str; 19] = [
@@ -281,8 +284,11 @@ impl MaterialDesc {
         }
         if let Some(x) = v.get("params") {
             let a = x.array().map_err(|e| field("params", e))?;
-            if a.len() > 16 {
-                return Err(field("params", "expected at most 16 numbers".into()));
+            if a.len() > PROP_SHADER_PARAMS {
+                return Err(field(
+                    "params",
+                    format!("expected at most {PROP_SHADER_PARAMS} numbers"),
+                ));
             }
             for (out, x) in d.params.iter_mut().zip(a) {
                 *out = x.float().map_err(|e| field("params", e))?;
@@ -752,7 +758,7 @@ impl Renderer {
     pub fn set_prop_material_params(
         &mut self,
         material: PropMaterial,
-        params: &[f32; 16],
+        params: &[f32; PROP_SHADER_PARAMS],
     ) -> Result<()> {
         let m = self
             .props
@@ -1299,9 +1305,10 @@ impl Renderer {
         push[24..28].copy_from_slice(&mat.data.params);
         push[28..32].copy_from_slice(&mat.data.flags);
         if mat.desc.shader.is_some() {
-            // A prop shader's parameters: detail0..2 and emissive (prop_shader.wgsl).
+            // A prop shader's parameters: detail0..2, emissive and flags (prop_shader.wgsl).
             push[..12].copy_from_slice(&mat.desc.params[..12]);
-            push[20..24].copy_from_slice(&mat.desc.params[12..]);
+            push[20..24].copy_from_slice(&mat.desc.params[12..16]);
+            push[28..32].copy_from_slice(&mat.desc.params[16..]);
         }
         push
     }

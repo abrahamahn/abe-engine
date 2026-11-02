@@ -80,7 +80,7 @@ export interface AbeMaterialDesc {
   readonly order?: number;
   /** An overlay drawn by a prop shader (`createShader`) instead of in its colour and texture. */
   readonly shader?: number | null;
-  /** Up to sixteen numbers the prop shader reads (`ShadeInput.p0`..`p3`). */
+  /** Up to twenty numbers the prop shader reads (`ShadeInput.p0`..`p4`). */
   readonly params?: readonly number[];
 }
 
@@ -141,7 +141,8 @@ export interface AbeEngine {
    * Compiles a prop shader: WGSL defining `fn shade(in: ShadeInput) -> vec4f`, returning straight
    * linear colour and alpha, which may call the engine's shader functions but reads nothing
    * besides its input (uv, world, normal, tint, color, the base texture's sample `base`, and the
-   * material's params as `p0`..`p3`). It lasts as long as the engine.
+   * material's params as `p0`..`p4`) and its base texture (`base_tex` with `material_sampler`,
+   * at any uv or mip bias). It lasts as long as the engine.
    */
   createShader(source: string): number;
   /** New params for a material drawn by a prop shader, without a rebuild. */

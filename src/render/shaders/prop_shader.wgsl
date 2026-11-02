@@ -1,6 +1,6 @@
 // The overlay entry point of a game's prop shader (see prop_shader_input.wgsl). The parameters
-// travel in the draw block's detail0..2 and emissive (`prop_push`); detail3 keeps the instance
-// offset, the sRGB encoding and premultiplication as for fs_overlay.
+// travel in the draw block's detail0..2, emissive and flags (`prop_push`); detail3 keeps the
+// instance offset, the sRGB encoding and premultiplication as for fs_overlay.
 @fragment fn fs_prop_shader(in: VsOut) -> @location(0) vec4f {
   var s: ShadeInput;
   s.uv = in.uv;
@@ -13,6 +13,7 @@
   s.p1 = draw.detail1;
   s.p2 = draw.detail2;
   s.p3 = draw.emissive;
+  s.p4 = draw.flags;
   let c = shade(s);
   if (c.a < draw.params.x) {
     discard;
