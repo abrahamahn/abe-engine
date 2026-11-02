@@ -1837,6 +1837,48 @@ fn prop_shaders_colour_overlays_from_their_params() {
         ([0, 255, 0], [255, 0, 255])
     );
 
+    // A shader reads all three of its material's textures as pictures: the base (red) on the
+    // left, the emissive (blue) on the right, the normal (green) sampled at another uv where
+    // the base's alpha is low.
+    let solid = |r: &mut Renderer, device: &mut Device<'_>, c: [u8; 4]| {
+        r.create_prop_texture(device, (2, 2), &[c, c, c, c].concat(), true)
+            .expect("texture")
+    };
+    let (red, green, blue) = (
+        solid(&mut r, &mut device, [255, 0, 0, 255]),
+        solid(&mut r, &mut device, [0, 255, 0, 255]),
+        solid(&mut r, &mut device, [0, 0, 255, 255]),
+    );
+    let pictures = r
+        .create_prop_shader(
+            &mut device,
+            "fn shade(in: ShadeInput) -> vec4f {
+               let elsewhere = textureSample(normal_tex, material_sampler, in.uv * 0.5);
+               let left = select(elsewhere.rgb, in.base.rgb, in.base.a > 0.5);
+               let c = select(in.emissive_map.rgb, left, in.uv.x < 0.5);
+               return vec4f(c * (in.normal_map.g + 0.0) , 1.0);
+             }",
+        )
+        .expect("pictures");
+    r.update_prop_material(
+        &mut device,
+        material,
+        &MaterialDesc {
+            shader: Some(pictures),
+            base_texture: Some(red),
+            normal_texture: Some(green),
+            emissive_texture: Some(blue),
+            ..desc.clone()
+        },
+    )
+    .expect("textured");
+    let img = render(&mut device, &mut r, 15.0, "clear");
+    assert_eq!(
+        (pixel(&img, at_left), pixel(&img, at_right)),
+        ([255, 0, 0], [0, 0, 255]),
+        "the base on the left, the emissive on the right"
+    );
+
     // Refused: a shader that reads the frame block, one that does not compile, and a prop
     // shader on a material drawn in the scene.
     let reads_frame = r

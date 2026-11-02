@@ -2,8 +2,8 @@
 // `fn shade(in: ShadeInput) -> vec4f` returns straight (not premultiplied) linear colour and
 // alpha, which the overlay pass then cuts at the material's alpha cutoff, encodes and blends as
 // it does every overlay. A prop shader may call the functions of common.wgsl and scene.wgsl (noise,
-// hashing) but reads no resource other than through this input; the time, and anything else that
-// moves, comes in the material's `params`.
+// hashing) but reads no resource other than through this input and its material's three textures;
+// the time, and anything else that moves, comes in the material's `params`.
 struct ShadeInput {
   // The mesh's texture coordinates, its world position and normal.
   uv: vec2f,
@@ -15,6 +15,11 @@ struct ShadeInput {
   // The material's base texture at `uv` (white without one); `base_tex` with `material_sampler`
   // samples it elsewhere (another uv, a mip bias), in uniform control flow.
   base: vec4f,
+  // Its normal and emissive textures at `uv` (flat (0.5, 0.5, 1) and white without them): more
+  // pictures for the shader to use as it likes (a card's face under its back), sampled elsewhere
+  // through `normal_tex` and `emissive_tex` with `material_sampler`.
+  normal_map: vec4f,
+  emissive_map: vec4f,
   // The material's twenty `params`, four at a time.
   p0: vec4f,
   p1: vec4f,

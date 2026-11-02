@@ -311,6 +311,22 @@ async function run() {
     && near(pixel(ninth, shaderRight), [255, 0, 0], 2),
     { left: pixel(ninth, shaderLeft), right: pixel(ninth, shaderRight) });
   engine.destroyInstance(mirrored);
+  // It reads its material's three textures: the base (red) left, the emissive (blue) right,
+  // brightened by the normal texture's green, which is full.
+  const plain = (c) => engine.createTexture({ width: 2, height: 2, data: new Uint8Array([...c, ...c, ...c, ...c]) });
+  const pictures = engine.createShader(`fn shade(in: ShadeInput) -> vec4f {
+    let c = select(in.emissive_map.rgb, in.base.rgb, in.uv.x < 0.5);
+    return vec4f(c * in.normal_map.g, 1.0);
+  }`);
+  const picturesMaterial = engine.createMaterial({ name: 'check-pictures', overlay: true, blend: 'alpha',
+    depthTest: false, order: 4, shader: pictures, baseTexture: plain([255, 0, 0, 255]),
+    normalTexture: plain([0, 255, 0, 255]), emissiveTexture: plain([0, 0, 255, 255]) });
+  const pictured = engine.createInstance(wide, picturesMaterial, translate(0, 5, 0));
+  const pictureFrame = await frame(engine);
+  check('a prop shader reads its three textures', near(pixel(pictureFrame, shaderLeft), [255, 0, 0], 2)
+    && near(pixel(pictureFrame, shaderRight), [0, 0, 255], 2),
+    { left: pixel(pictureFrame, shaderLeft), right: pixel(pictureFrame, shaderRight) });
+  engine.destroyInstance(pictured);
   let shaderRefused = '';
   try { engine.createShader('fn shade(in: ShadeInput) -> vec4f { return vec4f(frame.camera.xyz, 1.0); }'); }
   catch (e) { shaderRefused = e.message; }

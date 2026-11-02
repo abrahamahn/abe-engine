@@ -9,6 +9,8 @@
   s.tint = in.tint;
   s.color = draw.base_color;
   s.base = textureSample(base_tex, material_sampler, in.uv);
+  s.normal_map = textureSample(normal_tex, material_sampler, in.uv);
+  s.emissive_map = textureSample(emissive_tex, material_sampler, in.uv);
   s.p0 = draw.detail0;
   s.p1 = draw.detail1;
   s.p2 = draw.detail2;

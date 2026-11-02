@@ -148,7 +148,9 @@ pub(super) struct Pipelines {
     /// so it takes the same bind groups).
     pub(super) output_format: Format,
     pub(super) prop_layout: VertexLayout,
-    pub(super) overlay_bindings: Vec<abe_shader::Binding>,
+    /// What a prop shader's fragment stage reads: an overlay's frame bindings and a scene prop's
+    /// material group (its draws bind a material made for `scene_prop`).
+    pub(super) prop_shader_bindings: Vec<abe_shader::Binding>,
     /// The props' vertex stage (`vs_prop`): every prop shader's, which never calls `shade`.
     pub(super) prop_vs: Compiled,
     shadow: PipelineId,
@@ -265,19 +267,30 @@ pub(super) fn prop_shader_source(user: &str) -> String {
     )
 }
 
-/// A game's prop shader's fragment stage compiled, checked to read only what an overlay draw
-/// binds. Its vertex stage is every prop's (`Pipelines::prop_vs`).
+/// A game's prop shader's fragment stage compiled, checked to read only what its draw binds: an
+/// overlay's frame and a scene prop's material (its three textures). Its vertex stage is every
+/// prop's (`Pipelines::prop_vs`).
 pub(super) fn prop_shader_stage(pipelines: &Pipelines, user: &str) -> Result<Compiled> {
     let source = prop_shader_source(user);
     let fs = crate::gpu::compile_shader(&source, Stage::Fragment, "fs_prop_shader")?;
-    if fs.bindings != pipelines.overlay_bindings {
+    if sorted_bindings(&fs.bindings) != pipelines.prop_shader_bindings {
         return Err(
-            "a prop shader reads only its material's base texture and the draw's parameters \
+            "a prop shader reads only its material's textures and the draw's parameters \
              (`ShadeInput`); pass anything else, the time among it, in `params`"
                 .into(),
         );
     }
     Ok(fs)
+}
+
+/// The bind group a prop's material binds (its textures and sampler).
+const MATERIAL_GROUP: u32 = 1;
+
+/// Bindings by group and binding, for comparing stages.
+fn sorted_bindings(bindings: &[abe_shader::Binding]) -> Vec<abe_shader::Binding> {
+    let mut out = bindings.to_vec();
+    out.sort_by_key(|b| (b.group, b.binding));
+    out
 }
 
 /// One overlay pipeline of a game's prop shader: `blend` 0 opaque, 1 alpha, 2 additive; `depth` 0
@@ -424,7 +437,15 @@ impl Pipelines {
             })?;
         }
         let overlay_fs = compile(SCENE, Stage::Fragment, "fs_overlay")?;
-        let overlay_bindings = overlay_fs.bindings.clone();
+        let prop_shader_bindings = sorted_bindings(
+            &overlay_fs
+                .bindings
+                .iter()
+                .filter(|b| b.group != MATERIAL_GROUP)
+                .chain(fs.bindings.iter().filter(|b| b.group == MATERIAL_GROUP))
+                .copied()
+                .collect::<Vec<_>>(),
+        );
         let mut overlay = [[scene_prop; 3]; 3];
         for (i, blend) in [Blend::Replace, Blend::Premultiplied, Blend::Additive]
             .into_iter()
@@ -612,7 +633,7 @@ impl Pipelines {
             overlay,
             output_format: output,
             prop_layout: layout,
-            overlay_bindings,
+            prop_shader_bindings,
             prop_vs,
             shadow,
             shadow_masked,

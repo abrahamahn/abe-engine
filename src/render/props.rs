@@ -106,7 +106,9 @@ pub struct MaterialDesc {
     /// Draw order among blended and overlay props: lower first (any finite number, so one can be
     /// slipped between two others); ties draw far to near.
     pub order: f32,
-    /// An overlay drawn by a game's prop shader instead of in its colour and texture.
+    /// An overlay drawn by a game's prop shader instead of in its colour and texture. The shader
+    /// reads all three textures (`ShadeInput::base`, `normal_map`, `emissive_map`): pictures it
+    /// combines as it likes.
     pub shader: Option<PropShader>,
     /// What the prop shader reads (`ShadeInput::p0`..`p4`); unused without one.
     pub params: [f32; PROP_SHADER_PARAMS],
@@ -890,7 +892,8 @@ impl Renderer {
         let normal = self.prop_texture_id(desc.normal_texture, self.flat)?;
         let emissive = self.prop_texture_id(desc.emissive_texture, self.white)?;
         let p = &self.pipelines;
-        let group = if desc.overlay {
+        // A prop shader may read all three textures, as a scene prop's material binds them.
+        let group = if desc.overlay && desc.shader.is_none() {
             device.create_bind_group(
                 p.overlay[0][0],
                 1,
