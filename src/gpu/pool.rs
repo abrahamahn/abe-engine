@@ -1,6 +1,6 @@
 //! Generational object pools (the browser backends' GPU objects, the renderer's props): ids are
 //! `generation << 20 | index`, so a destroyed object's id is reported as stale instead of
-//! reaching a recycled one.
+//! reaching a recycled one. Generations run from 1, so no id is ever 0 (hosts use 0 for none).
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -8,7 +8,12 @@ const INDEX_BITS: u32 = 20;
 const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;
 const GENERATIONS: u32 = 1 << (32 - INDEX_BITS);
 
-/// Generational slots: ids are `generation << 20 | index`.
+/// The generation after `g`, skipping 0.
+fn next_generation(g: u32) -> u32 {
+    g % (GENERATIONS - 1) + 1
+}
+
+/// Generational slots: ids are `generation << 20 | index`, with generations 1..4096.
 pub(crate) struct Pool<T> {
     pub(crate) slots: Vec<(u32, Option<T>)>,
     pub(crate) free: Vec<u32>,
@@ -32,8 +37,8 @@ impl<T> Pool<T> {
         if index > INDEX_MASK {
             return Err("too many live GPU objects of one kind".into());
         }
-        self.slots.push((0, Some(value)));
-        Ok(index)
+        self.slots.push((1, Some(value)));
+        Ok(1 << INDEX_BITS | index)
     }
     pub(crate) fn get(&self, raw: u32) -> Option<&T> {
         let slot = self.slots.get((raw & INDEX_MASK) as usize)?;
@@ -50,7 +55,7 @@ impl<T> Pool<T> {
             return None;
         }
         let value = slot.1.take()?;
-        slot.0 = (slot.0 + 1) % GENERATIONS;
+        slot.0 = next_generation(slot.0);
         self.free.push(index);
         Some(value)
     }
@@ -72,7 +77,7 @@ impl<T> Pool<T> {
         self.free.clear();
         for (i, slot) in self.slots.iter_mut().enumerate().rev() {
             if let Some(v) = slot.1.take() {
-                slot.0 = (slot.0 + 1) % GENERATIONS;
+                slot.0 = next_generation(slot.0);
                 out.push(v);
             }
             self.free.push(i as u32);
@@ -102,5 +107,22 @@ mod tests {
         let d = p.insert("d").unwrap();
         assert!(d != b && d != c && p.get(d) == Some(&"d"));
         assert_eq!(p.iter().count(), 1);
+        assert!([a, b, c, d].iter().all(|&id| id != 0));
+    }
+
+    #[test]
+    fn ids_are_never_zero_across_generations() {
+        let mut p = Pool::default();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..(2 * super::GENERATIONS + 5) {
+            let id = p.insert(()).unwrap();
+            assert_ne!(id, 0);
+            assert!(p.get(id).is_some());
+            seen.insert(id);
+            p.remove(id);
+            assert!(p.get(id).is_none());
+        }
+        // One slot cycles through every generation but 0.
+        assert_eq!(seen.len(), (super::GENERATIONS - 1) as usize);
     }
 }

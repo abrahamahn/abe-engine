@@ -107,6 +107,123 @@ impl Default for MaterialDesc {
     }
 }
 
+impl MaterialDesc {
+    /// A description from JSON, for hosts across a language boundary. Every field is optional
+    /// and unknown fields are errors:
+    ///
+    /// ```json
+    /// {"name": "felt", "color": [0.1, 0.3, 0.2, 1], "emissive": [0, 0, 0], "lamp": false,
+    ///  "roughness": 0.8, "metallic": 0, "shading": "standard",
+    ///  "alphaCutoff": 0.5, "baseTexture": 3, "normalTexture": 4, "emissiveTexture": 5,
+    ///  "normalScale": 1, "castsShadow": true}
+    /// ```
+    ///
+    /// Colours are linear; `shading` is `standard`, `foliage`, `water` or `unlit`; textures are
+    /// raw [`PropTexture`] handles.
+    pub fn from_json(text: &[u8]) -> Result<Self> {
+        use crate::assets::json::{self, Value};
+        const KNOWN: [&str; 13] = [
+            "name",
+            "color",
+            "emissive",
+            "lamp",
+            "roughness",
+            "metallic",
+            "shading",
+            "alphaCutoff",
+            "baseTexture",
+            "normalTexture",
+            "emissiveTexture",
+            "normalScale",
+            "castsShadow",
+        ];
+        let v = json::parse(text).map_err(|e| format!("material: {e}"))?;
+        let Value::Object(map) = &v else {
+            return Err("material: expected a JSON object".into());
+        };
+        if let Some(unknown) = map.keys().find(|k| !KNOWN.contains(&k.as_str())) {
+            return Err(format!("material: unknown field {unknown:?}"));
+        }
+        let field = |key: &str, e: String| format!("material {key}: {e}");
+        let num = |key: &str| -> Result<Option<f32>> {
+            v.get(key)
+                .map(|x| x.float().map_err(|e| field(key, e)))
+                .transpose()
+        };
+        let floats = |key: &str, n: usize| -> Result<Option<Vec<f32>>> {
+            let Some(x) = v.get(key) else {
+                return Ok(None);
+            };
+            let a = x.array().map_err(|e| field(key, e))?;
+            if a.len() != n {
+                return Err(field(key, format!("expected {n} numbers")));
+            }
+            a.iter()
+                .map(|x| x.float().map_err(|e| field(key, e)))
+                .collect::<Result<Vec<f32>>>()
+                .map(Some)
+        };
+        let flag = |key: &str| -> Result<Option<bool>> {
+            match v.get(key) {
+                None => Ok(None),
+                Some(Value::Bool(b)) => Ok(Some(*b)),
+                Some(_) => Err(field(key, "expected true or false".into())),
+            }
+        };
+        let texture = |key: &str| -> Result<Option<PropTexture>> {
+            match v.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(x) => x
+                    .unsigned()
+                    .ok()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|&n| n != 0)
+                    .map(|n| Some(PropTexture(n)))
+                    .ok_or_else(|| field(key, "expected a texture handle".into())),
+            }
+        };
+        let mut d = MaterialDesc::default();
+        if let Some(name) = v.get("name") {
+            d.name = name.string().map_err(|e| field("name", e))?.into();
+        }
+        if let Some(c) = floats("color", 4)? {
+            d.base_color = [c[0], c[1], c[2], c[3]];
+        }
+        if let Some(e) = floats("emissive", 3)? {
+            d.emissive = [e[0], e[1], e[2]];
+        }
+        if let Some(b) = flag("lamp")? {
+            d.lamp = b;
+        }
+        if let Some(x) = num("roughness")? {
+            d.roughness = x.clamp(0.0, 1.0);
+        }
+        if let Some(x) = num("metallic")? {
+            d.metallic = x.clamp(0.0, 1.0);
+        }
+        if let Some(s) = v.get("shading") {
+            d.shading = match s.string().map_err(|e| field("shading", e))? {
+                "standard" => Shading::Standard,
+                "foliage" => Shading::Foliage,
+                "water" => Shading::Water,
+                "unlit" => Shading::Unlit,
+                other => return Err(field("shading", format!("unknown {other:?}"))),
+            };
+        }
+        d.alpha_cutoff = num("alphaCutoff")?;
+        d.base_texture = texture("baseTexture")?;
+        d.normal_texture = texture("normalTexture")?;
+        d.emissive_texture = texture("emissiveTexture")?;
+        if let Some(x) = num("normalScale")? {
+            d.normal_scale = x;
+        }
+        if let Some(b) = flag("castsShadow")? {
+            d.casts_shadow = b;
+        }
+        Ok(d)
+    }
+}
+
 /// Bytes per instance in the instance buffer (`Prop` in common.wgsl: two matrices).
 const PROP_BYTES: u64 = 128;
 const MIN_CAPACITY: u32 = 64;
@@ -164,6 +281,8 @@ pub(super) struct Props {
     slots: Vec<Option<PropSlot>>,
     capacity: u32,
     batches: Vec<Batch>,
+    /// World bounds of this frame's visible instances.
+    bounds: Option<(V3, V3)>,
 }
 
 fn normal_matrix(m: &M4) -> M4 {
@@ -709,6 +828,11 @@ impl Renderer {
         ])
     }
 
+    /// World bounds of the visible props, as of the last frame recorded.
+    pub(super) fn props_bounds(&self) -> Option<(V3, V3)> {
+        self.props.bounds
+    }
+
     /// Recomputes the prop detail blocks after the Look changed.
     pub(super) fn restyle_props(&mut self) {
         let look = &self.look;
@@ -743,7 +867,23 @@ impl Renderer {
         live.sort_by_key(|(material, mesh, _)| (*material, *mesh));
         let mut batches: Vec<Batch> = Vec::new();
         let mut data: Vec<f32> = Vec::with_capacity(live.len() * 32);
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
         for (n, (material, mesh, inst)) in live.iter().enumerate() {
+            if let Some(m) = self.props.meshes.get(*mesh) {
+                for corner in 0..8 {
+                    let p = [
+                        if corner & 1 == 0 { m.min[0] } else { m.max[0] },
+                        if corner & 2 == 0 { m.min[1] } else { m.max[1] },
+                        if corner & 4 == 0 { m.min[2] } else { m.max[2] },
+                    ];
+                    let w = math::transform_point(&inst.model, p);
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(w[k]);
+                        hi[k] = hi[k].max(w[k]);
+                    }
+                }
+            }
             match batches.last_mut() {
                 Some(b) if b.material == *material && b.mesh == *mesh => b.count += 1,
                 _ => batches.push(Batch {
@@ -757,6 +897,7 @@ impl Renderer {
             data.extend_from_slice(&inst.normal);
         }
         self.props.batches = batches;
+        self.props.bounds = (lo[0] <= hi[0]).then_some((lo, hi));
         let needed = (live.len() as u32).max(MIN_CAPACITY);
         if needed > self.props.capacity {
             self.reset_prop_slots(device);
@@ -932,5 +1073,46 @@ impl Renderer {
         }
         self.props.instances.drain();
         self.props.batches.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn material_from_json() {
+        let d = MaterialDesc::from_json(
+            br#"{"name": "felt", "color": [0.1, 0.3, 0.2, 1], "roughness": 2,
+                 "shading": "unlit", "alphaCutoff": 0.5, "baseTexture": 7,
+                 "castsShadow": false, "lamp": true, "emissive": [1, 0.5, 0]}"#,
+        )
+        .unwrap();
+        assert_eq!(d.name, "felt");
+        assert_eq!(d.base_color, [0.1, 0.3, 0.2, 1.0]);
+        assert_eq!((d.roughness, d.shading), (1.0, Shading::Unlit));
+        assert_eq!(
+            (d.alpha_cutoff, d.base_texture),
+            (Some(0.5), Some(PropTexture(7)))
+        );
+        assert!(!d.casts_shadow && d.lamp && d.emissive == [1.0, 0.5, 0.0]);
+        assert_eq!(
+            MaterialDesc::from_json(b"{}").unwrap(),
+            MaterialDesc::default()
+        );
+        for bad in [
+            &b"[]"[..],
+            br#"{"colour": [1, 1, 1, 1]}"#,
+            br#"{"color": [1, 1, 1]}"#,
+            br#"{"shading": "toon"}"#,
+            br#"{"baseTexture": 0}"#,
+            br#"{"castsShadow": 1}"#,
+        ] {
+            assert!(
+                MaterialDesc::from_json(bad).is_err(),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 }

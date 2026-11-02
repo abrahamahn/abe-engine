@@ -186,8 +186,13 @@ impl GpuScene {
                 water,
             });
         }
+        let triangles = indices.len() / 3;
         if draws.is_empty() {
-            return Err("the world has no triangles to draw".into());
+            // Nothing cooked: a scene of props only. A placeholder keeps the buffers non-empty
+            // and the bounds finite.
+            (min, max) = ([-1.0; 3], [1.0; 3]);
+            vertices = vec![0.0; FLOATS_PER_VERTEX];
+            indices = vec![0; 3];
         }
         if land_min[0] > land_max[0] {
             (land_min, land_max) = (min, max);
@@ -281,7 +286,7 @@ impl GpuScene {
             land_min,
             land_max,
             land_centre,
-            triangles: indices.len() / 3,
+            triangles,
         })
     }
 }

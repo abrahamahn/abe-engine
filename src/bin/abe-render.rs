@@ -127,6 +127,7 @@ fn run() -> Result<(), String> {
             eye: [c[0] + r, c[1] + r * 0.6, c[2] + r],
             target: c,
             fov: 45.0,
+            ..View::default()
         }]
     };
     if let Some((start, end, frames)) = sequence {

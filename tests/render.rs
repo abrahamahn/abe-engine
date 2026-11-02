@@ -158,6 +158,7 @@ fn view() -> View {
         eye: [0.0, 4.0, 10.0],
         target: [0.0, 0.5, 0.0],
         fov: 50.0,
+        ..View::default()
     }
 }
 
@@ -254,6 +255,7 @@ fn rain_stops_under_a_roof() {
         eye: [0.0, 1.5, 0.0],
         target: [0.0, 1.0, -10.0],
         fov: 60.0,
+        ..View::default()
     };
     let mut frame = |roof: bool, particles: bool| {
         let mut meshes = vec![quad(0.0, 40.0, 0)];
@@ -347,6 +349,7 @@ fn grass_and_surface_detail() {
         eye: [0.0, 1.2, 0.0],
         target: [0.0, 1.0, -10.0],
         fov: 60.0,
+        ..View::default()
     };
     let rule = |pattern: &str, preset| DetailRule {
         patterns: vec![pattern.into()],
@@ -418,6 +421,7 @@ fn colour_rules_recolour_any_material() {
         eye: [0.0, 2.0, 2.0],
         target: [0.0, 1.5, -6.0],
         fov: 50.0,
+        ..View::default()
     };
     let mut frame = |rules: Vec<DetailRule>| {
         let look = Look {
@@ -491,6 +495,7 @@ fn lattice_bars_shade_a_lamp() {
         eye: [0.0, 1.2, -1.0],
         target: [0.0, 1.0, -4.0],
         fov: 50.0,
+        ..View::default()
     };
     let mut frame = |rules: Vec<DetailRule>| {
         let look = Look {
@@ -570,6 +575,7 @@ fn tide_marks_stain_what_stands_in_water() {
         eye: [0.0, 0.8, -1.0],
         target: [0.0, 0.4, -4.0],
         fov: 50.0,
+        ..View::default()
     };
     let mut frame = |tide: f32| {
         let look = Look {
@@ -700,6 +706,7 @@ fn terrain_beaches_and_distant_shallows() {
         eye: [0.0, 10.0, 10.0],
         target: [0.0, 0.0, -20.0],
         fov: 60.0,
+        ..View::default()
     };
     let blue = |r: f32, g: f32, b: f32| b > 1.5 * r + 10.0 && b > 1.5 * g + 10.0;
     let red_shallows = [1.0, 0.0, 0.0];
@@ -711,6 +718,7 @@ fn terrain_beaches_and_distant_shallows() {
         eye: [0.0, 25.0, 190.0],
         target: [0.0, 0.0, 0.0],
         fov: 40.0,
+        ..View::default()
     };
     let red = |r: f32, g: f32, b: f32| r > 1.4 * g + 8.0 && r > 1.4 * b + 8.0;
     let shallows = count(&frame(DetailPreset::Terrain, &far, red_shallows), &red);
@@ -956,6 +964,234 @@ fn props_draw_move_pick_and_cast_shadows() {
     r.destroy_props(&mut device);
     assert_eq!(r.prop_instances(), 0);
     assert!(r.pick(&view(), size, (p[0], p[1])).is_none());
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}
+
+/// Lens shift translates the image without rotating the camera, and a camera can look straight
+/// down when it names another up direction.
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn lens_shift_and_looking_straight_down() {
+    let mut device = Device::headless().expect("device");
+    let mut box_ = material("box", [0.9, 0.05, 0.05, 1.0], Shading::Standard);
+    box_.metallic = 0.0;
+    let world = World {
+        instances: (0..2)
+            .map(|mesh| Instance {
+                mesh,
+                transform: Transform::IDENTITY,
+            })
+            .collect(),
+        meshes: vec![quad(0.0, 20.0, 0), cube([0.0, 0.5, 0.0], 0.5, 1)],
+        materials: vec![
+            material("ground", [0.6, 0.6, 0.6, 1.0], Shading::Standard),
+            box_,
+        ],
+        textures: vec![],
+        lights: vec![],
+    };
+    let mut quality = Quality::realtime();
+    quality.shadow_size = 512;
+    let mut r = Renderer::new(
+        &mut device,
+        &world,
+        Look::default(),
+        quality,
+        (W, H),
+        Output::Still,
+    )
+    .expect("renderer");
+    let env = Environment::resolve(
+        &TimeOfDay {
+            hours: 15.0,
+            ..TimeOfDay::default()
+        },
+        &Weather::default(),
+        &r.look().palette,
+        3.0,
+    );
+    // The centroid of red-dominant pixels.
+    let red = |px: &[u8]| {
+        let (mut sx, mut sy, mut n) = (0.0, 0.0, 0.0);
+        for y in 0..H {
+            for x in 0..W {
+                let i = ((y * W + x) * 4) as usize;
+                if u32::from(px[i]) > u32::from(px[i + 1]) + 40 {
+                    sx += x as f32 + 0.5;
+                    sy += y as f32 + 0.5;
+                    n += 1.0;
+                }
+            }
+        }
+        assert!(n > 10.0, "the box is in view");
+        [sx / n, sy / n]
+    };
+    let size = (W, H);
+    let plain = view();
+    let base = red(&r
+        .render_still(&mut device, &plain, &env, 1)
+        .expect("render"));
+    for shift in [[0.0, 0.2], [0.3, 0.0], [-0.25, -0.15]] {
+        let shifted = View { shift, ..view() };
+        // The view axis lands `shift` from the centre (y up), whatever the depth.
+        let target = r.project(&shifted, size, shifted.target).expect("in front");
+        let want = [
+            W as f32 * 0.5 * (1.0 + shift[0]),
+            H as f32 * 0.5 * (1.0 - shift[1]),
+        ];
+        assert!(
+            (target[0] - want[0]).abs() < 0.01 && (target[1] - want[1]).abs() < 0.01,
+            "{shift:?}: {target:?} vs {want:?}"
+        );
+        let moved = red(&r
+            .render_still(&mut device, &shifted, &env, 1)
+            .expect("render"));
+        let (dx, dy) = (moved[0] - base[0], moved[1] - base[1]);
+        let (wx, wy) = (shift[0] * W as f32 * 0.5, -shift[1] * H as f32 * 0.5);
+        eprintln!("shift {shift:?}: the box moved {dx:.2}, {dy:.2} px (want {wx:.2}, {wy:.2})");
+        assert!((dx - wx).abs() < 1.0 && (dy - wy).abs() < 1.0);
+    }
+    // Straight down, with north (-z) at the top of the image.
+    let down = View {
+        eye: [0.0, 12.0, 0.0],
+        target: [0.0, 0.0, 0.0],
+        up: [0.0, 0.0, -1.0],
+        ..view()
+    };
+    let top = red(&r.render_still(&mut device, &down, &env, 1).expect("render"));
+    assert!(
+        (top[0] - W as f32 * 0.5).abs() < 2.0 && (top[1] - H as f32 * 0.5).abs() < 2.0,
+        "{top:?}"
+    );
+    let north = r.project(&down, size, [0.0, 0.0, -3.0]).expect("in front");
+    let east = r.project(&down, size, [3.0, 0.0, 0.0]).expect("in front");
+    assert!(
+        north[1] < H as f32 * 0.5 && east[0] > W as f32 * 0.5,
+        "{north:?} {east:?}"
+    );
+    // The same view with the default up (parallel to the line of sight) still renders.
+    let degenerate = View {
+        up: [0.0, 1.0, 0.0],
+        ..down.clone()
+    };
+    let px = r
+        .render_still(&mut device, &degenerate, &env, 1)
+        .expect("render");
+    assert!(region(&px, 0, 0, W, H) > 20.0, "not black");
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}
+
+/// A renderer without a cooked world draws the sky, and props on their own. Prop bounds widen
+/// the shadow depth range: a prop floor 30 m above the (placeholder) world bounds still takes
+/// a prop cube's shadow.
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn empty_world_with_props() {
+    let mut device = Device::headless().expect("device");
+    let empty = World {
+        instances: vec![],
+        meshes: vec![],
+        materials: vec![],
+        textures: vec![],
+        lights: vec![],
+    };
+    let mut quality = Quality::realtime();
+    quality.shadow_size = 512;
+    let mut r = Renderer::new(
+        &mut device,
+        &empty,
+        Look::default(),
+        quality,
+        (W, H),
+        Output::Still,
+    )
+    .expect("renderer");
+    let sky = render(&mut device, &mut r, 12.0, "clear");
+    assert!(region(&sky, 0, 0, W, H) > 40.0, "the sky is drawn");
+    let mesh_of = |device: &mut Device<'_>, r: &mut Renderer, m: &Mesh| {
+        let positions: Vec<[f32; 3]> = m.positions.iter().map(|p| [p.0, p.1, p.2]).collect();
+        r.create_prop_mesh(
+            device,
+            &MeshData {
+                positions: &positions,
+                normals: &[],
+                uvs: &[],
+                indices: &m.indices,
+            },
+        )
+        .expect("mesh")
+    };
+    let cube_mesh = mesh_of(&mut device, &mut r, &cube([0.0, 0.0, 0.0], 0.5, 0));
+    let floor_mesh = mesh_of(&mut device, &mut r, &quad(0.0, 6.0, 0));
+    let mut red = MaterialDesc {
+        name: "red".into(),
+        base_color: [0.9, 0.05, 0.05, 1.0],
+        ..MaterialDesc::default()
+    };
+    let red_id = r.create_prop_material(&mut device, &red).expect("red");
+    let grey = r
+        .create_prop_material(
+            &mut device,
+            &MaterialDesc {
+                name: "floor".into(),
+                base_color: [0.6, 0.6, 0.6, 1.0],
+                ..MaterialDesc::default()
+            },
+        )
+        .expect("grey");
+    let at = |y: f32| {
+        let mut m = [0.0f32; 16];
+        for i in [0, 5, 10, 15] {
+            m[i] = 1.0;
+        }
+        m[13] = y;
+        m
+    };
+    let cube = r
+        .create_prop_instance(cube_mesh, red_id, &at(0.5))
+        .expect("cube");
+    let with = render(&mut device, &mut r, 12.0, "clear");
+    let i = (((H / 2) * W + W / 2) * 4) as usize;
+    assert!(
+        u32::from(with[i]) > u32::from(with[i + 1]) + 40,
+        "the prop is drawn: {:?}",
+        &with[i..i + 4]
+    );
+    r.set_prop_instance(cube, &at(33.0), true).expect("raise");
+    r.create_prop_instance(floor_mesh, grey, &at(30.0))
+        .expect("floor");
+    let lit = |device: &mut Device<'_>, r: &mut Renderer| {
+        let v = View {
+            eye: [0.0, 37.0, 9.0],
+            target: [0.0, 30.5, 0.0],
+            ..view()
+        };
+        let time = TimeOfDay {
+            hours: 15.5,
+            ..TimeOfDay::default()
+        };
+        let env = Environment::resolve(
+            &time,
+            &Weather::preset("clear").expect("clear"),
+            &r.look().palette,
+            3.0,
+        );
+        r.render_still(device, &v, &env, 1).expect("render")
+    };
+    let shadowed = lit(&mut device, &mut r);
+    red.casts_shadow = false;
+    r.update_prop_material(&mut device, red_id, &red)
+        .expect("no shadow");
+    let unshadowed = lit(&mut device, &mut r);
+    let darker = shadowed
+        .chunks(4)
+        .zip(unshadowed.chunks(4))
+        .filter(|(a, b)| u32::from(a[1]) + 12 < u32::from(b[1]))
+        .count();
+    eprintln!("pixels darkened by the prop's shadow on the prop floor: {darker}");
+    assert!(darker > 25, "the cube shades the floor: {darker}");
     let errors = device.validation_errors();
     assert!(errors.is_empty(), "validation: {errors:?}");
 }

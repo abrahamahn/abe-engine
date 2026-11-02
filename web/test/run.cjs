@@ -6,6 +6,10 @@
 //
 // --api webgl2 runs everything on the WebGL 2 backend instead of WebGPU.
 //
+// --engine WORLD.abew runs web/test/engine.html: library mode (createEngine) with the world plus
+// props, checking drawing, texture orientation, projection, picking, hiding, batch moves,
+// texture updates and error reporting (OUT/engine-first.png, OUT/engine-second.png).
+//
 // --selftest first runs the module's GPU-layer self-test (compute with push constants into a
 // storage texture, copies, mip generation, a blit into the canvas, misuse reporting) and checks
 // the gradient it presents (OUT/selftest-web.png).
@@ -39,7 +43,7 @@ const CHROMIUM_ARGS = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--
   '--use-vulkan=swiftshader'];
 
 function parseArgs(argv) {
-  const opts = { cases: [], dist: path.join(__dirname, '..', 'dist'), out: 'web-test-out', abeRender: null, selftest: false, api: '' };
+  const opts = { cases: [], dist: path.join(__dirname, '..', 'dist'), out: 'web-test-out', abeRender: null, selftest: false, api: '', engine: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const val = () => argv[++i];
@@ -48,6 +52,7 @@ function parseArgs(argv) {
     else if (a === '--abe-render') opts.abeRender = val();
     else if (a === '--selftest') opts.selftest = true;
     else if (a === '--api') opts.api = val();
+    else if (a === '--engine') opts.engine = val();
     else if (a === '--case') {
       const c = { seconds: '12', frames: '3', size: '960x540', max_mean: '3' };
       for (const kv of val().split(',')) {
@@ -58,7 +63,7 @@ function parseArgs(argv) {
       opts.cases.push(c);
     } else throw new Error(`unknown argument ${a}`);
   }
-  if (!opts.cases.length && !opts.selftest) throw new Error('no --case given');
+  if (!opts.cases.length && !opts.selftest && !opts.engine) throw new Error('no --case given');
   return opts;
 }
 
@@ -69,7 +74,9 @@ function serve(dist, assets, gzipped) {
   const server = http.createServer((req, res) => {
     const url = decodeURIComponent(new URL(req.url, 'http://x').pathname);
     let file = null;
-    if (url.startsWith('/assets/')) {
+    if (url === '/test/engine.html') {
+      file = path.join(__dirname, 'engine.html');
+    } else if (url.startsWith('/assets/')) {
       const name = url.slice('/assets/'.length);
       file = assets.get(name);
       if (file && gzipped.has(name)) {
@@ -369,6 +376,38 @@ async function runSelfTest(browser, port, opts) {
   return result;
 }
 
+/** Library mode: web/test/engine.html drives createEngine and reports its checks. */
+async function runEngineCheck(browser, port, opts) {
+  const log = [];
+  const page = await browser.newPage({ viewport: { width: 600, height: 400 }, deviceScaleFactor: 1 });
+  page.on('console', (m) => log.push(`[${m.type()}] ${m.text()}`));
+  page.on('pageerror', (e) => log.push(`[pageerror] ${e.message}`));
+  const result = { name: 'engine' };
+  try {
+    const query = new URLSearchParams({ world: '/assets/engine.abew' });
+    if (opts.api) query.set('api', opts.api);
+    await page.goto(`http://localhost:${port}/test/engine.html?${query}`);
+    await page.waitForFunction(() => window.engineCheck, null, { timeout: 300000, polling: 200 });
+    const r = await page.evaluate(() => window.engineCheck);
+    for (const k of ['first', 'second']) {
+      if (r[k]) {
+        fs.writeFileSync(path.join(opts.out, `engine-${k}.png`), Buffer.from(r[k], 'base64'));
+        delete r[k];
+      }
+    }
+    log.push(...(r.log || []));
+    delete r.log;
+    Object.assign(result, r);
+  } catch (e) {
+    result.ok = false;
+    result.failed = e.message;
+  } finally {
+    fs.writeFileSync(path.join(opts.out, 'engine-console.txt'), `${log.join('\n')}\n`);
+    await page.close();
+  }
+  return result;
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   fs.mkdirSync(opts.out, { recursive: true });
@@ -387,6 +426,7 @@ async function main() {
       delete c.native;
     }
   }
+  if (opts.engine) assets.set('engine.abew', path.resolve(opts.engine));
   const gzipped = new Set(opts.cases.filter((c) => c.gzip === '1').map((c) => `${c.name}.abew`));
   const server = await serve(path.resolve(opts.dist), assets, gzipped);
   const port = server.address().port;
@@ -395,6 +435,11 @@ async function main() {
   const results = [];
   if (opts.selftest) {
     const r = await runSelfTest(browser, port, opts);
+    results.push(r);
+    console.log(JSON.stringify(r, null, 2));
+  }
+  if (opts.engine) {
+    const r = await runEngineCheck(browser, port, opts);
     results.push(r);
     console.log(JSON.stringify(r, null, 2));
   }

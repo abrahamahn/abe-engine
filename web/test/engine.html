@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ABE library-mode check</title>
+<style>
+  html, body { margin: 0; background: #111; }
+  canvas { display: block; width: 320px; height: 180px; }
+</style>
+</head>
+<body>
+<canvas></canvas>
+<script type="module">
+// Library mode (createEngine) end to end, for web/test/run.cjs --engine: a world plus props
+// (a lit cube, an unlit textured card), the camera, projection, picking, hiding, batch moves
+// and texture updates. The verdict and two frames land in window.engineCheck.
+import { createEngine } from '/abe.js';
+
+const params = new URLSearchParams(location.search);
+const canvas = document.querySelector('canvas');
+const log = [];
+const result = { checks: {} };
+const check = (name, ok, detail) => { result.checks[name] = { ok: !!ok, detail }; };
+
+function cube(h) {
+  const positions = []; const normals = []; const indices = [];
+  const faces = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  for (const n of faces) {
+    const u = n[1] !== 0 ? [1, 0, 0] : [0, 1, 0];
+    const v = [n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0]];
+    const base = positions.length / 3;
+    for (const [a, b] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+      positions.push(h * (n[0] + a * u[0] + b * v[0]), h * (n[1] + a * u[1] + b * v[1]),
+        h * (n[2] + a * u[2] + b * v[2]));
+      normals.push(...n);
+    }
+    // Counter-clockwise seen from outside: (u, v, n) is right-handed.
+    indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  }
+  return { positions, normals, indices };
+}
+
+const translate = (x, y, z) => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1];
+
+function stripes(top, bottom) {
+  const c = document.createElement('canvas');
+  c.width = 32; c.height = 32;
+  const g = c.getContext('2d');
+  g.fillStyle = top; g.fillRect(0, 0, 32, 16);
+  g.fillStyle = bottom; g.fillRect(0, 16, 32, 16);
+  return c;
+}
+
+/** Counts pixels by dominant colour in a CSS-pixel box of a capture. */
+function count(px, box, test) {
+  let n = 0;
+  for (let y = Math.max(0, box[1] | 0); y < Math.min(px.height, box[3] | 0); y++) {
+    for (let x = Math.max(0, box[0] | 0); x < Math.min(px.width, box[2] | 0); x++) {
+      const i = (y * px.width + x) * 4;
+      if (test(px.rgba[i], px.rgba[i + 1], px.rgba[i + 2])) n++;
+    }
+  }
+  return n;
+}
+const red = (r, g, b) => r > g + 40 && r > b + 40;
+const blue = (r, g, b) => b > r + 40 && b > g + 20;
+
+function png(px) {
+  const c = document.createElement('canvas');
+  c.width = px.width; c.height = px.height;
+  c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(px.rgba), px.width, px.height), 0, 0);
+  return c.toDataURL('image/png').split(',')[1];
+}
+
+async function frame(engine) {
+  // Render and start the readback in the same task, before the canvas image is presented.
+  await new Promise((r) => requestAnimationFrame(r));
+  if (!engine.render()) throw new Error('render skipped a frame');
+  const px = await engine.capture();
+  await engine.idle();
+  return px;
+}
+
+async function run() {
+  const engine = await createEngine({
+    canvas,
+    wasm: '/abe_web.wasm',
+    api: params.get('api') || 'auto',
+    world: params.get('world') || undefined,
+    onLog: (level, text) => log.push(`[${level}] ${text}`),
+  });
+  result.api = engine.api;
+  result.adapter = engine.adapter;
+  engine.fitCanvas(1);
+  engine.setView({ eye: [0, 4, 10], target: [0, 0.5, 0], fov: 50 });
+  engine.setClock(15, 3);
+  engine.setWeather('clear');
+
+  const box = engine.createMesh(cube(0.5));
+  const paint = engine.createMaterial({ name: 'check-red', color: [0.9, 0.05, 0.05, 1], roughness: 0.8 });
+  const left = engine.createInstance(box, paint, translate(-2, 0.5, 0));
+  // An upright card facing the camera: v = 0 (the canvas's top row) along its top edge.
+  const card = engine.createMesh({
+    positions: [-0.6, -0.6, 0, 0.6, -0.6, 0, 0.6, 0.6, 0, -0.6, 0.6, 0],
+    normals: [0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1],
+    uvs: [0, 1, 1, 1, 1, 0, 0, 0],
+    indices: [0, 1, 2, 0, 2, 3],
+  });
+  const art = engine.createTexture(stripes('#ff0000', '#0000ff'));
+  const face = engine.createMaterial({ name: 'check-card', shading: 'unlit', baseTexture: art, castsShadow: false });
+  const right = engine.createInstance(card, face, translate(2, 1.0, 0));
+
+  const first = await frame(engine);
+  result.size = engine.size();
+  const at = (p) => engine.project(p);
+  const c = at([-2, 0.5, 0]);
+  const top = at([2, 1.35, 0]);
+  const bottom = at([2, 0.65, 0]);
+  const boxAround = (p, r) => [p.x - r, p.y - r, p.x + r, p.y + r];
+  check('cube drawn where projected', count(first, boxAround(c, 6), red) > 40, { at: c });
+  check('card top is the texture top', count(first, boxAround(top, 4), red) > 20, { at: top });
+  check('card bottom is the texture bottom', count(first, boxAround(bottom, 4), blue) > 20, { at: bottom });
+  const hitCube = engine.pick(c.x, c.y);
+  const hitCard = engine.pick(top.x, top.y);
+  check('pick finds the cube', hitCube && hitCube.instance === left, hitCube);
+  check('pick finds the card', hitCard && hitCard.instance === right, hitCard);
+  check('pick misses the sky', engine.pick(4, 4) === null);
+  result.first = png(first);
+
+  // Hide the cube, move the card left in one batch call, swap the texture's colours.
+  engine.setInstances([
+    { instance: left, matrix: translate(-2, 0.5, 0), visible: false },
+    { instance: right, matrix: translate(-1, 2.8, 0) },
+  ]);
+  engine.updateTexture(art, stripes('#0000ff', '#ff0000'));
+  const second = await frame(engine);
+  const movedTop = at([-1, 3.15, 0]);
+  check('hidden cube is gone', count(second, boxAround(c, 6), red) < 4, { red: count(second, boxAround(c, 6), red) });
+  check('updated texture shows', count(second, boxAround(movedTop, 4), blue) > 20, { at: movedTop });
+  check('the old card place is empty', count(second, boxAround(top, 4), (r, g, b) => red(r, g, b) || blue(r, g, b)) < 4);
+  check('picking skips hidden props', engine.pick(c.x, c.y) === null);
+  result.second = png(second);
+
+  // Errors are reported, not thrown away: a stale handle and a bad material.
+  engine.destroyInstance(left);
+  let refused = 0;
+  try { engine.setInstance(left, translate(0, 0, 0)); } catch (_) { refused++; }
+  try { engine.createMaterial({ shading: 'toon' }); } catch (_) { refused++; }
+  check('misuse is refused with a message', refused === 2);
+  engine.destroy();
+  result.errors = engine.errors();
+  result.ok = Object.values(result.checks).every((c) => c.ok) && result.errors.length === 0;
+}
+
+run().catch((e) => { result.ok = false; result.failed = `${e.message}`; })
+  .finally(() => { result.log = log; window.engineCheck = result; });
+</script>
+</body>
+</html>

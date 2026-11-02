@@ -55,6 +55,7 @@ mod app {
                 eye: self.pos,
                 target: math::add(self.pos, math::scale(self.forward(), 30.0)),
                 fov,
+                ..View::default()
             }
         }
     }
@@ -130,6 +131,7 @@ mod app {
                     eye: [c[0] + 40.0, c[1] + 25.0, c[2] + 40.0],
                     target: c,
                     fov: 50.0,
+                    ..View::default()
                 }]
             } else {
                 file.views.clone()

@@ -28,7 +28,22 @@ const WORLD_FX: &str = include_str!("shaders/world_fx.wgsl");
 const POST: &str = include_str!("shaders/post.wgsl");
 const HDR: Format = Format::Rgba16Float;
 const MAX_LIGHTS_PER_TILE: usize = 96;
-const NEAR: f32 = 0.08;
+/// The near clip distance of `view`, kept positive.
+fn near(view: &View) -> f32 {
+    if view.near > 1e-4 { view.near } else { 1e-4 }
+}
+
+/// `view.up`, or a perpendicular fallback when it is (nearly) along the line of sight.
+fn camera_up(view: &View) -> V3 {
+    let fwd = normalize(sub(view.target, view.eye));
+    if math::length(cross(fwd, view.up)) > 1e-4 {
+        view.up
+    } else if fwd[1].abs() > 0.9 {
+        [0.0, 0.0, -1.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
 /// The ground map covers this far (metres) around a point just ahead of the camera.
 const GROUND_REACH: f32 = 48.0;
 /// The world map covers the land's bounds plus this margin (metres) on every side, so shallows
@@ -498,6 +513,7 @@ pub(super) struct Eye {
     pub(super) view_proj: M4,
     pub(super) inv: M4,
     pos: V3,
+    near: f32,
 }
 
 struct Cascades {
@@ -1030,15 +1046,17 @@ impl Renderer {
     }
 
     pub(super) fn eye(&self, view: &View, jitter: [f32; 2], (w, h): (u32, u32)) -> Eye {
-        let v = look_at(view.eye, view.target, [0.0, 1.0, 0.0]);
-        let mut p = perspective(view.fov.to_radians(), w as f32 / h as f32, NEAR);
-        p[8] += 2.0 * jitter[0] / w as f32;
-        p[9] += 2.0 * jitter[1] / h as f32;
+        let v = look_at(view.eye, view.target, camera_up(view));
+        let mut p = perspective(view.fov.to_radians(), w as f32 / h as f32, near(view));
+        // Column 2 skews the frustum: x_ndc gains -p[8] and y_ndc (pointing down) -p[9].
+        p[8] += 2.0 * jitter[0] / w as f32 - view.shift[0];
+        p[9] += 2.0 * jitter[1] / h as f32 + view.shift[1];
         let view_proj = mul(&p, &v);
         Eye {
             view_proj,
             inv: invert(&view_proj).unwrap_or(math::IDENTITY),
             pos: view.eye,
+            near: near(view),
         }
     }
 
@@ -1080,10 +1098,11 @@ impl Renderer {
         let l = normalize(env.key_dir);
         let size = self.quality.shadow_size as f32;
         let fwd = normalize(sub(view.target, view.eye));
-        let right = normalize(cross(fwd, [0.0, 1.0, 0.0]));
+        let right = normalize(cross(fwd, camera_up(view)));
         let up = cross(right, fwd);
         let ty = (0.5 * view.fov.to_radians()).tan();
         let tx = ty * w / h;
+        let [shift_x, shift_y] = view.shift;
         let mut out = Cascades {
             mats: [math::IDENTITY; 2],
             split,
@@ -1092,15 +1111,27 @@ impl Renderer {
             bias: [0.0; 2],
         };
         // Water casts no shadow, so a wide sea does not stretch the depth range.
-        let (smin, smax) = (self.scene.land_min, self.scene.land_max);
-        for (c, (d0, d1)) in [(NEAR, split), (split * 0.85, far)].into_iter().enumerate() {
+        let (mut smin, mut smax) = (self.scene.land_min, self.scene.land_max);
+        if let Some((lo, hi)) = self.props_bounds() {
+            for k in 0..3 {
+                smin[k] = smin[k].min(lo[k]);
+                smax[k] = smax[k].max(hi[k]);
+            }
+        }
+        for (c, (d0, d1)) in [(near(view), split), (split * 0.85, far)]
+            .into_iter()
+            .enumerate()
+        {
             let mut pts = vec![];
             for d in [d0, d1] {
                 for sx in [-1.0, 1.0] {
                     for sy in [-1.0, 1.0] {
                         pts.push(add(
                             add(view.eye, scale(fwd, d)),
-                            add(scale(right, sx * d * tx), scale(up, sy * d * ty)),
+                            add(
+                                scale(right, (sx - shift_x) * d * tx),
+                                scale(up, (sy - shift_y) * d * ty),
+                            ),
                         ));
                     }
                 }
@@ -1188,7 +1219,7 @@ impl Renderer {
                         l[2] + if k & 4 == 0 { -r } else { r },
                     ];
                     let c = transform(&eye.view_proj, [p[0], p[1], p[2], 1.0]);
-                    if c[3] <= NEAR * 0.5 {
+                    if c[3] <= eye.near * 0.5 {
                         behind += 1;
                         straddle = true;
                         continue;
@@ -1304,7 +1335,7 @@ impl Renderer {
         b.f(fog_base, l.fog_falloff, env.mist, l.fog);
         b.f(env.wind[0], env.wind[1], 1.0, seed as f32);
         b.f(w as f32, h as f32, 1.0 / w as f32, 1.0 / h as f32);
-        b.f(cas.split, cas.offset[0], cas.offset[1], NEAR);
+        b.f(cas.split, cas.offset[0], cas.offset[1], eye.near);
         b.f(cas.radius[0], cas.radius[1], cas.bias[0], cas.bias[1]);
         b.f(
             ground.top,
@@ -1485,6 +1516,8 @@ impl Renderer {
         // The world map is drawn in this frame's first passes, before anything reads it.
         let draw_world = !self.world_drawn;
         self.world_drawn = true;
+        // Props first: their bounds widen the shadow cascades' depth range.
+        self.prepare_props(device, slot_index)?;
         let t = &self.targets;
         let size = (t.width, t.height);
         let eye = self.eye(view, jitter, size);
@@ -1501,6 +1534,7 @@ impl Renderer {
                 view_proj,
                 inv: invert(&view_proj).unwrap_or(math::IDENTITY),
                 pos: [view.eye[0], 2.0 * h - view.eye[1], view.eye[2]],
+                near: base.near,
             }
         });
         {
@@ -1519,7 +1553,6 @@ impl Renderer {
                 device.write_buffer(slot.frame[1], 0, &block)?;
             }
         }
-        self.prepare_props(device, slot_index)?;
         let slot = &self.slots[slot_index];
         let t = &self.targets;
         let p = &self.pipelines;

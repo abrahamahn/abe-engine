@@ -1596,3 +1596,278 @@ export async function startPlayer(options) {
     capture: () => new Promise((resolve, reject) => captures.push({ resolve, reject })),
   };
 }
+
+// ------------------------------------------------------------------------------ Library mode
+
+/** RGBA8 pixels of an image source: `{width, height, data}` passes through; canvases, image
+ * bitmaps and images are drawn into a 2D canvas and read back (straight alpha). */
+function pixelsOf(source) {
+  if (source && source.data && source.width && source.height) return source;
+  const width = source.naturalWidth || source.videoWidth || source.width;
+  const height = source.naturalHeight || source.videoHeight || source.height;
+  if (!width || !height) throw new Error('createTexture: the source has no size');
+  const c = typeof OffscreenCanvas !== 'undefined'
+    ? new OffscreenCanvas(width, height)
+    : Object.assign(document.createElement('canvas'), { width, height });
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.clearRect(0, 0, width, height);
+  ctx.drawImage(source, 0, 0, width, height);
+  return { width, height, data: ctx.getImageData(0, 0, width, height).data };
+}
+
+/**
+ * Library mode: the engine as a renderer that a host page (a game with its own interface)
+ * drives. Resolves with an engine object; its methods throw with the engine's message when a
+ * call fails. Handles (textures, meshes, materials, instances) are nonzero numbers.
+ *
+ * `options`: canvas; wasm (URL of abe_web.wasm); api ('auto', 'webgpu' or 'webgl2');
+ * world (URL, ArrayBuffer or Uint8Array of a cooked `.abew`; omit for a scene of props only);
+ * look (Look file as an object or JSON text; optional); quality ('realtime' or 'still');
+ * onLog(level, text); onPhase(text, progress).
+ *
+ * The page sizes the canvas (canvas.width/height in device pixels; `fitCanvas(dpr)` helps) and
+ * calls `render()` when it wants a frame. Positions are metres; matrices are 16 numbers,
+ * column-major, model to world.
+ */
+export async function createEngine(options) {
+  const { canvas } = options;
+  let lastError = '';
+  const onLog = options.onLog || (() => {});
+  const { gpu, host, x, errors } = await boot({
+    ...options,
+    onLog: (level, text) => {
+      if (level >= 2) lastError = text;
+      onLog(level, text);
+    },
+    onError: (text) => {
+      lastError = text;
+      onLog(2, text);
+    },
+  });
+  const fail = (what) => new Error(`${what}: ${lastError || 'the engine refused'}`);
+  const ok = (what, r) => {
+    if (!r) throw fail(what);
+    return r;
+  };
+
+  // One scratch allocation, reused: the engine reads call arguments during the call only.
+  // Its start is rounded up to 4 bytes so typed-array views of it are aligned.
+  let scratch = 0;
+  let scratchCap = 0;
+  const reserve = (len) => {
+    if (len + 4 > scratchCap) {
+      if (scratch) x.abe_free(scratch, scratchCap);
+      scratchCap = Math.max(len + 4, scratchCap * 2, 4096);
+      scratch = x.abe_alloc(scratchCap) >>> 0;
+    }
+    return (scratch + 3) & ~3;
+  };
+  const encoder = new TextEncoder();
+  /** Copies byte arrays into scratch memory, each at a 4-byte boundary; returns pointers. */
+  const place = (...arrays) => {
+    let total = 0;
+    const offsets = arrays.map((a) => {
+      const at = total;
+      total += a ? (a.byteLength + 3) & ~3 : 0;
+      return at;
+    });
+    const base = reserve(Math.max(total, 4));
+    const mem = new Uint8Array(x.memory.buffer);
+    return arrays.map((a, i) => {
+      if (!a) return 0;
+      mem.set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), base + offsets[i]);
+      return base + offsets[i];
+    });
+  };
+  const text = (s) => encoder.encode(s);
+  const f32 = (a) => (a instanceof Float32Array ? a : new Float32Array(a));
+  const out = (n) => new Float32Array(x.memory.buffer, reserve(n * 4), n);
+
+  // The world and the Look.
+  let world = { ptr: 0, len: 0 };
+  if (typeof options.world === 'string') {
+    world = await fetchInto(options.world, x, (p, bytes) =>
+      (options.onPhase || (() => {}))(`Downloading the world (${(bytes / 1048576).toFixed(1)} MB)`, p));
+  } else if (options.world) {
+    const bytes = options.world instanceof Uint8Array ? options.world : new Uint8Array(options.world);
+    const ptr = x.abe_alloc(bytes.length) >>> 0;
+    new Uint8Array(x.memory.buffer, ptr, bytes.length).set(bytes);
+    world = { ptr, len: bytes.length };
+  }
+  const lookText = options.look == null ? ''
+    : (typeof options.look === 'string' ? options.look : JSON.stringify(options.look));
+  const lookBytes = text(lookText);
+  const [lookPtr] = place(lookBytes);
+  (options.onPhase || (() => {}))('Compiling shaders and uploading', 1);
+  ok('start', x.abe_rt_start(world.ptr, world.len, lookPtr, lookBytes.length,
+    options.quality === 'still' ? 1 : 0));
+
+  let inFlight = 0;
+  let stopped = false;
+  const size = () => {
+    const p = reserve(8);
+    ok('size', x.abe_rt_size(p));
+    const s = new Uint32Array(x.memory.buffer, p, 2);
+    return { width: s[0], height: s[1] };
+  };
+  /** CSS pixels per rendered pixel along x and y. */
+  const cssScale = () => {
+    const s = size();
+    return { sx: (canvas.clientWidth || s.width) / s.width, sy: (canvas.clientHeight || s.height) / s.height };
+  };
+
+  return {
+    api: gpu.api,
+    adapter: gpu.adapterName,
+    errors: () => [...errors, ...host.errors.filter((e) => !errors.includes(e))],
+    /** Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). */
+    fitCanvas(dpr = window.devicePixelRatio || 1) {
+      const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+      const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+    },
+    /** The size the last frame was drawn at, in device pixels. */
+    size,
+    setLook(look) {
+      const t = text(typeof look === 'string' ? look : JSON.stringify(look));
+      const [p] = place(t);
+      ok('setLook', x.abe_rt_set_look(p, t.length));
+    },
+    /** `{eye, target, up = [0, 1, 0], fov = 50, shift = [0, 0], near = 0.08}`. */
+    setView(v) {
+      const up = v.up || [0, 1, 0];
+      const shift = v.shift || [0, 0];
+      const [p] = place(f32([...v.eye, ...v.target, ...up, v.fov ?? 50, shift[0], shift[1],
+        v.near ?? 0.08]));
+      ok('setView', x.abe_rt_set_view(p));
+    },
+    /** Time of day in hours and the animation clock in seconds. */
+    setClock(hours, seconds = 0) { ok('setClock', x.abe_rt_set_clock(hours, seconds)); },
+    setWeather(preset) {
+      const t = text(preset);
+      const [p] = place(t);
+      ok('setWeather', x.abe_rt_set_weather(p, t.length));
+    },
+    /** Draws and presents a frame. Returns false when it skipped (GPU busy, nothing to draw). */
+    render() {
+      if (stopped) return false;
+      if (gpu.device && inFlight >= 2) return false;
+      host.nextFrame();
+      const r = x.abe_rt_render();
+      if (!r) throw fail('render');
+      if (r !== 1) return false;
+      if (gpu.device) {
+        inFlight++;
+        gpu.device.queue.onSubmittedWorkDone().then(() => { inFlight--; }, () => { inFlight--; });
+      }
+      return true;
+    },
+    frames: () => x.abe_rt_frames(),
+    /** The last frame's pixels (RGBA rows, top first); for tests. */
+    async capture() {
+      const texture = host.frameTexture();
+      if (!texture) throw new Error('capture: no frame was rendered');
+      return readPixels(gpu, texture, host);
+    },
+    /** Waits until the GPU has finished submitted work (WebGPU; immediate on WebGL 2). */
+    async idle() { if (gpu.device) await gpu.device.queue.onSubmittedWorkDone(); },
+
+    /** `source`: {width, height, data (RGBA8)} or a canvas, ImageBitmap or loaded image. */
+    createTexture(source, { srgb = true } = {}) {
+      const { width, height, data } = pixelsOf(source);
+      const [p] = place(data);
+      return ok('createTexture', x.abe_rt_texture_create(width, height, p, data.byteLength, srgb ? 1 : 0));
+    },
+    updateTexture(texture, source) {
+      const { data } = pixelsOf(source);
+      const [p] = place(data);
+      ok('updateTexture', x.abe_rt_texture_update(texture, p, data.byteLength));
+    },
+    destroyTexture(texture) { x.abe_rt_texture_destroy(texture); },
+    /** `{positions, normals?, uvs?, indices}` as flat arrays (3, 3 and 2 numbers per vertex). */
+    createMesh(m) {
+      const positions = f32(m.positions);
+      const normals = m.normals && m.normals.length ? f32(m.normals) : null;
+      const uvs = m.uvs && m.uvs.length ? f32(m.uvs) : null;
+      const indices = m.indices instanceof Uint32Array ? m.indices : new Uint32Array(m.indices);
+      const [p, n, u, i] = place(positions, normals, uvs, indices);
+      return ok('createMesh', x.abe_rt_mesh_create(p, positions.length / 3, n, u, i, indices.length));
+    },
+    /** New `{positions, normals?}` for a mesh (same vertex count). */
+    updateMesh(mesh, m) {
+      const positions = f32(m.positions);
+      const normals = m.normals && m.normals.length ? f32(m.normals) : null;
+      const [p, n] = place(positions, normals);
+      ok('updateMesh', x.abe_rt_mesh_update(mesh, p, n, positions.length / 3));
+    },
+    destroyMesh(mesh) { x.abe_rt_mesh_destroy(mesh); },
+    /** See `MaterialDesc::from_json` (name, color, emissive, lamp, roughness, metallic,
+     * shading, alphaCutoff, baseTexture, normalTexture, emissiveTexture, normalScale,
+     * castsShadow). */
+    createMaterial(desc) {
+      const t = text(JSON.stringify(desc));
+      const [p] = place(t);
+      return ok('createMaterial', x.abe_rt_material_create(p, t.length));
+    },
+    updateMaterial(material, desc) {
+      const t = text(JSON.stringify(desc));
+      const [p] = place(t);
+      ok('updateMaterial', x.abe_rt_material_update(material, p, t.length));
+    },
+    destroyMaterial(material) { x.abe_rt_material_destroy(material); },
+    createInstance(mesh, material, matrix) {
+      const [p] = place(f32(matrix));
+      return ok('createInstance', x.abe_rt_instance_create(mesh, material, p));
+    },
+    setInstance(instance, matrix, visible = true) {
+      const [p] = place(f32(matrix));
+      ok('setInstance', x.abe_rt_instance_set(instance, p, visible ? 1 : 0));
+    },
+    /** Many at once: `[{instance, matrix, visible = true}]`. */
+    setInstances(list) {
+      const words = new ArrayBuffer(list.length * 72);
+      const u = new Uint32Array(words);
+      const f = new Float32Array(words);
+      list.forEach((r, k) => {
+        u[k * 18] = r.instance;
+        u[k * 18 + 1] = r.visible === false ? 0 : 1;
+        f.set(r.matrix, k * 18 + 2);
+      });
+      const [p] = place(new Uint8Array(words));
+      ok('setInstances', x.abe_rt_instances_set(p, list.length));
+    },
+    setInstanceMaterial(instance, material) {
+      ok('setInstanceMaterial', x.abe_rt_instance_material(instance, material));
+    },
+    destroyInstance(instance) { x.abe_rt_instance_destroy(instance); },
+    /** Where a world point lands, in CSS pixels of the canvas (and depth in metres), or null
+     * behind the camera. */
+    project(point) {
+      const { sx, sy } = cssScale();
+      const p = out(3).byteOffset;
+      if (!x.abe_rt_project(point[0], point[1], point[2], p)) return null;
+      const [px, py, depth] = new Float32Array(x.memory.buffer, p, 3);
+      return { x: px * sx, y: py * sy, depth };
+    },
+    /** The nearest visible prop under a CSS pixel of the canvas: `{instance, distance, point}`
+     * or null. */
+    pick(cssX, cssY) {
+      const { sx, sy } = cssScale();
+      const p = out(4).byteOffset;
+      const instance = x.abe_rt_pick(cssX / sx, cssY / sy, p);
+      if (!instance) return null;
+      const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
+      return { instance, distance, point: [px, py, pz] };
+    },
+    /** Releases the engine's GPU objects. */
+    destroy() {
+      if (stopped) return;
+      stopped = true;
+      x.abe_rt_stop();
+      if (scratch) x.abe_free(scratch, scratchCap);
+      scratch = 0;
+      scratchCap = 0;
+    },
+  };
+}

@@ -311,6 +311,28 @@ pub struct View {
     pub eye: V3,
     pub target: V3,
     pub fov: f32,
+    /// Which way is up in the image (pick another than +Y to look straight down).
+    pub up: V3,
+    /// Lens shift: where the view axis (the target) lands in the image, in normalized device
+    /// units with x right and y up; `[0.0, 0.2]` puts it a tenth of the image height above the
+    /// centre. The frustum is skewed, not rotated, so verticals stay vertical.
+    pub shift: [f32; 2],
+    /// Near clip distance in metres.
+    pub near: f32,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            eye: [0.0, 0.0, 5.0],
+            target: [0.0; 3],
+            fov: 50.0,
+            up: [0.0, 1.0, 0.0],
+            shift: [0.0; 2],
+            near: 0.08,
+        }
+    }
 }
 
 /// A parsed Look file: the look plus where/when the scene is, its default weather and views.
@@ -488,14 +510,28 @@ impl LookFile {
                     .to_owned();
                 let eye = vec3(v.get("eye").ok_or("view without eye")?)?;
                 let target = vec3(v.get("target").ok_or("view without target")?)?;
-                let mut fov = 50.0;
-                num(v, "fov", &mut fov)?;
-                file.views.push(View {
+                let mut view = View {
                     name,
                     eye,
                     target,
-                    fov,
-                });
+                    ..View::default()
+                };
+                num(v, "fov", &mut view.fov)?;
+                num(v, "near", &mut view.near)?;
+                if let Some(up) = v.get("up") {
+                    view.up = vec3(up)?;
+                }
+                if let Some(shift) = v.get("shift") {
+                    let s = shift.array()?;
+                    if s.len() != 2 {
+                        return Err("view shift: expected [x, y]".into());
+                    }
+                    view.shift = [s[0].float()?, s[1].float()?];
+                }
+                if !(view.near > 0.0 && view.fov > 0.0 && view.fov < 180.0) {
+                    return Err(format!("view {:?}: fov or near out of range", view.name));
+                }
+                file.views.push(view);
             }
         }
         Ok(file)
@@ -601,6 +637,29 @@ mod tests {
         assert_eq!(f.weather.rain, Weather::preset("rain").unwrap().rain);
         assert_eq!(f.weather.wind, 2.0);
         assert_eq!(f.views[0].fov, 40.0);
+        assert_eq!(f.views[0].up, [0.0, 1.0, 0.0]);
+        assert_eq!((f.views[0].shift, f.views[0].near), ([0.0; 2], 0.08));
+    }
+
+    #[test]
+    fn view_up_shift_and_near() {
+        let f = LookFile::parse(
+            br##"{"views": [{"name": "top", "eye": [0, 9, 0], "target": [0, 0, 0],
+                             "up": [0, 0, -1], "shift": [0, 0.12], "near": 0.05}]}"##,
+        )
+        .unwrap();
+        let v = &f.views[0];
+        assert_eq!(
+            (v.up, v.shift, v.near),
+            ([0.0, 0.0, -1.0], [0.0, 0.12], 0.05)
+        );
+        for bad in [
+            &br##"{"views": [{"name": "a", "eye": [0, 1, 2], "target": [0, 0, 0], "shift": [1]}]}"##[..],
+            br##"{"views": [{"name": "a", "eye": [0, 1, 2], "target": [0, 0, 0], "near": 0}]}"##,
+            br##"{"views": [{"name": "a", "eye": [0, 1, 2], "target": [0, 0, 0], "fov": 180}]}"##,
+        ] {
+            assert!(LookFile::parse(bad).is_err());
+        }
     }
 
     #[test]

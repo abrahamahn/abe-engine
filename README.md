@@ -64,6 +64,29 @@ python3 -m http.server -d ~/abe-site 8000
 
 `scene` and `look` name the files; `view=NAME`, `time=HOURS`, `weather=PRESET`, `seconds=S` and `paused=1` set the starting state; `quality=high` uses still-image quality; `dpr=N` caps the device pixel ratio (default 2, 1.5 on touch screens), `scale=F` scales the resolution and `size=WxH` fixes it. The controls are abe-player's (W/A/S/D, Q/E, arrows or drag, Shift, 1–9, T/G, C, Y, P) plus H for help. On a touch screen, drag with one finger to look and two to move; buttons change the time, weather and view. The page shows loading progress, a status line (clock, weather, frame rate, view, resolution) and every error, including WebGPU validation errors.
 
+### Library mode: a game drives the engine
+
+A game with its own interface uses the same module as a renderer instead of the player. `createEngine` from `web/abe.js` starts it on a canvas with a cooked world (or none: a scene of props only) and a Look; the page then sets the camera, clock and weather, creates and moves props, and calls `render()` when it wants a frame:
+
+```js
+import { createEngine } from './abe.js';
+const engine = await createEngine({ canvas, wasm: 'abe_web.wasm', world: 'world.abew', look });
+engine.fitCanvas();                                   // canvas size = CSS box x devicePixelRatio
+engine.setView({ eye: [0, 4, 10], target: [0, 0.5, 0], fov: 45, shift: [0, 0.1] });
+engine.setClock(18.5, performance.now() / 1000);     // time of day, animation clock
+engine.setWeather('clear');
+const mesh = engine.createMesh({ positions, normals, uvs, indices });
+const art = engine.createTexture(canvasOrImageBitmap);
+const felt = engine.createMaterial({ name: 'felt', color: [0.1, 0.3, 0.2, 1], baseTexture: art });
+const chip = engine.createInstance(mesh, felt, matrix); // 16 numbers, column-major
+engine.setInstances([{ instance: chip, matrix, visible: true }]);
+engine.render();
+engine.project([0, 1, 0]);                            // CSS pixels for overlays
+engine.pick(event.offsetX, event.offsetY);            // the prop under the pointer
+```
+
+Views take an `up` direction (to look straight down), a lens `shift` (where the target lands in the image, in normalized device units with y up, so a camera can frame its subject around an interface without turning) and a `near` distance; Look files accept the same fields. The wasm exports behind it are `abe_rt_*` in `crates/abe-web/src/runtime.rs`; every handle is nonzero, and a refused call throws with the engine's message. `node web/test/run.cjs --engine world.abew` (with or without `--api webgl2`) checks it end to end: props drawn where `project` says, texture orientation, picking, hiding, batch moves, texture updates and errors.
+
 On WebGPU, `abe_shader::compile_wgsl` (through `gpu::compile_shader`) turns each shader into standard WGSL: `var<push_constant>` becomes a uniform at `@group(3)` that the backend fills from a per-submission ring with dynamic offsets, and a generated entry point negates clip-space y because ABE uses Vulkan's convention. The browser derives barriers, `submit` and `present` do not wait, the frame is presented when the `requestAnimationFrame` callback returns, and `read_buffer` is unavailable because browsers map buffers asynchronously.
 
 On WebGL 2, `abe_shader::compile_glsl` turns each shader into GLSL ES 3.00 (`crates/abe-shader/src/glsl.rs` documents the lowering): uniforms become std140 blocks, every texture/sampler pair a combined sampler on its own texture unit, push constants the block `abe_push` filled from a ring, and read-only storage buffers RGBA32UI textures that loads fetch from; the wrapper keeps Vulkan's clip space apart from the depth range, so images lie in memory as on Vulkan and the canvas is flipped when presented. A pipeline is a linked program plus fixed-function state; the backend (`src/gpu/webgl`) resolves bind groups at each draw and emits only the GL bindings that changed. `read_buffer` works and is synchronous. Compute, storage writes, storage textures and texture views do not exist there, so those calls report errors (the renderer uses none of them).

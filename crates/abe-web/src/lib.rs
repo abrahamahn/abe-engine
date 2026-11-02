@@ -1,5 +1,7 @@
-//! ABE's web player: the stylized renderer drawing a cooked world into a browser canvas
-//! through WebGPU, with the controls of `abe-player`.
+//! ABE's web module: the stylized renderer drawing into a browser canvas through WebGPU or
+//! WebGL 2. It has two modes. The player (this file) flies through a cooked world with the
+//! controls of `abe-player`; library mode (`runtime.rs`, `abe_rt_*`) lets a host page such as
+//! a game drive the camera, clock, weather and props itself.
 //!
 //! `web/abe.js` instantiates this module, copies the world (`.abew`) into memory allocated
 //! with [`abe_alloc`], calls [`abe_load_world`] and [`abe_start`] (with the Look file and the
@@ -11,6 +13,7 @@
 //! (start of the animation clock), `paused=1`, `quality=high`.
 #![cfg(target_arch = "wasm32")]
 
+mod runtime;
 mod selftest;
 
 use abe_engine::gpu::Device;
@@ -28,7 +31,7 @@ unsafe extern "C" {
 }
 
 /// Sends a message to the page: level 0 info, 1 warning, 2 error.
-fn say(level: u32, msg: &str) {
+pub(crate) fn say(level: u32, msg: &str) {
     // SAFETY: the host reads the UTF-8 text during the call.
     unsafe { log(level, msg.as_ptr(), msg.len()) }
 }
@@ -69,6 +72,7 @@ impl Fly {
             eye: self.pos,
             target: math::add(self.pos, math::scale(self.forward(), 30.0)),
             fov,
+            ..View::default()
         }
     }
 }
@@ -105,7 +109,7 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
-fn install_panic_hook() {
+pub(crate) fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| say(2, &format!("panic: {info}"))));
 }
 
@@ -265,6 +269,7 @@ fn start(look: &[u8], query: &str) -> Result<App, String> {
             eye: [c[0] + r, c[1] + r * 0.6, c[2] + r],
             target: c,
             fov: 45.0,
+            ..View::default()
         }]
     } else {
         file.views.clone()
