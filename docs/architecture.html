@@ -241,7 +241,7 @@ p,footer,.eyebrow,.gate b{color:black}
           <details>
             <summary>Materials, shaders and lighting <small class="partial">Working slice</small>
             </summary>
-            <p>Shaders are written in a WGSL subset and compiled by ABE's own compiler (<code>abe-shader</code>) to SPIR-V; MSL, HLSL and WGSL emitters come with their backends. The stylized renderer draws cooked materials and textures with soft cel lighting, two shadow cascades, tiled lamp lights, water reflections and a time-of-day sky with weather; each game sets its style in a Look file. Skinned models are skinned on the GPU in every pass. Next come pipeline cache keys and a physically based shading model beside the stylized one. Ray tracing, virtual shadows and advanced GI are optional higher tiers.</p>
+            <p>Shaders are written in a WGSL subset and compiled by ABE's own compiler (<code>abe-shader</code>) to SPIR-V; MSL, HLSL and WGSL emitters come with their backends. The stylized renderer draws cooked materials and textures with soft cel lighting, two shadow cascades, tiled lamp lights and the lights a game hangs (spots casting the props' shadows), water reflections and a time-of-day sky with weather; each game sets its style in a Look file. Skinned models are skinned on the GPU in every pass. Next come pipeline cache keys and a physically based shading model beside the stylized one. Ray tracing, virtual shadows and advanced GI are optional higher tiers.</p>
             <p class="gate">
               <b>Acceptance test</b> Reimporting one material updates the editor and player with the same pipeline and stable cache keys.</p>
           </details>

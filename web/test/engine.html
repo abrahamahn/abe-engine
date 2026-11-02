@@ -337,6 +337,30 @@ async function run() {
   const putOut = await frame(engine);
   check('a light put out is gone', Math.abs(brightness(putOut, lightAt) - brightness(unlit, lightAt)) < 12,
     { before: pixel(unlit, lightAt), after: pixel(putOut, lightAt) });
+  // A spot casting shadows from a box's left takes its light off the ground behind the box, and
+  // nowhere else; two lights cast at most.
+  const caster = engine.createInstance(box, paint, translate(-2, 0.5, 2.5));
+  const castSpot = { position: [-5, 3, 2.5], range: 12, color: [1, 0.9, 0.8], intensity: 60,
+    direction: [4.5, -3, 0], inner: 0.3, outer: 0.6 };
+  const behindBox = at([-0.6, 0, 2.5]);
+  const besideBox = at([-0.6, 0, 4.1]);
+  const castLight = engine.createLight(castSpot);
+  const castOpen = await frame(engine);
+  engine.setLight(castLight, { ...castSpot, shadow: 1 });
+  const castShaded = await frame(engine);
+  result.seventh = png(castShaded);
+  check('a spot casting shadows leaves the ground behind a prop without its light',
+    brightness(castShaded, behindBox) < brightness(castOpen, behindBox) - 30
+    && Math.abs(brightness(castShaded, besideBox) - brightness(castOpen, besideBox)) < 12,
+    { open: pixel(castOpen, behindBox), shaded: pixel(castShaded, behindBox),
+      beside: [pixel(castOpen, besideBox), pixel(castShaded, besideBox)] });
+  const secondCaster = engine.createLight({ ...castSpot, shadow: 1 });
+  let thirdRefused = '';
+  try { engine.createLight({ ...castSpot, shadow: 1 }); } catch (e) { thirdRefused = e.message; }
+  check('at most two lights cast shadows', thirdRefused.includes('cast shadows'), thirdRefused);
+  engine.destroyLight(secondCaster);
+  engine.destroyLight(castLight);
+  engine.destroyInstance(caster);
 
   // Errors are reported, not thrown away: a stale handle and a bad material.
   engine.destroyInstance(left);

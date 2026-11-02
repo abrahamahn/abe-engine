@@ -29,7 +29,9 @@ mod renderer;
 mod scene;
 pub mod sky;
 
-pub use lights::{GameLight, LightDesc, MAX_GAME_LIGHTS, SpotCone};
+pub use lights::{
+    GameLight, LightDesc, MAX_GAME_LIGHTS, MAX_SHADOW_CONE, MAX_SHADOWED_LIGHTS, SpotCone,
+};
 pub use look::{DetailPreset, DetailRule, Grass, Look, LookFile, Terrain, View};
 pub use models::{ModelId, ModelInstance};
 pub use props::{

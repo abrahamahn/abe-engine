@@ -113,6 +113,19 @@ pub fn perspective(fov_y_radians: f32, aspect: f32, near: f32) -> M4 {
     m
 }
 
+/// Perspective projection to depth 0..1 (near..far), no y flip: a spot light's shadow map, looked
+/// up through the same matrix (see [`ortho`]).
+pub fn perspective_depth(fov_y_radians: f32, aspect: f32, near: f32, far: f32) -> M4 {
+    let t = 1.0 / (0.5 * fov_y_radians).tan();
+    let mut m = [0.0; 16];
+    m[0] = t / aspect;
+    m[5] = t;
+    m[10] = far / (near - far);
+    m[11] = -1.0;
+    m[14] = near * far / (near - far);
+    m
+}
+
 /// Orthographic projection to depth 0..1 (near..far), no y flip. Used for shadow maps, whose
 /// lookups use the same matrix so the orientation cancels out.
 pub fn ortho(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) -> M4 {
@@ -261,5 +274,19 @@ mod tests {
         assert!((c[2] / c[3] - 1.0).abs() < 1e-6);
         let far = transform(&p, [0.0, 0.0, -1e6, 1.0]);
         assert!(far[2] / far[3] < 1e-5);
+    }
+    #[test]
+    fn shadow_depth_runs_from_near_to_far() {
+        let p = perspective_depth(1.2, 1.0, 0.1, 8.0);
+        let depth = |z: f32| {
+            let c = transform(&p, [0.0, 0.0, z, 1.0]);
+            c[2] / c[3]
+        };
+        assert!(depth(-0.1).abs() < 1e-6);
+        assert!((depth(-8.0) - 1.0).abs() < 1e-6);
+        assert!(depth(-1.0) < depth(-2.0));
+        // The cone's edge lands on the map's edge, up being up.
+        let up = transform(&p, [0.0, (0.6f32).tan(), -1.0, 1.0]);
+        assert!((up[1] / up[3] - 1.0).abs() < 1e-5);
     }
 }

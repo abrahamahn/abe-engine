@@ -50,6 +50,9 @@ struct Frame {
   lamps: vec4f,         // lamp light on foliage (scale), unused, unused, unused
   tide: vec4f,          // tide-mark height above the water (m, 0 = none), rgb stain multiplier
   tiles: vec4u,         // tiles across, tiles down, tile size in pixels, light count
+  light_shadow0: mat4x4f, // world to the shadow maps of a game's shadowed lights (layers 0, 1):
+  light_shadow1: mat4x4f, // perspective from each light, depth 0 at it to 1 at its range
+  light_shadow: vec4f,  // 1 / texels per side of those maps, unused, unused, unused
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;

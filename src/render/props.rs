@@ -1567,6 +1567,7 @@ impl Renderer {
                     (11, buf(buffer)),
                     (12, buf(joints)),
                     (13, buf(skins)),
+                    (14, Resource::Texture(self.light_shadow_map)),
                 ],
             )?);
         }

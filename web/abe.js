@@ -1726,7 +1726,7 @@ export async function createEngine(options) {
   const f32 = (a) => (a instanceof Float32Array ? a : new Float32Array(a));
   /** A light as the 14 floats the runtime reads (`light_desc` in runtime.rs). */
   const lightFloats = (light) => {
-    const v = new Float32Array(14);
+    const v = new Float32Array(15);
     v.set(light.position, 0);
     v[3] = light.range;
     v.set(light.color, 4);
@@ -1737,6 +1737,7 @@ export async function createEngine(options) {
       v[12] = light.outer ?? light.inner ?? 0;
     }
     v[13] = light.followsLamps === true ? 1 : 0;
+    v[14] = light.shadow ?? 0;
     return v;
   };
   const out = (n) => new Float32Array(x.memory.buffer, reserve(n * 4), n);

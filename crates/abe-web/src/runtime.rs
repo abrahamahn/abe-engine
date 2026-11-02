@@ -691,9 +691,10 @@ pub extern "C" fn abe_rt_instance_destroy(instance: u32) -> u32 {
     })
 }
 
-/// A game light from 14 floats: position (3), range, linear colour (3), intensity, a spot's
-/// direction (3, all zero for a point light), its inner and outer half-angles (radians), and 1 to
-/// follow the lamps (lit only as the evening lights them).
+/// A game light from 15 floats: position (3), range, linear colour (3), intensity, a spot's
+/// direction (3, all zero for a point light), its inner and outer half-angles (radians), 1 to
+/// follow the lamps (lit only as the evening lights them), and how much of its light the props'
+/// shadows take (0 casts none).
 fn light_desc(v: &[f32]) -> LightDesc {
     let at = |i: usize| v.get(i).copied().unwrap_or(0.0);
     let direction = [at(8), at(9), at(10)];
@@ -708,28 +709,29 @@ fn light_desc(v: &[f32]) -> LightDesc {
             outer: at(12),
         }),
         follows_lamps: at(13) > 0.5,
+        shadow: at(14),
     }
 }
 
-/// Hangs a game light (see `light_desc` for the 14 floats at `ptr`).
+/// Hangs a game light (see `light_desc` for the 15 floats at `ptr`).
 ///
 /// # Safety
-/// `ptr` must address 56 readable bytes.
+/// `ptr` must address 60 readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn abe_rt_light_create(ptr: *const u8) -> u32 {
-    // SAFETY: the caller passes 14 floats.
-    let v = unsafe { floats(ptr, 14) };
+    // SAFETY: the caller passes 15 floats.
+    let v = unsafe { floats(ptr, 15) };
     with(0, |rt| Ok(rt.renderer.create_light(&light_desc(&v))?.raw()))
 }
 
-/// Moves, recolours or reshapes a game light (14 floats at `ptr`, as `abe_rt_light_create`).
+/// Moves, recolours or reshapes a game light (15 floats at `ptr`, as `abe_rt_light_create`).
 ///
 /// # Safety
-/// `ptr` must address 56 readable bytes.
+/// `ptr` must address 60 readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn abe_rt_light_set(light: u32, ptr: *const u8) -> u32 {
-    // SAFETY: the caller passes 14 floats.
-    let v = unsafe { floats(ptr, 14) };
+    // SAFETY: the caller passes 15 floats.
+    let v = unsafe { floats(ptr, 15) };
     with(0, |rt| {
         rt.renderer
             .set_light(GameLight::from_raw(light), &light_desc(&v))?;

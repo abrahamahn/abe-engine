@@ -23,7 +23,8 @@ struct Light {
   pos: vec4f,    // xyz, w = range
   color: vec4f,  // rgb, w = intensity
   spot: vec4f,   // a spot's direction (xyz, away from the light), w = cos of its outer edge (< -1.5: all round)
-  cone: vec4f,   // x = cos of a spot's inner edge, y = 1 for a game's light, lit whatever the hour
+  cone: vec4f,   // x = cos of a spot's inner edge, y = 1 for a game's light, lit whatever the hour,
+                 // z = its shadow map's layer + 1 (0: casts none), w = how much its shadows take
 };
 
 @group(0) @binding(1) var<storage, read> lights: array<Light>;
@@ -36,6 +37,7 @@ struct Light {
 @group(0) @binding(8) var ground_depth: texture_depth_2d;
 @group(0) @binding(9) var ground_mask: texture_2d<f32>;
 @group(0) @binding(10) var world_depth: texture_depth_2d;
+@group(0) @binding(14) var light_shadow_map: texture_depth_2d_array;
 @group(1) @binding(0) var base_tex: texture_2d<f32>;
 @group(1) @binding(1) var normal_tex: texture_2d<f32>;
 @group(1) @binding(2) var emissive_tex: texture_2d<f32>;
@@ -171,6 +173,41 @@ fn perturb(n: vec3f, p: vec3f, uv: vec2f, m: vec3f) -> vec3f {
   return normalize(t * (invmax * m.x) + b * (invmax * m.y) + n * m.z);
 }
 
+// How much of a game light reaches `world` past the props' shadows (1 all), from its shadow map
+// `layer`, filtered over a texel and a half with eight taps turned per pixel.
+fn light_shadow(world: vec3f, n: vec3f, ld: vec3f, l: Light, layer: i32, frag: vec2f) -> f32 {
+  var m = frame.light_shadow0;
+  if (layer == 1) {
+    m = frame.light_shadow1;
+  }
+  // A texel's width where the point is (the map spans the cone across), and the point moved off
+  // its surface by about that much, more where the light grazes it.
+  let c = l.spot.w;
+  let spread = sqrt(max(1.0 - c * c, 0.0)) / max(c, 0.05);
+  let texel = 2.0 * length(l.pos.xyz - world) * spread * frame.light_shadow.x;
+  let graze = 1.0 - abs(dot(n, ld));
+  let p = m * vec4f(world + n * (texel * (1.0 + 2.0 * graze)), 1.0);
+  if (p.w <= 1e-4) {
+    return 1.0;
+  }
+  let q = p.xyz / p.w;
+  let uv = q.xy * 0.5 + vec2f(0.5);
+  if (any(uv <= vec2f(0.0)) || any(uv >= vec2f(1.0)) || q.z >= 1.0) {
+    return 1.0;
+  }
+  let spin = rand01(u32(frag.x) * 7919u + u32(frag.y) * 104729u + u32(frame.wind.w) * 15485863u) * 6.2831;
+  let cs = cos(spin);
+  let sn = sin(spin);
+  let radius = 1.5 * frame.light_shadow.x;
+  var sum = 0.0;
+  for (var i = 0; i < 8; i++) {
+    let t = TAPS[i * 2];
+    let o = vec2f(t.x * cs - t.y * sn, t.x * sn + t.y * cs) * radius;
+    sum += textureSampleCompareLevel(light_shadow_map, shadow_sampler, uv + o, layer, q.z);
+  }
+  return sum / 8.0;
+}
+
 fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
   // The lamps follow the time of day; a game's own lights shine at every hour.
   let level = frame.amb_sky.w;
@@ -193,6 +230,10 @@ fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
     var att = win * win / (1.0 + d2 * 0.45) * lit;
     if (l.spot.w > -1.5) {
       att *= smoothstep(l.spot.w, l.cone.x, dot(-ld, l.spot.xyz));
+      if (l.cone.z > 0.5 && att > 0.0) {
+        let lit_share = light_shadow(world, n, ld, l, i32(l.cone.z + 0.5) - 1, frag);
+        att *= 1.0 - l.cone.w * (1.0 - lit_share);
+      }
     }
     let nl = dot(n, ld);
     var w = smoothstep(-0.2, 0.3, nl);

@@ -118,6 +118,12 @@ export interface AbeLight {
   readonly inner?: number;
   readonly outer?: number;
   readonly followsLamps?: boolean;
+  /**
+   * How much of a spot's light the props' shadows take: 0 (the default) casts none, 1 leaves the
+   * shadows without it. The opaque props whose materials cast shadows block it; the world does
+   * not. At most 2 lights cast shadows at once, none reaching wider than 1.4 radians out.
+   */
+  readonly shadow?: number;
 }
 
 export interface AbeNodeTransform {

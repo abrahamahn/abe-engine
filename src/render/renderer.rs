@@ -82,6 +82,10 @@ pub struct Quality {
     pub world_size: u32,
     /// Fraction of the full grass area drawn around the camera (0 = no grass).
     pub grass: f32,
+    /// Texels per side of each game light's shadow map (see [`LightDesc::shadow`]).
+    ///
+    /// [`LightDesc::shadow`]: super::LightDesc::shadow
+    pub light_shadow_size: u32,
 }
 impl Quality {
     pub fn still() -> Self {
@@ -98,6 +102,7 @@ impl Quality {
             ground_size: 1024,
             world_size: 2048,
             grass: 1.0,
+            light_shadow_size: 2048,
         }
     }
     pub fn realtime() -> Self {
@@ -114,6 +119,7 @@ impl Quality {
             ground_size: 1024,
             world_size: 1024,
             grass: 0.6,
+            light_shadow_size: 1024,
         }
     }
 }
@@ -216,6 +222,10 @@ pub struct Renderer {
     /// Bind groups for alpha-masked materials in the masked shadow pipeline.
     pub(super) shadow_materials: Vec<Option<BindGroupId>>,
     pub(super) shadow_map: TextureId,
+    /// The game lights' shadow maps, a layer for each light casting shadows.
+    pub(super) light_shadow_map: TextureId,
+    /// Every layer of the light shadow map has been written (cleared) once.
+    light_shadows_ready: bool,
     pub(super) ground_depth: TextureId,
     pub(super) ground_mask: TextureId,
     /// The world map: the whole land seen from above once, for shallows and foam on shores
@@ -807,6 +817,14 @@ impl Renderer {
             format: Format::Depth32Float,
             usage: TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED,
         })?;
+        let light_shadow_map = device.create_texture(&TextureDesc {
+            width: quality.light_shadow_size.max(16),
+            height: quality.light_shadow_size.max(16),
+            layers: super::lights::MAX_SHADOWED_LIGHTS as u32,
+            mips: 1,
+            format: Format::Depth32Float,
+            usage: TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED,
+        })?;
         let ground_size = quality.ground_size.max(64);
         let ground_depth = device.create_texture(&TextureDesc {
             width: ground_size,
@@ -855,6 +873,8 @@ impl Renderer {
             materials,
             shadow_materials,
             shadow_map,
+            light_shadow_map,
+            light_shadows_ready: false,
             ground_depth,
             ground_mask,
             world_depth,
@@ -1027,6 +1047,7 @@ impl Renderer {
                 (8, Resource::Texture(self.ground_depth)),
                 (9, Resource::Texture(self.ground_mask)),
                 (10, Resource::Texture(self.world_depth)),
+                (14, Resource::Texture(self.light_shadow_map)),
             ];
             scene.push(device.create_bind_group(p.scene, 0, &entries)?);
             sky.push(device.create_bind_group(p.sky, 0, &entries[..1])?);
@@ -1531,6 +1552,20 @@ impl Renderer {
         ] {
             bytes.extend_from_slice(&u.to_le_bytes());
         }
+        // The game lights' shadow maps.
+        let mut b = Block(Vec::with_capacity(36));
+        let views = self.game_lights.shadow_views();
+        for layer in 0..super::lights::MAX_SHADOWED_LIGHTS {
+            b.m(views.get(layer).unwrap_or(&math::IDENTITY));
+        }
+        b.f(
+            1.0 / self.quality.light_shadow_size.max(16) as f32,
+            0.0,
+            0.0,
+            0.0,
+        );
+        bytes.extend_from_slice(&f32_bytes(&b.0));
+        debug_assert!(bytes.len() as u64 <= FRAME_BYTES);
         bytes
     }
 
@@ -1663,6 +1698,9 @@ impl Renderer {
         // The world map is drawn in this frame's first passes, before anything reads it.
         let draw_world = !self.world_drawn;
         self.world_drawn = true;
+        // Every layer of the light shadow map holds depth before any is read.
+        let first_light_shadows = !self.light_shadows_ready;
+        self.light_shadows_ready = true;
         // Props first: their bounds widen the shadow cascades' depth range.
         self.prepare_props(device, slot_index, view.eye)?;
         // A game's lights after the lamps in the light buffer, written when they changed.
@@ -1779,6 +1817,29 @@ impl Renderer {
                 });
                 enc.end_pass();
             }
+        }
+
+        // A game's shadowed lights: the props seen from each, on a layer apiece.
+        let views = self.game_lights.shadow_views();
+        for layer in 0..super::lights::MAX_SHADOWED_LIGHTS {
+            let light_vp = views.get(layer);
+            if light_vp.is_none() && !first_light_shadows {
+                continue;
+            }
+            enc.begin_pass(PassDesc {
+                colors: vec![],
+                depth: Some(Attachment {
+                    texture: self.light_shadow_map,
+                    mip: 0,
+                    layer: layer as u32,
+                    load: Load::Clear([1.0; 4]),
+                    store: true,
+                }),
+            });
+            if let Some(m) = light_vp {
+                self.draw_prop_shadows(enc, slot_index, m);
+            }
+            enc.end_pass();
         }
 
         // Rain and petals wrap around a box just ahead of the camera.

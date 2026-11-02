@@ -4,7 +4,7 @@ use abe_engine::Vec3;
 use abe_engine::gpu::Device;
 use abe_engine::render::{
     DetailPreset, DetailRule, Environment, LightDesc, Look, MaterialDesc, MeshData, Output,
-    Quality, Renderer, SpotCone, Terrain, TimeOfDay, View, Weather,
+    Quality, Renderer, SpotCone, Terrain, TimeOfDay, View, Weather, math,
 };
 use abe_engine::world::{
     AlphaMode, Emission, Instance, Material, Mesh, PointLight, Shading, Texture, Transform, World,
@@ -273,6 +273,7 @@ fn game_lights_spot_and_follow_the_lamps() {
             outer: 0.4,
         }),
         follows_lamps: false,
+        shadow: 0.0,
     };
     let light = r.create_light(&spot).expect("light");
     assert_eq!(r.game_lights(), 1);
@@ -309,6 +310,129 @@ fn game_lights_spot_and_follow_the_lamps() {
     let out = render(&mut device, &mut r, 0.0, "clear");
     assert!(difference(&out, &dark) < 0.5, "put out");
     assert!(r.set_light(light, &spot).is_err());
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}
+
+/// A spot casting shadows: a prop between it and the ground takes its light off the ground behind
+/// the prop, as much as the light asks, and nowhere else; at most two lights cast at once.
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn game_lights_cast_the_props_shadows() {
+    let mut device = Device::headless().expect("device");
+    let world = World {
+        instances: vec![Instance {
+            mesh: 0,
+            transform: Transform::IDENTITY,
+        }],
+        meshes: vec![quad(0.0, 20.0, 0)],
+        materials: vec![material("ground", [0.5, 0.5, 0.5, 1.0], Shading::Standard)],
+        textures: vec![],
+        lights: vec![],
+    };
+    let mut quality = Quality::realtime();
+    quality.shadow_size = 512;
+    quality.light_shadow_size = 512;
+    let mut r = Renderer::new(
+        &mut device,
+        &world,
+        Look::default(),
+        quality,
+        (W, H),
+        Output::Still,
+    )
+    .expect("renderer");
+    // A metre cube on the ground at the middle.
+    let c = cube([0.0, 0.0, 0.0], 0.5, 0);
+    let positions: Vec<[f32; 3]> = c.positions.iter().map(|p| [p.0, p.1, p.2]).collect();
+    let normals: Vec<[f32; 3]> = c.normals.iter().map(|n| [n.0, n.1, n.2]).collect();
+    let mesh = r
+        .create_prop_mesh(
+            &mut device,
+            &MeshData {
+                positions: &positions,
+                normals: &normals,
+                uvs: &c.uvs,
+                indices: &c.indices,
+            },
+        )
+        .expect("mesh");
+    let white = MaterialDesc {
+        name: "prop-white".into(),
+        base_color: [0.8, 0.8, 0.8, 1.0],
+        ..MaterialDesc::default()
+    };
+    let white = r
+        .create_prop_material(&mut device, &white)
+        .expect("material");
+    let mut place = math::IDENTITY;
+    place[13] = 0.5;
+    r.create_prop_instance(mesh, white, &place).expect("cube");
+    // From up on the left, aimed past the cube: its shadow falls on the ground to its right.
+    let spot = LightDesc {
+        position: [-3.0, 3.0, 0.0],
+        range: 12.0,
+        color: [1.0, 0.9, 0.8],
+        intensity: 60.0,
+        spot: Some(SpotCone {
+            direction: [4.5, -3.0, 0.0],
+            inner: 0.3,
+            outer: 0.6,
+        }),
+        follows_lamps: false,
+        shadow: 0.0,
+    };
+    let light = r.create_light(&spot).expect("light");
+    let pixel = |p: [f32; 3]| {
+        let q = r.project(&view(), (W, H), p).expect("in front");
+        (q[0] as u32, q[1] as u32)
+    };
+    let (behind, beside) = (pixel([1.4, 0.0, 0.0]), pixel([1.4, 0.0, 1.6]));
+    let at = |px: &[u8], (x, y): (u32, u32)| region(px, x - 1, y - 1, x + 2, y + 2);
+    let open = render(&mut device, &mut r, 0.0, "clear");
+    let mut frame = |shadow: f32| {
+        r.set_light(light, &LightDesc { shadow, ..spot })
+            .expect("set");
+        render(&mut device, &mut r, 0.0, "clear")
+    };
+    let full = frame(1.0);
+    let half = frame(0.5);
+    let none = frame(0.0);
+    eprintln!(
+        "behind the cube: {:.1} open, {:.1} half, {:.1} full shadow; beside it {:.1} / {:.1}",
+        at(&open, behind),
+        at(&half, behind),
+        at(&full, behind),
+        at(&open, beside),
+        at(&full, beside),
+    );
+    assert!(
+        at(&open, behind) > at(&full, behind) + 15.0,
+        "the cube's shadow"
+    );
+    let mid = at(&half, behind);
+    assert!(
+        mid < at(&open, behind) - 4.0 && mid > at(&full, behind) + 4.0,
+        "half a shadow"
+    );
+    assert!(
+        (at(&open, beside) - at(&full, beside)).abs() < 3.0,
+        "lit beside it"
+    );
+    assert!(difference(&none, &open) < 0.5, "none cast");
+    // Two lights cast at most; a third waits until one stops.
+    let shadowed = LightDesc {
+        shadow: 1.0,
+        ..spot
+    };
+    r.set_light(light, &shadowed).expect("first");
+    let second = r.create_light(&shadowed).expect("second");
+    assert!(r.create_light(&shadowed).is_err(), "a third");
+    let third = r.create_light(&spot).expect("unshadowed");
+    assert!(r.set_light(third, &shadowed).is_err(), "made a third");
+    r.destroy_light(second);
+    r.set_light(third, &shadowed).expect("now there is room");
+    render(&mut device, &mut r, 0.0, "clear");
     let errors = device.validation_errors();
     assert!(errors.is_empty(), "validation: {errors:?}");
 }
