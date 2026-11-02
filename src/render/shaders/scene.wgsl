@@ -11,7 +11,7 @@ struct Draw {
   detail0: vec4f,    // preset (0 none, 1 roof tiles, 2 wood, 3 plaster, 4 stone, 5 lacquer, 6 grass, 7 terrain, 8 lattice), size u, size v, strength
   detail1: vec4f,    // variation, rgb replacement colour
   detail2: vec4f,    // has replacement colour, gloss, unused, unused
-  detail3: vec4f,    // unused
+  detail3: vec4f,    // first prop instance (props only: vs_prop), unused, unused, unused
   base_color: vec4f,
   emissive: vec4f,   // rgb, w = 1 for lamps (scaled by the lamp level)
   params: vec4f,     // alpha cutoff, roughness, metallic, shading (0 standard, 1 foliage, 2 water, 3 unlit)
@@ -60,6 +60,18 @@ struct FsOut {
   o.clip = frame.view_proj * vec4f(v.position, 1.0);
   o.world = v.position;
   o.normal = v.normal;
+  o.uv = v.uv;
+  return o;
+}
+
+// Props: model-space vertices placed by their instance's transform.
+@vertex fn vs_prop(v: VsIn, @builtin(instance_index) ii: u32) -> VsOut {
+  let p = props[u32(draw.detail3.x) + ii];
+  let world = p.model * vec4f(v.position, 1.0);
+  var o: VsOut;
+  o.clip = frame.view_proj * world;
+  o.world = world.xyz;
+  o.normal = normalize((p.normal * vec4f(v.normal, 0.0)).xyz);
   o.uv = v.uv;
   return o;
 }

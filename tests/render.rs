@@ -3,8 +3,8 @@
 use abe_engine::Vec3;
 use abe_engine::gpu::Device;
 use abe_engine::render::{
-    DetailPreset, DetailRule, Environment, Look, Output, Quality, Renderer, Terrain, TimeOfDay,
-    View, Weather,
+    DetailPreset, DetailRule, Environment, Look, MaterialDesc, MeshData, Output, Quality, Renderer,
+    Terrain, TimeOfDay, View, Weather,
 };
 use abe_engine::world::{
     AlphaMode, Emission, Instance, Material, Mesh, PointLight, Shading, Texture, Transform, World,
@@ -761,6 +761,201 @@ fn accumulated_stills_and_resize() {
         .render_still(&mut device, &view(), &env, 1)
         .expect("after resize");
     assert_eq!(b.len(), (W * H) as usize);
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}
+
+/// Props: a run-time mesh drawn twice from one batch, moved, recoloured, hidden, picked and
+/// projected, casting a shadow on the world. A prop renders like the same mesh cooked into the
+/// world.
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn props_draw_move_pick_and_cast_shadows() {
+    // Late afternoon: long shadows.
+    const HOURS: f32 = 16.5;
+    let mut device = Device::headless().expect("device");
+    let mut quality = Quality::realtime();
+    quality.shadow_size = 512;
+    quality.ground_size = 256;
+    quality.world_size = 256;
+    let ground = material("ground", [0.6, 0.6, 0.6, 1.0], Shading::Standard);
+    let red = MaterialDesc {
+        name: "prop-red".into(),
+        base_color: [0.9, 0.05, 0.05, 1.0],
+        ..MaterialDesc::default()
+    };
+    let new = |device: &mut Device<'_>, world: &World| {
+        Renderer::new(
+            device,
+            world,
+            Look::default(),
+            quality,
+            (W, H),
+            Output::Still,
+        )
+        .expect("renderer")
+    };
+    let instance = |mesh| Instance {
+        mesh,
+        transform: Transform::IDENTITY,
+    };
+    // The reference: the cube cooked into the world at x = 2.
+    let mut cooked_red = material("prop-red", red.base_color, Shading::Standard);
+    cooked_red.metallic = red.metallic;
+    cooked_red.roughness = red.roughness;
+    let mut reference = new(
+        &mut device,
+        &World {
+            instances: vec![instance(0), instance(1)],
+            meshes: vec![quad(0.0, 20.0, 0), cube([2.0, 0.5, 0.0], 0.5, 1)],
+            materials: vec![ground.clone(), cooked_red],
+            textures: vec![],
+            lights: vec![],
+        },
+    );
+    let cooked = render(&mut device, &mut reference, HOURS, "clear");
+    let mut r = new(
+        &mut device,
+        &World {
+            instances: vec![instance(0)],
+            meshes: vec![quad(0.0, 20.0, 0)],
+            materials: vec![ground],
+            textures: vec![],
+            lights: vec![],
+        },
+    );
+    // A unit cube in model space.
+    let c = cube([0.0, 0.0, 0.0], 0.5, 0);
+    let positions: Vec<[f32; 3]> = c.positions.iter().map(|p| [p.0, p.1, p.2]).collect();
+    let normals: Vec<[f32; 3]> = c.normals.iter().map(|n| [n.0, n.1, n.2]).collect();
+    let mesh = r
+        .create_prop_mesh(
+            &mut device,
+            &MeshData {
+                positions: &positions,
+                normals: &normals,
+                uvs: &c.uvs,
+                indices: &c.indices,
+            },
+        )
+        .expect("mesh");
+    let red = r.create_prop_material(&mut device, &red).expect("material");
+    let at = |x: f32, y: f32, z: f32| {
+        let mut m = [0.0f32; 16];
+        m[0] = 1.0;
+        m[5] = 1.0;
+        m[10] = 1.0;
+        m[15] = 1.0;
+        m[12] = x;
+        m[13] = y;
+        m[14] = z;
+        m
+    };
+    let right = r
+        .create_prop_instance(mesh, red, &at(2.0, 0.5, 0.0))
+        .expect("right");
+    // Pixels that differ visibly between two frames.
+    let differing = |a: &[u8], b: &[u8]| {
+        a.chunks(4)
+            .zip(b.chunks(4))
+            .filter(|(p, q)| (0..3).any(|c| p[c].abs_diff(q[c]) > 12))
+            .count()
+    };
+    let alone = render(&mut device, &mut r, HOURS, "clear");
+    let off = differing(&alone, &cooked);
+    // Without its shadow the prop no longer matches: the shadow pass draws it.
+    let mut unshadowed = r.prop_material(red).expect("desc").clone();
+    unshadowed.casts_shadow = false;
+    r.update_prop_material(&mut device, red, &unshadowed)
+        .expect("no shadow");
+    let missing = differing(&render(&mut device, &mut r, HOURS, "clear"), &cooked);
+    eprintln!(
+        "pixels unlike the cooked cube: {off} as a prop, {missing} without its shadow \
+         (mean difference {:.3})",
+        difference(&alone, &cooked)
+    );
+    assert!(
+        off <= 8,
+        "a prop renders like the cooked mesh: {off} pixels differ"
+    );
+    assert!(missing > off + 20, "the prop's shadow: {missing} vs {off}");
+    unshadowed.casts_shadow = true;
+    r.update_prop_material(&mut device, red, &unshadowed)
+        .expect("shadow again");
+    let left = r
+        .create_prop_instance(mesh, red, &at(-2.0, 0.5, 0.0))
+        .expect("left");
+    // Red-dominant pixels (in the bright afternoon light the cube reads as a warm pink).
+    let reddish = |px: &[u8], x0: u32, x1: u32| {
+        let mut n = 0;
+        for y in 0..H {
+            for x in x0..x1 {
+                let i = ((y * W + x) * 4) as usize;
+                let (r, g, b) = (px[i], px[i + 1], px[i + 2]);
+                if u32::from(r) > u32::from(g) + 40 && u32::from(r) > u32::from(b) + 40 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    let both = render(&mut device, &mut r, HOURS, "clear");
+    let (l, rr) = (reddish(&both, 0, W / 2), reddish(&both, W / 2, W));
+    eprintln!("red pixels: {l} left, {rr} right");
+    assert!(l > 30 && rr > 30, "both instances drawn: {l} / {rr}");
+    // Projection lands on the cube, and picking there finds it.
+    let size = (W, H);
+    let p = r.project(&view(), size, [2.0, 0.5, 0.0]).expect("in front");
+    assert!(
+        p[0] > W as f32 / 2.0 && p[1] > 0.0 && p[1] < H as f32,
+        "{p:?}"
+    );
+    // Up in the world is up in the image, and the projected centre is on the drawn cube.
+    let top = r.project(&view(), size, [2.0, 1.0, 0.0]).expect("in front");
+    assert!(top[1] < p[1], "image rows run down: {top:?} {p:?}");
+    let i = ((p[1] as u32 * W + p[0] as u32) * 4) as usize;
+    assert!(
+        u32::from(both[i]) > u32::from(both[i + 1]) + 40,
+        "the cube is under its projection: {:?}",
+        &both[i..i + 4]
+    );
+    let hit = r.pick(&view(), size, (p[0], p[1])).expect("a pick");
+    assert_eq!(hit.instance, right);
+    assert!(
+        (hit.point[0] - 2.0).abs() < 0.6 && hit.distance > 5.0,
+        "{hit:?}"
+    );
+    assert!(
+        r.pick(&view(), size, (2.0, 2.0)).is_none(),
+        "sky has no prop"
+    );
+    // Hide one, move the other far left: the right half has no red.
+    r.set_prop_instance(right, &at(2.0, 0.5, 0.0), false)
+        .expect("hide");
+    r.set_prop_instance(left, &at(-3.0, 0.5, 0.0), true)
+        .expect("move");
+    let moved = render(&mut device, &mut r, HOURS, "clear");
+    let (l2, r2) = (reddish(&moved, 0, W / 2), reddish(&moved, W / 2, W));
+    eprintln!("after hiding and moving: {l2} left, {r2} right");
+    assert!(l2 > 30 && r2 == 0, "{l2} / {r2}");
+    r.destroy_prop_instance(left);
+    assert_eq!(r.prop_instances(), 1);
+    // Recolour through the material: the hidden instance stays hidden, so show it again.
+    let mut blue = r.prop_material(red).expect("desc").clone();
+    blue.base_color = [0.05, 0.1, 0.9, 1.0];
+    r.update_prop_material(&mut device, red, &blue)
+        .expect("update");
+    r.set_prop_instance(right, &at(2.0, 0.5, 0.0), true)
+        .expect("show");
+    let recoloured = render(&mut device, &mut r, HOURS, "clear");
+    assert_eq!(
+        reddish(&recoloured, 0, W),
+        0,
+        "no red after the material changed"
+    );
+    r.destroy_props(&mut device);
+    assert_eq!(r.prop_instances(), 0);
+    assert!(r.pick(&view(), size, (p[0], p[1])).is_none());
     let errors = device.validation_errors();
     assert!(errors.is_empty(), "validation: {errors:?}");
 }

@@ -15,8 +15,15 @@ const POST: &str = include_str!("../src/render/shaders/post.wgsl");
 /// (body, vertex entry, fragment entry or `None` for depth-only pipelines).
 const PAIRS: &[(&str, &str, Option<&str>)] = &[
     (SCENE, "vs_main", Some("fs_main")),
+    (SCENE, "vs_prop", Some("fs_main")),
     (WORLD_FX, "vs_shadow", None),
     (WORLD_FX, "vs_shadow_masked", Some("fs_shadow_masked")),
+    (WORLD_FX, "vs_shadow_prop", None),
+    (
+        WORLD_FX,
+        "vs_shadow_prop_masked",
+        Some("fs_shadow_prop_masked"),
+    ),
     (WORLD_FX, "vs_ground", Some("fs_ground")),
     (SCENE, "vs_grass", Some("fs_grass")),
     (SCENE, "vs_flower", Some("fs_flower")),

@@ -54,6 +54,14 @@ struct Frame {
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 
+// Props: meshes a game creates at run time, in model space, placed per instance. A draw of n
+// instances reads props[base + instance_index], `base` coming with the draw.
+struct Prop {
+  model: mat4x4f,
+  normal: mat4x4f,  // inverse transpose of the model matrix (upper 3x3 used)
+};
+@group(0) @binding(11) var<storage, read> props: array<Prop>;
+
 const PI = 3.14159265;
 
 fn hash_u(n: u32) -> u32 {

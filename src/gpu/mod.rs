@@ -82,8 +82,7 @@ pub use types::*;
 use crate::metal::Gpu;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
 use crate::vulkan::rhi::Gpu;
-#[cfg(target_arch = "wasm32")]
-mod pool;
+pub(crate) mod pool;
 #[cfg(target_arch = "wasm32")]
 mod webgl;
 #[cfg(target_arch = "wasm32")]

@@ -111,10 +111,14 @@ pub enum Output {
     Surface(Format),
 }
 
-struct Pipelines {
-    scene: PipelineId,
+pub(super) struct Pipelines {
+    pub(super) scene: PipelineId,
+    /// The scene shading for props (model-space vertices placed per instance).
+    pub(super) scene_prop: PipelineId,
     shadow: PipelineId,
     shadow_masked: PipelineId,
+    pub(super) shadow_prop: PipelineId,
+    pub(super) shadow_prop_masked: PipelineId,
     ground: PipelineId,
     grass: PipelineId,
     flower: PipelineId,
@@ -129,14 +133,14 @@ struct Pipelines {
     output: PipelineId,
 }
 
-struct Targets {
+pub(super) struct Targets {
     width: u32,
     height: u32,
     hdr: TextureId,
     aux: TextureId,
     depth: TextureId,
     refl: (u32, u32),
-    refl_hdr: TextureId,
+    pub(super) refl_hdr: TextureId,
     refl_aux: TextureId,
     refl_depth: TextureId,
     ao: (u32, u32),
@@ -153,10 +157,10 @@ struct Targets {
 }
 
 /// Per-frame-slot uniform buffers, light tiles and the bind groups that reference them.
-struct Slot {
-    frame: [BufferId; 2],
-    tiles: [BufferId; 2],
-    index: [BufferId; 2],
+pub(super) struct Slot {
+    pub(super) frame: [BufferId; 2],
+    pub(super) tiles: [BufferId; 2],
+    pub(super) index: [BufferId; 2],
     scene: [BindGroupId; 2],
     sky: [BindGroupId; 2],
     grass: BindGroupId,
@@ -172,33 +176,38 @@ struct Slot {
 }
 
 pub struct Renderer {
-    scene: GpuScene,
-    pipelines: Pipelines,
-    quality: Quality,
-    output: Output,
-    look: Look,
-    targets: Targets,
-    slots: Vec<Slot>,
-    materials: Vec<BindGroupId>,
+    pub(super) scene: GpuScene,
+    pub(super) pipelines: Pipelines,
+    pub(super) quality: Quality,
+    pub(super) output: Output,
+    pub(super) look: Look,
+    pub(super) targets: Targets,
+    pub(super) slots: Vec<Slot>,
+    pub(super) materials: Vec<BindGroupId>,
     /// Bind groups for alpha-masked materials in the masked shadow pipeline.
-    shadow_materials: Vec<Option<BindGroupId>>,
-    shadow_map: TextureId,
-    ground_depth: TextureId,
-    ground_mask: TextureId,
+    pub(super) shadow_materials: Vec<Option<BindGroupId>>,
+    pub(super) shadow_map: TextureId,
+    pub(super) ground_depth: TextureId,
+    pub(super) ground_mask: TextureId,
     /// The world map: the whole land seen from above once, for shallows and foam on shores
     /// beyond the ground map. Drawn on the first frame and again when the Look changes.
-    world_depth: TextureId,
-    world_mask: TextureId,
+    pub(super) world_depth: TextureId,
+    pub(super) world_mask: TextureId,
     world: Ground,
-    world_drawn: bool,
+    pub(super) world_drawn: bool,
     /// Per material: the procedural detail block pushed with each draw (see `Draw` in
     /// scene.wgsl), from the Look's detail rules.
-    details: Vec<[f32; 16]>,
+    pub(super) details: Vec<[f32; 16]>,
     /// Per material: grows grass (the ground map's mask).
-    grassy: Vec<bool>,
-    dummy: TextureId,
-    linear_clamp: SamplerId,
-    shadow_sampler: SamplerId,
+    pub(super) grassy: Vec<bool>,
+    pub(super) dummy: TextureId,
+    pub(super) linear_clamp: SamplerId,
+    pub(super) shadow_sampler: SamplerId,
+    /// Fallback textures and the material sampler, shared with prop materials.
+    pub(super) white: TextureId,
+    pub(super) flat: TextureId,
+    pub(super) material_sampler: SamplerId,
+    pub(super) props: super::props::Props,
 }
 
 fn compile(body: &str, stage: Stage, entry: &str) -> Result<Compiled> {
@@ -276,6 +285,54 @@ impl Pipelines {
             front_ccw: true,
             depth: Some(reverse_depth(Compare::Greater, true)),
             colors: mrt(),
+        })?;
+        let vs = compile(SCENE, Stage::Vertex, "vs_prop")?;
+        let scene_prop = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: Some(&fs),
+            vertex_layout: Some(layout.clone()),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(reverse_depth(Compare::Greater, true)),
+            colors: mrt(),
+        })?;
+        let shadow_depth = DepthState {
+            format: Format::Depth32Float,
+            compare: Compare::Less,
+            write: true,
+            bias_constant: 1.0,
+            bias_slope: 1.75,
+            clamp: true,
+        };
+        let vs = compile(WORLD_FX, Stage::Vertex, "vs_shadow_prop")?;
+        let shadow_prop = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: None,
+            vertex_layout: Some(VertexLayout {
+                stride: 32,
+                attributes: vec![layout.attributes[0]],
+            }),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(shadow_depth),
+            colors: vec![],
+        })?;
+        let vs = compile(WORLD_FX, Stage::Vertex, "vs_shadow_prop_masked")?;
+        let fs = compile(WORLD_FX, Stage::Fragment, "fs_shadow_prop_masked")?;
+        let shadow_prop_masked = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: Some(&fs),
+            vertex_layout: Some(VertexLayout {
+                stride: 32,
+                attributes: vec![layout.attributes[0], layout.attributes[2]],
+            }),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(shadow_depth),
+            colors: vec![],
         })?;
         let vs = compile(WORLD_FX, Stage::Vertex, "vs_shadow")?;
         let shadow = device.create_render_pipeline(&RenderPipelineDesc {
@@ -392,8 +449,11 @@ impl Pipelines {
         let fsvs = compile(POST, Stage::Vertex, "vs_fullscreen")?;
         Ok(Self {
             scene,
+            scene_prop,
             shadow,
             shadow_masked,
+            shadow_prop,
+            shadow_prop_masked,
             ground,
             grass,
             flower,
@@ -434,9 +494,9 @@ struct Ground {
 
 /// A camera for one frame: view-projection, its inverse and the eye.
 #[derive(Clone, Copy)]
-struct Eye {
-    view_proj: M4,
-    inv: M4,
+pub(super) struct Eye {
+    pub(super) view_proj: M4,
+    pub(super) inv: M4,
     pos: V3,
 }
 
@@ -494,39 +554,39 @@ fn world_view(scene: &GpuScene, size: u32) -> Ground {
     }
 }
 
-/// The detail block of each material (its first matching Look rule) and whether grass grows on it.
-fn material_details(look: &Look, scene: &GpuScene) -> (Vec<[f32; 16]>, Vec<bool>) {
-    let mut details = Vec::with_capacity(scene.names.len());
-    let mut grassy = Vec::with_capacity(scene.names.len());
-    for name in &scene.names {
-        let rule = (!name.is_empty())
-            .then(|| look.details.iter().find(|r| r.matches(name)))
-            .flatten();
-        let mut d = [0.0f32; 16];
-        if let Some(r) = rule {
-            let c = r.color.unwrap_or([0.0; 3]);
-            // A lattice may leave out one direction of bars with a zero size.
-            let floor = if r.preset == DetailPreset::Lattice {
-                0.0
-            } else {
-                1e-3
-            };
-            d[..4].copy_from_slice(&[
-                r.preset as u32 as f32,
-                r.scale[0].max(floor),
-                r.scale[1].max(floor),
-                r.strength,
-            ]);
-            d[4..8].copy_from_slice(&[r.variation, c[0], c[1], c[2]]);
-            d[8] = if r.color.is_some() { 1.0 } else { 0.0 };
-            d[9] = r.gloss;
-        }
-        grassy.push(
-            rule.is_some_and(|r| matches!(r.preset, DetailPreset::Grass | DetailPreset::Terrain)),
-        );
-        details.push(d);
+/// The detail block of a material named `name` (its first matching Look rule) and whether grass
+/// grows on it.
+pub(super) fn detail_block(look: &Look, name: &str) -> ([f32; 16], bool) {
+    let rule = (!name.is_empty())
+        .then(|| look.details.iter().find(|r| r.matches(name)))
+        .flatten();
+    let mut d = [0.0f32; 16];
+    if let Some(r) = rule {
+        let c = r.color.unwrap_or([0.0; 3]);
+        // A lattice may leave out one direction of bars with a zero size.
+        let floor = if r.preset == DetailPreset::Lattice {
+            0.0
+        } else {
+            1e-3
+        };
+        d[..4].copy_from_slice(&[
+            r.preset as u32 as f32,
+            r.scale[0].max(floor),
+            r.scale[1].max(floor),
+            r.strength,
+        ]);
+        d[4..8].copy_from_slice(&[r.variation, c[0], c[1], c[2]]);
+        d[8] = if r.color.is_some() { 1.0 } else { 0.0 };
+        d[9] = r.gloss;
     }
-    (details, grassy)
+    let grassy =
+        rule.is_some_and(|r| matches!(r.preset, DetailPreset::Grass | DetailPreset::Terrain));
+    (d, grassy)
+}
+
+/// The detail block of each world material and whether grass grows on it.
+fn material_details(look: &Look, scene: &GpuScene) -> (Vec<[f32; 16]>, Vec<bool>) {
+    scene.names.iter().map(|n| detail_block(look, n)).unzip()
 }
 
 impl Renderer {
@@ -664,6 +724,10 @@ impl Renderer {
             dummy,
             linear_clamp,
             shadow_sampler,
+            white,
+            flat,
+            material_sampler,
+            props: super::props::Props::default(),
         };
         let slots = match output {
             Output::Still => 1,
@@ -683,6 +747,7 @@ impl Renderer {
         (self.details, self.grassy) = material_details(&look, &self.scene);
         self.look = look;
         self.world_drawn = false;
+        self.restyle_props();
     }
     pub fn size(&self) -> (u32, u32) {
         (self.targets.width, self.targets.height)
@@ -910,6 +975,7 @@ impl Renderer {
         if size == (self.targets.width, self.targets.height) {
             return Ok(());
         }
+        self.reset_prop_slots(device);
         let old = std::mem::replace(
             &mut self.targets,
             Self::create_targets(device, &self.quality, self.output, size)?,
@@ -963,7 +1029,7 @@ impl Renderer {
         Ok(())
     }
 
-    fn eye(&self, view: &View, jitter: [f32; 2], (w, h): (u32, u32)) -> Eye {
+    pub(super) fn eye(&self, view: &View, jitter: [f32; 2], (w, h): (u32, u32)) -> Eye {
         let v = look_at(view.eye, view.target, [0.0, 1.0, 0.0]);
         let mut p = perspective(view.fov.to_radians(), w as f32 / h as f32, NEAR);
         p[8] += 2.0 * jitter[0] / w as f32;
@@ -1453,6 +1519,7 @@ impl Renderer {
                 device.write_buffer(slot.frame[1], 0, &block)?;
             }
         }
+        self.prepare_props(device, slot_index)?;
         let slot = &self.slots[slot_index];
         let t = &self.targets;
         let p = &self.pipelines;
@@ -1500,6 +1567,7 @@ impl Renderer {
                     enc.push_constants(&f32_bytes(&push));
                     enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
                 }
+                self.draw_prop_shadows(enc, slot_index, m);
                 enc.end_pass();
             }
         } else {
@@ -1541,6 +1609,7 @@ impl Renderer {
             enc.set_pipeline(p.scene);
             enc.set_bind_group(0, slot.scene[1]);
             self.draw_world(enc, &mut push, false);
+            self.draw_props(enc, slot_index, 1);
             enc.set_pipeline(p.sky);
             enc.set_bind_group(0, slot.sky[1]);
             enc.draw(3, 1, 0, 0);
@@ -1558,6 +1627,7 @@ impl Renderer {
         enc.set_pipeline(p.scene);
         enc.set_bind_group(0, slot.scene[0]);
         self.draw_world(enc, &mut push, true);
+        self.draw_props(enc, slot_index, 0);
         let blades = self.grass_instances();
         if blades > 0 {
             enc.set_pipeline(p.grass);

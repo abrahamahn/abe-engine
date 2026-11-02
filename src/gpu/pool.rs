@@ -1,6 +1,6 @@
-//! Generational object pools shared by the browser backends: ids are `generation << 20 |
-//! index`, so a destroyed object's id is reported as stale instead of reaching a recycled one.
-#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+//! Generational object pools (the browser backends' GPU objects, the renderer's props): ids are
+//! `generation << 20 | index`, so a destroyed object's id is reported as stale instead of
+//! reaching a recycled one.
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -53,5 +53,54 @@ impl<T> Pool<T> {
         slot.0 = (slot.0 + 1) % GENERATIONS;
         self.free.push(index);
         Some(value)
+    }
+}
+
+impl<T> Pool<T> {
+    /// Live values with their ids.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (u32, &T)> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (generation, v))| {
+                v.as_ref().map(|v| (generation << INDEX_BITS | i as u32, v))
+            })
+    }
+    /// Removes every value. Ids handed out before stay stale.
+    pub(crate) fn drain(&mut self) -> Vec<T> {
+        let mut out = Vec::new();
+        self.free.clear();
+        for (i, slot) in self.slots.iter_mut().enumerate().rev() {
+            if let Some(v) = slot.1.take() {
+                slot.0 = (slot.0 + 1) % GENERATIONS;
+                out.push(v);
+            }
+            self.free.push(i as u32);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pool;
+
+    #[test]
+    fn stale_ids_miss_after_remove_and_drain() {
+        let mut p = Pool::default();
+        let a = p.insert("a").unwrap();
+        let b = p.insert("b").unwrap();
+        assert_eq!(p.remove(a), Some("a"));
+        assert_eq!(p.get(a), None);
+        let c = p.insert("c").unwrap();
+        assert_ne!(a, c, "a recycled slot gets a new generation");
+        assert_eq!(p.iter().map(|(_, v)| *v).collect::<Vec<_>>(), ["c", "b"]);
+        let mut all = p.drain();
+        all.sort_unstable();
+        assert_eq!(all, ["b", "c"]);
+        assert_eq!((p.get(b), p.get(c)), (None, None));
+        let d = p.insert("d").unwrap();
+        assert!(d != b && d != c && p.get(d) == Some(&"d"));
+        assert_eq!(p.iter().count(), 1);
     }
 }

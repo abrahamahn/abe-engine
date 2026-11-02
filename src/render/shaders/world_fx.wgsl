@@ -10,6 +10,37 @@ var<push_constant> shadow_push: ShadowPush;
   return shadow_push.light_vp * vec4f(position, 1.0);
 }
 
+// Props cast shadows from their instances' transforms: index.x = first prop instance.
+struct PropShadowPush {
+  light_vp: mat4x4f,
+  params: vec4f,   // as MaskedShadowPush.params (masked props only)
+  index: vec4f,
+};
+var<push_constant> prop_shadow: PropShadowPush;
+
+@vertex fn vs_shadow_prop(@location(0) position: vec3f, @builtin(instance_index) ii: u32) -> @builtin(position) vec4f {
+  let p = props[u32(prop_shadow.index.x) + ii];
+  return prop_shadow.light_vp * (p.model * vec4f(position, 1.0));
+}
+
+@vertex fn vs_shadow_prop_masked(@location(0) position: vec3f, @location(2) uv: vec2f, @builtin(instance_index) ii: u32) -> MaskedOut {
+  let p = props[u32(prop_shadow.index.x) + ii];
+  var o: MaskedOut;
+  o.clip = prop_shadow.light_vp * (p.model * vec4f(position, 1.0));
+  o.uv = uv;
+  return o;
+}
+
+@fragment fn fs_shadow_prop_masked(in: MaskedOut) {
+  var a = prop_shadow.params.y;
+  if (prop_shadow.params.z > 0.5) {
+    a *= textureSampleLevel(mask_tex, mask_sampler, in.uv, 0.0).a;
+  }
+  if (a < prop_shadow.params.x) {
+    discard;
+  }
+}
+
 // Alpha-masked casters: params = (alpha cutoff, base alpha, has texture, unused).
 struct MaskedShadowPush {
   light_vp: mat4x4f,
