@@ -2,8 +2,8 @@
 //!
 //! The engine owns its shader toolchain end to end. Shaders are authored once in a documented
 //! WGSL subset, compiled here with zero third-party code, and handed to each graphics backend:
-//! SPIR-V for Vulkan and Metal Shading Language for Metal ([`compile_msl`]); HLSL and WGSL
-//! text emitters belong next to these later.
+//! SPIR-V for Vulkan, Metal Shading Language for Metal ([`compile_msl`]), WGSL for WebGPU
+//! ([`compile_wgsl`]) and GLSL ES 3.00 for WebGL 2 ([`compile_glsl`]).
 //!
 //! The public types below are the contract the GPU layer builds pipelines from. Reflection only
 //! lists resources and interface variables that the selected entry point statically uses.
@@ -124,6 +124,7 @@ mod builtins;
 mod check;
 mod consteval;
 mod emit;
+pub mod glsl;
 mod ir;
 mod lexer;
 mod msl;
@@ -169,6 +170,8 @@ pub struct Compiled {
     /// WebGPU WGSL for the same entry point, filled by [`compile_wgsl`] (`None` from
     /// [`compile`]).
     pub wgsl: Option<wgsl::Wgsl>,
+    /// GLSL ES 3.00 for WebGL 2, filled by [`compile_glsl`] (`None` otherwise).
+    pub glsl: Option<glsl::Glsl>,
 }
 
 /// A resource declared with `@group(g) @binding(b)`.
@@ -297,6 +300,19 @@ pub fn compile_wgsl(source: &str, stage: Stage, entry: &str) -> Result<Compiled,
     let program = check::check(&module)?;
     let mut compiled = emit::emit(&program, stage, entry)?;
     compiled.wgsl = Some(wgsl::emit(&program, stage, entry)?);
+    Ok(compiled)
+}
+
+/// [`compile`], plus GLSL ES 3.00 for WebGL 2 in [`Compiled::glsl`] ([`glsl`] describes the
+/// lowering: uniform blocks, combined samplers, storage buffers read through textures, push
+/// constants as the `abe_push` block, and the Vulkan clip-space conventions kept). The
+/// reflection is the SPIR-V module's.
+pub fn compile_glsl(source: &str, stage: Stage, entry: &str) -> Result<Compiled, Error> {
+    let tokens = lexer::tokenize(source)?;
+    let module = parser::parse(tokens)?;
+    let program = check::check(&module)?;
+    let mut compiled = emit::emit(&program, stage, entry)?;
+    compiled.glsl = Some(glsl::emit(&program, stage, entry)?);
     Ok(compiled)
 }
 

@@ -1,8 +1,10 @@
 // Headless browser test of the ABE web player.
 //
-//   node web/test/run.cjs --dist web/dist --out OUT_DIR [--abe-render PATH] [--selftest] \
+//   node web/test/run.cjs --dist web/dist --out OUT_DIR [--abe-render PATH] [--selftest] [--api webgl2] \
 //     --case name=NAME,scene=WORLD.abew,look=LOOK.json,view=VIEW,time=HOURS,weather=PRESET,size=WxH
 //     [--case ...]
+//
+// --api webgl2 runs everything on the WebGL 2 backend instead of WebGPU.
 //
 // --selftest first runs the module's GPU-layer self-test (compute with push constants into a
 // storage texture, copies, mip generation, a blit into the canvas, misuse reporting) and checks
@@ -37,7 +39,7 @@ const CHROMIUM_ARGS = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--
   '--use-vulkan=swiftshader'];
 
 function parseArgs(argv) {
-  const opts = { cases: [], dist: path.join(__dirname, '..', 'dist'), out: 'web-test-out', abeRender: null, selftest: false };
+  const opts = { cases: [], dist: path.join(__dirname, '..', 'dist'), out: 'web-test-out', abeRender: null, selftest: false, api: '' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const val = () => argv[++i];
@@ -45,6 +47,7 @@ function parseArgs(argv) {
     else if (a === '--out') opts.out = val();
     else if (a === '--abe-render') opts.abeRender = val();
     else if (a === '--selftest') opts.selftest = true;
+    else if (a === '--api') opts.api = val();
     else if (a === '--case') {
       const c = { seconds: '12', frames: '3', size: '960x540', max_mean: '3' };
       for (const kv of val().split(',')) {
@@ -121,6 +124,7 @@ async function runCase(browser, port, opts, c, assets) {
   const q = new URLSearchParams({ scene: `/assets/${c.name}.abew`, dpr: '1', seconds: c.seconds,
     paused: '1' });
   if (c.size !== 'auto') q.set('size', c.size);
+  if (opts.api) q.set('api', opts.api);
   if (c.look) q.set('look', `/assets/${c.name}.json`);
   for (const k of ['view', 'time', 'weather', 'quality']) if (c[k]) q.set(k, c[k]);
   const url = `http://localhost:${port}/index.html?${q}`;
@@ -324,7 +328,7 @@ async function runSelfTest(browser, port, opts) {
   page.on('pageerror', (e) => log.push(`[pageerror] ${e.message}`));
   const result = { name: 'selftest' };
   try {
-    await page.goto(`http://localhost:${port}/index.html?selftest=1&size=256x256&dpr=1`);
+    await page.goto(`http://localhost:${port}/index.html?selftest=1&size=256x256&dpr=1${opts.api ? `&api=${opts.api}` : ''}`);
     await page.waitForFunction(() => window.abe && (window.abe.failed || window.abe.selftest),
       null, { timeout: 120000, polling: 100 });
     const r = await page.evaluate(() => {

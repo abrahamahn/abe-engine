@@ -45,6 +45,7 @@ fn shader(
         workgroup_size: [1, 1, 1],
         msl: None,
         wgsl: None,
+        glsl: None,
     }
 }
 fn fullscreen_vs() -> Compiled {

@@ -64,7 +64,7 @@
 </div>
 <div id="errors" class="panel"><h2>Errors</h2><pre id="error-list"></pre></div>
 <div id="touch" class="panel" aria-label="Controls"></div>
-<noscript>The ABE web player needs JavaScript and WebGPU.</noscript>
+<noscript>The ABE web player needs JavaScript and WebGPU or WebGL 2.</noscript>
 <script type="module">
 import { startPlayer, startSelfTest } from './abe.js';
 
@@ -125,7 +125,7 @@ if (params.get('selftest') === '1') {
   // GPU-layer self-test (compute, copies, mips, canvas blit); see crates/abe-web/src/selftest.rs.
   try {
     const result = await startSelfTest({
-      canvas, wasm: params.get('wasm') || './abe_web.wasm', sizeCanvas,
+      canvas, wasm: params.get('wasm') || './abe_web.wasm', sizeCanvas, api: params.get('api') || 'auto',
       onPhase(text) { phase.textContent = text; },
       onLog(level, text) { (level >= 2 ? console.error : console.log)(text); if (level >= 2) showError(text); },
       onError: showError,
@@ -147,6 +147,7 @@ if (params.get('selftest') === '1') {
     const player = await startPlayer({
       canvas,
       wasm: params.get('wasm') || './abe_web.wasm',
+      api: params.get('api') || 'auto',
       scene,
       look: params.get('look') || '',
       query: location.search,

@@ -1,9 +1,10 @@
-// ABE web host: creates the WebGPU device and canvas context, provides the imports of the
-// wasm module (crates/abe-web, which links abe-engine's WebGPU backend), executes the command
-// streams it submits, forwards input and drives the frame loop.
+// ABE web host: creates the WebGPU device (or, without WebGPU, a WebGL 2 context) and the
+// canvas context, provides the imports of the wasm module (crates/abe-web, which links
+// abe-engine's WebGPU and WebGL 2 backends), executes the command streams it submits, forwards
+// input and drives the frame loop. `api: 'webgl2'` (the page's ?api=webgl2) forces WebGL 2.
 //
-// Imports (wasm module "abe"): gpu_* calls of src/gpu/webgpu/ffi.rs, plus log and status for
-// the player. GPU objects live in `objects`; Rust holds their indices (see ffi.rs for the
+// Imports (wasm module "abe"): gpu_* calls of src/gpu/webgpu/ffi.rs, gl_* calls of
+// src/gpu/webgl/ffi.rs, gpu_api (1 WebGPU, 2 WebGL 2), plus log and status for the player. GPU objects live in `objects`; Rust holds their indices (see ffi.rs for the
 // lifetime and synchronization rules). Everything here runs on the page's main thread.
 
 const FORMATS = [null, 'rgba8unorm', 'rgba8unorm-srgb', 'bgra8unorm', 'bgra8unorm-srgb',
@@ -67,7 +68,7 @@ export async function createGpu(canvas) {
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
     });
   }
-  return { adapter, device, adapterName, features: requiredFeatures, canvas, context, format };
+  return { api: 'webgpu', adapter, device, adapterName, features: requiredFeatures, canvas, context, format };
 }
 
 /** The import object for the wasm module and the host state behind it. */
@@ -467,7 +468,11 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     },
     log: (level, ptr, len) => onLog(level, str(ptr, len)),
     status: (ptr, len) => onStatus(str(ptr, len)),
+    gpu_api: () => 1,
   };
+  // The WebGL 2 imports exist in the module too; on this host they are never reached.
+  const unavailable = () => { throw new Error('WebGL 2 call on the WebGPU host'); };
+  for (const name of GL_IMPORTS) imports[name] = unavailable;
 
   return {
     imports: { abe: imports },
@@ -479,6 +484,788 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     frameTexture() { return surfaceTexture; },
   };
 }
+
+
+// ---------------------------------------------------------------------------------- WebGL 2
+//
+// The fallback host for browsers without WebGPU: provides the gl_* imports of
+// src/gpu/webgl/ffi.rs and executes the command streams of src/gpu/webgl/record.rs. Shaders
+// arrive as GLSL ES 3.00 from abe-shader's GLSL emitter, which keeps Vulkan's clip space apart
+// from the depth range: images lie in GL memory with row 0 at the top, so the canvas texture
+// is flipped when it is copied to the canvas.
+
+const GL_SURFACE = 0xFFFFFFFF;
+const ROW_TEXELS = 1024; // abe_shader::glsl::STORAGE_ROW_TEXELS
+const ROW_BYTES = ROW_TEXELS * 16;
+const BUF_DATA = 1;
+const BUF_INDEX = 2;
+const BUF_STORAGE = 4;
+const BUF_READBACK = 8;
+
+const BLIT_VS = `#version 300 es
+out vec2 uv;
+void main() {
+  uv = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+}`;
+const blitFs = (array) => `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+uniform highp ${array ? 'sampler2DArray' : 'sampler2D'} src;
+uniform float layer;
+in vec2 uv;
+out vec4 color;
+void main() { color = ${array ? 'texture(src, vec3(uv, layer))' : 'texture(src, uv)'}; }`;
+
+/** Creates a WebGL 2 context on `canvas` (or an offscreen one) with the extensions ABE uses. */
+export function createGl(canvas) {
+  const target = canvas || (typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(1, 1) : document.createElement('canvas'));
+  const gl = target.getContext('webgl2', {
+    alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false,
+    preserveDrawingBuffer: false, powerPreference: 'high-performance',
+  });
+  if (!gl) {
+    throw new Error('This browser has neither WebGPU nor WebGL 2.');
+  }
+  const ext = {
+    colorFloat: gl.getExtension('EXT_color_buffer_float'),
+    floatLinear: gl.getExtension('OES_texture_float_linear'),
+    floatBlend: gl.getExtension('EXT_float_blend'),
+    aniso: gl.getExtension('EXT_texture_filter_anisotropic'),
+    provoking: gl.getExtension('WEBGL_provoking_vertex'),
+    indexed: gl.getExtension('OES_draw_buffers_indexed'),
+  };
+  // Flat varyings come from the first vertex, as on Vulkan and WebGPU.
+  if (ext.provoking) ext.provoking.provokingVertexWEBGL(ext.provoking.FIRST_VERTEX_CONVENTION_WEBGL);
+  const debug = gl.getExtension('WEBGL_debug_renderer_info');
+  const renderer = debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  const features = Object.entries(ext).filter(([, v]) => v).map(([k]) => k);
+  return { api: 'webgl2', gl, ext, canvas, adapterName: `WebGL 2 ${renderer}`, features, format: 'rgba8unorm' };
+}
+
+/** The import object for the wasm module on WebGL 2 and the host state behind it. */
+export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onError = () => {}, checkErrors = true } = {}) {
+  const { gl, ext, canvas } = gpu;
+  const objects = [null];
+  const freeList = [];
+  const errors = [];
+  let lastError = '';
+  let memory = null;
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const report = (message) => {
+    errors.push(message);
+    onError(message);
+  };
+  if (canvas && canvas.addEventListener) {
+    canvas.addEventListener('webglcontextlost', () => report('WebGL 2 context lost'));
+  }
+  const put = (obj) => {
+    const h = freeList.length ? freeList.pop() : objects.length;
+    objects[h] = obj;
+    return h;
+  };
+  const u8 = (ptr, len) => new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0);
+  const u32 = (ptr, n) => new Uint32Array(memory.buffer, ptr >>> 0, n >>> 0);
+  const str = (ptr, len) => decoder.decode(u8(ptr, len));
+  const writeStr = (s, out, cap) => {
+    const bytes = encoder.encode(s);
+    const n = Math.min(bytes.length, cap >>> 0);
+    u8(out, n).set(bytes.subarray(0, n));
+    return n;
+  };
+  const guard = (what, f) => (...args) => {
+    try {
+      return f(...args);
+    } catch (e) {
+      lastError = `${what}: ${e.message}`;
+      return 0;
+    }
+  };
+  const glErrors = (what) => {
+    if (!checkErrors) return;
+    for (let e = gl.getError(), n = 0; e !== gl.NO_ERROR && n < 8; e = gl.getError(), n++) {
+      report(`WebGL error 0x${e.toString(16)} in ${what}`);
+    }
+  };
+
+  const FORMATS = [null,
+    { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, size: 4 },
+    { internal: gl.SRGB8_ALPHA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, size: 4 },
+    { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, size: 4, bgra: true },
+    { internal: gl.SRGB8_ALPHA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, size: 4, bgra: true },
+    { internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT, size: 8, channels: 4, half: true },
+    { internal: gl.RG16F, format: gl.RG, type: gl.HALF_FLOAT, size: 4, channels: 2, half: true },
+    { internal: gl.R16F, format: gl.RED, type: gl.HALF_FLOAT, size: 2, channels: 1, half: true },
+    { internal: gl.R8, format: gl.RED, type: gl.UNSIGNED_BYTE, size: 1, channels: 1, unorm: true },
+    { internal: gl.R32F, format: gl.RED, type: gl.FLOAT, size: 4, channels: 1, float: true },
+    { internal: gl.RGBA32F, format: gl.RGBA, type: gl.FLOAT, size: 16, channels: 4, float: true },
+    { internal: gl.DEPTH_COMPONENT32F, format: gl.DEPTH_COMPONENT, type: gl.FLOAT, size: 4, depth: true },
+  ];
+  const COMPARES = [0, gl.NEVER, gl.LESS, gl.LEQUAL, gl.EQUAL, gl.GREATER, gl.GEQUAL, gl.NOTEQUAL, gl.ALWAYS];
+  const WRAP = [gl.REPEAT, gl.CLAMP_TO_EDGE, gl.MIRRORED_REPEAT];
+  const MODES = [gl.TRIANGLES, gl.TRIANGLE_STRIP, gl.LINES];
+
+  // A texture unit the stream never uses, for uploads and mip generation.
+  const scratchUnit = gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS) - 1;
+  let uid = 0;
+  const textures = new Set();
+  const bindScratch = (t) => {
+    gl.activeTexture(gl.TEXTURE0 + scratchUnit);
+    gl.bindTexture(t.target, t.tex);
+  };
+  const setLevels = (t, base, count) => {
+    if (t.base === base && t.count === count) return;
+    gl.texParameteri(t.target, gl.TEXTURE_BASE_LEVEL, base);
+    gl.texParameteri(t.target, gl.TEXTURE_MAX_LEVEL, base + count - 1);
+    t.base = base;
+    t.count = count;
+  };
+  const makeTexture = (w, h, layers, mips, f, array) => {
+    const target = array ? gl.TEXTURE_2D_ARRAY : gl.TEXTURE_2D;
+    const t = { tex: gl.createTexture(), target, f, w, h, layers, mips, base: 0, count: mips, uid: ++uid };
+    bindScratch(t);
+    if (array) gl.texStorage3D(target, mips, f.internal, w, h, layers);
+    else gl.texStorage2D(target, mips, f.internal, w, h);
+    textures.add(t);
+    return t;
+  };
+
+  // The canvas texture (RGBA8) and its copy to the canvas.
+  let surface = null;
+  const ensureSurface = () => {
+    if (!canvas) return null;
+    const w = canvas.width; const h = canvas.height;
+    if (w === 0 || h === 0) return null;
+    if (!surface || surface.w !== w || surface.h !== h) {
+      if (surface) dropTexture(surface);
+      surface = makeTexture(w, h, 1, 1, FORMATS[1], false);
+    }
+    return surface;
+  };
+  const texture = (h) => (h >>> 0 === GL_SURFACE ? ensureSurface() : objects[h >>> 0]);
+
+  // Framebuffers, cached by attachments.
+  const fbos = new Map();
+  const attach = (point, t, mip, layer) => {
+    if (t.target === gl.TEXTURE_2D_ARRAY) gl.framebufferTextureLayer(gl.FRAMEBUFFER, point, t.tex, mip, layer);
+    else gl.framebufferTexture2D(gl.FRAMEBUFFER, point, gl.TEXTURE_2D, t.tex, mip);
+  };
+  const framebuffer = (colors, depth) => {
+    const key = [...colors, depth].map((a) => (a ? `${a.t.uid}.${a.mip}.${a.layer}` : '-')).join('|');
+    let f = fbos.get(key);
+    if (!f) {
+      f = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+      colors.forEach((a, i) => attach(gl.COLOR_ATTACHMENT0 + i, a.t, a.mip, a.layer));
+      if (depth) attach(gl.DEPTH_ATTACHMENT, depth.t, depth.mip, depth.layer);
+      gl.drawBuffers(colors.length ? colors.map((_, i) => gl.COLOR_ATTACHMENT0 + i) : [gl.NONE]);
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        gl.deleteFramebuffer(f);
+        throw new Error(`framebuffer incomplete (0x${status.toString(16)}) for ${key}`);
+      }
+      f.uids = [...colors, depth].filter(Boolean).map((a) => a.t.uid);
+      fbos.set(key, f);
+    } else {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    }
+    return f;
+  };
+  const dropTexture = (t) => {
+    for (const [k, f] of fbos) {
+      if (f.uids.includes(t.uid)) { gl.deleteFramebuffer(f); fbos.delete(k); }
+    }
+    gl.deleteTexture(t.tex);
+    textures.delete(t);
+  };
+  const readFbo = gl.createFramebuffer();
+
+  // Fixed-function state, applied by difference.
+  const fixed = {};
+  const setFlag = (cap, on) => {
+    if (fixed[cap] !== on) {
+      if (on) gl.enable(cap); else gl.disable(cap);
+      fixed[cap] = on;
+    }
+  };
+  const resetFixed = () => { for (const k of Object.keys(fixed)) delete fixed[k]; };
+  let current = null; // pipeline
+  let currentProgram = null;
+  const applyPipeline = (p) => {
+    if (currentProgram !== p.program.program) {
+      gl.useProgram(p.program.program);
+      currentProgram = p.program.program;
+    }
+    current = p;
+    setFlag(gl.CULL_FACE, p.cull !== 0);
+    if (p.cull !== 0 && fixed.cullFace !== p.cull) { gl.cullFace(p.cull === 1 ? gl.BACK : gl.FRONT); fixed.cullFace = p.cull; }
+    // Vulkan counter-clockwise is clockwise in GL window terms (see the module comment).
+    const front = p.frontCcw ? gl.CW : gl.CCW;
+    if (fixed.frontFace !== front) { gl.frontFace(front); fixed.frontFace = front; }
+    setFlag(gl.DEPTH_TEST, p.depthTest);
+    if (p.depthTest) {
+      if (fixed.depthFunc !== p.depthFunc) { gl.depthFunc(p.depthFunc); fixed.depthFunc = p.depthFunc; }
+      if (fixed.depthMask !== p.depthWrite) { gl.depthMask(p.depthWrite); fixed.depthMask = p.depthWrite; }
+    }
+    const offset = p.bias !== 0 || p.slope !== 0;
+    setFlag(gl.POLYGON_OFFSET_FILL, offset);
+    if (offset && (fixed.bias !== p.bias || fixed.slope !== p.slope)) {
+      gl.polygonOffset(p.slope, p.bias);
+      fixed.bias = p.bias; fixed.slope = p.slope;
+    }
+    // Targets the pipeline does not write are left out of the draw buffers.
+    if (p.targets.length && fixed.drawBuffers !== p.drawBuffers) {
+      gl.drawBuffers(p.targets.map((t, i) => (t.mask ? gl.COLOR_ATTACHMENT0 + i : gl.NONE)));
+      fixed.drawBuffers = p.drawBuffers;
+    }
+    if (p.indexed) {
+      // Per-target blend state and masks (OES_draw_buffers_indexed).
+      const x = ext.indexed;
+      p.targets.forEach((t, i) => {
+        if (t.blend) x.enableiOES(gl.BLEND, i); else x.disableiOES(gl.BLEND, i);
+        if (t.blend) blendFunc((...a) => x.blendFuncSeparateiOES(i, ...a), t.blend);
+        x.colorMaskiOES(i, !!(t.mask & 1), !!(t.mask & 2), !!(t.mask & 4), !!(t.mask & 8));
+      });
+      delete fixed[gl.BLEND];
+      delete fixed.blendMode;
+      delete fixed.colorMask;
+      return;
+    }
+    setFlag(gl.BLEND, p.blend !== 0);
+    if (p.blend !== 0 && fixed.blendMode !== p.blend) {
+      blendFunc((...a) => gl.blendFuncSeparate(...a), p.blend);
+      gl.blendEquation(gl.FUNC_ADD);
+      fixed.blendMode = p.blend;
+    }
+    if (fixed.colorMask !== p.mask) {
+      gl.colorMask(!!(p.mask & 1), !!(p.mask & 2), !!(p.mask & 4), !!(p.mask & 8));
+      fixed.colorMask = p.mask;
+    }
+  };
+  const blendFunc = (set, mode) => {
+    if (mode === 1) set(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    else if (mode === 2) set(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    else set(gl.ONE, gl.ONE, gl.ONE, gl.ONE);
+  };
+
+  // Samplers: the host's nearest sampler for units without one (texelFetch, storage).
+  const nearest = gl.createSampler();
+  gl.samplerParameteri(nearest, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.samplerParameteri(nearest, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  for (const w of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.samplerParameteri(nearest, w, gl.CLAMP_TO_EDGE);
+  const linear = gl.createSampler();
+  gl.samplerParameteri(linear, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.samplerParameteri(linear, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  for (const w of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.samplerParameteri(linear, w, gl.CLAMP_TO_EDGE);
+
+  // Programs.
+  const compile = (type, source) => {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, source);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(sh) || '';
+      gl.deleteShader(sh);
+      const lines = source.split('\n');
+      const where = [...log.matchAll(/ERROR: \d+:(\d+)/g)].slice(0, 3)
+        .map((m) => `  ${m[1]}: ${(lines[Number(m[1]) - 1] || '').trim()}`).join('\n');
+      throw new Error(`${type === gl.VERTEX_SHADER ? 'vertex' : 'fragment'} shader: ${log}${where ? `\n${where}` : ''}`);
+    }
+    return sh;
+  };
+  const link = (vs, fs) => {
+    const p = gl.createProgram();
+    const v = compile(gl.VERTEX_SHADER, vs);
+    const f = compile(gl.FRAGMENT_SHADER, fs);
+    gl.attachShader(p, v);
+    gl.attachShader(p, f);
+    gl.linkProgram(p);
+    gl.deleteShader(v);
+    gl.deleteShader(f);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      const log = gl.getProgramInfoLog(p);
+      gl.deleteProgram(p);
+      throw new Error(`link: ${log}`);
+    }
+    return p;
+  };
+  const blitPrograms = [false, true].map((array) => {
+    const program = link(BLIT_VS, blitFs(array));
+    return { program, src: gl.getUniformLocation(program, 'src'), layer: gl.getUniformLocation(program, 'layer') };
+  });
+  const emptyVao = gl.createVertexArray();
+
+  // The push-constant ring.
+  const ring = gl.createBuffer();
+  let ringSize = 0;
+
+  // Buffers.
+  const bufferTarget = (b) => (b.index ? gl.ELEMENT_ARRAY_BUFFER : gl.COPY_WRITE_BUFFER);
+  const bindForWrite = (b) => {
+    if (b.index) {
+      gl.bindVertexArray(null);
+      currentVao = null;
+    }
+    gl.bindBuffer(bufferTarget(b), b.gl);
+  };
+  const uploadRows = (b, offset, len) => {
+    if (!len) return;
+    const first = Math.floor(offset / ROW_BYTES);
+    const last = Math.floor((offset + len - 1) / ROW_BYTES);
+    gl.activeTexture(gl.TEXTURE0 + scratchUnit);
+    gl.bindTexture(gl.TEXTURE_2D, b.tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, first, ROW_TEXELS, last - first + 1, gl.RGBA_INTEGER, gl.UNSIGNED_INT,
+      new Uint32Array(b.shadow.buffer, first * ROW_BYTES, (last - first + 1) * ROW_TEXELS * 4));
+  };
+  /** The bytes of a buffer range (read back from GL when the buffer has no copy here). */
+  const bytesOf = (b, offset, size) => {
+    if (b.shadow) return b.shadow.subarray(offset, offset + size);
+    if (b.host) return b.host.subarray(offset, offset + size);
+    const out = new Uint8Array(size);
+    gl.bindBuffer(gl.COPY_READ_BUFFER, b.gl);
+    gl.getBufferSubData(gl.COPY_READ_BUFFER, offset, out);
+    return out;
+  };
+  const writeBytes = (b, offset, data) => {
+    if (b.gl) {
+      bindForWrite(b);
+      gl.bufferSubData(bufferTarget(b), offset, data);
+    }
+    if (b.shadow) {
+      b.shadow.set(data, offset);
+      uploadRows(b, offset, data.length);
+    }
+    if (b.host) b.host.set(data, offset);
+  };
+
+  // Half floats, for reading float textures back in their own format.
+  const f32 = new Float32Array(1);
+  const i32 = new Uint32Array(f32.buffer);
+  const toHalf = (v) => {
+    f32[0] = v;
+    const x = i32[0];
+    const sign = (x >>> 16) & 0x8000;
+    const e = (x >>> 23) & 0xff;
+    const m = x & 0x7fffff;
+    if (e === 0xff) return sign | 0x7c00 | (m ? 0x200 : 0);
+    const he = e - 127 + 15;
+    if (he >= 0x1f) return sign | 0x7c00;
+    if (he <= 0) {
+      if (he < -10) return sign;
+      const mm = (m | 0x800000) >> (1 - he);
+      return sign | ((mm + 0x1000) >> 13);
+    }
+    return sign | (he << 10) | ((m + 0x1000) >> 13);
+  };
+
+  let currentVao = null;
+  const blit = (src, srcMip, srcLayer, dst, dstMip, dstLayer, filterLinear) => {
+    const s = texture(src);
+    const d = texture(dst);
+    const w = Math.max(1, d.w >> dstMip); const h = Math.max(1, d.h >> dstMip);
+    framebuffer([{ t: d, mip: dstMip, layer: dstLayer }], null);
+    const bp = blitPrograms[s.target === gl.TEXTURE_2D_ARRAY ? 1 : 0];
+    gl.useProgram(bp.program);
+    currentProgram = bp.program;
+    gl.uniform1i(bp.src, 0);
+    gl.uniform1f(bp.layer, srcLayer);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(s.target, s.tex);
+    setLevels(s, srcMip, 1);
+    gl.bindSampler(0, filterLinear ? linear : nearest);
+    gl.bindVertexArray(emptyVao);
+    currentVao = emptyVao;
+    resetFixed();
+    for (const cap of [gl.DEPTH_TEST, gl.BLEND, gl.CULL_FACE, gl.SCISSOR_TEST, gl.POLYGON_OFFSET_FILL]) gl.disable(cap);
+    gl.colorMask(true, true, true, true);
+    gl.viewport(0, 0, w, h);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    current = null;
+  };
+
+  const execute = (cmdPtr, words, pushPtr, pushLen) => {
+    const c = u32(cmdPtr, words).slice();
+    const f = new Float32Array(c.buffer);
+    pushLen >>>= 0;
+    if (pushLen) {
+      gl.bindBuffer(gl.UNIFORM_BUFFER, ring);
+      if (pushLen > ringSize) {
+        ringSize = Math.max(pushLen, 65536);
+        gl.bufferData(gl.UNIFORM_BUFFER, ringSize, gl.DYNAMIC_DRAW);
+      }
+      gl.bufferSubData(gl.UNIFORM_BUFFER, 0, u8(pushPtr, pushLen));
+    }
+    let discard = [];
+    let i = 0;
+    while (i < c.length) {
+      const op = c[i++];
+      switch (op) {
+        case 1: { // BEGIN_PASS
+          const colors = c[i++];
+          const hasDepth = c[i++];
+          const cs = [];
+          for (let k = 0; k < colors; k++) {
+            cs.push({ t: texture(c[i]), mip: c[i + 1], layer: c[i + 2], load: c[i + 3], store: c[i + 4],
+              clear: [f[i + 5], f[i + 6], f[i + 7], f[i + 8]] });
+            i += 9;
+          }
+          let depth = null;
+          if (hasDepth) {
+            depth = { t: texture(c[i]), mip: c[i + 1], layer: c[i + 2], load: c[i + 3], store: c[i + 4], clear: f[i + 5] };
+            i += 6;
+          }
+          framebuffer(cs, depth);
+          gl.drawBuffers(cs.length ? cs.map((_, k) => gl.COLOR_ATTACHMENT0 + k) : [gl.NONE]);
+          fixed.drawBuffers = cs.map(() => 1).join('');
+          const a = cs[0] || depth;
+          gl.viewport(0, 0, Math.max(1, a.t.w >> a.mip), Math.max(1, a.t.h >> a.mip));
+          setFlag(gl.SCISSOR_TEST, false);
+          // Clears obey the write masks.
+          const dontCare = [];
+          cs.forEach((x, k) => {
+            if (x.load === 1) {
+              if (fixed.colorMask !== 15) { gl.colorMask(true, true, true, true); fixed.colorMask = 15; }
+              gl.clearBufferfv(gl.COLOR, k, x.clear);
+            } else if (x.load === 2) dontCare.push(gl.COLOR_ATTACHMENT0 + k);
+          });
+          if (depth) {
+            if (depth.load === 1) {
+              if (fixed.depthMask !== true) { gl.depthMask(true); fixed.depthMask = true; }
+              gl.clearBufferfv(gl.DEPTH, 0, [depth.clear]);
+            } else if (depth.load === 2) dontCare.push(gl.DEPTH_ATTACHMENT);
+          }
+          if (dontCare.length) gl.invalidateFramebuffer(gl.FRAMEBUFFER, dontCare);
+          discard = cs.map((x, k) => (x.store ? null : gl.COLOR_ATTACHMENT0 + k)).filter((x) => x !== null);
+          if (depth && !depth.store) discard.push(gl.DEPTH_ATTACHMENT);
+          break;
+        }
+        case 2: // END_PASS
+          if (discard.length) gl.invalidateFramebuffer(gl.FRAMEBUFFER, discard);
+          discard = [];
+          break;
+        case 3: applyPipeline(objects[c[i++]]); break;
+        case 4: gl.viewport(Math.round(f[i]), Math.round(f[i + 1]), Math.round(f[i + 2]), Math.round(f[i + 3])); i += 4; break;
+        case 5:
+          setFlag(gl.SCISSOR_TEST, true);
+          gl.scissor(c[i], c[i + 1], c[i + 2], c[i + 3]);
+          i += 4;
+          break;
+        case 6: gl.bindBufferRange(gl.UNIFORM_BUFFER, c[i], objects[c[i + 1]].gl, c[i + 2], c[i + 3]); i += 4; break;
+        case 7: gl.bindBufferRange(gl.UNIFORM_BUFFER, 0, ring, c[i], c[i + 1]); i += 2; break;
+        case 8: { // BIND_UNIT
+          const t = texture(c[i + 1]);
+          gl.activeTexture(gl.TEXTURE0 + c[i]);
+          gl.bindTexture(t.target, t.tex);
+          setLevels(t, c[i + 3], c[i + 4]);
+          gl.bindSampler(c[i], c[i + 2] ? objects[c[i + 2]] : nearest);
+          i += 5;
+          break;
+        }
+        case 9: { // BIND_STORAGE
+          gl.activeTexture(gl.TEXTURE0 + c[i]);
+          gl.bindTexture(gl.TEXTURE_2D, objects[c[i + 1]].tex);
+          gl.bindSampler(c[i], nearest);
+          i += 2;
+          break;
+        }
+        case 10: { // SET_HIDDEN
+          const h = current.program.hidden[c[i]];
+          if (h && h.loc) {
+            if (h.uint) gl.uniform1ui(h.loc, c[i + 1]);
+            else gl.uniform1i(h.loc, c[i + 1] | 0);
+          }
+          i += 2;
+          break;
+        }
+        case 11: {
+          const v = objects[c[i++]].vao;
+          if (currentVao !== v) { gl.bindVertexArray(v); currentVao = v; }
+          break;
+        }
+        case 12: gl.drawArraysInstanced(current.mode, c[i + 2], c[i], c[i + 1]); i += 3; break;
+        case 13: gl.drawElementsInstanced(current.mode, c[i], gl.UNSIGNED_INT, c[i + 2] * 4, c[i + 1]); i += 3; break;
+        case 14: { // COPY_BUFFER
+          const s = objects[c[i]]; const d = objects[c[i + 2]];
+          const so = c[i + 1]; const dO = c[i + 3]; const size = c[i + 4];
+          if (s.gl && d.gl && !d.shadow && !d.host) {
+            gl.bindBuffer(gl.COPY_READ_BUFFER, s.gl);
+            gl.bindBuffer(gl.COPY_WRITE_BUFFER, d.gl);
+            gl.copyBufferSubData(gl.COPY_READ_BUFFER, gl.COPY_WRITE_BUFFER, so, dO, size);
+          } else {
+            writeBytes(d, dO, bytesOf(s, so, size).slice());
+          }
+          i += 5;
+          break;
+        }
+        case 15: { // COPY_TEXTURE
+          const t = texture(c[i]); const mip = c[i + 1]; const layer = c[i + 2];
+          const w = c[i + 3]; const h = c[i + 4]; const b = objects[c[i + 5]]; const off = c[i + 6];
+          gl.bindFramebuffer(gl.READ_FRAMEBUFFER, readFbo);
+          if (t.target === gl.TEXTURE_2D_ARRAY) gl.framebufferTextureLayer(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, t.tex, mip, layer);
+          else gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t.tex, mip);
+          gl.readBuffer(gl.COLOR_ATTACHMENT0);
+          gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
+          const fm = t.f;
+          let out;
+          if (fm.type === gl.UNSIGNED_BYTE && !fm.unorm) {
+            out = new Uint8Array(w * h * 4);
+            gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, out);
+            if (fm.bgra) for (let k = 0; k < out.length; k += 4) { const r = out[k]; out[k] = out[k + 2]; out[k + 2] = r; }
+          } else if (fm.unorm) {
+            const rgba = new Uint8Array(w * h * 4);
+            gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+            out = new Uint8Array(w * h);
+            for (let k = 0; k < w * h; k++) out[k] = rgba[k * 4];
+          } else {
+            const rgba = new Float32Array(w * h * 4);
+            gl.readPixels(0, 0, w, h, gl.RGBA, gl.FLOAT, rgba);
+            const n = fm.channels;
+            if (fm.half) {
+              const halfs = new Uint16Array(w * h * n);
+              for (let k = 0; k < w * h; k++) for (let ch = 0; ch < n; ch++) halfs[k * n + ch] = toHalf(rgba[k * 4 + ch]);
+              out = new Uint8Array(halfs.buffer);
+            } else {
+              const fl = new Float32Array(w * h * n);
+              for (let k = 0; k < w * h; k++) for (let ch = 0; ch < n; ch++) fl[k * n + ch] = rgba[k * 4 + ch];
+              out = new Uint8Array(fl.buffer);
+            }
+          }
+          b.host.set(out, off);
+          gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+          i += 7;
+          break;
+        }
+        case 16: // BLIT
+          blit(c[i], c[i + 1], c[i + 2], c[i + 3], c[i + 4], c[i + 5], c[i + 6]);
+          i += 7;
+          break;
+        default:
+          throw new Error(`unknown command ${op} at word ${i - 1}`);
+      }
+    }
+  };
+
+  const present = () => {
+    const s = ensureSurface();
+    if (!s) return;
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, readFbo);
+    gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, s.tex, 0);
+    gl.readBuffer(gl.COLOR_ATTACHMENT0);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    setFlag(gl.SCISSOR_TEST, false);
+    // Row 0 of the surface is the top of the image; GL's window origin is the bottom-left.
+    gl.blitFramebuffer(0, 0, s.w, s.h, 0, s.h, s.w, 0, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+  };
+
+  const imports = {
+    gpu_api: () => 2,
+    gl_info(out, cap) {
+      const P = (p) => gl.getParameter(p);
+      const features = (ext.colorFloat ? 1 : 0) | (ext.floatLinear ? 2 : 0) | (ext.floatBlend ? 4 : 0)
+        | (ext.indexed ? 8 : 0);
+      const aniso = ext.aniso ? P(ext.aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT) : 1;
+      f32[0] = aniso;
+      const v = [P(gl.MAX_TEXTURE_SIZE), P(gl.MAX_ARRAY_TEXTURE_LAYERS), P(gl.MAX_UNIFORM_BLOCK_SIZE),
+        P(gl.UNIFORM_BUFFER_OFFSET_ALIGNMENT), scratchUnit, P(gl.MAX_TEXTURE_IMAGE_UNITS),
+        P(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS), P(gl.MAX_DRAW_BUFFERS), P(gl.MAX_VERTEX_ATTRIBS),
+        P(gl.MAX_UNIFORM_BUFFER_BINDINGS), features, i32[0], 0, 0, 0, 0];
+      const n = Math.min(v.length, cap >>> 0);
+      u32(out, n).set(v.slice(0, n));
+      return n;
+    },
+    gl_renderer_name: (out, cap) => writeStr(gpu.adapterName, out, cap),
+    gl_last_error: (out, cap) => writeStr(lastError, out, cap),
+    gl_error_count: () => errors.length,
+    gl_error: (i, out, cap) => writeStr(errors[i >>> 0] || '', out, cap),
+    gl_canvas(out) {
+      if (!canvas) return 0;
+      ensureSurface();
+      u32(out, 2).set([canvas.width, canvas.height]);
+      return 1;
+    },
+    gl_create_buffer: guard('createBuffer', (size, kinds) => {
+      const b = { size, index: !!(kinds & BUF_INDEX), gl: null, shadow: null, tex: null, host: null };
+      if (kinds & (BUF_DATA | BUF_INDEX)) {
+        b.gl = gl.createBuffer();
+        bindForWrite(b);
+        gl.bufferData(bufferTarget(b), size, gl.DYNAMIC_DRAW);
+      }
+      if (kinds & BUF_STORAGE) {
+        const rows = Math.max(1, Math.ceil(size / ROW_BYTES));
+        b.shadow = new Uint8Array(rows * ROW_BYTES);
+        b.tex = gl.createTexture();
+        gl.activeTexture(gl.TEXTURE0 + scratchUnit);
+        gl.bindTexture(gl.TEXTURE_2D, b.tex);
+        gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32UI, ROW_TEXELS, rows);
+        uploadRows(b, 0, rows * ROW_BYTES);
+      }
+      if (kinds & BUF_READBACK) b.host = new Uint8Array(size);
+      return put(b);
+    }),
+    gl_write_buffer(h, offset, ptr, len) {
+      writeBytes(objects[h >>> 0], offset, u8(ptr, len));
+    },
+    gl_read_buffer: guard('readBuffer', (h, out, len) => {
+      const b = objects[h >>> 0];
+      u8(out, len).set(b.host.subarray(0, len));
+      return 1;
+    }),
+    gl_create_texture: guard('createTexture', (w, h, layers, mips, format, array) =>
+      put(makeTexture(w, h, layers, mips, FORMATS[format], !!array))),
+    gl_write_texture(h, mip, layer, w, hgt, ptr, len) {
+      const t = objects[h >>> 0];
+      const fm = t.f;
+      let data = u8(ptr, len).slice();
+      if (fm.bgra) for (let k = 0; k < data.length; k += 4) { const r = data[k]; data[k] = data[k + 2]; data[k + 2] = r; }
+      if (fm.type === gl.HALF_FLOAT) data = new Uint16Array(data.buffer);
+      else if (fm.type === gl.FLOAT) data = new Float32Array(data.buffer);
+      bindScratch(t);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      if (t.target === gl.TEXTURE_2D_ARRAY) gl.texSubImage3D(t.target, mip, 0, 0, layer, w, hgt, 1, fm.format, fm.type, data);
+      else gl.texSubImage2D(t.target, mip, 0, 0, w, hgt, fm.format, fm.type, data);
+    },
+    gl_generate_mips(h) {
+      const t = objects[h >>> 0];
+      bindScratch(t);
+      setLevels(t, 0, t.mips);
+      gl.generateMipmap(t.target);
+    },
+    gl_create_sampler: guard('createSampler', (ptr, words) => {
+      const d = u32(ptr, words);
+      const lod = new Float32Array(memory.buffer, (ptr >>> 0) + 20, 1)[0];
+      const s = gl.createSampler();
+      const lin = d[0] !== 0;
+      gl.samplerParameteri(s, gl.TEXTURE_MAG_FILTER, lin ? gl.LINEAR : gl.NEAREST);
+      gl.samplerParameteri(s, gl.TEXTURE_MIN_FILTER, lin
+        ? (d[1] ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR_MIPMAP_NEAREST)
+        : (d[1] ? gl.NEAREST_MIPMAP_LINEAR : gl.NEAREST_MIPMAP_NEAREST));
+      for (const w of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.samplerParameteri(s, w, WRAP[d[2]]);
+      gl.samplerParameterf(s, gl.TEXTURE_MAX_LOD, lod);
+      if (d[4]) {
+        gl.samplerParameteri(s, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+        gl.samplerParameteri(s, gl.TEXTURE_COMPARE_FUNC, COMPARES[d[4]]);
+      }
+      if (ext.aniso && d[3] > 1) gl.samplerParameterf(s, ext.aniso.TEXTURE_MAX_ANISOTROPY_EXT, d[3]);
+      return put(s);
+    }),
+    gl_create_program: guard('createProgram', (vp, vl, fp, fl, mp, ml) => {
+      const program = link(str(vp, vl), str(fp, fl));
+      const hidden = [];
+      gl.useProgram(program);
+      for (const line of str(mp, ml).split('\n')) {
+        const [kind, name, a, b] = line.split(' ');
+        if (kind === 'b') {
+          const index = gl.getUniformBlockIndex(program, name);
+          if (index !== gl.INVALID_INDEX) gl.uniformBlockBinding(program, index, Number(a));
+        } else if (kind === 'u') {
+          const loc = gl.getUniformLocation(program, name);
+          if (loc) gl.uniform1i(loc, Number(a));
+        } else if (kind === 'h') {
+          hidden[Number(a)] = { loc: gl.getUniformLocation(program, name), uint: b === 'uint' };
+        }
+      }
+      gl.useProgram(currentProgram);
+      return put({ program, hidden });
+    }),
+    gl_create_pipeline: guard('createPipeline', (program, ptr, words) => {
+      const w = u32(ptr, words);
+      const fl = new Float32Array(w.slice().buffer);
+      const targets = [];
+      let k = 9;
+      for (let t = 0; t < w[8]; t++, k += 2) targets.push({ blend: w[k], mask: w[k + 1] });
+      const stride = w[k]; const count = w[k + 1];
+      const attrs = [];
+      for (let a = 0; a < count; a++) attrs.push([w[k + 2 + a * 3], w[k + 3 + a * 3], w[k + 4 + a * 3]]);
+      const written = targets.filter((t) => t.mask !== 0);
+      const uniform = written.every((t) => t.blend === written[0].blend && t.mask === written[0].mask);
+      return put({
+        program: objects[program], mode: MODES[w[0]], cull: w[1], frontCcw: w[2] !== 0,
+        depthTest: w[3] !== 0, depthFunc: COMPARES[w[4]], depthWrite: w[5] !== 0, bias: fl[6], slope: fl[7],
+        targets, drawBuffers: targets.map((t) => (t.mask ? 1 : 0)).join(''),
+        blend: written.length ? written[0].blend : 0, mask: written.length ? written[0].mask : 15,
+        indexed: !uniform, stride, attrs,
+      });
+    }),
+    gl_create_vao: guard('createVertexArray', (pipeline, buffer, offset, index) => {
+      const p = objects[pipeline];
+      const vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      if (buffer) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, objects[buffer].gl);
+        for (const [loc, fmt, off] of p.attrs) {
+          gl.enableVertexAttribArray(loc);
+          if (fmt <= 4) gl.vertexAttribPointer(loc, fmt, gl.FLOAT, false, p.stride, offset + off);
+          else if (fmt === 5) gl.vertexAttribIPointer(loc, 1, gl.UNSIGNED_INT, p.stride, offset + off);
+          else gl.vertexAttribPointer(loc, 4, gl.UNSIGNED_BYTE, true, p.stride, offset + off);
+        }
+      }
+      if (index) gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, objects[index].gl);
+      gl.bindVertexArray(null);
+      currentVao = null;
+      return put({ vao });
+    }),
+    gl_submit: guard('submit', (cmdPtr, words, pushPtr, pushLen, isPresent) => {
+      execute(cmdPtr, words, pushPtr, pushLen);
+      if (isPresent) present();
+      glErrors(isPresent ? 'present' : 'submit');
+      return 1;
+    }),
+    gl_release(h) {
+      h >>>= 0;
+      const o = objects[h];
+      if (!o) return;
+      if (o.tex && o.target) dropTexture(o);
+      else if (o.vao) gl.deleteVertexArray(o.vao);
+      else if (o.program && o.hidden) gl.deleteProgram(o.program);
+      else if (o.mode !== undefined) { /* a pipeline: its program is released on its own */ } else if ('shadow' in o) {
+        if (o.gl) gl.deleteBuffer(o.gl);
+        if (o.tex) gl.deleteTexture(o.tex);
+      } else if (o instanceof WebGLSampler) gl.deleteSampler(o);
+      objects[h] = null;
+      freeList.push(h);
+    },
+    log: (level, ptr, len) => onLog(level, str(ptr, len)),
+    status: (ptr, len) => onStatus(str(ptr, len)),
+  };
+  // The WebGPU imports exist in the module too; on this host they are never reached.
+  const unavailable = () => { throw new Error('WebGPU call on the WebGL 2 host'); };
+  for (const name of GPU_IMPORTS) imports[name] = unavailable;
+
+  return {
+    imports: { abe: imports },
+    errors,
+    attach(instance) { memory = instance.exports.memory; },
+    nextFrame() {},
+    frameTexture() { return surface; },
+    /** The canvas texture's pixels as RGBA rows, top row first. */
+    readSurface() {
+      const s = surface;
+      if (!s) return null;
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, readFbo);
+      gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, s.tex, 0);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0);
+      gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
+      const rgba = new Uint8ClampedArray(s.w * s.h * 4);
+      gl.readPixels(0, 0, s.w, s.h, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+      for (let k = 3; k < rgba.length; k += 4) rgba[k] = 255;
+      return { width: s.w, height: s.h, rgba };
+    },
+  };
+}
+
+const GPU_IMPORTS = ['gpu_info', 'gpu_adapter_name', 'gpu_last_error', 'gpu_error_count', 'gpu_error',
+  'gpu_canvas', 'gpu_create_buffer', 'gpu_write_buffer', 'gpu_create_texture', 'gpu_write_texture',
+  'gpu_generate_mips', 'gpu_create_sampler', 'gpu_create_shader', 'gpu_create_bind_group_layout',
+  'gpu_create_pipeline_layout', 'gpu_create_render_pipeline', 'gpu_create_compute_pipeline',
+  'gpu_create_bind_group', 'gpu_submit', 'gpu_release'];
+const GL_IMPORTS = ['gl_info', 'gl_renderer_name', 'gl_last_error', 'gl_error_count', 'gl_error',
+  'gl_canvas', 'gl_create_buffer', 'gl_write_buffer', 'gl_read_buffer', 'gl_create_texture',
+  'gl_write_texture', 'gl_generate_mips', 'gl_create_sampler', 'gl_create_program',
+  'gl_create_pipeline', 'gl_create_vao', 'gl_submit', 'gl_release'];
 
 const KEY_CODES = { ArrowLeft: 1, ArrowRight: 2, ArrowUp: 3, ArrowDown: 4, ShiftLeft: 5, ShiftRight: 5, Space: 32 };
 function keyCode(e) {
@@ -551,10 +1338,28 @@ async function boot(options) {
     errors.push(text);
     (options.onError || (() => {}))(text);
   };
-  onPhase('Starting WebGPU', 0);
-  const gpu = await createGpu(canvas);
+  // WebGPU when the browser has it (unless `api` is 'webgl2'), otherwise WebGL 2.
+  const api = options.api || 'auto';
+  let gpu = null;
+  if (api !== 'webgl2' && typeof navigator !== 'undefined' && navigator.gpu) {
+    onPhase('Starting WebGPU', 0);
+    try {
+      gpu = await createGpu(canvas);
+    } catch (e) {
+      if (api === 'webgpu') throw e;
+      onLog(1, `WebGPU unavailable (${e.message}); using WebGL 2`);
+    }
+  } else if (api === 'webgpu') {
+    throw new Error('This browser has no WebGPU. Use Chrome or Edge 113+ or Safari 26+, ' +
+      'served over https or from localhost.');
+  }
+  if (!gpu) {
+    onPhase('Starting WebGL 2', 0);
+    gpu = createGl(canvas);
+  }
   onLog(0, `${gpu.adapterName}; features: ${gpu.features.join(', ') || 'none'}; canvas ${gpu.format}`);
-  const host = createHost(gpu, { onLog, onStatus: options.onStatus || (() => {}), onError: fail });
+  const hostOptions = { onLog, onStatus: options.onStatus || (() => {}), onError: fail };
+  const host = gpu.api === 'webgl2' ? createGlHost(gpu, hostOptions) : createHost(gpu, hostOptions);
   onPhase('Loading the engine', 0);
   const wasmResponse = await fetch(options.wasm);
   if (!wasmResponse.ok) throw new Error(`${options.wasm}: HTTP ${wasmResponse.status}`);
@@ -569,7 +1374,8 @@ async function boot(options) {
 }
 
 /** Reads `texture` (the canvas texture of the current frame) back as RGBA8 pixels. */
-async function readPixels(gpu, texture) {
+async function readPixels(gpu, texture, host) {
+  if (gpu.api === 'webgl2') return host.readSurface();
   const width = texture.width; const height = texture.height;
   const bytesPerRow = Math.ceil(width * 4 / 256) * 256;
   const buffer = gpu.device.createBuffer({ size: bytesPerRow * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -612,10 +1418,10 @@ export async function startSelfTest(options) {
       reject(new Error(errors[errors.length - 1] || 'the self-test presented nothing'));
       return;
     }
-    readPixels(gpu, texture).then(resolve, reject);
+    readPixels(gpu, texture, host).then(resolve, reject);
   }));
   // Let asynchronous WebGPU errors arrive.
-  await gpu.device.queue.onSubmittedWorkDone();
+  if (gpu.device) await gpu.device.queue.onSubmittedWorkDone();
   await nextFrame();
   return {
     adapter: gpu.adapterName,
@@ -737,7 +1543,7 @@ export async function startPlayer(options) {
   let last = performance.now();
   let running = true;
   let captures = [];
-  const capture = (texture) => readPixels(gpu, texture);
+  const capture = (texture) => readPixels(gpu, texture, host);
   // At most two frames in flight: without vsync (or on a slow GPU) frames would otherwise queue
   // up without bound and input, readbacks and resizes would wait behind them.
   let inFlight = 0;
@@ -762,8 +1568,10 @@ export async function startPlayer(options) {
       if (!errors.length) fail('the engine stopped');
       return;
     }
-    inFlight++;
-    gpu.device.queue.onSubmittedWorkDone().then(() => { inFlight--; }, () => { inFlight--; });
+    if (gpu.device) {
+      inFlight++;
+      gpu.device.queue.onSubmittedWorkDone().then(() => { inFlight--; }, () => { inFlight--; });
+    }
     const texture = host.frameTexture();
     if (captures.length && texture) {
       const pending = captures;

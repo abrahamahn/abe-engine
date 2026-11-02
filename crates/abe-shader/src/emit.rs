@@ -430,6 +430,7 @@ pub fn emit(prog: &Program, stage: Stage, entry: &str) -> R<Compiled> {
         },
         msl: None,
         wgsl: None,
+        glsl: None,
     })
 }
 
