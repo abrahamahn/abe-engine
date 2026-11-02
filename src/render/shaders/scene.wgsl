@@ -418,21 +418,25 @@ fn terrain_ground(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
 }
 
 // A lattice of thin bars over the surface (a lantern's frame, paper ribs): cells `size u` wide
-// and `size v` tall on the face's plane, bars `strength` of a cell wide in the rule's colour
-// (dark wood by default). The cavity term carries the bars, so they also shade a lamp's glow.
-// Bars thinner than a pixel fade to a faint tint rather than shimmer.
+// and `size v` tall on the face's plane (a zero size leaves that direction's bars out), bars
+// `strength` of a cell wide in the rule's colour (dark wood by default). The cavity term carries
+// the bars, so they also shade a lamp's glow. Bars thinner than a pixel fade to their average
+// cover rather than shimmer.
 fn lattice(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f) -> Detail {
   var o = no_detail(albedo, n);
-  let size = vec2f(draw.detail0.y, draw.detail0.z);
+  let raw = vec2f(draw.detail0.y, draw.detail0.z);
+  let used = vec2f(step(1e-4, raw.x), step(1e-4, raw.y));
+  let size = max(raw, vec2f(1e-3));
   let q = plane_uv(p, geo) / size;
   let f = abs(fract(q) - vec2f(0.5));
   let half = 0.5 - draw.detail0.w * 0.5;
   // The pattern's footprint per pixel, from the world-space derivatives taken up front.
   let aa = max((abs(plane_uv(dpx, geo)) + abs(plane_uv(dpy, geo))) / size * 0.75, vec2f(1e-4));
-  let bars = vec2f(smoothstep(half - aa.x, half + aa.x, f.x), smoothstep(half - aa.y, half + aa.y, f.y));
+  let bars = vec2f(smoothstep(half - aa.x, half + aa.x, f.x), smoothstep(half - aa.y, half + aa.y, f.y)) * used;
   // Where cells shrink under a few pixels the pattern averages to its coverage.
-  let fade = 1.0 - smoothstep(0.15, 0.4, max(aa.x, aa.y));
-  let cover = mix(draw.detail0.w * 0.6, max(bars.x, bars.y), fade);
+  let fade = 1.0 - smoothstep(0.15, 0.4, max(aa.x * used.x, aa.y * used.y));
+  let average = draw.detail0.w * 0.6 * max(used.x, used.y);
+  let cover = mix(average, max(bars.x, bars.y), fade);
   var wood = vec3f(0.06, 0.035, 0.02);
   if (draw.detail2.x > 0.5) {
     wood = draw.detail1.yzw;

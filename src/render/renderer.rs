@@ -505,10 +505,16 @@ fn material_details(look: &Look, scene: &GpuScene) -> (Vec<[f32; 16]>, Vec<bool>
         let mut d = [0.0f32; 16];
         if let Some(r) = rule {
             let c = r.color.unwrap_or([0.0; 3]);
+            // A lattice may leave out one direction of bars with a zero size.
+            let floor = if r.preset == DetailPreset::Lattice {
+                0.0
+            } else {
+                1e-3
+            };
             d[..4].copy_from_slice(&[
                 r.preset as u32 as f32,
-                r.scale[0].max(1e-3),
-                r.scale[1].max(1e-3),
+                r.scale[0].max(floor),
+                r.scale[1].max(floor),
                 r.strength,
             ]);
             d[4..8].copy_from_slice(&[r.variation, c[0], c[1], c[2]]);

@@ -521,11 +521,25 @@ fn lattice_bars_shade_a_lamp() {
         color: None,
         gloss: 0.0,
     }]);
-    let (before, after) = (bright(&plain), bright(&barred));
-    eprintln!("bright pixels: {before} plain, {after} with a lattice");
+    let ribbed = frame(vec![DetailRule {
+        patterns: vec!["paper-*".into()],
+        preset: DetailPreset::Lattice,
+        scale: [0.0, 0.2],
+        strength: 0.25,
+        variation: 0.0,
+        color: None,
+        gloss: 0.0,
+    }]);
+    let (before, after, ribs) = (bright(&plain), bright(&barred), bright(&ribbed));
+    eprintln!("bright pixels: {before} plain, {after} with a lattice, {ribs} with ribs only");
     assert!(
         before > 500 && after < before * 9 / 10,
         "no bars: {before} / {after}"
+    );
+    // Ribs alone (no bars across) cover less than the full lattice, but still some.
+    assert!(
+        ribs > after && ribs < before,
+        "ribs: {before} / {ribs} / {after}"
     );
 }
 

@@ -104,8 +104,9 @@ pub enum DetailPreset {
     /// rock on steep slopes, where no grass grows (see [`Terrain`]).
     Terrain = 7,
     /// A lattice of thin bars (a lantern's wooden frame, paper ribs): `scale` is the cell's
-    /// width and height, `strength` the bar width as a fraction of a cell, `color` the bars'
-    /// (dark wood by default). Bars also shade the material's glow.
+    /// width and height (0 leaves that direction's bars out: `[0, 0.05]` draws only ribs),
+    /// `strength` the bar width as a fraction of a cell, `color` the bars' (dark wood by
+    /// default). Bars also shade the material's glow.
     Lattice = 8,
 }
 
