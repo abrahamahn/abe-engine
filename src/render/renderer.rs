@@ -142,6 +142,8 @@ pub(super) struct Pipelines {
     pub(super) output_format: Format,
     pub(super) prop_layout: VertexLayout,
     pub(super) overlay_bindings: Vec<abe_shader::Binding>,
+    /// The props' vertex stage (`vs_prop`): every prop shader's, which never calls `shade`.
+    pub(super) prop_vs: Compiled,
     shadow: PipelineId,
     shadow_masked: PipelineId,
     pub(super) shadow_prop: PipelineId,
@@ -251,14 +253,10 @@ pub(super) fn prop_shader_source(user: &str) -> String {
     )
 }
 
-/// A game's prop shader compiled (its overlay vertex and fragment stages), checked to read only
-/// what an overlay draw binds.
-pub(super) fn prop_shader_stages(
-    pipelines: &Pipelines,
-    user: &str,
-) -> Result<(Compiled, Compiled)> {
+/// A game's prop shader's fragment stage compiled, checked to read only what an overlay draw
+/// binds. Its vertex stage is every prop's (`Pipelines::prop_vs`).
+pub(super) fn prop_shader_stage(pipelines: &Pipelines, user: &str) -> Result<Compiled> {
     let source = prop_shader_source(user);
-    let vs = crate::gpu::compile_shader(&source, Stage::Vertex, "vs_prop")?;
     let fs = crate::gpu::compile_shader(&source, Stage::Fragment, "fs_prop_shader")?;
     if fs.bindings != pipelines.overlay_bindings {
         return Err(
@@ -267,7 +265,7 @@ pub(super) fn prop_shader_stages(
                 .into(),
         );
     }
-    Ok((vs, fs))
+    Ok(fs)
 }
 
 /// One overlay pipeline of a game's prop shader: `blend` 0 opaque, 1 alpha, 2 additive; with the
@@ -275,7 +273,7 @@ pub(super) fn prop_shader_stages(
 pub(super) fn prop_shader_pipeline(
     device: &mut Device<'_>,
     pipelines: &Pipelines,
-    (vs, fs): (&Compiled, &Compiled),
+    fs: &Compiled,
     blend: usize,
     depth_test: bool,
 ) -> Result<PipelineId> {
@@ -284,7 +282,7 @@ pub(super) fn prop_shader_pipeline(
         .copied()
         .ok_or("prop_shader_pipeline: no such blend")?;
     device.create_render_pipeline(&RenderPipelineDesc {
-        vertex: vs,
+        vertex: &pipelines.prop_vs,
         fragment: Some(fs),
         vertex_layout: Some(pipelines.prop_layout.clone()),
         topology: Topology::TriangleList,
@@ -378,6 +376,7 @@ impl Pipelines {
             colors: mrt(),
         })?;
         let vs = compile(SCENE, Stage::Vertex, "vs_prop")?;
+        let prop_vs = vs.clone();
         let scene_prop = device.create_render_pipeline(&RenderPipelineDesc {
             vertex: &vs,
             fragment: Some(&fs),
@@ -590,6 +589,7 @@ impl Pipelines {
             output_format: output,
             prop_layout: layout,
             overlay_bindings,
+            prop_vs,
             shadow,
             shadow_masked,
             shadow_prop,

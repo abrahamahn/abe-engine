@@ -390,7 +390,8 @@ pub(super) struct Batch {
 
 /// A game's prop shader: its compiled stages and the overlay pipelines made from them so far.
 pub(super) struct PropShaderEntry {
-    stages: (abe_shader::Compiled, abe_shader::Compiled),
+    /// Its fragment stage (the vertex stage is every prop's).
+    fragment: abe_shader::Compiled,
     pipelines: [[Option<crate::gpu::PipelineId>; 2]; 3],
 }
 
@@ -913,9 +914,9 @@ impl Renderer {
         _device: &mut Device<'_>,
         source: &str,
     ) -> Result<PropShader> {
-        let stages = super::renderer::prop_shader_stages(&self.pipelines, source)?;
+        let fragment = super::renderer::prop_shader_stage(&self.pipelines, source)?;
         Ok(PropShader(self.props.shaders.insert(PropShaderEntry {
-            stages,
+            fragment,
             pipelines: [[None; 2]; 3],
         })?))
     }
@@ -956,7 +957,7 @@ impl Renderer {
             let made = super::renderer::prop_shader_pipeline(
                 device,
                 &self.pipelines,
-                (&entry.stages.0, &entry.stages.1),
+                &entry.fragment,
                 blend,
                 depth == 1,
             )?;
