@@ -22,6 +22,8 @@ var<push_constant> draw: Draw;
 struct Light {
   pos: vec4f,    // xyz, w = range
   color: vec4f,  // rgb, w = intensity
+  spot: vec4f,   // a spot's direction (xyz, away from the light), w = cos of its outer edge (< -1.5: all round)
+  cone: vec4f,   // x = cos of a spot's inner edge, y = 1 for a game's light, lit whatever the hour
 };
 
 @group(0) @binding(1) var<storage, read> lights: array<Light>;
@@ -170,10 +172,8 @@ fn perturb(n: vec3f, p: vec3f, uv: vec2f, m: vec3f) -> vec3f {
 }
 
 fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
+  // The lamps follow the time of day; a game's own lights shine at every hour.
   let level = frame.amb_sky.w;
-  if (level <= 0.001) {
-    return vec3f(0.0);
-  }
   let size = f32(frame.tiles.z);
   let tx = min(u32(frag.x / size), frame.tiles.x - 1u);
   let ty = min(u32(frag.y / size), frame.tiles.y - 1u);
@@ -181,15 +181,19 @@ fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
   var sum = vec3f(0.0);
   for (var k = 0u; k < t.y; k++) {
     let l = lights[light_index[t.x + k]];
+    let lit = select(level, 1.0, l.cone.y > 0.5);
     let d = l.pos.xyz - world;
     let d2 = dot(d, d);
     let r2 = l.pos.w * l.pos.w;
-    if (d2 >= r2) {
+    if (d2 >= r2 || lit <= 0.001) {
       continue;
     }
     let ld = d * inverseSqrt(d2 + 1e-6);
     let win = 1.0 - d2 / r2;
-    let att = win * win / (1.0 + d2 * 0.45);
+    var att = win * win / (1.0 + d2 * 0.45) * lit;
+    if (l.spot.w > -1.5) {
+      att *= smoothstep(l.spot.w, l.cone.x, dot(-ld, l.spot.xyz));
+    }
     let nl = dot(n, ld);
     var w = smoothstep(-0.2, 0.3, nl);
     if (foliage) {
@@ -197,7 +201,7 @@ fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
     }
     sum += l.color.rgb * (l.color.w * att * w);
   }
-  return sum * (level * frame.style2.z);
+  return sum * frame.style2.z;
 }
 
 fn water_normal(world: vec3f, t: f32) -> vec3f {

@@ -3,8 +3,8 @@
 use abe_engine::Vec3;
 use abe_engine::gpu::Device;
 use abe_engine::render::{
-    DetailPreset, DetailRule, Environment, Look, MaterialDesc, MeshData, Output, Quality, Renderer,
-    Terrain, TimeOfDay, View, Weather,
+    DetailPreset, DetailRule, Environment, LightDesc, Look, MaterialDesc, MeshData, Output,
+    Quality, Renderer, SpotCone, Terrain, TimeOfDay, View, Weather,
 };
 use abe_engine::world::{
     AlphaMode, Emission, Instance, Material, Mesh, PointLight, Shading, Texture, Transform, World,
@@ -231,6 +231,84 @@ fn time_of_day_weather_and_lamps() {
         let px = render(&mut device, &mut r, 17.5, weather);
         assert!(region(&px, 0, 0, W, H) > 5.0, "{weather} rendered black");
     }
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}
+
+/// A game's lights: a spot lights the ground inside its cone at midnight and not outside it, a
+/// light that follows the lamps is dark by day, and one put out leaves the frame as it was.
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn game_lights_spot_and_follow_the_lamps() {
+    let mut device = Device::headless().expect("device");
+    let world = World {
+        instances: vec![Instance {
+            mesh: 0,
+            transform: Transform::IDENTITY,
+        }],
+        meshes: vec![quad(0.0, 20.0, 0)],
+        materials: vec![material("ground", [0.4, 0.4, 0.4, 1.0], Shading::Standard)],
+        textures: vec![],
+        lights: vec![],
+    };
+    let mut r = Renderer::new(
+        &mut device,
+        &world,
+        Look::default(),
+        Quality::realtime(),
+        (W, H),
+        Output::Still,
+    )
+    .expect("renderer");
+    let dark = render(&mut device, &mut r, 0.0, "clear");
+    // Straight down onto the ground in front of the camera, a narrow cone.
+    let spot = LightDesc {
+        position: [0.0, 3.0, 0.0],
+        range: 8.0,
+        color: [1.0, 0.85, 0.6],
+        intensity: 40.0,
+        spot: Some(SpotCone {
+            direction: [0.0, -1.0, 0.0],
+            inner: 0.25,
+            outer: 0.4,
+        }),
+        follows_lamps: false,
+    };
+    let light = r.create_light(&spot).expect("light");
+    assert_eq!(r.game_lights(), 1);
+    let lit = render(&mut device, &mut r, 0.0, "clear");
+    // Where the cone's middle and a point well outside it land in the frame.
+    let pixel = |p: [f32; 3]| {
+        let q = r.project(&view(), (W, H), p).expect("in front");
+        (q[0] as u32, q[1] as u32)
+    };
+    let (centre, aside) = (pixel([0.0, 0.0, 0.0]), pixel([3.0, 0.0, 0.0]));
+    let at = |px: &[u8], (x, y): (u32, u32)| region(px, x - 2, y - 2, x + 2, y + 2);
+    assert!(at(&lit, centre) > at(&dark, centre) + 20.0, "in the cone");
+    assert!(
+        (at(&lit, aside) - at(&dark, aside)).abs() < 3.0,
+        "outside it"
+    );
+    // Following the lamps, it is dark at noon like them.
+    let noon = render(&mut device, &mut r, 12.0, "clear");
+    r.set_light(
+        light,
+        &LightDesc {
+            follows_lamps: true,
+            ..spot
+        },
+    )
+    .expect("follow");
+    let noon_follow = render(&mut device, &mut r, 12.0, "clear");
+    assert!(
+        at(&noon, centre) > at(&noon_follow, centre) + 5.0,
+        "by day it follows the lamps"
+    );
+    r.destroy_light(light);
+    assert_eq!(r.game_lights(), 0);
+    let out = render(&mut device, &mut r, 0.0, "clear");
+    assert!(difference(&out, &dark) < 0.5, "put out");
+    assert!(r.set_light(light, &spot).is_err());
     let errors = device.validation_errors();
     assert!(errors.is_empty(), "validation: {errors:?}");
 }

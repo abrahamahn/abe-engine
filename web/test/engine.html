@@ -317,6 +317,27 @@ async function run() {
   check('a prop shader that reads the frame is refused', shaderRefused.includes('reads only'), shaderRefused);
   result.sixth = png(eighth);
 
+  // A game's light: a spot straight down onto the ground lights it inside its cone at night, and
+  // put out leaves the frame as it was.
+  engine.setClock(23, 3);
+  const lightAt = at([0, 0, 2]);
+  const lightAside = at([-4.5, 0, 2]);
+  const unlit = await frame(engine);
+  const spot = engine.createLight({
+    position: [0, 3, 2], range: 8, color: [1, 0.85, 0.6], intensity: 40,
+    direction: [0, -1, 0], inner: 0.25, outer: 0.4,
+  });
+  const spotLit = await frame(engine);
+  const brightness = (px, p) => { const c = pixel(px, p); return c[0] + c[1] + c[2]; };
+  check('a spot light lights the ground in its cone', brightness(spotLit, lightAt) > brightness(unlit, lightAt) + 40,
+    { before: pixel(unlit, lightAt), after: pixel(spotLit, lightAt) });
+  check('and not outside it', Math.abs(brightness(spotLit, lightAside) - brightness(unlit, lightAside)) < 12,
+    { before: pixel(unlit, lightAside), after: pixel(spotLit, lightAside) });
+  engine.destroyLight(spot);
+  const putOut = await frame(engine);
+  check('a light put out is gone', Math.abs(brightness(putOut, lightAt) - brightness(unlit, lightAt)) < 12,
+    { before: pixel(unlit, lightAt), after: pixel(putOut, lightAt) });
+
   // Errors are reported, not thrown away: a stale handle and a bad material.
   engine.destroyInstance(left);
   let refused = 0;

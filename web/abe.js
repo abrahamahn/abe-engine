@@ -1724,6 +1724,21 @@ export async function createEngine(options) {
   };
   const text = (s) => encoder.encode(s);
   const f32 = (a) => (a instanceof Float32Array ? a : new Float32Array(a));
+  /** A light as the 14 floats the runtime reads (`light_desc` in runtime.rs). */
+  const lightFloats = (light) => {
+    const v = new Float32Array(14);
+    v.set(light.position, 0);
+    v[3] = light.range;
+    v.set(light.color, 4);
+    v[7] = light.intensity;
+    if (light.direction !== undefined) {
+      v.set(light.direction, 8);
+      v[11] = light.inner ?? 0;
+      v[12] = light.outer ?? light.inner ?? 0;
+    }
+    v[13] = light.followsLamps === true ? 1 : 0;
+    return v;
+  };
   const out = (n) => new Float32Array(x.memory.buffer, reserve(n * 4), n);
 
   // The world (decoded, its images decoded by the browser) and the Look.
@@ -1912,6 +1927,17 @@ export async function createEngine(options) {
       ok('setInstancePick', x.abe_rt_instance_pick(instance, layers >>> 0));
     },
     destroyInstance(instance) { x.abe_rt_instance_destroy(instance); },
+    /** A light the game hangs: a point light, or a spot with a `direction` and its `inner` and
+     * `outer` half-angles (radians); it shines at every hour unless it `followsLamps`. */
+    createLight(light) {
+      const [p] = place(lightFloats(light));
+      return ok('createLight', x.abe_rt_light_create(p));
+    },
+    setLight(id, light) {
+      const [p] = place(lightFloats(light));
+      ok('setLight', x.abe_rt_light_set(id, p));
+    },
+    destroyLight(id) { x.abe_rt_light_destroy(id); },
     /** Where a world point lands, in CSS pixels of the canvas (and depth in metres), or null
      * behind the camera. */
     project(point) {

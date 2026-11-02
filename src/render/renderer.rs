@@ -237,6 +237,7 @@ pub struct Renderer {
     pub(super) flat: TextureId,
     pub(super) material_sampler: SamplerId,
     pub(super) props: super::props::Props,
+    pub(super) game_lights: super::lights::GameLights,
     pub(super) models: super::models::Models,
 }
 
@@ -869,6 +870,7 @@ impl Renderer {
             flat,
             material_sampler,
             props: super::props::Props::default(),
+            game_lights: super::lights::GameLights::default(),
             models: super::models::Models::default(),
         };
         let slots = match output {
@@ -1325,15 +1327,34 @@ impl Renderer {
     ) -> (Vec<u32>, Vec<u32>) {
         let ts = self.quality.tile_size as f32;
         let mut lists: Vec<Vec<u32>> = vec![vec![]; (tx * ty) as usize];
-        if on {
-            let mut order: Vec<usize> = (0..self.scene.lights.len()).collect();
+        // The lamps while they are lit, and a game's lights (after them in the light buffer):
+        // those that follow the lamps while they are lit, the rest always.
+        let lamps = self.scene.lights.len();
+        let game = self.game_lights.records();
+        let mut order: Vec<usize> = (0..lamps)
+            .filter(|_| on)
+            .chain(
+                game.iter()
+                    .enumerate()
+                    .filter(|(_, l)| on || l[13] > 0.5)
+                    .map(|(k, _)| lamps + k),
+            )
+            .collect();
+        let light = |i: usize| -> &[f32; 16] {
+            if i < lamps {
+                &self.scene.lights[i]
+            } else {
+                &game[i - lamps]
+            }
+        };
+        if !order.is_empty() {
             let dist = |i: usize| {
-                let l = &self.scene.lights[i];
+                let l = light(i);
                 math::length(sub([l[0], l[1], l[2]], eye.pos))
             };
             order.sort_by(|a, b| dist(*a).total_cmp(&dist(*b)));
             for i in order {
-                let l = &self.scene.lights[i];
+                let l = light(i);
                 let r = l[3];
                 let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
                 let mut behind = 0;
@@ -1506,7 +1527,7 @@ impl Renderer {
             tiles.0,
             tiles.1,
             self.quality.tile_size,
-            self.scene.lights.len() as u32,
+            (self.scene.lights.len() + self.game_lights.records().len()) as u32,
         ] {
             bytes.extend_from_slice(&u.to_le_bytes());
         }
@@ -1644,12 +1665,27 @@ impl Renderer {
         self.world_drawn = true;
         // Props first: their bounds widen the shadow cascades' depth range.
         self.prepare_props(device, slot_index, view.eye)?;
+        // A game's lights after the lamps in the light buffer, written when they changed.
+        if self.game_lights.dirty {
+            let data: Vec<f32> = self
+                .game_lights
+                .records()
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
+            if !data.is_empty() {
+                let at = (self.scene.lights.len() * 64) as u64;
+                device.write_buffer(self.scene.light_buffer, at, &crate::gpu::f32_bytes(&data))?;
+            }
+            self.game_lights.dirty = false;
+        }
         let t = &self.targets;
         let size = (t.width, t.height);
         let eye = self.eye(view, jitter, size);
         let cas = self.cascades(view, env);
         let ground = self.ground_view(view);
-        let lamps_on = env.lamp_level > 0.001 && !self.scene.lights.is_empty();
+        let lamps_on = env.lamp_level > 0.001;
         let water = self.scene.water_level;
         // Mirror camera for the water reflection.
         let refl_eye = water.map(|h| {

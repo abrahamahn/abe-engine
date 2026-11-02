@@ -103,6 +103,23 @@ export interface AbeModelInfo {
   readonly materials: readonly string[];
 }
 
+/**
+ * A light a game hangs, shaded like the world's lamps: metres, linear colour, an intensity as a
+ * cooked lamp's. A spot shines along `direction`, fully within `inner` radians of it and fading to
+ * nothing at `outer`. It shines at every hour unless it `followsLamps` (lit only as the evening
+ * lights the lamps). At most 64 at once.
+ */
+export interface AbeLight {
+  readonly position: Vec3;
+  readonly range: number;
+  readonly color: Vec3;
+  readonly intensity: number;
+  readonly direction?: Vec3;
+  readonly inner?: number;
+  readonly outer?: number;
+  readonly followsLamps?: boolean;
+}
+
 export interface AbeNodeTransform {
   readonly translation: Vec3;
   /** Quaternion x, y, z, w. */
@@ -161,6 +178,10 @@ export interface AbeEngine {
   /** Pick layers (bit mask); 0: never picked. New instances: 1. */
   setInstancePick(instance: number, layers: number): void;
   destroyInstance(instance: number): void;
+  /** Hangs a light (a point light, or a spot with a `direction`); returns its handle. */
+  createLight(light: AbeLight): number;
+  setLight(light: number, desc: AbeLight): void;
+  destroyLight(light: number): void;
   /** Where a world point lands in CSS pixels of the canvas, with its depth; null behind the camera. */
   project(point: Vec3): { x: number; y: number; depth: number } | null;
   /** The visible prop under a CSS pixel on one of `layers`. */

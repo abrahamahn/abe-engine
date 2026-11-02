@@ -20,6 +20,7 @@ macro_rules! handle {
     };
 }
 
+mod lights;
 pub mod look;
 pub mod math;
 mod models;
@@ -28,6 +29,7 @@ mod renderer;
 mod scene;
 pub mod sky;
 
+pub use lights::{GameLight, LightDesc, MAX_GAME_LIGHTS, SpotCone};
 pub use look::{DetailPreset, DetailRule, Grass, Look, LookFile, Terrain, View};
 pub use models::{ModelId, ModelInstance};
 pub use props::{

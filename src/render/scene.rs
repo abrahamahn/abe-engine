@@ -40,8 +40,8 @@ pub(super) struct GpuScene {
     /// rules that select materials by name.
     pub names: Vec<String>,
     pub textures: Vec<TextureId>,
-    /// Point lights as (position, range, colour, intensity).
-    pub lights: Vec<[f32; 8]>,
+    /// The world's lamps, as the shaders read them (`lights::LightRecord`).
+    pub lights: Vec<[f32; 16]>,
     pub light_buffer: BufferId,
     pub water_level: Option<f32>,
     /// Bounds of everything drawn, and of everything but water (what casts shadows and what
@@ -275,35 +275,30 @@ impl GpuScene {
             textures.push(id);
         }
 
-        let lights: Vec<[f32; 8]> = world
+        let lights: Vec<[f32; 16]> = world
             .lights
             .iter()
             .map(|l| {
                 // glTF: range 0 means unlimited; a very large range lights every tile.
                 let range = if l.range > 0.0 { l.range } else { 1.0e4 };
-                [
-                    l.position.0,
-                    l.position.1,
-                    l.position.2,
+                super::lights::lamp_record(
+                    [l.position.0, l.position.1, l.position.2],
                     range,
-                    l.color[0],
-                    l.color[1],
-                    l.color[2],
+                    l.color,
                     l.intensity,
-                ]
+                )
             })
             .collect();
-        let light_data: Vec<f32> = if lights.is_empty() {
-            vec![0.0; 8]
-        } else {
-            lights.iter().flatten().copied().collect()
-        };
+        let light_data: Vec<f32> = lights.iter().flatten().copied().collect();
+        // The lamps, then room for a game's own lights (`lights.rs`).
         let light_buffer = device.create_buffer(&BufferDesc {
-            size: (light_data.len() * 4) as u64,
+            size: ((lights.len() + super::lights::MAX_GAME_LIGHTS) * 64) as u64,
             usage: BufferUsage::STORAGE | BufferUsage::COPY_DST,
             memory: Memory::Device,
         })?;
-        device.write_buffer(light_buffer, 0, &f32_bytes(&light_data))?;
+        if !light_data.is_empty() {
+            device.write_buffer(light_buffer, 0, &f32_bytes(&light_data))?;
+        }
 
         Ok(Self {
             vertices: vb,

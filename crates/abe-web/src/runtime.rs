@@ -19,7 +19,7 @@ use abe_engine::render::{
     Environment, LookFile, MaterialDesc, MeshData, Output, PROP_SHADER_PARAMS, PropInstance,
     PropMaterial, PropMesh, PropTexture, Quality, Renderer, TimeOfDay, View, Weather,
 };
-use abe_engine::render::{ModelId, ModelInstance};
+use abe_engine::render::{GameLight, LightDesc, ModelId, ModelInstance, SpotCone};
 use abe_engine::world::World;
 use std::cell::RefCell;
 
@@ -687,6 +687,61 @@ pub extern "C" fn abe_rt_instance_destroy(instance: u32) -> u32 {
     with(0, |rt| {
         rt.renderer
             .destroy_prop_instance(PropInstance::from_raw(instance));
+        Ok(1)
+    })
+}
+
+/// A game light from 14 floats: position (3), range, linear colour (3), intensity, a spot's
+/// direction (3, all zero for a point light), its inner and outer half-angles (radians), and 1 to
+/// follow the lamps (lit only as the evening lights them).
+fn light_desc(v: &[f32]) -> LightDesc {
+    let at = |i: usize| v.get(i).copied().unwrap_or(0.0);
+    let direction = [at(8), at(9), at(10)];
+    LightDesc {
+        position: [at(0), at(1), at(2)],
+        range: at(3),
+        color: [at(4), at(5), at(6)],
+        intensity: at(7),
+        spot: direction.iter().any(|d| *d != 0.0).then_some(SpotCone {
+            direction,
+            inner: at(11),
+            outer: at(12),
+        }),
+        follows_lamps: at(13) > 0.5,
+    }
+}
+
+/// Hangs a game light (see `light_desc` for the 14 floats at `ptr`).
+///
+/// # Safety
+/// `ptr` must address 56 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_light_create(ptr: *const u8) -> u32 {
+    // SAFETY: the caller passes 14 floats.
+    let v = unsafe { floats(ptr, 14) };
+    with(0, |rt| Ok(rt.renderer.create_light(&light_desc(&v))?.raw()))
+}
+
+/// Moves, recolours or reshapes a game light (14 floats at `ptr`, as `abe_rt_light_create`).
+///
+/// # Safety
+/// `ptr` must address 56 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_light_set(light: u32, ptr: *const u8) -> u32 {
+    // SAFETY: the caller passes 14 floats.
+    let v = unsafe { floats(ptr, 14) };
+    with(0, |rt| {
+        rt.renderer
+            .set_light(GameLight::from_raw(light), &light_desc(&v))?;
+        Ok(1)
+    })
+}
+
+/// Puts a game light out.
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_light_destroy(light: u32) -> u32 {
+    with(0, |rt| {
+        rt.renderer.destroy_light(GameLight::from_raw(light));
         Ok(1)
     })
 }
