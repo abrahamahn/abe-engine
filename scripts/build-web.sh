@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the ABE web player: crates/abe-web for wasm32-unknown-unknown (release, zero
-# third-party crates) plus web/index.html and web/abe.js, into OUT_DIR (default web/dist).
+# third-party crates) plus web/index.html, web/abe.js and its declarations web/abe.d.ts, into
+# OUT_DIR (default web/dist).
 #
 #   scripts/build-web.sh [OUT_DIR]
 #
@@ -65,6 +66,6 @@ esac
 
 mkdir -p "$out"
 cp "$target_dir/$target/release/abe_web.wasm" "$out/abe_web.wasm"
-cp web/index.html web/abe.js "$out/"
+cp web/index.html web/abe.js web/abe.d.ts "$out/"
 size=$(wc -c < "$out/abe_web.wasm")
 echo "build-web: $out (abe_web.wasm $((size / 1024)) KiB, $mode)"
