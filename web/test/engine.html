@@ -43,9 +43,10 @@ function cube(h) {
 
 const translate = (x, y, z) => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1];
 
-/** A GLB: a 2 m bar of two blocks skinned to a root and an elbow joint, textured with `png`
- * (unlit), and a clip "bend" turning the elbow 90 degrees about z over one second. */
-function testGlb(png) {
+/** A GLB: a 2 m bar of two blocks skinned to a root and an elbow joint, textured with the image
+ * `png` (of `mimeType`; unlit), and a clip "bend" turning the elbow 90 degrees about z over one
+ * second. */
+function testGlb(png, mimeType = 'image/png') {
   const positions = []; const normals = []; const uvs = []; const joints = []; const indices = [];
   for (const [joint, y0] of [[0, 0], [1, 1]]) {
     const c = cube(0.5);
@@ -83,7 +84,7 @@ function testGlb(png) {
       acc(2, 5126, 'VEC2', n), acc(3, 5121, 'VEC4', n), acc(4, 5126, 'VEC4', n),
       acc(5, 5123, 'SCALAR', indices.length), acc(6, 5126, 'MAT4', 2), acc(7, 5126, 'SCALAR', 2, { min: [0], max: [1] }),
       acc(8, 5126, 'VEC4', 2)],
-    images: [{ bufferView: 9, mimeType: 'image/png', name: 'paint' }],
+    images: [{ bufferView: 9, mimeType, name: 'paint' }],
     textures: [{ source: 0 }],
     materials: [{ name: 'check-model', pbrMetallicRoughness: { baseColorTexture: { index: 0 } },
       extensions: { KHR_materials_unlit: {} } }],
@@ -246,8 +247,9 @@ async function run() {
   swatch.width = 4; swatch.height = 4;
   const sg = swatch.getContext('2d');
   sg.fillStyle = '#ff00ff'; sg.fillRect(0, 0, 4, 4);
-  const pngBytes = new Uint8Array(await (await new Promise((r) => swatch.toBlob(r, 'image/png'))).arrayBuffer());
-  const { model, info } = await engine.loadModel(testGlb(pngBytes));
+  // A JPEG, so the browser's decoder makes the texture (PNGs go to the engine's).
+  const jpegBytes = new Uint8Array(await (await new Promise((r) => swatch.toBlob(r, 'image/jpeg', 0.95))).arrayBuffer());
+  const { model, info } = await engine.loadModel(testGlb(jpegBytes, 'image/jpeg'));
   const bar = engine.createModelInstance(model, translate(3.5, 0, 3));
   const magenta = (r, g, b) => r > g + 60 && b > g + 60;
   const upright = at([3.5, 1.6, 3.15]);

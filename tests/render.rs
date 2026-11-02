@@ -127,6 +127,7 @@ fn world() -> World {
                 height: 2,
                 srgb: true,
                 levels: vec![checker, vec![227, 227, 227, 255]],
+                encoded: None,
             },
             Texture {
                 width: 2,
@@ -138,6 +139,7 @@ fn world() -> World {
                     ],
                     vec![255, 255, 255, 128],
                 ],
+                encoded: None,
             },
         ],
         lights: vec![PointLight {

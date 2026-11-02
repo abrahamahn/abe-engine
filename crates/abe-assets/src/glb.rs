@@ -294,6 +294,8 @@ struct Importer<'a> {
     /// Engine texture per (glTF image, sRGB). An image used in both colour spaces is stored twice.
     textures: HashMap<(usize, bool), u32>,
     remaining: usize,
+    /// Keep images in their file format (PNG, JPEG, WebP) for the host to decode.
+    keep_images: bool,
 }
 impl Importer<'_> {
     fn spend(&mut self, bytes: u64) -> Result<(), String> {
@@ -318,7 +320,13 @@ impl Importer<'_> {
             ));
         }
         let texture = index(arr(self.doc, "textures")?, id)?;
-        let Some(source) = texture.get("source") else {
+        let webp = ext(texture, "EXT_texture_webp").and_then(|w| w.get("source"));
+        let source = if self.keep_images {
+            webp.or_else(|| texture.get("source"))
+        } else {
+            texture.get("source")
+        };
+        let Some(source) = source else {
             let alternatives = match texture.get("extensions") {
                 Some(Value::Object(m)) => m.keys().cloned().collect::<Vec<_>>().join(", "),
                 _ => String::new(),
@@ -341,6 +349,33 @@ impl Importer<'_> {
             return Err(format!(
                 "image {image_id} {name:?} is referenced by URI; embed it as image/png"
             ));
+        }
+        if self.keep_images {
+            let bytes = view(self.doc, self.bin, need(image, "bufferView")?.integer()?)?;
+            let mime = crate::image::mime(bytes)
+                .ok_or_else(|| format!("image {image_id} {name:?} is not PNG, JPEG or WebP"))?;
+            let (width, height) = crate::image::size(bytes)
+                .filter(|&(w, h)| {
+                    w <= abe_core::world::MAX_TEXTURE_SIZE && h <= abe_core::world::MAX_TEXTURE_SIZE
+                })
+                .ok_or_else(|| format!("image {image_id} {name:?}: unreadable or too large"))?;
+            self.spend(bytes.len() as u64)?;
+            if self.world.textures.len() >= MAX_TEXTURES {
+                return Err("too many textures".into());
+            }
+            self.world.textures.push(abe_core::world::Texture {
+                width,
+                height,
+                srgb: filter == Filter::Srgb,
+                levels: vec![],
+                encoded: Some(abe_core::world::EncodedImage {
+                    mime: mime.to_string(),
+                    data: bytes.to_vec(),
+                }),
+            });
+            let k = (self.world.textures.len() - 1) as u32;
+            self.textures.insert(key, k);
+            return Ok(k);
         }
         let mime = need(image, "mimeType")?.string()?;
         if mime != "image/png" {
@@ -610,13 +645,20 @@ impl Scene<'_> {
 }
 
 pub fn import(data: &[u8]) -> Result<World, String> {
+    import_with(data, false)
+}
+
+/// As [`import`]; with `keep_images` the textures stay in their file format (PNG, JPEG or WebP,
+/// `EXT_texture_webp` included) for the host to decode, instead of being decoded to mip chains.
+pub fn import_with(data: &[u8], keep_images: bool) -> Result<World, String> {
     let (doc, bin) = chunks(data)?;
     if need(need(&doc, "asset")?, "version")?.string()? != "2.0" {
         return Err("expected glTF 2.0".into());
     }
     for name in arr(&doc, "extensionsRequired")? {
         let name = name.string()?;
-        if !SUPPORTED.contains(&name) {
+        let webp = keep_images && name == "EXT_texture_webp";
+        if !(SUPPORTED.contains(&name) || webp) {
             return Err(format!("unsupported required glTF extension: {name}"));
         }
     }
@@ -642,6 +684,7 @@ pub fn import(data: &[u8]) -> Result<World, String> {
         materials: HashMap::new(),
         textures: HashMap::new(),
         remaining: MAX_BYTES,
+        keep_images,
     };
     let mut ranges = Vec::new();
     for gltf_mesh in arr(&doc, "meshes")? {

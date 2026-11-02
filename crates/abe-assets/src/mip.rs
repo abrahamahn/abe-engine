@@ -129,5 +129,6 @@ pub fn texture(width: u32, height: u32, rgba: Vec<u8>, filter: Filter) -> Result
         height,
         srgb: filter == Filter::Srgb,
         levels,
+        encoded: None,
     })
 }

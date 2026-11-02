@@ -77,7 +77,7 @@ fn abe_build_cooks_and_inspects_a_textured_lit_scene() {
     );
     let (ok, text) = build(&[Path::new("inspect"), &cooked_path]);
     assert!(ok, "{text}");
-    assert!(text.starts_with("ABEW v2 |"), "{text}");
+    assert!(text.starts_with("ABEW v3 |"), "{text}");
     assert!(
         text.contains("material 0: lantern [standard, lamp, base 2x2]"),
         "{text}"
@@ -93,6 +93,30 @@ fn abe_build_cooks_and_inspects_a_textured_lit_scene() {
     assert_eq!(
         w.scene().unwrap().triangles[0].positions[1],
         Vec3(4., 0., 0.)
+    );
+
+    // Compact, with the image kept as a file for the host to decode: the same world.
+    let compact_path = dir.join("scene-compact.abew");
+    let (ok, text) = build(&[
+        Path::new("cook"),
+        Path::new("--compact"),
+        Path::new("--keep-images"),
+        &source,
+        &compact_path,
+    ]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("0 texel bytes,") && text.contains("encoded image bytes"),
+        "{text}"
+    );
+    let c = cooked::decode(&read_asset(&compact_path).unwrap()).unwrap();
+    assert_eq!(
+        (c.materials.clone(), c.lights.clone()),
+        (w.materials.clone(), w.lights.clone())
+    );
+    assert_eq!(
+        c.textures[0].encoded.as_ref().map(|e| e.mime.as_str()),
+        Some("image/png")
     );
 
     // A JPEG texture is named in the error and leaves the previous output in place.

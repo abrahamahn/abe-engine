@@ -12,8 +12,19 @@ fn summary(w: &World) -> Result<String, String> {
         .flat_map(|t| &t.levels)
         .map(|l| l.len() as u64)
         .sum();
+    let encoded: u64 = w
+        .textures
+        .iter()
+        .filter_map(|t| t.encoded.as_ref())
+        .map(|e| e.data.len() as u64)
+        .sum();
+    let images = if encoded > 0 {
+        format!(", {encoded} encoded image bytes")
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "{} meshes | {} instances | {} triangles | {} materials | {} textures ({texels} texel bytes) | {} lights",
+        "{} meshes | {} instances | {} triangles | {} materials | {} textures ({texels} texel bytes{images}) | {} lights",
         w.meshes.len(),
         w.instances.len(),
         w.validate()?,
@@ -24,11 +35,23 @@ fn summary(w: &World) -> Result<String, String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // Cook options: --compact quantizes geometry, --keep-images keeps PNG, JPEG and WebP
+    // images encoded (for hosts that decode them, such as browsers).
+    let mut flag = |name: &str| {
+        let before = args.len();
+        args.retain(|a| a != name);
+        args.len() != before
+    };
+    let (compact, keep_images) = (flag("--compact"), flag("--keep-images"));
     match args.as_slice() {
         [cmd, source, dest] if cmd == "cook" => {
-            let w = glb::import(&read_asset(Path::new(source))?)?;
-            let data = cooked::encode(&w)?;
+            let w = glb::import_with(&read_asset(Path::new(source))?, keep_images)?;
+            let data = if compact {
+                cooked::encode_compact(&w)?
+            } else {
+                cooked::encode(&w)?
+            };
             if Path::new(dest).canonicalize().ok() == Some(Path::new(source).canonicalize()?) {
                 return Err("cook destination must differ from the source".into());
             }
@@ -71,7 +94,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  material {i}: {} [{}]", m.name, traits.join(", "));
             }
         }
-        _ => return Err("usage: abe-build cook source.glb output.abew | inspect file.abew".into()),
+        _ => {
+            return Err(
+                "usage: abe-build cook [--compact] [--keep-images] source.glb output.abew \
+                        | inspect file.abew"
+                    .into(),
+            );
+        }
     }
     Ok(())
 }

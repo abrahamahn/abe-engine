@@ -49,7 +49,7 @@ fn source_to_cooked_roundtrip_preserves_hierarchy_and_sharing() {
         Vec3(1., 3., 0.)
     );
     let b = cooked::encode(&w).unwrap();
-    assert_eq!(cooked::version(&b), Some(2));
+    assert_eq!(cooked::version(&b), Some(3));
     let w2 = cooked::decode(&b).unwrap();
     assert_eq!(w, w2);
     assert_eq!(cooked::encode(&w2).unwrap(), b);
@@ -57,7 +57,7 @@ fn source_to_cooked_roundtrip_preserves_hierarchy_and_sharing() {
         assert!(cooked::decode(&b[..n]).is_err())
     }
     let mut future = b.clone();
-    future[4] = 3;
+    future[4] = 4;
     assert!(cooked::decode(&future).is_err());
     let mut extra = b;
     extra.push(0);
@@ -138,8 +138,8 @@ fn version_1_files_still_decode() {
     let mut extra = v1.clone();
     extra.push(0);
     assert!(cooked::decode(&extra).is_err());
-    // Re-cooking upgrades to version 2.
-    assert_eq!(cooked::version(&cooked::encode(&decoded).unwrap()), Some(2));
+    // Re-cooking upgrades to version 3.
+    assert_eq!(cooked::version(&cooked::encode(&decoded).unwrap()), Some(3));
 }
 
 // Synthetic GLB with materials, textures and a light.
@@ -325,8 +325,11 @@ fn materials_textures_and_lights_cook_exactly() {
     corrupt.meshes[1].material = Some(9);
     assert!(cooked::encode(&corrupt).is_err());
     let mut corrupt = w.clone();
-    corrupt.textures[1].levels.pop();
-    assert!(corrupt.validate().is_err());
+    corrupt.textures[0].levels.pop();
+    assert!(corrupt.validate().is_err(), "a partial chain");
+    let mut top = w.clone();
+    top.textures[0].levels.truncate(1);
+    assert!(top.validate().is_ok(), "the top level alone");
     let mut corrupt = w.clone();
     corrupt.meshes[0].uvs.pop();
     assert!(corrupt.validate().is_err());
@@ -946,3 +949,219 @@ const RGB_KEY: &[u8] = &[
     166, 119, 9, 96, 56, 60, 132, 44, 151, 151, 15, 34, 194, 3, 89, 200, 37, 16, 6, 0, 0, 0, 0, 73,
     69, 78, 68, 174, 66, 96, 130,
 ];
+
+/// Version 2 as it was written: f32 everything, u32 indices, textures without a kind.
+fn encode_v2(w: &World) -> Vec<u8> {
+    let mut v = b"ABEW".to_vec();
+    let word = |v: &mut Vec<u8>, n: u32| v.extend_from_slice(&n.to_le_bytes());
+    let floats = |v: &mut Vec<u8>, f: &[f32]| {
+        for x in f {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+    };
+    word(&mut v, 2);
+    for n in [
+        w.meshes.len(),
+        w.instances.len(),
+        w.materials.len(),
+        w.textures.len(),
+        w.lights.len(),
+    ] {
+        word(&mut v, n as u32);
+    }
+    for m in &w.meshes {
+        word(&mut v, m.positions.len() as u32);
+        word(&mut v, m.indices.len() as u32);
+        word(
+            &mut v,
+            u32::from(!m.normals.is_empty()) | u32::from(!m.uvs.is_empty()) << 1,
+        );
+        floats(&mut v, &m.color);
+        word(&mut v, m.material.unwrap_or(u32::MAX));
+        for p in m.positions.iter().chain(&m.normals) {
+            floats(&mut v, &[p.0, p.1, p.2]);
+        }
+        for uv in &m.uvs {
+            floats(&mut v, uv);
+        }
+        for &i in &m.indices {
+            word(&mut v, i);
+        }
+    }
+    for i in &w.instances {
+        word(&mut v, i.mesh);
+        floats(&mut v, &i.transform.0);
+    }
+    for m in &w.materials {
+        word(&mut v, m.name.len() as u32);
+        v.extend_from_slice(m.name.as_bytes());
+        v.resize(v.len().next_multiple_of(4), 0);
+        floats(&mut v, &m.base_color);
+        word(&mut v, m.base_color_texture.unwrap_or(u32::MAX));
+        word(&mut v, m.normal_texture.unwrap_or(u32::MAX));
+        floats(&mut v, &[m.normal_scale]);
+        floats(&mut v, &m.emissive);
+        word(&mut v, m.emissive_texture.unwrap_or(u32::MAX));
+        floats(&mut v, &[m.metallic, m.roughness]);
+        let (mode, cutoff) = match m.alpha {
+            AlphaMode::Opaque => (0, 0.),
+            AlphaMode::Mask(c) => (1, c),
+            AlphaMode::Blend => (2, 0.),
+        };
+        word(&mut v, mode);
+        floats(&mut v, &[cutoff]);
+        word(&mut v, u32::from(m.double_sided));
+        word(&mut v, m.shading as u32);
+        word(&mut v, m.emission as u32);
+    }
+    for t in &w.textures {
+        word(&mut v, t.width);
+        word(&mut v, t.height);
+        word(&mut v, u32::from(t.srgb));
+        word(&mut v, t.levels.len() as u32);
+        for l in &t.levels {
+            v.extend_from_slice(l);
+        }
+    }
+    for l in &w.lights {
+        floats(&mut v, &[l.position.0, l.position.1, l.position.2]);
+        floats(&mut v, &l.color);
+        floats(&mut v, &[l.intensity, l.range]);
+    }
+    v
+}
+
+#[test]
+fn version_2_files_still_decode() {
+    let w = glb::import(&scene_glb("")).unwrap();
+    let v2 = encode_v2(&w);
+    assert_eq!(cooked::version(&v2), Some(2));
+    assert_eq!(cooked::decode(&v2).unwrap(), w);
+    for n in (0..v2.len()).step_by(5) {
+        assert!(cooked::decode(&v2[..n]).is_err());
+    }
+}
+
+#[test]
+fn compact_worlds_code_meshes_within_tolerance_and_keep_encoded_images() {
+    let mut w = glb::import(&scene_glb("")).unwrap();
+    // A large mesh (a sea 1 km across, far off the origin) and a vertex no triangle uses.
+    let mut sea = w.meshes[0].clone();
+    for p in &mut sea.positions {
+        p.0 = p.0 * 400.0 + 1237.25;
+    }
+    sea.positions.push(Vec3(9., 9., 9.));
+    if !sea.normals.is_empty() {
+        sea.normals.push(Vec3(0., 1., 0.));
+    }
+    if !sea.uvs.is_empty() {
+        sea.uvs.push([0.5, 0.5]);
+    }
+    w.meshes.push(sea);
+    w.instances.push(abe_core::world::Instance {
+        mesh: 2,
+        transform: abe_core::world::Transform::IDENTITY,
+    });
+    // An encoded image stays as it is.
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    png.extend_from_slice(&4u32.to_be_bytes());
+    png.extend_from_slice(&4u32.to_be_bytes());
+    png.extend_from_slice(b"rest of the file");
+    w.textures[0].levels.clear();
+    w.textures[0].encoded = Some(abe_core::world::EncodedImage {
+        mime: "image/png".into(),
+        data: png.clone(),
+    });
+    let exact = cooked::encode(&w).unwrap();
+    assert_eq!(cooked::decode(&exact).unwrap(), w);
+    let compact = cooked::encode_compact(&w).unwrap();
+    assert!(
+        compact.len() < exact.len(),
+        "{} vs {}",
+        compact.len(),
+        exact.len()
+    );
+    let c = cooked::decode(&compact).unwrap();
+    assert_eq!(c.textures, w.textures);
+    assert_eq!(
+        (c.materials.clone(), c.lights.clone(), c.instances.clone()),
+        (w.materials.clone(), w.lights.clone(), w.instances.clone())
+    );
+    for (a, b) in w.meshes.iter().zip(&c.meshes) {
+        assert_eq!(a.indices.len(), b.indices.len());
+        assert_eq!((a.material, a.color), (b.material, b.color));
+        // The unused vertex is gone; every corner keeps its attributes within tolerance.
+        let used: std::collections::BTreeSet<u32> = a.indices.iter().copied().collect();
+        assert_eq!(b.positions.len(), used.len());
+        for (&i, &j) in a.indices.iter().zip(&b.indices) {
+            let (p, q) = (a.positions[i as usize], b.positions[j as usize]);
+            for (x, y) in [(p.0, q.0), (p.1, q.1), (p.2, q.2)] {
+                assert!((x - y).abs() <= 0.00025 + x.abs() * 1e-6, "{x} vs {y}");
+            }
+            if let (Some(n), Some(m)) = (a.normals.get(i as usize), b.normals.get(j as usize)) {
+                let dot = n.0 * m.0 + n.1 * m.1 + n.2 * m.2;
+                assert!(dot > 0.99999, "{n:?} vs {m:?}");
+            }
+            if let (Some(u), Some(v)) = (a.uvs.get(i as usize), b.uvs.get(j as usize)) {
+                assert!(
+                    (u[0] - v[0]).abs() <= 1.0 / 16384.0 && (u[1] - v[1]).abs() <= 1.0 / 16384.0
+                );
+            }
+        }
+    }
+    // Coding again gives the same bytes.
+    assert_eq!(cooked::encode_compact(&c).unwrap(), compact);
+    for n in (0..compact.len()).step_by(3) {
+        assert!(cooked::decode(&compact[..n]).is_err());
+    }
+    // A corrupted stream is an error, never a panic.
+    for at in (48..compact.len()).step_by(11) {
+        let mut bad = compact.clone();
+        bad[at] ^= 0x5A;
+        let _ = cooked::decode(&bad);
+    }
+}
+
+#[test]
+fn octahedral_normals_survive_every_direction() {
+    let mut w = World::default();
+    let mut m = Mesh {
+        color: [0.5; 3],
+        ..Mesh::default()
+    };
+    // Directions over the whole sphere, including the axes and the octahedron's seams.
+    for i in 0..400 {
+        let t = i as f32 / 400.0;
+        let z = 1.0 - 2.0 * t;
+        let r = (1.0 - z * z).max(0.0).sqrt();
+        let phi = i as f32 * 2.399_963;
+        m.normals.push(Vec3(r * phi.cos(), r * phi.sin(), z));
+    }
+    for axis in [
+        Vec3(1., 0., 0.),
+        Vec3(-1., 0., 0.),
+        Vec3(0., 1., 0.),
+        Vec3(0., -1., 0.),
+        Vec3(0., 0., 1.),
+        Vec3(0., 0., -1.),
+        Vec3(0.6, 0., -0.8),
+    ] {
+        m.normals.push(axis);
+    }
+    m.positions = (0..m.normals.len())
+        .map(|i| Vec3(i as f32 * 0.01, 0., 0.))
+        .collect();
+    m.indices = (0..(m.normals.len() as u32 / 3) * 3).collect();
+    w.meshes.push(m);
+    w.instances.push(abe_core::world::Instance {
+        mesh: 0,
+        transform: abe_core::world::Transform::IDENTITY,
+    });
+    let back = cooked::decode(&cooked::encode_compact(&w).unwrap()).unwrap();
+    let (a, b) = (&w.meshes[0], &back.meshes[0]);
+    for (&i, &j) in a.indices.iter().zip(&b.indices) {
+        let (n, m) = (a.normals[i as usize], b.normals[j as usize]);
+        let dot = n.0 * m.0 + n.1 * m.1 + n.2 * m.2;
+        assert!(dot > 0.99999, "{n:?} vs {m:?}");
+    }
+}

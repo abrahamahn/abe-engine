@@ -126,6 +126,7 @@ fn world() -> World {
                 height: 2,
                 srgb: true,
                 levels: vec![checker, vec![227, 227, 227, 255]],
+                encoded: None,
             },
             Texture {
                 width: 2,
@@ -137,6 +138,7 @@ fn world() -> World {
                     ],
                     vec![255, 255, 255, 128],
                 ],
+                encoded: None,
             },
         ],
         lights: vec![PointLight {
@@ -168,6 +170,18 @@ fn main() -> Result<(), String> {
     let bytes = abe_engine::assets::cooked::encode(&world())?;
     std::fs::write(dir.join("synthetic.abew"), bytes).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("synthetic-look.json"), LOOK).map_err(|e| e.to_string())?;
+    // The same world as delivered to browsers: coded meshes and textures kept as PNG files.
+    let mut compact = world();
+    for t in &mut compact.textures {
+        let png = abe_engine::assets::png::encode(t.width, t.height, &t.levels[0])?;
+        t.levels.clear();
+        t.encoded = Some(abe_engine::world::EncodedImage {
+            mime: "image/png".into(),
+            data: png,
+        });
+    }
+    let bytes = abe_engine::assets::cooked::encode_compact(&compact)?;
+    std::fs::write(dir.join("synthetic-compact.abew"), bytes).map_err(|e| e.to_string())?;
     println!("{}", dir.join("synthetic.abew").display());
     Ok(())
 }

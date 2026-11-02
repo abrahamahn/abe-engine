@@ -11,7 +11,7 @@
 //! byte by byte (little-endian), so pointers need no alignment. A world handed to
 //! [`abe_rt_start`] comes from `abe_alloc` and becomes the engine's.
 
-use crate::{install_panic_hook, say};
+use crate::{give, install_panic_hook, say};
 use abe_engine::anim::normalize_q;
 use abe_engine::assets::model::{self, Model};
 use abe_engine::gpu::Device;
@@ -107,7 +107,8 @@ fn matrix(v: &[f32]) -> Result<[f32; 16], String> {
 }
 
 /// Starts the engine on the page's canvas with the `.abew` world at `world` (ownership passes
-/// from `abe_alloc`; a zero length starts without a world) and the Look file at `look`.
+/// from `abe_alloc`; a zero length takes the world `abe_load_world` decoded, whose images the
+/// host may have decoded with `abe_world_set_image`, or none) and the Look file at `look`.
 /// `quality` 1 renders at still-image quality, 0 at real-time quality. Returns 1, or 0 after
 /// logging why not.
 ///
@@ -124,7 +125,9 @@ pub unsafe extern "C" fn abe_rt_start(
 ) -> u32 {
     install_panic_hook();
     let world = if world_len == 0 || world.is_null() {
-        Ok(World::default())
+        Ok(crate::WORLD
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_default())
     } else {
         // SAFETY: the caller hands over an initialized allocation of `world_len` bytes.
         let owned = unsafe { Vec::from_raw_parts(world, world_len, world_len) };
@@ -359,6 +362,27 @@ pub unsafe extern "C" fn abe_rt_texture_create(
         let t =
             rt.renderer
                 .create_prop_texture(&mut rt.device, (width, height), data, srgb != 0)?;
+        Ok(t.raw())
+    })
+}
+
+/// A texture from a PNG file (`len` bytes at `ptr`), decoded by the engine: sRGB colour
+/// (`srgb` 1) or linear data (0), with a full mip chain.
+///
+/// # Safety
+/// `ptr` must address `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_texture_png(ptr: *const u8, len: usize, srgb: u32) -> u32 {
+    // SAFETY: the caller passes a readable range.
+    let data = unsafe { bytes(ptr, len) };
+    with(0, |rt| {
+        let image = abe_engine::assets::png::decode(data).map_err(|e| format!("PNG: {e}"))?;
+        let t = rt.renderer.create_prop_texture(
+            &mut rt.device,
+            (image.width, image.height),
+            &image.rgba,
+            srgb != 0,
+        )?;
         Ok(t.raw())
     })
 }
@@ -677,19 +701,6 @@ unsafe fn write_floats(out: *mut u8, v: &[f32]) {
     let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
     // SAFETY: forwarded.
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len()) };
-}
-
-/// Copies `text` to `out` when it fits in `cap` bytes; returns its length either way (a host
-/// with a smaller buffer calls again with a bigger one).
-///
-/// # Safety
-/// `out` must address `cap` writable bytes.
-unsafe fn give(text: &[u8], out: *mut u8, cap: usize) -> u32 {
-    if text.len() <= cap && !out.is_null() {
-        // SAFETY: the caller passes `cap` writable bytes.
-        unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), out, text.len()) };
-    }
-    text.len() as u32
 }
 
 fn json_string(s: &str) -> String {

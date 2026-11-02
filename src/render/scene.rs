@@ -222,21 +222,55 @@ impl GpuScene {
         device.write_buffer(ib, 0, &u32_bytes(&indices))?;
 
         let mut textures = Vec::with_capacity(world.textures.len());
-        for t in &world.textures {
+        for (i, t) in world.textures.iter().enumerate() {
+            // Encoded PNGs are decoded here; other formats are the host's to decode first.
+            let decoded;
+            let levels: &[Vec<u8>] = match &t.encoded {
+                Some(e) if e.mime == "image/png" => {
+                    let d = crate::assets::png::decode(&e.data)
+                        .map_err(|err| format!("texture {i}: {err}"))?;
+                    if (d.width, d.height) != (t.width, t.height) {
+                        return Err(format!(
+                            "texture {i}: the PNG is not {}x{}",
+                            t.width, t.height
+                        ));
+                    }
+                    decoded = [d.rgba];
+                    &decoded
+                }
+                Some(e) => {
+                    return Err(format!(
+                        "texture {i} is still encoded as {}: decode it before creating the \
+                         renderer (createEngine does this in the browser)",
+                        e.mime
+                    ));
+                }
+                None => &t.levels,
+            };
+            // A top level alone gets the rest of its chain made on the GPU.
+            let full = crate::world::Texture::level_count(t.width, t.height) as u32;
+            let generate = (levels.len() as u32) < full;
+            let mut usage = TextureUsage::SAMPLED | TextureUsage::COPY_DST;
+            if generate {
+                usage = usage | TextureUsage::COPY_SRC | TextureUsage::COLOR_TARGET;
+            }
             let id = device.create_texture(&TextureDesc {
                 width: t.width,
                 height: t.height,
                 layers: 1,
-                mips: t.levels.len() as u32,
+                mips: full,
                 format: if t.srgb {
                     Format::Rgba8Srgb
                 } else {
                     Format::Rgba8Unorm
                 },
-                usage: TextureUsage::SAMPLED | TextureUsage::COPY_DST,
+                usage,
             })?;
-            for (level, data) in t.levels.iter().enumerate() {
+            for (level, data) in levels.iter().enumerate() {
                 device.write_texture(id, level as u32, 0, data)?;
+            }
+            if generate {
+                device.generate_mips(id)?;
             }
             textures.push(id);
         }

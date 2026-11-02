@@ -105,7 +105,8 @@ struct App {
 }
 
 thread_local! {
-    static WORLD: RefCell<Option<World>> = const { RefCell::new(None) };
+    /// The world decoded by `abe_load_world`, until the player or the engine starts with it.
+    pub(crate) static WORLD: RefCell<Option<World>> = const { RefCell::new(None) };
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
@@ -163,6 +164,119 @@ pub unsafe extern "C" fn abe_load_world(ptr: *mut u8, len: usize) -> u32 {
         }
         Err(e) => {
             say(2, &format!("cannot decode the world: {e}"));
+            0
+        }
+    }
+}
+
+/// Copies `bytes` to `out` when they fit in `cap`; returns their length either way.
+///
+/// # Safety
+/// `out` must address `cap` writable bytes.
+pub(crate) unsafe fn give(bytes: &[u8], out: *mut u8, cap: usize) -> u32 {
+    if bytes.len() <= cap && !out.is_null() {
+        // SAFETY: the caller passes `cap` writable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
+    }
+    bytes.len() as u32
+}
+
+/// Lists the loaded world's still-encoded images as JSON (`[{"texture", "mime", "srgb",
+/// "width", "height", "size"}]`) for the host to decode, written to `out` when it fits in `cap`
+/// bytes; returns the length. The host decodes what it can and hands the pixels back with
+/// [`abe_world_set_image`]; PNGs left encoded are decoded by the engine.
+///
+/// # Safety
+/// `out` must address `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_world_images(out: *mut u8, cap: usize) -> u32 {
+    let text = WORLD.with(|cell| {
+        let world = cell.borrow();
+        let items: Vec<String> = world
+            .iter()
+            .flat_map(|w| w.textures.iter().enumerate())
+            .filter_map(|(i, t)| {
+                t.encoded.as_ref().map(|e| {
+                    format!(
+                        r#"{{"texture":{i},"mime":"{}","srgb":{},"width":{},"height":{},"size":{}}}"#,
+                        e.mime,
+                        t.srgb,
+                        t.width,
+                        t.height,
+                        e.data.len()
+                    )
+                })
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    });
+    // SAFETY: forwarded.
+    unsafe { give(text.as_bytes(), out, cap) }
+}
+
+/// Copies texture `texture`'s encoded image to `out` when it fits in `cap` bytes; returns its
+/// length (0 when the texture is not encoded).
+///
+/// # Safety
+/// `out` must address `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_world_image(texture: u32, out: *mut u8, cap: usize) -> u32 {
+    WORLD.with(|cell| {
+        let world = cell.borrow();
+        let Some(e) = world
+            .as_ref()
+            .and_then(|w| w.textures.get(texture as usize))
+            .and_then(|t| t.encoded.as_ref())
+        else {
+            return 0;
+        };
+        // SAFETY: forwarded.
+        unsafe { give(&e.data, out, cap) }
+    })
+}
+
+/// Replaces texture `texture`'s encoded image with its decoded pixels (`width` x `height`
+/// RGBA8, `len` bytes at `ptr`, read during the call; the engine makes the mips). Returns 1, or
+/// 0 after logging why not.
+///
+/// # Safety
+/// `ptr` must address `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_world_set_image(
+    texture: u32,
+    width: u32,
+    height: u32,
+    ptr: *const u8,
+    len: usize,
+) -> u32 {
+    // SAFETY: the caller passes a readable range.
+    let rgba = if len == 0 || ptr.is_null() {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    };
+    let done = WORLD.with(|cell| {
+        let mut world = cell.borrow_mut();
+        let t = world
+            .as_mut()
+            .and_then(|w| w.textures.get_mut(texture as usize))
+            .ok_or_else(|| format!("no texture {texture} in the loaded world"))?;
+        if (width, height) != (t.width, t.height)
+            || len as u64 != u64::from(width) * u64::from(height) * 4
+        {
+            return Err(format!(
+                "texture {texture}: {width}x{height} pixels ({len} bytes) for a {}x{} image",
+                t.width, t.height
+            ));
+        }
+        t.encoded = None;
+        t.levels = vec![rgba.to_vec()];
+        Ok(())
+    });
+    match done {
+        Ok(()) => 1,
+        Err(e) => {
+            say(2, &e);
             0
         }
     }

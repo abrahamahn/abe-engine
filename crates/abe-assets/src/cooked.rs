@@ -1,31 +1,54 @@
 //! ABEW cooked worlds. Little-endian, deterministic bytes; every count is bounded and checked
 //! against the remaining input before allocation, and trailing bytes are rejected.
 //!
-//! Version 2 (written): header `ABEW`, version, then counts of meshes, instances, materials,
+//! Version 3 (written): header `ABEW`, version, then counts of meshes, instances, materials,
 //! textures and lights, followed by those sections in that order.
-//! - mesh: position count, index count, flags (1 normals, 2 UVs), colour (3 f32), material
-//!   (`u32::MAX` for none), positions (3 f32 each), normals, UVs (2 f32 each), indices (u32).
+//! - mesh: position count, index count, flags (1 normals, 2 UVs, 4 16-bit indices, 32 coded),
+//!   colour (3 f32), material (`u32::MAX` for none), then either the plain arrays (positions
+//!   and normals as 3 f32, UVs as 2 f32, indices as u16 (zero-padded to 4 bytes) or u32) or,
+//!   when coded, the stream's length and a zlib stream zero-padded to 4 bytes holding, in
+//!   order: the indices with vertices numbered in order of first use, each as a LEB128 varint
+//!   (0 for the next new vertex, otherwise how far below it); positions on a 0.5 mm grid; then
+//!   octahedral normals with 12-bit components; then UVs on a 1/8192 grid. Each attribute is
+//!   coded as zigzag deltas from the previous vertex, stored byte plane by byte plane (all low
+//!   bytes first): 4 planes per position or UV component, 2 per normal component.
 //! - instance: mesh, column-major affine transform (16 f32).
 //! - material: name byte length, UTF-8 name zero-padded to 4 bytes, base colour (4 f32),
 //!   base colour texture, normal texture, normal scale, emissive (3 f32), emissive texture,
 //!   metallic, roughness, alpha mode (0 opaque, 1 mask, 2 blend), alpha cutoff (0 unless mask),
 //!   double-sided (0/1), shading (0 standard, 1 foliage, 2 water, 3 unlit), emission
 //!   (0 constant, 1 lamp). Absent textures are `u32::MAX`.
-//! - texture: width, height, sRGB (0/1), level count (the complete chain), then each level's
-//!   RGBA8 texels; level sizes follow from the dimensions.
+//! - texture: width, height, sRGB (0/1), kind. Kind 0: level count (the complete chain, or 1
+//!   for the top level alone), then each level's RGBA8 texels. Kind 1: an encoded image (MIME
+//!   type length, the type zero-padded to 4 bytes, data length, the data zero-padded to 4).
 //! - light: position (3 f32), colour (3 f32), intensity, range.
+//!
+//! Version 2 (read only): as version 3 with mesh flags 1 and 2 only (f32 positions and
+//! normals, u32 indices) and textures without a kind (always the complete chain).
 //!
 //! Version 1 (read only): mesh and instance counts, then meshes as position count, index
 //! count, colour, positions and indices, then instances as above.
 use abe_core::{
     Vec3,
     world::{
-        AlphaMode, Emission, Instance, MAX_LIGHTS, MAX_MATERIALS, MAX_NAME_BYTES, MAX_TEXTURE_SIZE,
-        MAX_TEXTURES, Material, Mesh, PointLight, Shading, Texture, Transform, World,
+        AlphaMode, Emission, EncodedImage, IMAGE_TYPES, Instance, MAX_LIGHTS, MAX_MATERIALS,
+        MAX_NAME_BYTES, MAX_TEXTURE_SIZE, MAX_TEXTURES, Material, Mesh, PointLight, Shading,
+        Texture, Transform, World,
     },
 };
 const MAGIC: &[u8; 4] = b"ABEW";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
+/// Mesh flags.
+const NORMALS: u32 = 1;
+const UVS: u32 = 2;
+const SHORT_INDICES: u32 = 4;
+const CODED: u32 = 32;
+/// Coded meshes: the position grid (metres), the UV grid and the octahedral normal range.
+const POSITION_GRID: f32 = 0.0005;
+const UV_GRID: f32 = 1.0 / 8192.0;
+const NORMAL_RANGE: f32 = 2047.0;
+/// Grid values stay within ±2^30, so deltas fit 32-bit zigzag codes.
+const GRID_LIMIT: f64 = 1_073_741_823.0;
 pub const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_MESHES: usize = 65_536;
 const MAX_INSTANCES: usize = 250_000;
@@ -64,28 +87,257 @@ pub fn version(data: &[u8]) -> Option<u32> {
     (magic == MAGIC).then(|| u32::from_le_bytes(*v))
 }
 
+/// Octahedral encoding of a unit vector: two components in -1..1.
+fn oct_encode(n: Vec3) -> [f32; 2] {
+    let Vec3(x, y, z) = n;
+    let l1 = x.abs() + y.abs() + z.abs();
+    if l1.is_nan() || l1 <= 0.0 || !l1.is_finite() {
+        return [0.0, 0.0];
+    }
+    let (mut px, mut py) = (x / l1, y / l1);
+    if z < 0.0 {
+        let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
+        (px, py) = ((1.0 - py.abs()) * sign(px), (1.0 - px.abs()) * sign(py));
+    }
+    [px, py]
+}
+
+fn oct_decode([mut px, mut py]: [f32; 2]) -> Vec3 {
+    let z = 1.0 - px.abs() - py.abs();
+    if z < 0.0 {
+        let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
+        (px, py) = ((1.0 - py.abs()) * sign(px), (1.0 - px.abs()) * sign(py));
+    }
+    let l = (px * px + py * py + z * z).sqrt();
+    if l > 0.0 {
+        Vec3(px / l, py / l, z / l)
+    } else {
+        Vec3(0.0, 1.0, 0.0)
+    }
+}
+
+fn pad4(v: &mut Vec<u8>) {
+    v.resize(v.len().next_multiple_of(4), 0);
+}
+
+fn zigzag(v: i64) -> u32 {
+    ((v << 1) ^ (v >> 63)) as u32
+}
+
+fn unzigzag(u: u32) -> i64 {
+    i64::from(u >> 1) ^ -i64::from(u & 1)
+}
+
+fn put_varint(v: &mut Vec<u8>, mut n: u64) {
+    while n >= 0x80 {
+        v.push((n as u8 & 0x7F) | 0x80);
+        n >>= 7;
+    }
+    v.push(n as u8);
+}
+
+/// Appends `values` byte plane by byte plane, `width` planes.
+fn put_planes(v: &mut Vec<u8>, values: &[u32], width: usize) {
+    for plane in 0..width {
+        v.extend(values.iter().map(|x| (x >> (8 * plane)) as u8));
+    }
+}
+
+/// Zigzag deltas of grid values, `components` per vertex.
+fn deltas(values: &[i64], components: usize) -> Vec<u32> {
+    let mut prev = vec![0i64; components];
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let c = i % components;
+            let d = v - prev[c];
+            prev[c] = v;
+            zigzag(d)
+        })
+        .collect()
+}
+
+fn on_grid(c: f32, step: f32, what: &str) -> Result<i64, String> {
+    let q = (f64::from(c) / f64::from(step)).round();
+    if q.is_nan() || q.abs() > GRID_LIMIT {
+        return Err(format!(
+            "{what} {c} is too far out to code; cook it exactly"
+        ));
+    }
+    Ok(q as i64)
+}
+
+/// A mesh's coded stream (see the module notes) and its vertex count.
+fn code_mesh(m: &Mesh) -> Result<(usize, Vec<u8>), String> {
+    let mut first = vec![u32::MAX; m.positions.len()];
+    let mut order = Vec::new();
+    let mut v = Vec::with_capacity(m.indices.len() * 2);
+    let mut next: u64 = 0;
+    for &i in &m.indices {
+        let i = i as usize;
+        if first[i] == u32::MAX {
+            first[i] = order.len() as u32;
+            order.push(i);
+        }
+        let k = u64::from(first[i]);
+        if k == next {
+            put_varint(&mut v, 0);
+            next += 1;
+        } else {
+            put_varint(&mut v, next - k);
+        }
+    }
+    let mut grid = Vec::with_capacity(order.len() * 3);
+    for &i in &order {
+        let Vec3(x, y, z) = m.positions[i];
+        for c in [x, y, z] {
+            grid.push(on_grid(c, POSITION_GRID, "position")?);
+        }
+    }
+    put_planes(&mut v, &deltas(&grid, 3), 4);
+    if !m.normals.is_empty() {
+        let oct: Vec<i64> = order
+            .iter()
+            .flat_map(|&i| oct_encode(m.normals[i]))
+            .map(|c| (c * NORMAL_RANGE).round() as i64)
+            .collect();
+        put_planes(&mut v, &deltas(&oct, 2), 2);
+    }
+    if !m.uvs.is_empty() {
+        let mut uv = Vec::with_capacity(order.len() * 2);
+        for &i in &order {
+            for c in m.uvs[i] {
+                uv.push(on_grid(c, UV_GRID, "uv")?);
+            }
+        }
+        put_planes(&mut v, &deltas(&uv, 2), 4);
+    }
+    Ok((order.len(), crate::zlib::compress(&v)))
+}
+
+/// Reads a coded mesh's stream back into its arrays.
+#[allow(clippy::type_complexity)]
+fn decode_mesh(
+    data: &[u8],
+    n: usize,
+    k: usize,
+    normals: bool,
+    uvs: bool,
+) -> Result<(Vec<Vec3>, Vec<Vec3>, Vec<[f32; 2]>, Vec<u32>), String> {
+    let mut at = 0usize;
+    let mut indices = Vec::with_capacity(k);
+    let mut next: u64 = 0;
+    for _ in 0..k {
+        let mut code: u64 = 0;
+        let mut shift = 0;
+        loop {
+            let b = *data.get(at).ok_or("truncated mesh indices")?;
+            at += 1;
+            if shift > 56 {
+                return Err("overlong index code".into());
+            }
+            code |= u64::from(b & 0x7F) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        let index = if code == 0 {
+            next += 1;
+            next - 1
+        } else {
+            next.checked_sub(code)
+                .ok_or("index code before the first vertex")?
+        };
+        if index >= n as u64 {
+            return Err("index outside the mesh".into());
+        }
+        indices.push(index as u32);
+    }
+    if next != n as u64 {
+        return Err("coded mesh has unused vertices".into());
+    }
+    let mut planes = |count: usize, width: usize| -> Result<Vec<u32>, String> {
+        let bytes = data
+            .get(at..at + count * width)
+            .ok_or("truncated mesh attributes")?;
+        at += count * width;
+        Ok((0..count)
+            .map(|i| {
+                (0..width).fold(0u32, |acc, p| {
+                    acc | u32::from(bytes[p * count + i]) << (8 * p)
+                })
+            })
+            .collect())
+    };
+    let undelta = |codes: Vec<u32>, components: usize| -> Vec<i64> {
+        let mut prev = vec![0i64; components];
+        codes
+            .into_iter()
+            .enumerate()
+            .map(|(i, z)| {
+                let c = i % components;
+                prev[c] += unzigzag(z);
+                prev[c]
+            })
+            .collect()
+    };
+    let grid = undelta(planes(n * 3, 4)?, 3);
+    let positions = grid
+        .chunks_exact(3)
+        .map(|c| {
+            let f = |q: i64| (q as f64 * f64::from(POSITION_GRID)) as f32;
+            Vec3(f(c[0]), f(c[1]), f(c[2]))
+        })
+        .collect();
+    let normals = if normals {
+        undelta(planes(n * 2, 2)?, 2)
+            .chunks_exact(2)
+            .map(|c| {
+                let f = |q: i64| (q as f32 / NORMAL_RANGE).clamp(-1.0, 1.0);
+                oct_decode([f(c[0]), f(c[1])])
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    let uvs = if uvs {
+        undelta(planes(n * 2, 4)?, 2)
+            .chunks_exact(2)
+            .map(|c| {
+                let f = |q: i64| (q as f64 * f64::from(UV_GRID)) as f32;
+                [f(c[0]), f(c[1])]
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    if at != data.len() {
+        return Err("trailing bytes in a coded mesh".into());
+    }
+    Ok((positions, normals, uvs, indices))
+}
+
+/// Encodes a world exactly: f32 positions and normals (16-bit indices where they fit, and
+/// encoded images as they are), so decoding gives the same world back.
 pub fn encode(w: &World) -> Result<Vec<u8>, String> {
+    encode_with(w, false)
+}
+
+/// Encodes a world compactly for delivery: each mesh coded (see the module notes) with
+/// positions within 0.25 mm, normals within about 0.05 degrees and UVs within 1/16384 of the
+/// original. Vertices come back in order of first use, without the unused ones.
+pub fn encode_compact(w: &World) -> Result<Vec<u8>, String> {
+    encode_with(w, true)
+}
+
+fn encode_with(w: &World, compact: bool) -> Result<Vec<u8>, String> {
     w.validate()?;
     if w.meshes.len() > MAX_MESHES || w.instances.len() > MAX_INSTANCES {
         return Err("too many meshes or instances".into());
     }
-    let mut size =
-        28 + INSTANCE_BYTES * w.instances.len() as u64 + LIGHT_BYTES * w.lights.len() as u64;
-    for m in &w.meshes {
-        let n = m.positions.len() as u64;
-        size += MESH_BYTES + 12 * n + 4 * m.indices.len() as u64;
-        size += 12 * m.normals.len() as u64 + 8 * m.uvs.len() as u64;
-    }
-    for m in &w.materials {
-        size += MATERIAL_BYTES + padded(m.name.len());
-    }
-    for t in &w.textures {
-        size += 16 + t.levels.iter().map(|l| l.len() as u64).sum::<u64>();
-    }
-    if size > MAX_BYTES as u64 {
-        return Err("cooked file too large".into());
-    }
-    let mut v = Vec::with_capacity(size as usize);
+    let mut v = Vec::new();
     v.extend_from_slice(MAGIC);
     put_u32(&mut v, VERSION as usize)?;
     for n in [
@@ -98,20 +350,52 @@ pub fn encode(w: &World) -> Result<Vec<u8>, String> {
         put_u32(&mut v, n)?;
     }
     for m in &w.meshes {
-        put_u32(&mut v, m.positions.len())?;
-        put_u32(&mut v, m.indices.len())?;
-        let flags = usize::from(!m.normals.is_empty()) | usize::from(!m.uvs.is_empty()) << 1;
-        put_u32(&mut v, flags)?;
-        put_floats(&mut v, &m.color);
-        put_index(&mut v, m.material);
-        for &Vec3(x, y, z) in m.positions.iter().chain(&m.normals) {
-            put_floats(&mut v, &[x, y, z]);
+        let mut flags = 0;
+        if !m.normals.is_empty() {
+            flags |= NORMALS;
         }
-        for uv in &m.uvs {
-            put_floats(&mut v, uv);
+        if !m.uvs.is_empty() {
+            flags |= UVS;
         }
-        for i in &m.indices {
-            v.extend_from_slice(&i.to_le_bytes());
+        if compact {
+            let (n, stream) = code_mesh(m)?;
+            put_u32(&mut v, n)?;
+            put_u32(&mut v, m.indices.len())?;
+            put_u32(&mut v, (flags | CODED) as usize)?;
+            put_floats(&mut v, &m.color);
+            put_index(&mut v, m.material);
+            put_u32(&mut v, stream.len())?;
+            v.extend_from_slice(&stream);
+            pad4(&mut v);
+        } else {
+            let n = m.positions.len();
+            if n <= 65_536 {
+                flags |= SHORT_INDICES;
+            }
+            put_u32(&mut v, n)?;
+            put_u32(&mut v, m.indices.len())?;
+            put_u32(&mut v, flags as usize)?;
+            put_floats(&mut v, &m.color);
+            put_index(&mut v, m.material);
+            for &Vec3(x, y, z) in m.positions.iter().chain(&m.normals) {
+                put_floats(&mut v, &[x, y, z]);
+            }
+            for uv in &m.uvs {
+                put_floats(&mut v, uv);
+            }
+            if flags & SHORT_INDICES != 0 {
+                for &i in &m.indices {
+                    v.extend_from_slice(&(i as u16).to_le_bytes());
+                }
+                pad4(&mut v);
+            } else {
+                for i in &m.indices {
+                    v.extend_from_slice(&i.to_le_bytes());
+                }
+            }
+        }
+        if v.len() > MAX_BYTES {
+            return Err("cooked file too large".into());
         }
     }
     for i in &w.instances {
@@ -144,9 +428,26 @@ pub fn encode(w: &World) -> Result<Vec<u8>, String> {
         put_u32(&mut v, t.width as usize)?;
         put_u32(&mut v, t.height as usize)?;
         put_u32(&mut v, usize::from(t.srgb))?;
-        put_u32(&mut v, t.levels.len())?;
-        for level in &t.levels {
-            v.extend_from_slice(level);
+        match &t.encoded {
+            None => {
+                put_u32(&mut v, 0)?;
+                put_u32(&mut v, t.levels.len())?;
+                for level in &t.levels {
+                    v.extend_from_slice(level);
+                }
+            }
+            Some(e) => {
+                put_u32(&mut v, 1)?;
+                put_u32(&mut v, e.mime.len())?;
+                v.extend_from_slice(e.mime.as_bytes());
+                pad4(&mut v);
+                put_u32(&mut v, e.data.len())?;
+                v.extend_from_slice(&e.data);
+                pad4(&mut v);
+            }
+        }
+        if v.len() > MAX_BYTES {
+            return Err("cooked file too large".into());
         }
     }
     for l in &w.lights {
@@ -155,7 +456,9 @@ pub fn encode(w: &World) -> Result<Vec<u8>, String> {
         put_floats(&mut v, &l.color);
         put_floats(&mut v, &[l.intensity, l.range]);
     }
-    debug_assert_eq!(v.len() as u64, size);
+    if v.len() > MAX_BYTES {
+        return Err("cooked file too large".into());
+    }
     Ok(v)
 }
 
@@ -245,7 +548,7 @@ fn decode_v1(r: &mut Read) -> Result<World, String> {
     Ok(world)
 }
 
-fn decode_v2(r: &mut Read) -> Result<World, String> {
+fn decode_v2(r: &mut Read, version: u32) -> Result<World, String> {
     let [meshes, instance_count, materials, textures, lights] =
         [(); 5].map(|()| r.uint().map(|n| n as usize));
     let (meshes, instance_count, materials, textures, lights) =
@@ -272,26 +575,64 @@ fn decode_v2(r: &mut Read) -> Result<World, String> {
         lights: Vec::with_capacity(lights),
         ..World::default()
     };
+    let known = if version >= 3 {
+        NORMALS | UVS | SHORT_INDICES | CODED
+    } else {
+        NORMALS | UVS
+    };
     for _ in 0..meshes {
         let n = r.uint()? as usize;
         let k = r.uint()? as usize;
         let flags = r.uint()?;
         let color = r.floats()?;
         let material = r.index()?;
-        if k % 3 != 0 || flags > 3 {
+        if k % 3 != 0
+            || flags & !known != 0
+            || (flags & SHORT_INDICES != 0 && (n > 65_536 || flags & CODED != 0))
+        {
             return Err("invalid mesh ranges".into());
         }
-        let (normals, uvs) = (flags & 1 != 0, flags & 2 != 0);
-        let per_vertex = 12 + 12 * u64::from(normals) + 8 * u64::from(uvs);
-        r.holds(n as u64 * per_vertex + k as u64 * 4)?;
-        let positions = r.vec3s(n)?;
-        let normals = if normals { r.vec3s(n)? } else { vec![] };
-        let uvs = if uvs {
-            (0..n).map(|_| r.floats()).collect::<Result<_, _>>()?
+        let (normals, uvs) = (flags & NORMALS != 0, flags & UVS != 0);
+        let (positions, normals, uvs, indices) = if flags & CODED != 0 {
+            let len = r.uint()? as usize;
+            let raw = r.bytes(padded(len))?;
+            if raw[len..].iter().any(|&b| b != 0) {
+                return Err("nonzero mesh stream padding".into());
+            }
+            // Every vertex is used, so a mesh has at most as many vertices as indices.
+            if n > k || k > MAX_BYTES {
+                return Err("invalid coded mesh counts".into());
+            }
+            let limit = k * 10 + n * (12 + 4 * usize::from(normals) + 8 * usize::from(uvs));
+            let data = crate::zlib::decompress(&raw[..len], limit)?;
+            decode_mesh(&data, n, k, normals, uvs)?
         } else {
-            vec![]
+            let n64 = n as u64;
+            let index_bytes = if flags & SHORT_INDICES != 0 {
+                padded(k * 2)
+            } else {
+                4 * k as u64
+            };
+            let per_vertex = 12 + 12 * u64::from(normals) + 8 * u64::from(uvs);
+            r.holds(n64 * per_vertex + index_bytes)?;
+            let positions = r.vec3s(n)?;
+            let normals = if normals { r.vec3s(n)? } else { vec![] };
+            let uvs = if uvs {
+                (0..n).map(|_| r.floats()).collect::<Result<_, _>>()?
+            } else {
+                vec![]
+            };
+            let indices = if flags & SHORT_INDICES != 0 {
+                let raw = r.bytes(padded(k * 2))?;
+                raw.chunks_exact(2)
+                    .take(k)
+                    .map(|c| u32::from(u16::from_le_bytes([c[0], c[1]])))
+                    .collect()
+            } else {
+                (0..k).map(|_| r.uint()).collect::<Result<_, _>>()?
+            };
+            (positions, normals, uvs, indices)
         };
-        let indices = (0..k).map(|_| r.uint()).collect::<Result<_, _>>()?;
         world.meshes.push(Mesh {
             positions,
             normals,
@@ -353,12 +694,42 @@ fn decode_v2(r: &mut Read) -> Result<World, String> {
     for _ in 0..textures {
         let [width, height] = [r.uint()?, r.uint()?];
         let srgb = r.choice(2)? == 1;
-        let count = r.uint()? as usize;
         let limit = 1..=MAX_TEXTURE_SIZE;
-        if !limit.contains(&width)
-            || !limit.contains(&height)
-            || count != Texture::level_count(width, height)
-        {
+        if !limit.contains(&width) || !limit.contains(&height) {
+            return Err("invalid texture size".into());
+        }
+        let kind = if version >= 3 { r.choice(2)? } else { 0 };
+        if kind == 1 {
+            let len = r.uint()? as usize;
+            if len > 64 {
+                return Err("image type too long".into());
+            }
+            let raw = r.bytes(padded(len))?;
+            let mime = std::str::from_utf8(&raw[..len]).map_err(|_| "image type is not UTF-8")?;
+            if !IMAGE_TYPES.contains(&mime) || raw[len..].iter().any(|&b| b != 0) {
+                return Err(format!("unsupported image type {mime:?}"));
+            }
+            let size = r.uint()? as usize;
+            r.holds(padded(size))?;
+            let data = r.bytes(padded(size))?;
+            if data[size..].iter().any(|&b| b != 0) {
+                return Err("nonzero image padding".into());
+            }
+            world.textures.push(Texture {
+                width,
+                height,
+                srgb,
+                levels: vec![],
+                encoded: Some(EncodedImage {
+                    mime: mime.to_string(),
+                    data: data[..size].to_vec(),
+                }),
+            });
+            continue;
+        }
+        let count = r.uint()? as usize;
+        let full = Texture::level_count(width, height);
+        if count != full && !(version >= 3 && count == 1) {
             return Err("invalid texture size or mip chain".into());
         }
         let sizes: Vec<u64> = (0..count)
@@ -377,6 +748,7 @@ fn decode_v2(r: &mut Read) -> Result<World, String> {
             height,
             srgb,
             levels,
+            encoded: None,
         });
     }
     for _ in 0..lights {
@@ -393,7 +765,7 @@ fn decode_v2(r: &mut Read) -> Result<World, String> {
     Ok(world)
 }
 
-/// Decode an ABEW file of version 1 or 2.
+/// Decode an ABEW file of version 1, 2 or 3.
 pub fn decode(data: &[u8]) -> Result<World, String> {
     if data.len() > MAX_BYTES {
         return Err("cooked file too large".into());
@@ -404,7 +776,7 @@ pub fn decode(data: &[u8]) -> Result<World, String> {
     }
     let world = match r.uint()? {
         1 => decode_v1(&mut r)?,
-        2 => decode_v2(&mut r)?,
+        v @ (2 | 3) => decode_v2(&mut r, v)?,
         _ => return Err("unsupported ABEW header or version".into()),
     };
     if !r.0.is_empty() {

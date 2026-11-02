@@ -142,14 +142,26 @@ impl Default for Material {
         }
     }
 }
-/// RGBA8 texels, level 0 first. Level `i` is `max(1, width >> i)` by `max(1, height >> i)`,
-/// and the chain is complete down to 1x1.
+/// An image kept in its file format for the host to decode: browsers decode PNG, JPEG and WebP
+/// natively, and the engine decodes PNG itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncodedImage {
+    /// `image/png`, `image/jpeg` or `image/webp`.
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+pub const IMAGE_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/webp"];
+
+/// RGBA8 texels, level 0 first. Level `i` is `max(1, width >> i)` by `max(1, height >> i)`;
+/// `levels` holds the complete chain down to 1x1, or only level 0 (the renderer makes the
+/// rest), or nothing while the image is still `encoded`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Texture {
     pub width: u32,
     pub height: u32,
     pub srgb: bool,
     pub levels: Vec<Vec<u8>>,
+    pub encoded: Option<EncodedImage>,
 }
 impl Texture {
     /// Levels in a complete chain for a nonempty texture.
@@ -168,7 +180,17 @@ impl Texture {
                 self.width, self.height
             ));
         }
-        if self.levels.len() != Self::level_count(self.width, self.height) {
+        if let Some(e) = &self.encoded {
+            if !self.levels.is_empty() {
+                return Err("an encoded image also has texels".into());
+            }
+            if !IMAGE_TYPES.contains(&e.mime.as_str()) || e.data.is_empty() {
+                return Err(format!("encoded image of type {:?}", e.mime));
+            }
+            return Ok(());
+        }
+        let full = Self::level_count(self.width, self.height);
+        if self.levels.len() != full && self.levels.len() != 1 {
             return Err("incomplete mip chain".into());
         }
         for (i, level) in self.levels.iter().enumerate() {

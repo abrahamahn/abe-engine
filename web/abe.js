@@ -1330,6 +1330,47 @@ async function fetchInto(url, exports, onProgress) {
 
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
 
+/**
+ * Decodes the loaded world's JPEG and WebP images with the browser's decoders and hands the
+ * pixels to the engine. PNGs stay for the engine's own decoder, which keeps the colour of
+ * transparent pixels (a 2D canvas premultiplies them away, darkening filtered edges).
+ */
+async function decodeWorldImages(x, onLog) {
+  const read = (call) => {
+    const len = call(0, 0);
+    if (!len) return new Uint8Array(0);
+    const p = x.abe_alloc(len) >>> 0;
+    call(p, len);
+    const out = new Uint8Array(x.memory.buffer, p, len).slice();
+    x.abe_free(p, len);
+    return out;
+  };
+  const list = JSON.parse(new TextDecoder().decode(read((p, cap) => x.abe_world_images(p, cap))))
+    .filter((im) => im.mime !== 'image/png');
+  const decoded = await Promise.all(list.map(async (im) => {
+    const bytes = read((p, cap) => x.abe_world_image(im.texture, p, cap));
+    try {
+      const bitmap = await createImageBitmap(new Blob([bytes], { type: im.mime }),
+        { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+      const pixels = pixelsOf(bitmap);
+      if (bitmap.close) bitmap.close();
+      return { im, pixels };
+    } catch (e) {
+      onLog(1, `world image ${im.texture} (${im.mime}) not decoded: ${e.message}`);
+      return null;
+    }
+  }));
+  for (const d of decoded) {
+    if (!d) continue;
+    const { width, height, data } = d.pixels;
+    const p = x.abe_alloc(data.length) >>> 0;
+    new Uint8Array(x.memory.buffer, p, data.length).set(data);
+    x.abe_world_set_image(d.im.texture, width, height, p, data.length);
+    x.abe_free(p, data.length);
+  }
+  return list.length;
+}
+
 /** WebGPU, the host and the wasm module; shared by the player and the self-test. */
 async function boot(options) {
   const { canvas, onPhase = () => {}, onLog = () => {} } = options;
@@ -1455,6 +1496,8 @@ export async function startPlayer(options) {
   if (!call('decoding', () => x.abe_load_world(world.ptr, world.len))) {
     throw new Error(errors[errors.length - 1] || 'the world could not be decoded');
   }
+  onPhase('Decoding images', 1);
+  await decodeWorldImages(x, options.onLog || (() => {}));
   let lookText = '';
   if (options.look) {
     onPhase('Loading the look', 1);
@@ -1683,8 +1726,8 @@ export async function createEngine(options) {
   const f32 = (a) => (a instanceof Float32Array ? a : new Float32Array(a));
   const out = (n) => new Float32Array(x.memory.buffer, reserve(n * 4), n);
 
-  // The world and the Look.
-  let world = { ptr: 0, len: 0 };
+  // The world (decoded, its images decoded by the browser) and the Look.
+  let world = null;
   if (typeof options.world === 'string') {
     world = await fetchInto(options.world, x, (p, bytes) =>
       (options.onPhase || (() => {}))(`Downloading the world (${(bytes / 1048576).toFixed(1)} MB)`, p));
@@ -1694,13 +1737,17 @@ export async function createEngine(options) {
     new Uint8Array(x.memory.buffer, ptr, bytes.length).set(bytes);
     world = { ptr, len: bytes.length };
   }
+  if (world) {
+    (options.onPhase || (() => {}))('Decoding the world', 1);
+    if (!x.abe_load_world(world.ptr, world.len)) throw fail('world');
+    await decodeWorldImages(x, onLog);
+  }
   const lookText = options.look == null ? ''
     : (typeof options.look === 'string' ? options.look : JSON.stringify(options.look));
   const lookBytes = text(lookText);
   const [lookPtr] = place(lookBytes);
   (options.onPhase || (() => {}))('Compiling shaders and uploading', 1);
-  ok('start', x.abe_rt_start(world.ptr, world.len, lookPtr, lookBytes.length,
-    options.quality === 'still' ? 1 : 0));
+  ok('start', x.abe_rt_start(0, 0, lookPtr, lookBytes.length, options.quality === 'still' ? 1 : 0));
 
   let inFlight = 0;
   let stopped = false;
@@ -1900,6 +1947,13 @@ export async function createEngine(options) {
         bytes: fetchOut((at, cap) => x.abe_rt_model_image(parsed, i, at, cap)),
       }));
       const textures = await Promise.all(encoded.map(async (im) => {
+        if (im.mime === 'image/png') {
+          // The engine's decoder keeps the colour of transparent pixels.
+          const [p] = place(im.bytes);
+          const t = x.abe_rt_texture_png(p, im.bytes.length, im.srgb ? 1 : 0);
+          if (!t) onLog(1, `model image ${im.name || ''} not decoded: ${lastError}`);
+          return t;
+        }
         try {
           const bitmap = await createImageBitmap(new Blob([im.bytes], { type: im.mime }),
             { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
