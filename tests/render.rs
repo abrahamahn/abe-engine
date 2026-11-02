@@ -2093,6 +2093,149 @@ fn models_pose_skin_and_place() {
     assert!(errors.is_empty(), "validation: {errors:?}");
 }
 
+/// Morph targets on a model node with two primitives: a target stretches two boxes whose top
+/// corners lie scattered through their vertices, another lifts a third box in the second
+/// primitive only. Each weight moves what it should, whichever changed last.
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn models_morph_scattered_vertices() {
+    use abe_engine::anim::morphed_vertices;
+    use abe_engine::assets::model::{
+        Material as ModelMaterial, Mesh as ModelMesh, Model, MorphTarget, Node, Primitive,
+    };
+    let mut device = Device::headless().expect("device");
+    let world = World {
+        instances: vec![Instance {
+            mesh: 0,
+            transform: Transform::IDENTITY,
+        }],
+        meshes: vec![quad(0.0, 20.0, 0)],
+        materials: vec![material(
+            "ground",
+            [0.15, 0.15, 0.15, 1.0],
+            Shading::Standard,
+        )],
+        textures: vec![],
+        lights: vec![],
+    };
+    let mut r = Renderer::new(
+        &mut device,
+        &world,
+        Look::default(),
+        Quality::realtime(),
+        (W, H),
+        Output::Still,
+    )
+    .expect("renderer");
+    // Boxes 0.6 m across on the ground; a target raises every top corner 1 m.
+    let boxes = |xs: &[f32]| {
+        let mut p = Primitive {
+            material: Some(0),
+            ..Primitive::default()
+        };
+        let mut raise = vec![];
+        for &x in xs {
+            let m = cube([x, 0.3, 0.0], 0.3, 0);
+            let base = p.positions.len() as u32;
+            for v in &m.positions {
+                p.positions.push([v.0, v.1, v.2]);
+                raise.push([0.0, if v.1 > 0.5 { 1.0 } else { 0.0 }, 0.0]);
+            }
+            p.normals.extend(m.normals.iter().map(|n| [n.0, n.1, n.2]));
+            p.uvs.extend(&m.uvs);
+            p.indices.extend(m.indices.iter().map(|i| i + base));
+        }
+        (p, raise)
+    };
+    let (mut pair, stretch) = boxes(&[-1.6, 0.0]);
+    let (mut single, lift) = boxes(&[1.6]);
+    let none = |p: &Primitive| MorphTarget {
+        positions: vec![[0.0; 3]; p.positions.len()],
+        normals: vec![],
+    };
+    pair.targets = vec![
+        MorphTarget {
+            positions: stretch,
+            normals: vec![],
+        },
+        none(&pair),
+    ];
+    single.targets = vec![
+        none(&single),
+        MorphTarget {
+            positions: lift,
+            normals: vec![],
+        },
+    ];
+    let mut model = Model {
+        nodes: vec![Node {
+            name: "boxes".into(),
+            parent: None,
+            children: vec![],
+            translation: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+            mesh: Some(0),
+            skin: None,
+            weights: None,
+        }],
+        roots: vec![0],
+        ..Model::default()
+    };
+    model.meshes = vec![ModelMesh {
+        name: "boxes".into(),
+        primitives: vec![pair, single],
+        weights: vec![0.0, 0.0],
+        target_names: vec!["stretch".into(), "lift".into()],
+    }];
+    model.materials = vec![ModelMaterial {
+        name: "red".into(),
+        base_color: [0.9, 0.05, 0.05, 1.0],
+        unlit: true,
+        ..ModelMaterial::default()
+    }];
+    let id = r.create_model(&mut device, model, &[]).expect("model");
+    // The top corners, scattered through both boxes' faces, are gathered first.
+    let gathered = &r.model(id).expect("model").meshes[0].primitives[0];
+    assert_eq!(
+        morphed_vertices(gathered),
+        (0..24).collect::<Vec<u32>>(),
+        "moved vertices first"
+    );
+    let mut place = [0.0f32; 16];
+    for i in [0, 5, 10, 15] {
+        place[i] = 1.0;
+    }
+    let inst = r
+        .create_model_instance(&mut device, id, &place)
+        .expect("instance");
+    let size = (W, H);
+    let red_at = |img: &[u8], p: [f32; 3], r: &Renderer| {
+        let q = r.project(&view(), size, p).expect("in front");
+        let i = ((q[1] as u32 * W + q[0] as u32) * 4) as usize;
+        u32::from(img[i]) > u32::from(img[i + 2]) + 60
+    };
+    let tall = [[-1.6, 1.2, 0.3], [0.0, 1.2, 0.3], [1.6, 1.2, 0.3]];
+    let mut weigh = |r: &mut Renderer, weights: [f32; 2]| {
+        r.model_pose_mut(inst).expect("pose").weights[0] = weights.to_vec();
+        r.update_model_instance(&mut device, inst).expect("update");
+        let img = render(&mut device, r, 15.0, "clear");
+        tall.map(|p| red_at(&img, p, r))
+    };
+    assert_eq!(weigh(&mut r, [0.0, 0.0]), [false; 3], "all at rest");
+    assert_eq!(weigh(&mut r, [1.0, 0.0]), [true, true, false], "stretched");
+    assert_eq!(weigh(&mut r, [1.0, 1.0]), [true; 3], "and lifted");
+    assert_eq!(
+        weigh(&mut r, [0.0, 1.0]),
+        [false, false, true],
+        "lifted only"
+    );
+    assert_eq!(weigh(&mut r, [0.0, 0.0]), [false; 3], "at rest again");
+    r.destroy_model(&mut device, id);
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}
+
 fn math_translate(x: f32) -> [f32; 16] {
     let mut m = [0.0f32; 16];
     for i in [0, 5, 10, 15] {

@@ -4,7 +4,9 @@
 //! node, and skinned or morphed primitives get meshes of their own. A skinned primitive follows
 //! its joints on the GPU ([`Renderer::set_prop_mesh_skin`]): [`Renderer::update_model_instance`]
 //! hands it the pose's joint matrices, and morphs a primitive's vertices on the CPU only when
-//! its morph weights changed.
+//! the weight of a target that moves them changed. A morphed primitive's moved vertices are
+//! gathered at the front of its vertices as it is uploaded ([`anim::gather_morphed`]), so a
+//! morph rewrites one short run of them.
 //!
 //! Textures are the host's: it decodes the model's images (browsers decode PNG, JPEG and WebP
 //! natively) into prop textures and passes them in, one per image.
@@ -47,6 +49,8 @@ struct Part {
     morphed: Vec<f32>,
     /// The vertices its morph targets move (ascending): only they are morphed again.
     moved: Vec<u32>,
+    /// Per morph target: whether it moves any of them.
+    moving: Vec<bool>,
 }
 
 pub(super) struct InstanceEntry {
@@ -86,11 +90,13 @@ fn drawn_nodes(model: &Model) -> Vec<usize> {
 
 impl Renderer {
     /// Uploads a model: its materials (with `textures`, one prop texture per image of the
-    /// model, `None` where the host could not decode it) and its static primitives.
+    /// model, `None` where the host could not decode it) and its static primitives. A morphed
+    /// primitive keeps its vertices with those its targets move first ([`anim::gather_morphed`]),
+    /// as [`Self::model`] then gives it.
     pub fn create_model(
         &mut self,
         device: &mut Device<'_>,
-        model: Model,
+        mut model: Model,
         textures: &[Option<PropTexture>],
     ) -> Result<ModelId> {
         if textures.len() != model.images.len() {
@@ -154,6 +160,9 @@ impl Renderer {
                 cleanup(self, device, &materials, &[]);
                 return Err(e);
             }
+        }
+        for p in model.meshes.iter_mut().flat_map(|m| &mut m.primitives) {
+            anim::gather_morphed(p);
         }
         // Static primitives are shared; which are static depends on the nodes that use them.
         let mut needs_shared: Vec<Vec<bool>> = model
@@ -259,6 +268,7 @@ impl Renderer {
             skin: Option<Skin>,
             morphed: Vec<f32>,
             moved: Vec<u32>,
+            moving: Vec<bool>,
         }
         type Deformed = (Vec<[f32; 3]>, Vec<[f32; 3]>);
         type Skin = (Vec<[u16; 4]>, Vec<[f32; 4]>);
@@ -281,6 +291,7 @@ impl Renderer {
                     skin,
                     morphed: pose.weights[n].clone(),
                     moved: anim::morphed_vertices(p),
+                    moving: anim::moving_targets(p),
                 });
             }
         }
@@ -337,6 +348,7 @@ impl Renderer {
                     own,
                     morphed: plan.morphed,
                     moved: plan.moved,
+                    moving: plan.moving,
                 }),
                 Err(e) => {
                     if let Some(m) = own {
@@ -449,7 +461,8 @@ impl Renderer {
     }
 
     /// Applies the pose: node transforms, the joints of skinned primitives (skinned on the
-    /// GPU) and morphing (on the CPU, for a primitive whose morph weights changed).
+    /// GPU) and morphing (on the CPU, for a primitive where a target that moves its vertices
+    /// changed weight).
     pub fn update_model_instance(
         &mut self,
         device: &mut Device<'_>,
@@ -487,6 +500,10 @@ impl Renderer {
             let weights = &e.pose.weights[part.node];
             if !p.targets.is_empty() && part.morphed != *weights {
                 match (part.moved.first(), part.moved.last()) {
+                    // Only targets that move none of its vertices changed: nothing to rewrite.
+                    _ if !anim::morph_changes(&part.morphed, weights, &part.moving) => {
+                        morphs.push((k, own, Some(0), vec![], vec![], weights.clone()));
+                    }
                     // Without normals of its own the whole mesh is shaded again.
                     _ if p.normals.is_empty() => {
                         let (pos, nrm) = anim::deform(p, weights, None);

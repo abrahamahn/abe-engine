@@ -218,6 +218,90 @@ pub fn morphed_vertices(p: &Primitive) -> Vec<u32> {
         .collect()
 }
 
+/// Per morph target of `p`: whether it moves any vertex (by position or normal). A figure's
+/// face targets move nothing on its body.
+pub fn moving_targets(p: &Primitive) -> Vec<bool> {
+    p.targets
+        .iter()
+        .map(|t| {
+            t.positions
+                .iter()
+                .chain(&t.normals)
+                .any(|d| d.iter().any(|x| *x != 0.0))
+        })
+        .collect()
+}
+
+/// Whether morphing with `weights` rather than `from` moves a vertex: some target that moves one
+/// (`moving`, from [`moving_targets`]) changed weight.
+pub fn morph_changes(from: &[f32], weights: &[f32], moving: &[bool]) -> bool {
+    from.len() != weights.len()
+        || from
+            .iter()
+            .zip(weights)
+            .zip(moving)
+            .any(|((a, b), &moves)| moves && a != b)
+}
+
+/// Reorders `p`'s vertices so that those its morph targets move ([`morphed_vertices`]) come
+/// first, in their order, and the rest follow in theirs: a morph then rewrites one short run of
+/// the vertex buffer, however the modeller ordered them. Every per-vertex attribute moves with
+/// its vertex and the triangles are renumbered, so the primitive draws and deforms as before.
+pub fn gather_morphed(p: &mut Primitive) {
+    let moved = morphed_vertices(p);
+    // Nothing moves, or what moves is first already.
+    if moved
+        .last()
+        .is_none_or(|&last| last as usize + 1 == moved.len())
+    {
+        return;
+    }
+    let count = p.positions.len();
+    let mut is_moved = vec![false; count];
+    for &v in &moved {
+        is_moved[v as usize] = true;
+    }
+    let order: Vec<usize> = moved
+        .iter()
+        .map(|&v| v as usize)
+        .chain((0..count).filter(|&v| !is_moved[v]))
+        .collect();
+    let mut renumber = vec![0u32; count];
+    for (new, &old) in order.iter().enumerate() {
+        renumber[old] = new as u32;
+    }
+    fn reorder<T: Copy>(values: &mut Vec<T>, order: &[usize]) {
+        if values.len() == order.len() {
+            *values = order.iter().map(|&i| values[i]).collect();
+        }
+    }
+    // Every field named, so a new per-vertex attribute cannot be left out of order.
+    let Primitive {
+        positions,
+        normals,
+        uvs,
+        indices,
+        material: _,
+        joints,
+        weights,
+        targets,
+    } = p;
+    reorder(positions, &order);
+    reorder(normals, &order);
+    reorder(uvs, &order);
+    reorder(joints, &order);
+    reorder(weights, &order);
+    for t in targets {
+        reorder(&mut t.positions, &order);
+        reorder(&mut t.normals, &order);
+    }
+    for i in indices.iter_mut() {
+        if let Some(&new) = renumber.get(*i as usize) {
+            *i = new;
+        }
+    }
+}
+
 /// Positions and normals of `p`'s vertices `first..first + count` under morph `weights` (not
 /// skinned), where only `moved` ([`morphed_vertices`]) differ from the mesh: what
 /// [`deform`] gives for that range, without visiting the rest.
@@ -513,6 +597,68 @@ mod tests {
         // A wider range carries its unmoved vertices as modelled.
         let (pos, _) = morph_range(&p, &weights, &moved, 0, 3);
         assert!(close(&pos.concat(), &all_pos.concat()));
+    }
+
+    #[test]
+    fn gathering_puts_the_moved_vertices_first_and_deforms_as_before() {
+        let m = arm();
+        let mut p = m.meshes[0].primitives[0].clone();
+        // Two more vertices and a second triangle; the target moves only the last and the middle.
+        p.positions.extend([[0.2, 0.5, 0.0], [0.3, 1.5, 0.0]]);
+        p.normals.extend([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        p.uvs = vec![[0.0, 0.0], [0.1, 0.0], [0.2, 0.0], [0.3, 0.0], [0.4, 0.0]];
+        p.indices.extend([2, 3, 4]);
+        p.joints.extend([[1, 0, 0, 0], [0, 1, 0, 0]]);
+        p.weights
+            .extend([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]);
+        let push = [0.0, 0.0, 1.0];
+        p.targets = vec![
+            MorphTarget {
+                positions: vec![[0.0; 3], push, [0.0; 3], [0.0; 3], push],
+                normals: vec![],
+            },
+            MorphTarget {
+                positions: vec![[0.0; 3]; 5],
+                normals: vec![[0.0; 3]; 5],
+            },
+        ];
+        assert_eq!(moving_targets(&p), vec![true, false]);
+        let before = p.clone();
+        gather_morphed(&mut p);
+        assert_eq!(morphed_vertices(&p), vec![0, 1]);
+        // The moved vertices first in their order, then the rest in theirs.
+        let order = [1, 4, 0, 2, 3];
+        for (new, &old) in order.iter().enumerate() {
+            assert_eq!(p.positions[new], before.positions[old]);
+            assert_eq!(p.normals[new], before.normals[old]);
+            assert_eq!(p.uvs[new], before.uvs[old]);
+            assert_eq!(p.joints[new], before.joints[old]);
+            assert_eq!(p.weights[new], before.weights[old]);
+            assert_eq!(
+                p.targets[0].positions[new],
+                before.targets[0].positions[old]
+            );
+        }
+        // Every triangle keeps its corners, so it draws and deforms as before.
+        let globals = Pose::rest(&m).globals(&m);
+        let joints = joint_matrices(&m, 0, &globals);
+        let (was, _) = deform(&before, &[1.0, 0.0], Some(&joints));
+        let (now, _) = deform(&p, &[1.0, 0.0], Some(&joints));
+        for (a, b) in before.indices.iter().zip(&p.indices) {
+            assert!(close(&was[*a as usize], &now[*b as usize]));
+        }
+        // Gathered once, it stays as it is.
+        let gathered = p.clone();
+        gather_morphed(&mut p);
+        assert_eq!(p, gathered);
+    }
+
+    #[test]
+    fn only_a_moving_target_s_weight_changes_a_primitive() {
+        let moving = [true, false];
+        assert!(!morph_changes(&[0.0, 0.0], &[0.0, 0.7], &moving));
+        assert!(morph_changes(&[0.0, 0.0], &[0.2, 0.0], &moving));
+        assert!(morph_changes(&[0.0], &[0.0, 0.0], &moving));
     }
 
     #[test]

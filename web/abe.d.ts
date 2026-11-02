@@ -217,7 +217,8 @@ export interface AbeEngine {
   modelMorph(instance: number, node: number, target: number, weight: number): void;
   /**
    * Applies the pose to what is drawn: node transforms, the joints its skinned meshes follow (on
-   * the GPU) and morphs (on the CPU, where a mesh's morph weights changed).
+   * the GPU) and morphs (on the CPU, where the weight of a target that moves a mesh's vertices
+   * changed).
    */
   updateModel(instance: number): void;
   /** A node's world matrix as of the last update. */
