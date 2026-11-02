@@ -59,7 +59,7 @@ fn word(b: &[u8], offset: usize) -> Result<u32, String> {
     let bytes = b.get(offset..offset + 4).ok_or("truncated GLB")?;
     Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")))
 }
-fn chunks(data: &[u8]) -> Result<(Value, &[u8]), String> {
+pub(crate) fn chunks(data: &[u8]) -> Result<(Value, &[u8]), String> {
     if data.len() > MAX_BYTES
         || data.get(..4) != Some(b"glTF")
         || word(data, 4)? != 2

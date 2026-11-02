@@ -12,11 +12,14 @@
 //! [`abe_rt_start`] comes from `abe_alloc` and becomes the engine's.
 
 use crate::{install_panic_hook, say};
+use abe_engine::anim::normalize_q;
+use abe_engine::assets::model::{self, Model};
 use abe_engine::gpu::Device;
 use abe_engine::render::{
     Environment, LookFile, MaterialDesc, MeshData, Output, PropInstance, PropMaterial, PropMesh,
     PropTexture, Quality, Renderer, TimeOfDay, View, Weather,
 };
+use abe_engine::render::{ModelId, ModelInstance};
 use abe_engine::world::World;
 use std::cell::RefCell;
 
@@ -28,6 +31,8 @@ struct Runtime {
     weather: Weather,
     seconds: f32,
     frames: u32,
+    /// Parsed models waiting for their textures (handle = index + 1).
+    pending: Vec<Option<Model>>,
 }
 
 thread_local! {
@@ -178,6 +183,7 @@ fn start(world: &World, look: &[u8], quality: u32) -> Result<Runtime, String> {
         weather: file.weather,
         seconds: 0.0,
         frames: 0,
+        pending: vec![],
     })
 }
 
@@ -671,4 +677,433 @@ unsafe fn write_floats(out: *mut u8, v: &[f32]) {
     let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
     // SAFETY: forwarded.
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len()) };
+}
+
+/// Copies `text` to `out` when it fits in `cap` bytes; returns its length either way (a host
+/// with a smaller buffer calls again with a bigger one).
+///
+/// # Safety
+/// `out` must address `cap` writable bytes.
+unsafe fn give(text: &[u8], out: *mut u8, cap: usize) -> u32 {
+    if text.len() <= cap && !out.is_null() {
+        // SAFETY: the caller passes `cap` writable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), out, text.len()) };
+    }
+    text.len() as u32
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A model's contents as JSON, for the host: images to decode (type, colour or data, size),
+/// nodes (name, parent, mesh), meshes (name, morph target names), clips (name, duration) and
+/// material names. Indices are positions in these lists.
+fn describe(m: &Model) -> String {
+    let list = |items: Vec<String>| format!("[{}]", items.join(","));
+    let opt = |o: Option<usize>| o.map_or("null".to_string(), |v| v.to_string());
+    let images = m
+        .images
+        .iter()
+        .map(|i| {
+            format!(
+                r#"{{"name":{},"mime":{},"srgb":{},"size":{}}}"#,
+                json_string(&i.name),
+                json_string(&i.mime),
+                i.srgb,
+                i.data.len()
+            )
+        })
+        .collect();
+    let nodes = m
+        .nodes
+        .iter()
+        .map(|n| {
+            format!(
+                r#"{{"name":{},"parent":{},"mesh":{},"skin":{}}}"#,
+                json_string(&n.name),
+                opt(n.parent),
+                opt(n.mesh),
+                opt(n.skin)
+            )
+        })
+        .collect();
+    let meshes = m
+        .meshes
+        .iter()
+        .map(|me| {
+            format!(
+                r#"{{"name":{},"targets":{},"targetNames":{}}}"#,
+                json_string(&me.name),
+                me.weights.len(),
+                list(me.target_names.iter().map(|t| json_string(t)).collect())
+            )
+        })
+        .collect();
+    let clips = m
+        .clips
+        .iter()
+        .map(|c| {
+            format!(
+                r#"{{"name":{},"duration":{}}}"#,
+                json_string(&c.name),
+                c.duration
+            )
+        })
+        .collect();
+    let materials = m.materials.iter().map(|x| json_string(&x.name)).collect();
+    format!(
+        r#"{{"images":{},"nodes":{},"meshes":{},"clips":{},"materials":{}}}"#,
+        list(images),
+        list(nodes),
+        list(meshes),
+        list(clips),
+        list(materials)
+    )
+}
+
+fn pending(rt: &mut Runtime, id: u32) -> Result<&mut Model, String> {
+    rt.pending
+        .get_mut((id as usize).wrapping_sub(1))
+        .and_then(Option::as_mut)
+        .ok_or_else(|| format!("no parsed model {id}"))
+}
+
+/// Parses a GLB model (`len` bytes at `ptr`, read during the call). Returns a parsed-model
+/// handle for [`abe_rt_model_describe`], [`abe_rt_model_image`] and [`abe_rt_model_create`].
+///
+/// # Safety
+/// `ptr` must address `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_model_parse(ptr: *const u8, len: usize) -> u32 {
+    // SAFETY: the caller passes a readable range.
+    let data = unsafe { bytes(ptr, len) };
+    with(0, |rt| {
+        let m = model::load_glb(data).map_err(|e| format!("model: {e}"))?;
+        let slot = rt.pending.iter().position(Option::is_none);
+        let i = match slot {
+            Some(i) => {
+                rt.pending[i] = Some(m);
+                i
+            }
+            None => {
+                rt.pending.push(Some(m));
+                rt.pending.len() - 1
+            }
+        };
+        Ok(i as u32 + 1)
+    })
+}
+
+/// Writes a parsed model's description (JSON, see `describe`) to `out` if it fits in `cap`
+/// bytes; returns its length.
+///
+/// # Safety
+/// `out` must address `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_model_describe(parsed: u32, out: *mut u8, cap: usize) -> u32 {
+    with(0, |rt| {
+        let text = describe(pending(rt, parsed)?);
+        // SAFETY: forwarded.
+        Ok(unsafe { give(text.as_bytes(), out, cap) })
+    })
+}
+
+/// Copies image `index` of a parsed model (encoded PNG, JPEG or WebP) to `out` if it fits in
+/// `cap` bytes; returns its length.
+///
+/// # Safety
+/// `out` must address `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_model_image(
+    parsed: u32,
+    index: u32,
+    out: *mut u8,
+    cap: usize,
+) -> u32 {
+    with(0, |rt| {
+        let m = pending(rt, parsed)?;
+        let image = m
+            .images
+            .get(index as usize)
+            .ok_or_else(|| format!("no image {index}"))?;
+        // SAFETY: forwarded.
+        Ok(unsafe { give(&image.data, out, cap) })
+    })
+}
+
+/// Uploads a parsed model with its textures (`count` texture handles at `textures`, one per
+/// image, 0 where an image could not be decoded). Returns the model handle; the parsed handle
+/// is spent either way.
+///
+/// # Safety
+/// `textures` must address `count` words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_model_create(
+    parsed: u32,
+    textures: *const u8,
+    count: usize,
+) -> u32 {
+    // SAFETY: the caller passes `count` words.
+    let tex: Vec<Option<PropTexture>> = unsafe { words(textures, count) }
+        .into_iter()
+        .map(|t| (t != 0).then(|| PropTexture::from_raw(t)))
+        .collect();
+    with(0, |rt| {
+        let slot = (parsed as usize).wrapping_sub(1);
+        let m = rt
+            .pending
+            .get_mut(slot)
+            .and_then(Option::take)
+            .ok_or_else(|| format!("no parsed model {parsed}"))?;
+        Ok(rt.renderer.create_model(&mut rt.device, m, &tex)?.raw())
+    })
+}
+
+/// The prop material made for the model's material `index` (to restyle it).
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_model_material(model: u32, index: u32) -> u32 {
+    with(0, |rt| {
+        Ok(rt
+            .renderer
+            .model_material(ModelId::from_raw(model), index as usize)?
+            .raw())
+    })
+}
+
+/// Destroys a model and its instances (textures stay the host's).
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_model_destroy(model: u32) -> u32 {
+    with(0, |rt| {
+        rt.renderer
+            .destroy_model(&mut rt.device, ModelId::from_raw(model));
+        Ok(1)
+    })
+}
+
+/// Places a model at the column-major matrix (16 floats) at `matrix`, in its rest pose.
+///
+/// # Safety
+/// `matrix` must address 64 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_model_instance(model: u32, matrix: *const u8) -> u32 {
+    // SAFETY: the caller passes 16 floats.
+    let m = unsafe { floats(matrix, 16) };
+    with(0, |rt| {
+        let i = rt.renderer.create_model_instance(
+            &mut rt.device,
+            ModelId::from_raw(model),
+            &self::matrix(&m)?,
+        )?;
+        Ok(i.raw())
+    })
+}
+
+/// Moves a model instance and shows (`visible` 1) or hides it.
+///
+/// # Safety
+/// `matrix` must address 64 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_model_instance_set(
+    instance: u32,
+    matrix: *const u8,
+    visible: u32,
+) -> u32 {
+    // SAFETY: the caller passes 16 floats.
+    let m = unsafe { floats(matrix, 16) };
+    with(0, |rt| {
+        rt.renderer.set_model_instance(
+            ModelInstance::from_raw(instance),
+            &self::matrix(&m)?,
+            visible != 0,
+        )?;
+        Ok(1)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_model_instance_destroy(instance: u32) -> u32 {
+    with(0, |rt| {
+        rt.renderer
+            .destroy_model_instance(&mut rt.device, ModelInstance::from_raw(instance));
+        Ok(1)
+    })
+}
+
+/// Resets an instance's pose to the model's rest pose.
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_model_rest(instance: u32) -> u32 {
+    with(0, |rt| {
+        let (pose, model) = rt
+            .renderer
+            .model_pose_and_model(ModelInstance::from_raw(instance))?;
+        *pose = abe_engine::anim::Pose::rest(model);
+        Ok(1)
+    })
+}
+
+/// Mixes clip `clip` at `time` seconds into the instance's pose with `weight` (1 replaces what
+/// the clip animates).
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_model_clip(instance: u32, clip: u32, time: f32, weight: f32) -> u32 {
+    with(0, |rt| {
+        let (pose, model) = rt
+            .renderer
+            .model_pose_and_model(ModelInstance::from_raw(instance))?;
+        if clip as usize >= model.clips.len() {
+            return Err(format!("no clip {clip}"));
+        }
+        pose.apply(model, clip as usize, time, weight);
+        Ok(1)
+    })
+}
+
+/// Writes node `node`'s local transform as 10 floats at `out`: translation (3), rotation
+/// quaternion x, y, z, w (4), scale (3).
+///
+/// # Safety
+/// `out` must address 40 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_model_node_get(instance: u32, node: u32, out: *mut u8) -> u32 {
+    with(0, |rt| {
+        let (pose, _) = rt
+            .renderer
+            .model_pose_and_model(ModelInstance::from_raw(instance))?;
+        let n = node as usize;
+        if n >= pose.translation.len() {
+            return Err(format!("no node {node}"));
+        }
+        let mut v = [0.0f32; 10];
+        v[..3].copy_from_slice(&pose.translation[n]);
+        v[3..7].copy_from_slice(&pose.rotation[n]);
+        v[7..].copy_from_slice(&pose.scale[n]);
+        // SAFETY: the caller passes 40 writable bytes.
+        unsafe { write_floats(out, &v) };
+        Ok(1)
+    })
+}
+
+/// Sets node `node`'s local transform from 10 floats at `ptr` (as `abe_rt_model_node_get`
+/// writes them; the rotation is normalized).
+///
+/// # Safety
+/// `ptr` must address 40 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_model_node_set(instance: u32, node: u32, ptr: *const u8) -> u32 {
+    // SAFETY: the caller passes 10 floats.
+    let v = unsafe { floats(ptr, 10) };
+    with(0, |rt| {
+        if v.iter().any(|x| !x.is_finite()) {
+            return Err("model_node_set: values must be finite".into());
+        }
+        let (pose, _) = rt
+            .renderer
+            .model_pose_and_model(ModelInstance::from_raw(instance))?;
+        let n = node as usize;
+        if n >= pose.translation.len() {
+            return Err(format!("no node {node}"));
+        }
+        pose.translation[n] = [v[0], v[1], v[2]];
+        pose.rotation[n] = normalize_q([v[3], v[4], v[5], v[6]]);
+        pose.scale[n] = [v[7], v[8], v[9]];
+        Ok(1)
+    })
+}
+
+/// Sets morph target `target` of node `node`'s mesh to `weight`.
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_model_morph(instance: u32, node: u32, target: u32, weight: f32) -> u32 {
+    with(0, |rt| {
+        let (pose, _) = rt
+            .renderer
+            .model_pose_and_model(ModelInstance::from_raw(instance))?;
+        let w = pose
+            .weights
+            .get_mut(node as usize)
+            .and_then(|w| w.get_mut(target as usize))
+            .ok_or_else(|| format!("node {node} has no morph target {target}"))?;
+        if !weight.is_finite() {
+            return Err("model_morph: the weight must be finite".into());
+        }
+        *w = weight;
+        Ok(1)
+    })
+}
+
+/// Applies the instance's pose: node transforms, skinning and morphing.
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_model_update(instance: u32) -> u32 {
+    with(0, |rt| {
+        rt.renderer
+            .update_model_instance(&mut rt.device, ModelInstance::from_raw(instance))?;
+        Ok(1)
+    })
+}
+
+/// Writes node `node`'s world matrix (16 floats, as of the last update) at `out`.
+///
+/// # Safety
+/// `out` must address 64 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_model_node_world(instance: u32, node: u32, out: *mut u8) -> u32 {
+    with(0, |rt| {
+        let m = rt
+            .renderer
+            .model_node_world(ModelInstance::from_raw(instance), node as usize)?;
+        // SAFETY: the caller passes 64 writable bytes.
+        unsafe { write_floats(out, &m) };
+        Ok(1)
+    })
+}
+
+/// Shows (`visible` 1) or hides the meshes of node `node`.
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_model_node_visible(instance: u32, node: u32, visible: u32) -> u32 {
+    with(0, |rt| {
+        rt.renderer.set_model_node_visible(
+            ModelInstance::from_raw(instance),
+            node as usize,
+            visible != 0,
+        )?;
+        Ok(1)
+    })
+}
+
+/// Tints every part of a model instance.
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_model_tint(instance: u32, r: f32, g: f32, b: f32, a: f32) -> u32 {
+    with(0, |rt| {
+        rt.renderer
+            .set_model_instance_tint(ModelInstance::from_raw(instance), [r, g, b, a])?;
+        Ok(1)
+    })
+}
+
+/// The model instance a picked prop instance belongs to (0 for none); writes the node it draws
+/// as a word at `out`.
+///
+/// # Safety
+/// `out` must address 4 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_model_owner(prop: u32, out: *mut u8) -> u32 {
+    with(0, |rt| {
+        let Some((i, node)) = rt.renderer.model_part_owner(PropInstance::from_raw(prop)) else {
+            return Ok(0);
+        };
+        let b = (node as u32).to_le_bytes();
+        // SAFETY: the caller passes 4 writable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), out, 4) };
+        Ok(i.raw())
+    })
 }

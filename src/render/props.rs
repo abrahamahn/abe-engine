@@ -22,22 +22,6 @@ use crate::gpu::{
 };
 use crate::world::Shading;
 
-macro_rules! handle {
-    ($(#[$m:meta])* $name:ident) => {
-        $(#[$m])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-        pub struct $name(u32);
-        impl $name {
-            /// The raw id, for hosts that pass handles across a language boundary.
-            pub const fn raw(self) -> u32 {
-                self.0
-            }
-            pub const fn from_raw(raw: u32) -> Self {
-                Self(raw)
-            }
-        }
-    };
-}
 handle!(
     /// A prop mesh.
     PropMesh
@@ -1359,8 +1343,10 @@ impl Renderer {
         }
     }
 
-    /// Releases every prop object (when the renderer is dropped with its device still alive).
+    /// Releases every prop object, models included (when the renderer is dropped with its
+    /// device still alive).
     pub fn destroy_props(&mut self, device: &mut Device<'_>) {
+        self.drop_models();
         self.reset_prop_slots(device);
         for m in self.props.meshes.drain() {
             device.destroy_buffer(m.vertices);

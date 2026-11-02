@@ -1716,7 +1716,7 @@ export async function createEngine(options) {
     return { sx: (canvas.clientWidth || s.width) / s.width, sy: (canvas.clientHeight || s.height) / s.height };
   };
 
-  return {
+  const engine = {
     api: gpu.api,
     adapter: gpu.adapterName,
     errors: () => [...errors, ...host.errors.filter((e) => !errors.includes(e))],
@@ -1869,6 +1869,107 @@ export async function createEngine(options) {
       const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
       return { instance, distance, point: [px, py, pz] };
     },
+    /**
+     * Loads a glTF model (GLB): `source` is a URL, ArrayBuffer or Uint8Array. Its images are
+     * decoded by the browser into textures. Resolves with `{model, info, textures}`, where
+     * `info` lists images, nodes (name, parent, mesh, skin), meshes (morph targets), clips
+     * (name, duration) and materials by index.
+     */
+    async loadModel(source) {
+      let bytes;
+      if (typeof source === 'string') {
+        const r = await fetch(source);
+        if (!r.ok) throw new Error(`${source}: HTTP ${r.status} ${r.statusText}`);
+        bytes = new Uint8Array(await r.arrayBuffer());
+      } else {
+        bytes = source instanceof Uint8Array ? source : new Uint8Array(source);
+      }
+      const [p] = place(bytes);
+      const parsed = ok('loadModel', x.abe_rt_model_parse(p, bytes.length));
+      const fetchOut = (call) => {
+        const len = call(0, 0);
+        const at = reserve(len);
+        call(at, len);
+        return new Uint8Array(x.memory.buffer, at, len).slice();
+      };
+      const info = JSON.parse(new TextDecoder().decode(
+        fetchOut((at, cap) => x.abe_rt_model_describe(parsed, at, cap))));
+      // Copy every image out of wasm memory before awaiting the decoders.
+      const encoded = info.images.map((im, i) => ({
+        ...im,
+        bytes: fetchOut((at, cap) => x.abe_rt_model_image(parsed, i, at, cap)),
+      }));
+      const textures = await Promise.all(encoded.map(async (im) => {
+        try {
+          const bitmap = await createImageBitmap(new Blob([im.bytes], { type: im.mime }),
+            { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+          const t = engine.createTexture(bitmap, { srgb: im.srgb });
+          if (bitmap.close) bitmap.close();
+          return t;
+        } catch (e) {
+          onLog(1, `model image ${im.name || ''} (${im.mime}) not decoded: ${e.message}`);
+          return 0;
+        }
+      }));
+      const [tp] = place(new Uint32Array(textures));
+      const model = ok('loadModel', x.abe_rt_model_create(parsed, tp, textures.length));
+      return { model, info, textures };
+    },
+    /** Destroys a model and its instances (its textures stay: destroy them separately). */
+    destroyModel(model) { x.abe_rt_model_destroy(model); },
+    /** The material made for the model's glTF material `index`, to restyle with updateMaterial. */
+    modelMaterial(model, index) { return ok('modelMaterial', x.abe_rt_model_material(model, index)); },
+    createModelInstance(model, matrix) {
+      const [p] = place(f32(matrix));
+      return ok('createModelInstance', x.abe_rt_model_instance(model, p));
+    },
+    setModelInstance(instance, matrix, visible = true) {
+      const [p] = place(f32(matrix));
+      ok('setModelInstance', x.abe_rt_model_instance_set(instance, p, visible ? 1 : 0));
+    },
+    destroyModelInstance(instance) { x.abe_rt_model_instance_destroy(instance); },
+    /** Resets the pose to the model's rest pose. */
+    modelRest(instance) { ok('modelRest', x.abe_rt_model_rest(instance)); },
+    /** Mixes clip `clip` (index into info.clips) at `time` seconds into the pose with
+     * `weight` (1 replaces what it animates, less mixes toward it). */
+    modelClip(instance, clip, time, weight = 1) {
+      ok('modelClip', x.abe_rt_model_clip(instance, clip, time, weight));
+    },
+    /** A node's local transform: `{translation, rotation: [x, y, z, w], scale}`. */
+    modelNode(instance, node) {
+      const at = out(10).byteOffset;
+      ok('modelNode', x.abe_rt_model_node_get(instance, node, at));
+      const v = Array.from(new Float32Array(x.memory.buffer, at, 10));
+      return { translation: v.slice(0, 3), rotation: v.slice(3, 7), scale: v.slice(7, 10) };
+    },
+    setModelNode(instance, node, { translation, rotation, scale }) {
+      const [p] = place(f32([...translation, ...rotation, ...scale]));
+      ok('setModelNode', x.abe_rt_model_node_set(instance, node, p));
+    },
+    modelMorph(instance, node, target, weight) {
+      ok('modelMorph', x.abe_rt_model_morph(instance, node, target, weight));
+    },
+    /** Applies the pose (node transforms, skinning, morphs) to what is drawn. */
+    updateModel(instance) { ok('updateModel', x.abe_rt_model_update(instance)); },
+    /** A node's world matrix as of the last update (16 numbers, column-major). */
+    modelNodeWorld(instance, node) {
+      const at = out(16).byteOffset;
+      ok('modelNodeWorld', x.abe_rt_model_node_world(instance, node, at));
+      return new Float32Array(x.memory.buffer, at, 16).slice();
+    },
+    setModelNodeVisible(instance, node, visible) {
+      ok('setModelNodeVisible', x.abe_rt_model_node_visible(instance, node, visible ? 1 : 0));
+    },
+    setModelTint(instance, tint) {
+      ok('setModelTint', x.abe_rt_model_tint(instance, tint[0], tint[1], tint[2], tint[3] ?? 1));
+    },
+    /** The model instance and node a picked prop instance draws, or null. */
+    modelOwner(propInstance) {
+      const at = reserve(4);
+      const instance = x.abe_rt_model_owner(propInstance, at);
+      if (!instance) return null;
+      return { instance, node: new Uint32Array(x.memory.buffer, at, 1)[0] };
+    },
     /** Releases the engine's GPU objects. */
     destroy() {
       if (stopped) return;
@@ -1879,4 +1980,5 @@ export async function createEngine(options) {
       scratchCap = 0;
     },
   };
+  return engine;
 }

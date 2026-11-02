@@ -227,6 +227,7 @@ pub struct Renderer {
     pub(super) flat: TextureId,
     pub(super) material_sampler: SamplerId,
     pub(super) props: super::props::Props,
+    pub(super) models: super::models::Models,
 }
 
 fn compile(body: &str, stage: Stage, entry: &str) -> Result<Compiled> {
@@ -793,6 +794,7 @@ impl Renderer {
             flat,
             material_sampler,
             props: super::props::Props::default(),
+            models: super::models::Models::default(),
         };
         let slots = match output {
             Output::Still => 1,

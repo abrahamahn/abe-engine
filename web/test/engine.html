@@ -43,6 +43,76 @@ function cube(h) {
 
 const translate = (x, y, z) => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1];
 
+/** A GLB: a 2 m bar of two blocks skinned to a root and an elbow joint, textured with `png`
+ * (unlit), and a clip "bend" turning the elbow 90 degrees about z over one second. */
+function testGlb(png) {
+  const positions = []; const normals = []; const uvs = []; const joints = []; const indices = [];
+  for (const [joint, y0] of [[0, 0], [1, 1]]) {
+    const c = cube(0.5);
+    const base = positions.length / 3;
+    for (let i = 0; i < c.positions.length; i += 3) {
+      positions.push(c.positions[i] * 0.3, c.positions[i + 1] + y0 + 0.5, c.positions[i + 2] * 0.3);
+      uvs.push(0.5, 0.5);
+      joints.push(joint, 0, 0, 0);
+    }
+    normals.push(...c.normals);
+    indices.push(...c.indices.map((k) => k + base));
+  }
+  const n = positions.length / 3;
+  const weights = new Float32Array(n * 4).map((_, i) => (i % 4 === 0 ? 1 : 0));
+  const s = Math.SQRT1_2;
+  const chunks = [new Float32Array(positions), new Float32Array(normals), new Float32Array(uvs),
+    new Uint8Array(joints), weights, new Uint16Array(indices),
+    new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
+      1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, -1, 0, 1]),
+    new Float32Array([0, 1]), new Float32Array([0, 0, 0, 1, 0, 0, s, s]), png];
+  const views = []; const parts = []; let length = 0;
+  for (const c of chunks) {
+    const pad = (4 - (length % 4)) % 4;
+    if (pad) { parts.push(new Uint8Array(pad)); length += pad; }
+    views.push({ buffer: 0, byteOffset: length, byteLength: c.byteLength });
+    parts.push(new Uint8Array(c.buffer, c.byteOffset, c.byteLength));
+    length += c.byteLength;
+  }
+  const acc = (view, componentType, type, count, extra = {}) => ({ bufferView: view, componentType, type, count, ...extra });
+  const json = {
+    asset: { version: '2.0' },
+    buffers: [{ byteLength: length }],
+    bufferViews: views,
+    accessors: [acc(0, 5126, 'VEC3', n, { min: [-0.15, 0, -0.15], max: [0.15, 2, 0.15] }), acc(1, 5126, 'VEC3', n),
+      acc(2, 5126, 'VEC2', n), acc(3, 5121, 'VEC4', n), acc(4, 5126, 'VEC4', n),
+      acc(5, 5123, 'SCALAR', indices.length), acc(6, 5126, 'MAT4', 2), acc(7, 5126, 'SCALAR', 2, { min: [0], max: [1] }),
+      acc(8, 5126, 'VEC4', 2)],
+    images: [{ bufferView: 9, mimeType: 'image/png', name: 'paint' }],
+    textures: [{ source: 0 }],
+    materials: [{ name: 'check-model', pbrMetallicRoughness: { baseColorTexture: { index: 0 } },
+      extensions: { KHR_materials_unlit: {} } }],
+    extensionsUsed: ['KHR_materials_unlit'],
+    meshes: [{ name: 'bar', primitives: [{ attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 2, JOINTS_0: 3, WEIGHTS_0: 4 },
+      indices: 5, material: 0 }] }],
+    skins: [{ joints: [0, 1], inverseBindMatrices: 6 }],
+    nodes: [{ name: 'root', children: [1] }, { name: 'elbow', translation: [0, 1, 0] }, { name: 'bar', mesh: 0, skin: 0 }],
+    scenes: [{ nodes: [0, 2] }],
+    animations: [{ name: 'bend', channels: [{ sampler: 0, target: { node: 1, path: 'rotation' } }],
+      samplers: [{ input: 7, output: 8 }] }],
+  };
+  let text = new TextEncoder().encode(JSON.stringify(json));
+  const jpad = (4 - (text.length % 4)) % 4;
+  text = new Uint8Array([...text, ...new Array(jpad).fill(32)]);
+  const bpad = (4 - (length % 4)) % 4;
+  const total = 12 + 8 + text.length + 8 + length + bpad;
+  const out = new Uint8Array(total);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, 0x46546c67, true); dv.setUint32(4, 2, true); dv.setUint32(8, total, true);
+  dv.setUint32(12, text.length, true); dv.setUint32(16, 0x4e4f534a, true);
+  out.set(text, 20);
+  let at = 20 + text.length;
+  dv.setUint32(at, length + bpad, true); dv.setUint32(at + 4, 0x004e4942, true);
+  at += 8;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  return out;
+}
+
 function stripes(top, bottom) {
   const c = document.createElement('canvas');
   c.width = 32; c.height = 32;
@@ -170,6 +240,35 @@ async function run() {
   const fourth = await frame(engine);
   check('instance tint', near(pixel(fourth, badgeAt), [0, 188, 0], 3), { rgb: pixel(fourth, badgeAt) });
   result.third = png(third);
+
+  // A glTF model: its PNG decoded by the browser, skinned, bent by a clip, picked back.
+  const swatch = document.createElement('canvas');
+  swatch.width = 4; swatch.height = 4;
+  const sg = swatch.getContext('2d');
+  sg.fillStyle = '#ff00ff'; sg.fillRect(0, 0, 4, 4);
+  const pngBytes = new Uint8Array(await (await new Promise((r) => swatch.toBlob(r, 'image/png'))).arrayBuffer());
+  const { model, info } = await engine.loadModel(testGlb(pngBytes));
+  const bar = engine.createModelInstance(model, translate(3.5, 0, 3));
+  const magenta = (r, g, b) => r > g + 60 && b > g + 60;
+  const upright = at([3.5, 1.6, 3.15]);
+  const fifth = await frame(engine);
+  check('model drawn with its decoded texture', count(fifth, boxAround(upright, 3), magenta) > 10,
+    { at: upright, rgb: pixel(fifth, upright) });
+  const bend = info.clips.findIndex((c) => c.name === 'bend');
+  engine.modelClip(bar, bend, 1.0, 1);
+  engine.updateModel(bar);
+  const sixth = await frame(engine);
+  const side = at([2.9, 1.0, 3.15]);
+  check('a clip bends the skinned model', count(sixth, boxAround(side, 3), magenta) > 10
+    && count(sixth, boxAround(at([3.5, 1.8, 3.15]), 2), magenta) === 0, { at: side, rgb: pixel(sixth, side) });
+  const elbow = engine.modelNodeWorld(bar, info.nodes.findIndex((nd) => nd.name === 'elbow'));
+  check('node world transforms follow the instance', Math.abs(elbow[12] - 3.5) < 1e-4 && Math.abs(elbow[13] - 1) < 1e-4
+    && Math.abs(elbow[14] - 3) < 1e-4, Array.from(elbow.slice(12, 15)));
+  const hit = engine.pick(side.x, side.y);
+  const owner = hit && engine.modelOwner(hit.instance);
+  check('picking finds the model part', owner && owner.instance === bar && info.nodes[owner.node].name === 'bar', owner);
+  engine.destroyModel(model);
+  result.fifth = png(sixth);
 
   // Errors are reported, not thrown away: a stale handle and a bad material.
   engine.destroyInstance(left);

@@ -1,5 +1,6 @@
 //! ABE's portable scene data and camera. Game-specific content belongs to clients.
 
+pub mod anim;
 #[cfg(target_vendor = "apple")]
 mod apple;
 pub mod gpu;

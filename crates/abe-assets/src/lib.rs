@@ -3,6 +3,7 @@ pub mod cooked;
 pub mod glb;
 pub mod json;
 pub mod mip;
+pub mod model;
 pub mod png;
 pub mod zlib;
 use std::io::Read;
