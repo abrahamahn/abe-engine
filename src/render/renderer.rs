@@ -1330,8 +1330,15 @@ impl Renderer {
                 bound = d.material;
             }
             let m = &self.scene.materials[d.material];
-            model_push[..16].copy_from_slice(&self.details[d.material]);
-            model_push[16..20].copy_from_slice(&m.base_color);
+            let detail = &self.details[d.material];
+            model_push[..16].copy_from_slice(detail);
+            // A colour-only rule (preset `none`) recolours the material whatever its shading,
+            // foliage included; patterned presets take the colour in their own way.
+            let mut base = m.base_color;
+            if detail[0] == 0.0 && detail[8] > 0.5 {
+                base[..3].copy_from_slice(&detail[5..8]);
+            }
+            model_push[16..20].copy_from_slice(&base);
             model_push[20..24].copy_from_slice(&m.emissive);
             model_push[24..28].copy_from_slice(&m.params);
             model_push[28..32].copy_from_slice(&m.flags);

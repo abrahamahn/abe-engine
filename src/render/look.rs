@@ -126,7 +126,8 @@ pub struct DetailRule {
     pub strength: f32,
     /// Colour variation between tiles, planks or stones.
     pub variation: f32,
-    /// Replaces the material's colour (linear RGB) when set.
+    /// Replaces the material's colour (linear RGB) when set. With the `none` preset the rule
+    /// only recolours, and works on any material, foliage and water included.
     pub color: Option<V3>,
     /// Extra gloss (0..1), for lacquer and polished wood.
     pub gloss: f32,

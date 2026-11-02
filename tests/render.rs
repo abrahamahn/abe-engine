@@ -391,6 +391,77 @@ fn grass_and_surface_detail() {
     assert!(errors.is_empty(), "validation: {errors:?}");
 }
 
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn colour_rules_recolour_any_material() {
+    // A colour-only rule (preset `none`) recolours foliage, which takes no surface detail.
+    let mut device = Device::headless().expect("device");
+    let (w, h) = (96, 54);
+    let meshes = vec![quad(0.0, 30.0, 0), cube([0.0, 1.5, -6.0], 1.5, 1)];
+    let world = World {
+        instances: (0..meshes.len() as u32)
+            .map(|mesh| Instance {
+                mesh,
+                transform: Transform::IDENTITY,
+            })
+            .collect(),
+        meshes,
+        materials: vec![
+            material("ground", [0.3, 0.3, 0.3, 1.0], Shading::Standard),
+            material("leaf-1", [0.1, 0.3, 0.25, 1.0], Shading::Foliage),
+        ],
+        textures: vec![],
+        lights: vec![],
+    };
+    let view = View {
+        name: "tree".into(),
+        eye: [0.0, 2.0, 2.0],
+        target: [0.0, 1.5, -6.0],
+        fov: 50.0,
+    };
+    let mut frame = |rules: Vec<DetailRule>| {
+        let look = Look {
+            details: rules,
+            ..Look::default()
+        };
+        let mut quality = Quality::realtime();
+        quality.shadow_size = 512;
+        quality.ground_size = 256;
+        quality.world_size = 256;
+        let mut r = Renderer::new(&mut device, &world, look, quality, (w, h), Output::Still)
+            .expect("renderer");
+        let env = Environment::resolve(
+            &TimeOfDay::default(),
+            &Weather::default(),
+            &r.look().palette,
+            2.0,
+        );
+        r.render_still(&mut device, &view, &env, 1).expect("render")
+    };
+    let red = |image: &[u8]| {
+        image
+            .chunks(4)
+            .filter(|p| u32::from(p[0]) > 2 * u32::from(p[1]) + 20)
+            .count()
+    };
+    let plain = frame(vec![]);
+    let recoloured = frame(vec![DetailRule {
+        patterns: vec!["leaf-*".into()],
+        preset: DetailPreset::None,
+        scale: [1.0, 1.0],
+        strength: 1.0,
+        variation: 0.0,
+        color: Some([0.8, 0.05, 0.05]),
+        gloss: 0.0,
+    }]);
+    let (before, after) = (red(&plain), red(&recoloured));
+    eprintln!("red pixels: {before} before, {after} with the rule");
+    assert!(
+        before == 0 && after > 300,
+        "foliage not recoloured: {before} / {after}"
+    );
+}
+
 /// Land sloping from 3 m down to a seabed 4 m under a sea at 0 m: flat to z = -60, the water
 /// line at z = -10, 1.4 m deep at z = 13.
 fn shore() -> World {
