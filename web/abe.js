@@ -1797,12 +1797,17 @@ export async function createEngine(options) {
       const [p] = place(t);
       ok('setLook', x.abe_rt_set_look(p, t.length));
     },
-    /** `{eye, target, up = [0, 1, 0], fov = 50, shift = [0, 0], near = 0.08}`. */
+    /**
+     * `{eye, target, up = [0, 1, 0], fov = 50, shift = [0, 0], near = 0.08, focus}`, where
+     * `focus` is `{distance, depth = 4, blur = 0.006}` or absent for everything sharp.
+     */
     setView(v) {
       const up = v.up || [0, 1, 0];
       const shift = v.shift || [0, 0];
+      const f = v.focus;
       const [p] = place(f32([...v.eye, ...v.target, ...up, v.fov ?? 50, shift[0], shift[1],
-        v.near ?? 0.08]));
+        v.near ?? 0.08, f ? f.distance : 0, f ? f.depth ?? 4 : 0, f ? f.blur ?? 0.006 : 0,
+        f ? 1 : 0]));
       ok('setView', x.abe_rt_set_view(p));
     },
     /** Time of day in hours and the animation clock in seconds. */

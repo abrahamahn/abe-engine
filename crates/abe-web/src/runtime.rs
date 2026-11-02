@@ -16,7 +16,7 @@ use abe_engine::anim::normalize_q;
 use abe_engine::assets::model::{self, Model};
 use abe_engine::gpu::Device;
 use abe_engine::render::{
-    Environment, LookFile, MaterialDesc, MeshData, Output, PROP_SHADER_PARAMS, PropInstance,
+    Environment, Focus, LookFile, MaterialDesc, MeshData, Output, PROP_SHADER_PARAMS, PropInstance,
     PropMaterial, PropMesh, PropTexture, Quality, Renderer, TimeOfDay, View, Weather,
 };
 use abe_engine::render::{GameLight, LightDesc, ModelId, ModelInstance, SpotCone};
@@ -219,15 +219,16 @@ pub unsafe extern "C" fn abe_rt_set_look(ptr: *const u8, len: usize) -> u32 {
     })
 }
 
-/// Sets the camera from 13 floats at `ptr`: eye (3), target (3), up (3), vertical field of view
-/// in degrees, lens shift (2, normalized device units, y up), near clip distance.
+/// Sets the camera from 17 floats at `ptr`: eye (3), target (3), up (3), vertical field of view
+/// in degrees, lens shift (2, normalized device units, y up), near clip distance, and the focus
+/// (distance, depth, blur, then 1 for a focus or 0 for none).
 ///
 /// # Safety
-/// `ptr` must address 52 readable bytes.
+/// `ptr` must address 68 readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn abe_rt_set_view(ptr: *const u8) -> u32 {
-    // SAFETY: the caller passes 13 floats.
-    let v = unsafe { floats(ptr, 13) };
+    // SAFETY: the caller passes 17 floats.
+    let v = unsafe { floats(ptr, 17) };
     with(0, |rt| {
         if v.iter().any(|x| !x.is_finite()) {
             return Err("set_view: values must be finite".into());
@@ -238,6 +239,17 @@ pub unsafe extern "C" fn abe_rt_set_view(ptr: *const u8) -> u32 {
                 v[9], v[12]
             ));
         }
+        let focus = (v[16] > 0.5).then_some(Focus {
+            distance: v[13],
+            depth: v[14],
+            blur: v[15],
+        });
+        if focus.is_some_and(|f| !f.blurs() || f.distance < 0.0) {
+            return Err(format!(
+                "set_view: focus distance {}, depth {} or blur {} out of range",
+                v[13], v[14], v[15]
+            ));
+        }
         rt.view = View {
             name: "host".into(),
             eye: [v[0], v[1], v[2]],
@@ -246,6 +258,7 @@ pub unsafe extern "C" fn abe_rt_set_view(ptr: *const u8) -> u32 {
             fov: v[9],
             shift: [v[10], v[11]],
             near: v[12],
+            focus,
         };
         Ok(1)
     })

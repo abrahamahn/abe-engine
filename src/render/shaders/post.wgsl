@@ -175,8 +175,10 @@ fn light_shafts(uv: vec2f, frag: vec2f) -> vec3f {
       edge = max(edge, smoothstep(0.75, 0.35, dot(normalize(nq.xyz), normalize(aux.xyz))) * 0.6);
     }
   }
-  // Grass and flowers (aux.w = 0) get no outlines.
-  edge *= pc.a.y * smoothstep(90.0, 15.0, dist) * step(0.01, aux.w);
+  // Grass and flowers (aux.w = 0) get no outlines, and leaves and petals (aux.w = 0.5) only a
+  // trace: a line round every card of a canopy speckles it.
+  let weight = select(1.0, 0.15, aux.w < 0.6) * step(0.01, aux.w);
+  edge *= pc.a.y * smoothstep(90.0, 15.0, dist) * weight;
   col = mix(col, pc.c.rgb * (0.4 + 0.6 * luminance(col)), edge);
 
   // Aerial perspective, then low mist that pools over water and low ground.
@@ -256,11 +258,46 @@ fn aces(x: vec3f) -> vec3f {
   return vec4f(clamp(col, vec3f(0.0), vec3f(1.0)), 1.0);
 }
 
-// Painterly filter: a four-sector Kuwahara whose radius grows with distance, in perceptual space.
-// pc.a = (radius px near, radius px far, mix, unused)
+// Depth of field (pc.b = focus distance m, depth to the full blur m, blur radius px, on): how far
+// a pixel's colour spreads, in pixels. Nothing nearer than the focus spreads; past it the spread
+// grows to the full blur; the sky is as far as anything.
+fn defocus_radius(p: vec2i) -> f32 {
+  let d = depth_px(p);
+  let z = select(linear_depth(d), 1e5, d <= 0.0);
+  return pc.b.z * smoothstep(pc.b.x, pc.b.x + pc.b.y, z);
+}
+
+// A defocused pixel: a disc of taps as wide as its spread, each counted only where its own spread
+// reaches back here, so what is in focus (a table, its dealer) never smears into the soft scene
+// behind it.
+fn defocus(uv: vec2f, px: vec2i, r: f32) -> vec3f {
+  let size = vec2i(frame.viewport.xy);
+  var sum = textureLoad(src_tex, px, 0).rgb;
+  var weight = 1.0;
+  for (var i = 0; i < 24; i++) {
+    let spread = sqrt((f32(i) + 0.5) / 24.0) * r;
+    let angle = f32(i) * 2.39996323;
+    let off = vec2f(cos(angle), sin(angle)) * spread;
+    let q = clamp(px + vec2i(round(off)), vec2i(0), size - vec2i(1));
+    let w = smoothstep(spread - 1.0, spread, defocus_radius(q));
+    sum += textureSampleLevel(src_tex, lin_sampler, uv + off * frame.viewport.zw, 0.0).rgb * w;
+    weight += w;
+  }
+  return sum / weight;
+}
+
+// Painterly filter: a four-sector Kuwahara whose radius grows with distance, in perceptual space,
+// after the depth of field. pc.a = (radius px near, radius px far, mix, unused), pc.b as for
+// `defocus_radius`.
 @fragment fn fs_paint(in: Screen) -> @location(0) vec4f {
   let px = vec2i(in.clip.xy);
   let size = vec2i(frame.viewport.xy);
+  if (pc.b.w > 0.5) {
+    let spread = defocus_radius(px);
+    if (spread >= 0.75) {
+      return vec4f(defocus(in.uv, px, spread), 1.0);
+    }
+  }
   let centre = pow(textureLoad(src_tex, px, 0).rgb, vec3f(1.0 / 2.2));
   let d = depth_px(px);
   let far = select(smoothstep(8.0, 70.0, linear_depth(d)), 1.0, d <= 0.0);
@@ -331,14 +368,18 @@ fn aces(x: vec3f) -> vec3f {
   let px = vec2i(in.clip.xy);
   let size = vec2i(frame.viewport.xy);
   var col = textureLoad(src_tex, px, 0).rgb;
-  if (pc.a.z > 0.0) {
+  // Sharpening crisps what is near and leaves the distance soft: sharpened, fine far detail (a
+  // canopy's petals) turns to grit.
+  let d = depth_px(px);
+  let sharpen = pc.a.z * select(1.0 - smoothstep(6.0, 18.0, linear_depth(d)), 0.0, d <= 0.0);
+  if (sharpen > 0.0) {
     let ring = textureLoad(src_tex, clamp(px + vec2i(0, -1), vec2i(0), size - vec2i(1)), 0).rgb
       + textureLoad(src_tex, clamp(px + vec2i(0, 1), vec2i(0), size - vec2i(1)), 0).rgb
       + textureLoad(src_tex, clamp(px + vec2i(1, 0), vec2i(0), size - vec2i(1)), 0).rgb
       + textureLoad(src_tex, clamp(px + vec2i(-1, 0), vec2i(0), size - vec2i(1)), 0).rgb;
     let detail = col - ring * 0.25;
     // Limit the boost so edges sharpen without halos.
-    col = max(col + clamp(detail * pc.a.z, vec3f(-0.08), vec3f(0.08)), vec3f(0.0));
+    col = max(col + clamp(detail * sharpen, vec3f(-0.08), vec3f(0.08)), vec3f(0.0));
   }
   if (pc.a.x > 0.5) {
     let ln = luminance(textureLoad(src_tex, clamp(px + vec2i(0, -1), vec2i(0), size - vec2i(1)), 0).rgb);

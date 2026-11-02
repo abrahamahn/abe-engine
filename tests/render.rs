@@ -2286,3 +2286,167 @@ fn math_translate(x: f32) -> [f32; 16] {
     m[12] = x;
     m
 }
+
+/// Depth of field: past the focus the scene softens (a far wall of black and white squares loses
+/// its edges), what is nearer stays exactly as it was, and overlays are drawn sharp over the blur.
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn focus_softens_what_lies_past_it() {
+    use abe_engine::render::{BlendMode, Focus};
+    let mut device = Device::headless().expect("device");
+    let mut wall = material("wall", [1.0; 4], Shading::Standard);
+    wall.base_color_texture = Some(0);
+    // 2 m squares on a wall 40 m out, facing the camera; a red box 10 m out.
+    let far = Mesh {
+        positions: vec![
+            Vec3(-40.0, -5.0, -30.0),
+            Vec3(40.0, -5.0, -30.0),
+            Vec3(40.0, 35.0, -30.0),
+            Vec3(-40.0, 35.0, -30.0),
+        ],
+        normals: vec![Vec3(0.0, 0.0, 1.0); 4],
+        uvs: vec![[0.0, 10.0], [20.0, 10.0], [20.0, 0.0], [0.0, 0.0]],
+        indices: vec![0, 1, 2, 0, 2, 3],
+        color: [0.5; 3],
+        material: Some(0),
+    };
+    let world = World {
+        instances: (0..2)
+            .map(|mesh| Instance {
+                mesh,
+                transform: Transform::IDENTITY,
+            })
+            .collect(),
+        meshes: vec![far, cube([0.0, 0.5, 0.0], 0.8, 1)],
+        materials: vec![
+            wall,
+            material("box", [0.9, 0.05, 0.05, 1.0], Shading::Standard),
+        ],
+        textures: vec![Texture {
+            width: 2,
+            height: 2,
+            srgb: true,
+            levels: vec![
+                vec![
+                    0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255,
+                ],
+                vec![128, 128, 128, 255],
+            ],
+            encoded: None,
+        }],
+        lights: vec![],
+    };
+    let mut quality = Quality::realtime();
+    quality.shadow_size = 512;
+    let mut r = Renderer::new(
+        &mut device,
+        &world,
+        Look::default(),
+        quality,
+        (W, H),
+        Output::Still,
+    )
+    .expect("renderer");
+    // A green badge over the wall, drawn on top as an overlay.
+    let badge_mesh = r
+        .create_prop_mesh(
+            &mut device,
+            &MeshData {
+                positions: &[
+                    [-14.0, 0.0, -29.0],
+                    [-10.0, 0.0, -29.0],
+                    [-10.0, 4.0, -29.0],
+                    [-14.0, 4.0, -29.0],
+                ],
+                normals: &[],
+                uvs: &[],
+                indices: &[0, 1, 2, 0, 2, 3],
+            },
+        )
+        .expect("badge mesh");
+    let green = r
+        .create_prop_material(
+            &mut device,
+            &MaterialDesc {
+                name: "badge".into(),
+                base_color: [0.0, 1.0, 0.0, 1.0],
+                overlay: true,
+                blend: BlendMode::Alpha,
+                depth_test: false,
+                ..MaterialDesc::default()
+            },
+        )
+        .expect("badge");
+    let mut identity = [0.0f32; 16];
+    for i in [0, 5, 10, 15] {
+        identity[i] = 1.0;
+    }
+    r.create_prop_instance(badge_mesh, green, &identity)
+        .expect("badge instance");
+    let env = Environment::resolve(
+        &TimeOfDay {
+            hours: 12.0,
+            ..TimeOfDay::default()
+        },
+        &Weather::default(),
+        &r.look().palette,
+        3.0,
+    );
+    let sharp = r
+        .render_still(&mut device, &view(), &env, 1)
+        .expect("render");
+    let focused = View {
+        focus: Some(Focus {
+            distance: 12.0,
+            depth: 6.0,
+            blur: 0.08,
+        }),
+        ..view()
+    };
+    let soft = r
+        .render_still(&mut device, &focused, &env, 1)
+        .expect("render");
+    // How much neighbouring pixels differ across a region: the squares' edges.
+    let edges = |px: &[u8], x0: u32, y0: u32, x1: u32, y1: u32| {
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                sum += (luma(px, x + 1, y) - luma(px, x, y)).abs()
+                    + (luma(px, x, y + 1) - luma(px, x, y)).abs();
+                n += 1.0;
+            }
+        }
+        sum / n
+    };
+    // Right of the badge, which is drawn alike in both.
+    let (crisp, blurred) = (edges(&sharp, 60, 2, 120, 18), edges(&soft, 60, 2, 120, 18));
+    eprintln!("the far wall's edges: {crisp:.1} sharp, {blurred:.1} with the focus at 12 m");
+    assert!(crisp > 8.0, "the squares show: {crisp}");
+    assert!(blurred < crisp * 0.4, "{blurred} vs {crisp}");
+    // The box, nearer than the focus, is untouched.
+    let mut most = 0u8;
+    for y in 33..40 {
+        for x in 60..68 {
+            let i = ((y * W + x) * 4) as usize;
+            for c in 0..3 {
+                most = most.max(sharp[i + c].abs_diff(soft[i + c]));
+            }
+        }
+    }
+    assert!(most <= 1, "the box changed by {most}");
+    let i = ((H / 2 * W + W / 2) * 4) as usize;
+    assert!(
+        u32::from(soft[i]) > u32::from(soft[i + 1]) + 40,
+        "the box is in view"
+    );
+    // The badge keeps its exact colour over the blur.
+    let at = r
+        .project(&focused, (W, H), [-12.0, 2.0, -29.0])
+        .expect("badge in front");
+    let b = ((at[1] as u32 * W + at[0] as u32) * 4) as usize;
+    assert_eq!(&soft[b..b + 3], &[0, 255, 0], "the badge stays sharp");
+    assert_eq!(&soft[b..b + 3], &sharp[b..b + 3]);
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}

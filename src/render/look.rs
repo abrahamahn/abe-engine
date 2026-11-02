@@ -319,6 +319,25 @@ pub struct View {
     pub shift: [f32; 2],
     /// Near clip distance in metres.
     pub near: f32,
+    /// Depth of field: what lies past the focus softens (`None`: everything sharp).
+    pub focus: Option<Focus>,
+}
+
+/// A lens focused `distance` metres from the eye: nothing nearer blurs, and past it the scene
+/// softens, reaching its full blur `depth` metres further on, `blur` (the blur's radius as a share
+/// of the image height) across. A table in focus keeps its garden behind it soft.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Focus {
+    pub distance: f32,
+    pub depth: f32,
+    pub blur: f32,
+}
+
+impl Focus {
+    /// Whether it blurs anything: a positive depth and blur at a finite distance.
+    pub fn blurs(&self) -> bool {
+        self.distance.is_finite() && self.depth > 0.0 && self.blur > 0.0 && self.blur.is_finite()
+    }
 }
 
 impl Default for View {
@@ -331,6 +350,7 @@ impl Default for View {
             up: [0.0, 1.0, 0.0],
             shift: [0.0; 2],
             near: 0.08,
+            focus: None,
         }
     }
 }
@@ -528,6 +548,21 @@ impl LookFile {
                     }
                     view.shift = [s[0].float()?, s[1].float()?];
                 }
+                if let Some(f) = v.get("focus") {
+                    let mut focus = Focus {
+                        distance: f32::NAN,
+                        depth: 4.0,
+                        blur: 0.006,
+                    };
+                    // The distance has no default: a missing one is refused below.
+                    num(f, "distance", &mut focus.distance)?;
+                    num(f, "depth", &mut focus.depth)?;
+                    num(f, "blur", &mut focus.blur)?;
+                    if !focus.blurs() || focus.distance < 0.0 {
+                        return Err(format!("view {:?}: focus out of range", view.name));
+                    }
+                    view.focus = Some(focus);
+                }
                 if !(view.near > 0.0 && view.fov > 0.0 && view.fov < 180.0) {
                     return Err(format!("view {:?}: fov or near out of range", view.name));
                 }
@@ -639,6 +674,33 @@ mod tests {
         assert_eq!(f.views[0].fov, 40.0);
         assert_eq!(f.views[0].up, [0.0, 1.0, 0.0]);
         assert_eq!((f.views[0].shift, f.views[0].near), ([0.0; 2], 0.08));
+        assert_eq!(f.views[0].focus, None);
+    }
+
+    #[test]
+    fn view_focus() {
+        let f = LookFile::parse(
+            br##"{"views": [{"name": "table", "eye": [0, 2, 3], "target": [0, 0, 0],
+                             "focus": {"distance": 3.5}},
+                            {"name": "deep", "eye": [0, 2, 3], "target": [0, 0, 0],
+                             "focus": {"distance": 2, "depth": 6, "blur": 0.01}}]}"##,
+        )
+        .unwrap();
+        let focus = |i: usize| f.views[i].focus.map(|f| (f.distance, f.depth, f.blur));
+        assert_eq!(focus(0), Some((3.5, 4.0, 0.006)));
+        assert_eq!(focus(1), Some((2.0, 6.0, 0.01)));
+        for bad in [
+            &br##"{"views": [{"name": "a", "eye": [0, 1, 2], "target": [0, 0, 0],
+                             "focus": {"distance": -1}}]}"##[..],
+            br##"{"views": [{"name": "a", "eye": [0, 1, 2], "target": [0, 0, 0],
+                            "focus": {"distance": 2, "depth": 0}}]}"##,
+            br##"{"views": [{"name": "a", "eye": [0, 1, 2], "target": [0, 0, 0],
+                            "focus": {"distance": 2, "blur": 0}}]}"##,
+            br##"{"views": [{"name": "a", "eye": [0, 1, 2], "target": [0, 0, 0],
+                            "focus": {"depth": 3}}]}"##,
+        ] {
+            assert!(LookFile::parse(bad).is_err());
+        }
     }
 
     #[test]

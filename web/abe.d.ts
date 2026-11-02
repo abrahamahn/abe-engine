@@ -34,6 +34,19 @@ export interface AbeView {
   readonly fov?: number;
   readonly shift?: readonly [number, number];
   readonly near?: number;
+  /** Depth of field; absent, everything is sharp. */
+  readonly focus?: AbeFocus;
+}
+
+/**
+ * A lens focused `distance` metres from the eye: nothing nearer blurs, and past it the scene
+ * softens, reaching its full blur `depth` metres further on (default 4), `blur` across as a share
+ * of the image height (default 0.006, capped at 24 pixels). Overlays stay sharp.
+ */
+export interface AbeFocus {
+  readonly distance: number;
+  readonly depth?: number;
+  readonly blur?: number;
 }
 
 /** RGBA8 pixels, or a canvas, image bitmap or loaded image. */

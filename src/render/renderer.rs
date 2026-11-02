@@ -14,7 +14,7 @@ use crate::gpu::{
 };
 use abe_shader::{Compiled, Stage};
 
-use super::look::{DetailPreset, Look, View};
+use super::look::{DetailPreset, Focus, Look, View};
 use super::math::{
     self, M4, V3, add, cross, invert, look_at, mul, normalize, ortho, perspective, reflect_y,
     scale, sub, transform,
@@ -60,6 +60,8 @@ const GRASS_SIDE: u32 = 640;
 const RAIN_BOX: f32 = 16.0;
 const PETAL_BOX: f32 = 14.0;
 const GROUND_FORMAT: Format = Format::Rgba8Unorm;
+/// The widest a defocused pixel spreads, in pixels: past it the taps would scatter.
+const MAX_FOCUS_BLUR_PX: f32 = 24.0;
 /// Size of the per-view uniform buffer holding the `Frame` block.
 const FRAME_BYTES: u64 = 1536;
 
@@ -2048,6 +2050,15 @@ impl Renderer {
                 0.85,
                 0.0,
             ]);
+            // Depth of field, drawn with the painterly filter.
+            if let Some(f) = view.focus.filter(Focus::blurs) {
+                pc[4..8].copy_from_slice(&[
+                    f.distance.max(0.0),
+                    f.depth,
+                    (f.blur * t.height as f32).min(MAX_FOCUS_BLUR_PX),
+                    1.0,
+                ]);
+            }
             Self::post_pass(enc, t.paint, 0, Load::DontCare, p.paint, slot.paint, pc);
         }
         let (dest, encode_srgb) = match self.output {

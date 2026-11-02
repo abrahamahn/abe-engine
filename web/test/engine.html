@@ -134,6 +134,20 @@ function count(px, box, test) {
   }
   return n;
 }
+/** How much neighbouring pixels' luminance differs across a CSS-pixel box: its edges. */
+function edges(px, box) {
+  const l = (x, y) => {
+    const i = (y * px.width + x) * 4;
+    return 0.2126 * px.rgba[i] + 0.7152 * px.rgba[i + 1] + 0.0722 * px.rgba[i + 2];
+  };
+  let sum = 0;
+  for (let y = Math.max(0, box[1] | 0); y < Math.min(px.height - 1, box[3] | 0); y++) {
+    for (let x = Math.max(0, box[0] | 0); x < Math.min(px.width - 1, box[2] | 0); x++) {
+      sum += Math.abs(l(x + 1, y) - l(x, y)) + Math.abs(l(x, y + 1) - l(x, y));
+    }
+  }
+  return sum;
+}
 const red = (r, g, b) => r > g + 40 && r > b + 40;
 const blue = (r, g, b) => b > r + 40 && b > g + 20;
 
@@ -198,6 +212,21 @@ async function run() {
   check('pick finds the card', hitCard && hitCard.instance === right, hitCard);
   check('pick misses the sky', engine.pick(4, 4) === null);
   result.first = png(first);
+
+  // Depth of field: focused 4 m out, the card 10 m out softens (its edges and the line between its
+  // red and blue halves fade); a focus without a distance is refused.
+  const view = { eye: [0, 4, 10], target: [0, 0.5, 0], fov: 50 };
+  engine.setView({ ...view, focus: { distance: 4, depth: 2, blur: 0.02 } });
+  const soft = await frame(engine);
+  engine.setView(view);
+  const card = boxAround(at([2, 1.0, 0]), 16);
+  const crisp = Math.round(edges(first, card));
+  const blurred = Math.round(edges(soft, card));
+  check('a focus softens what lies past it', blurred < crisp * 0.6, { crisp, blurred });
+  let focusRefused = '';
+  try { engine.setView({ ...view, focus: { depth: 2 } }); } catch (e) { focusRefused = e.message; }
+  check('a focus without a distance is refused', focusRefused.includes('set_view'), focusRefused);
+  engine.setView(view);
 
   // Hide the cube, move the card left in one batch call, swap the texture's colours.
   engine.setInstances([
