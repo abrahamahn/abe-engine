@@ -219,9 +219,9 @@ async function run() {
   engine.setView({ ...view, focus: { distance: 4, depth: 2, blur: 0.02 } });
   const soft = await frame(engine);
   engine.setView(view);
-  const card = boxAround(at([2, 1.0, 0]), 16);
-  const crisp = Math.round(edges(first, card));
-  const blurred = Math.round(edges(soft, card));
+  const cardBox = boxAround(at([2, 1.0, 0]), 16);
+  const crisp = Math.round(edges(first, cardBox));
+  const blurred = Math.round(edges(soft, cardBox));
   check('a focus softens what lies past it', blurred < crisp * 0.6, { crisp, blurred });
   let focusRefused = '';
   try { engine.setView({ ...view, focus: { depth: 2 } }); } catch (e) { focusRefused = e.message; }
