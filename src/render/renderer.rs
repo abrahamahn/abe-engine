@@ -251,12 +251,12 @@ pub(super) fn prop_shader_source(user: &str) -> String {
     )
 }
 
-/// Overlay pipelines for a game's prop shader: [opaque, alpha, additive][without, with depth].
-pub(super) fn prop_shader_pipelines(
-    device: &mut Device<'_>,
+/// A game's prop shader compiled (its overlay vertex and fragment stages), checked to read only
+/// what an overlay draw binds.
+pub(super) fn prop_shader_stages(
     pipelines: &Pipelines,
     user: &str,
-) -> Result<[[PipelineId; 2]; 3]> {
+) -> Result<(Compiled, Compiled)> {
     let source = prop_shader_source(user);
     let vs = crate::gpu::compile_shader(&source, Stage::Vertex, "vs_prop")?;
     let fs = crate::gpu::compile_shader(&source, Stage::Fragment, "fs_prop_shader")?;
@@ -267,33 +267,43 @@ pub(super) fn prop_shader_pipelines(
                 .into(),
         );
     }
-    let depth = |compare| DepthState {
-        format: Format::Depth32Float,
-        compare,
-        write: false,
-        bias_constant: 0.0,
-        bias_slope: 0.0,
-        clamp: false,
-    };
-    let mut out = pipelines.overlay;
-    for (i, blend) in [Blend::Replace, Blend::Premultiplied, Blend::Additive]
-        .into_iter()
-        .enumerate()
-    {
-        for (j, compare) in [Compare::Always, Compare::Greater].into_iter().enumerate() {
-            out[i][j] = device.create_render_pipeline(&RenderPipelineDesc {
-                vertex: &vs,
-                fragment: Some(&fs),
-                vertex_layout: Some(pipelines.prop_layout.clone()),
-                topology: Topology::TriangleList,
-                cull: Cull::None,
-                front_ccw: true,
-                depth: Some(depth(compare)),
-                colors: vec![color(pipelines.output_format, blend)],
-            })?;
-        }
-    }
-    Ok(out)
+    Ok((vs, fs))
+}
+
+/// One overlay pipeline of a game's prop shader: `blend` 0 opaque, 1 alpha, 2 additive; with the
+/// scene's depth test or without.
+pub(super) fn prop_shader_pipeline(
+    device: &mut Device<'_>,
+    pipelines: &Pipelines,
+    (vs, fs): (&Compiled, &Compiled),
+    blend: usize,
+    depth_test: bool,
+) -> Result<PipelineId> {
+    let blend = [Blend::Replace, Blend::Premultiplied, Blend::Additive]
+        .get(blend)
+        .copied()
+        .ok_or("prop_shader_pipeline: no such blend")?;
+    device.create_render_pipeline(&RenderPipelineDesc {
+        vertex: vs,
+        fragment: Some(fs),
+        vertex_layout: Some(pipelines.prop_layout.clone()),
+        topology: Topology::TriangleList,
+        cull: Cull::None,
+        front_ccw: true,
+        depth: Some(DepthState {
+            format: Format::Depth32Float,
+            compare: if depth_test {
+                Compare::Greater
+            } else {
+                Compare::Always
+            },
+            write: false,
+            bias_constant: 0.0,
+            bias_slope: 0.0,
+            clamp: false,
+        }),
+        colors: vec![color(pipelines.output_format, blend)],
+    })
 }
 
 fn color(format: Format, blend: Blend) -> ColorTarget {

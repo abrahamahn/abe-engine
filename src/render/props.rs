@@ -388,6 +388,21 @@ pub(super) struct Batch {
     layer: Layer,
 }
 
+/// A game's prop shader: its compiled stages and the overlay pipelines made from them so far.
+pub(super) struct PropShaderEntry {
+    stages: (abe_shader::Compiled, abe_shader::Compiled),
+    pipelines: [[Option<crate::gpu::PipelineId>; 2]; 3],
+}
+
+/// The overlay pipeline index of a blend mode: opaque, alpha, additive.
+fn blend_index(blend: BlendMode) -> usize {
+    match blend {
+        BlendMode::Opaque => 0,
+        BlendMode::Alpha => 1,
+        BlendMode::Add => 2,
+    }
+}
+
 /// A frame slot's instance and joint buffers and the bind groups that read them.
 pub(super) struct PropSlot {
     buffer: BufferId,
@@ -403,8 +418,9 @@ pub(super) struct PropSlot {
 pub(super) struct Props {
     meshes: Pool<MeshEntry>,
     materials: Pool<MaterialEntry>,
-    /// A game's prop shaders: their overlay pipelines, [opaque, alpha, additive][depth test].
-    shaders: Pool<[[crate::gpu::PipelineId; 2]; 3]>,
+    /// A game's prop shaders: their stages, and their overlay pipelines, [opaque, alpha,
+    /// additive][depth test], each made the first time a prop draws with it.
+    shaders: Pool<PropShaderEntry>,
     textures: Pool<TextureId>,
     instances: Pool<InstanceEntry>,
     slots: Vec<Option<PropSlot>>,
@@ -889,15 +905,66 @@ impl Renderer {
     }
 
     /// Compiles a game's prop shader: WGSL that defines `fn shade(in: ShadeInput) -> vec4f`
-    /// (render/shaders/prop_shader_input.wgsl) and may call the scene shader's functions. Its
-    /// pipelines live as long as the renderer.
+    /// (render/shaders/prop_shader_input.wgsl) and may call the scene shader's functions. Each of
+    /// its overlay pipelines (a blend mode, with the scene's depth test or without) is made the
+    /// first time a prop draws with it, and lives as long as the renderer.
     pub fn create_prop_shader(
         &mut self,
-        device: &mut Device<'_>,
+        _device: &mut Device<'_>,
         source: &str,
     ) -> Result<PropShader> {
-        let pipelines = super::renderer::prop_shader_pipelines(device, &self.pipelines, source)?;
-        Ok(PropShader(self.props.shaders.insert(pipelines)?))
+        let stages = super::renderer::prop_shader_stages(&self.pipelines, source)?;
+        Ok(PropShader(self.props.shaders.insert(PropShaderEntry {
+            stages,
+            pipelines: [[None; 2]; 3],
+        })?))
+    }
+
+    /// The overlay pipelines this frame's prop-shader batches need and do not have yet.
+    fn make_prop_shader_pipelines(&mut self, device: &mut Device<'_>) -> Result<()> {
+        let mut wanted = vec![];
+        for b in self
+            .props
+            .batches
+            .iter()
+            .filter(|b| b.layer == Layer::Overlay)
+        {
+            let Some(mat) = self.props.materials.get(b.material) else {
+                continue;
+            };
+            let Some(shader) = mat.desc.shader else {
+                continue;
+            };
+            let (blend, depth) = (
+                blend_index(mat.desc.blend),
+                usize::from(mat.desc.depth_test),
+            );
+            if self
+                .props
+                .shaders
+                .get(shader.0)
+                .is_some_and(|s| s.pipelines[blend][depth].is_none())
+                && !wanted.contains(&(shader, blend, depth))
+            {
+                wanted.push((shader, blend, depth));
+            }
+        }
+        for (shader, blend, depth) in wanted {
+            let Some(entry) = self.props.shaders.get(shader.0) else {
+                continue;
+            };
+            let made = super::renderer::prop_shader_pipeline(
+                device,
+                &self.pipelines,
+                (&entry.stages.0, &entry.stages.1),
+                blend,
+                depth == 1,
+            )?;
+            if let Some(entry) = self.props.shaders.get_mut(shader.0) {
+                entry.pipelines[blend][depth] = Some(made);
+            }
+        }
+        Ok(())
     }
 
     /// Replaces a material's prop-shader parameters, without rebuilding anything (per frame).
@@ -1392,6 +1459,7 @@ impl Renderer {
         drop(live);
         self.props.batches = batches;
         self.props.bounds = (lo[0] <= hi[0]).then_some((lo, hi));
+        self.make_prop_shader_pipelines(device)?;
         // The shared skin records: rewritten when a skinned mesh came or went, and grown (with
         // every slot's bind groups) when they outgrow their buffer.
         if self.props.skin_dirty || self.props.skin_buffer.is_none() {
@@ -1698,17 +1766,23 @@ impl Renderer {
             ) else {
                 continue;
             };
-            let blend = match mat.desc.blend {
-                BlendMode::Opaque => 0,
-                BlendMode::Alpha => 1,
-                BlendMode::Add => 2,
+            let (blend, depth) = (
+                blend_index(mat.desc.blend),
+                usize::from(mat.desc.depth_test),
+            );
+            let p = match mat.desc.shader {
+                // Made in `prepare_props`; a pipeline that could not be made draws nothing.
+                Some(h) => match self
+                    .props
+                    .shaders
+                    .get(h.0)
+                    .and_then(|s| s.pipelines[blend][depth])
+                {
+                    Some(p) => p,
+                    None => continue,
+                },
+                None => self.pipelines.overlay[blend][depth],
             };
-            let pipelines = mat
-                .desc
-                .shader
-                .and_then(|h| self.props.shaders.get(h.0))
-                .unwrap_or(&self.pipelines.overlay);
-            let p = pipelines[blend][usize::from(mat.desc.depth_test)];
             if pipeline != Some(p) {
                 enc.set_pipeline(p);
                 enc.set_bind_group(0, s.overlay);
