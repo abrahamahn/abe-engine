@@ -50,6 +50,8 @@ pub(super) struct GpuScene {
     pub max: V3,
     pub land_min: V3,
     pub land_max: V3,
+    /// Mean position of the land's vertices: where its detail is densest.
+    pub land_centre: V3,
     pub triangles: usize,
 }
 
@@ -65,6 +67,8 @@ impl GpuScene {
         let mut max = [f32::NEG_INFINITY; 3];
         let mut land_min = [f32::INFINITY; 3];
         let mut land_max = [f32::NEG_INFINITY; 3];
+        let mut land_sum = [0.0f64; 3];
+        let mut land_n = 0usize;
         let mut water_sum = 0.0f64;
         let mut water_n = 0usize;
         // A default material for meshes without one: their flat colour, matte.
@@ -141,7 +145,11 @@ impl GpuScene {
                     if !water {
                         land_min[k] = land_min[k].min(w[k]);
                         land_max[k] = land_max[k].max(w[k]);
+                        land_sum[k] += f64::from(w[k]);
                     }
+                }
+                if !water {
+                    land_n += 1;
                 }
             }
             let first_index = indices.len() as u32;
@@ -184,6 +192,15 @@ impl GpuScene {
         if land_min[0] > land_max[0] {
             (land_min, land_max) = (min, max);
         }
+        let land_centre = if land_n > 0 {
+            land_sum.map(|v| (v / land_n as f64) as f32)
+        } else {
+            [
+                0.5 * (min[0] + max[0]),
+                0.5 * (min[1] + max[1]),
+                0.5 * (min[2] + max[2]),
+            ]
+        };
         // Water last, so the opaque world is already in the depth buffer.
         draws.sort_by_key(|d| d.water);
         let vb = device.create_buffer(&BufferDesc {
@@ -263,6 +280,7 @@ impl GpuScene {
             max,
             land_min,
             land_max,
+            land_centre,
             triangles: indices.len() / 3,
         })
     }

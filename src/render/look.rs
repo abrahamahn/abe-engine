@@ -45,6 +45,9 @@ pub struct Look {
     /// Scale of point-light (lamp) intensity and of lamp-emission glow.
     pub lamp_light: f32,
     pub lamp_glow: f32,
+    /// Scale of lamp light on foliage and grass (on top of `lamp_light`): blossom and leaves
+    /// crowding a lantern otherwise burn white.
+    pub lamp_foliage: f32,
     pub fog: f32,
     pub fog_height: f32,
     pub fog_falloff: f32,
@@ -263,6 +266,7 @@ impl Default for Look {
             vignette: 0.25,
             lamp_light: 1.0,
             lamp_glow: 1.0,
+            lamp_foliage: 1.0,
             fog: 1.0,
             fog_height: 0.0,
             fog_falloff: 0.08,
@@ -347,6 +351,7 @@ impl LookFile {
             num(s, "normal_map_strength", &mut l.normal_map_strength)?;
             num(s, "lamp_light", &mut l.lamp_light)?;
             num(s, "lamp_glow", &mut l.lamp_glow)?;
+            num(s, "lamp_foliage", &mut l.lamp_foliage)?;
             col(s, "water_color", &mut l.water_color)?;
             num(s, "water_reflection", &mut l.water_reflection)?;
             num(s, "water_ripples", &mut l.water_ripples)?;
@@ -568,13 +573,14 @@ mod tests {
     #[test]
     fn parses_overrides_and_views() {
         let f = LookFile::parse(
-            br##"{"shading": {"rim_strength": 0.7, "shadow_tint": "#808080"},
+            br##"{"shading": {"rim_strength": 0.7, "shadow_tint": "#808080", "lamp_foliage": 0.5},
                  "time": {"hours": 6.5, "north": [0, 0, 1]},
                  "weather": {"preset": "rain", "wind": 2},
                  "views": [{"name": "a", "eye": [0, 1, 2], "target": [0, 0, 0], "fov": 40}]}"##,
         )
         .unwrap();
         assert_eq!(f.look.rim_strength, 0.7);
+        assert_eq!(f.look.lamp_foliage, 0.5);
         assert!((f.look.shadow_tint[0] - 0.2158).abs() < 1e-3);
         assert_eq!(f.time.hours, 6.5);
         assert_eq!(f.weather.rain, Weather::preset("rain").unwrap().rain);

@@ -34,6 +34,9 @@ const GROUND_REACH: f32 = 48.0;
 /// The world map covers the land's bounds plus this margin (metres) on every side, so shallows
 /// and foam reach out past the outermost shore.
 const WORLD_MARGIN: f32 = 16.0;
+/// ...but reaches at most this far (metres) from where the land's detail is densest, so distant
+/// scenery does not spread its texels thin.
+const WORLD_MAX_REACH: f32 = 560.0;
 /// The grass instance grid is at most GRASS_SIDE x GRASS_SIDE cells of 13 cm around the camera
 /// (see scene.wgsl); `Quality::grass` scales its area.
 const GRASS_SIDE: u32 = 640;
@@ -466,12 +469,20 @@ fn f16_to_f32(h: u16) -> f32 {
     }
 }
 
-/// The world map's top-down projection: the land's XZ bounds plus a margin (square, so texels
-/// are square), depth 0 above the highest point of the world and 1 below the lowest.
+/// The world map's top-down projection: the land's XZ bounds plus a margin, no further than
+/// `WORLD_MAX_REACH` from the land's centre (square, so texels are square), depth 0 above the
+/// highest point of the world and 1 below the lowest.
 fn world_view(scene: &GpuScene, size: u32) -> Ground {
-    let (lo, hi) = (scene.land_min, scene.land_max);
-    let (x, z) = (0.5 * (lo[0] + hi[0]), 0.5 * (lo[2] + hi[2]));
-    let r = 0.5 * (hi[0] - lo[0]).max(hi[2] - lo[2]) + WORLD_MARGIN;
+    let c = scene.land_centre;
+    let span = |k: usize| {
+        (
+            (scene.land_min[k] - WORLD_MARGIN).max(c[k] - WORLD_MAX_REACH),
+            (scene.land_max[k] + WORLD_MARGIN).min(c[k] + WORLD_MAX_REACH),
+        )
+    };
+    let ((x0, x1), (z0, z1)) = (span(0), span(2));
+    let (x, z) = (0.5 * (x0 + x1), 0.5 * (z0 + z1));
+    let r = 0.5 * (x1 - x0).max(z1 - z0);
     let top = scene.max[1] + 1.0;
     let range = (top - scene.min[1] + 1.0).max(2.0);
     let v = look_at([x, top, z], [x, top - 1.0, z], [0.0, 0.0, -1.0]);
@@ -1253,6 +1264,7 @@ impl Renderer {
         b.v(t.wet_sand, 0.0);
         b.v(t.rock, 0.0);
         b.v(t.meadow, 0.0);
+        b.f(l.lamp_foliage, 0.0, 0.0, 0.0);
         let mut bytes = f32_bytes(&b.0);
         for u in [
             tiles.0,

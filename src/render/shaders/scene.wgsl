@@ -156,7 +156,7 @@ fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
     let nl = dot(n, ld);
     var w = smoothstep(-0.2, 0.3, nl);
     if (foliage) {
-      w = smoothstep(-0.8, 0.6, nl) * 0.8 + 0.2;
+      w = (smoothstep(-0.8, 0.6, nl) * 0.8 + 0.2) * frame.lamps.x;
     }
     sum += l.color.rgb * (l.color.w * att * w);
   }

@@ -47,6 +47,7 @@ struct Frame {
   wet_sand: vec4f,      // rgb sand at the water line
   rock: vec4f,          // rgb bare rock
   meadow: vec4f,        // rgb second grass tone of the broad patches
+  lamps: vec4f,         // lamp light on foliage (scale), unused, unused, unused
   tiles: vec4u,         // tiles across, tiles down, tile size in pixels, light count
 };
 
