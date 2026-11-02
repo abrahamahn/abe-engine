@@ -45,6 +45,8 @@ struct Part {
     own: Option<PropMesh>,
     /// The morph weights its own mesh's vertices were last morphed with.
     morphed: Vec<f32>,
+    /// The vertices its morph targets move (ascending): only they are morphed again.
+    moved: Vec<u32>,
 }
 
 pub(super) struct InstanceEntry {
@@ -256,6 +258,7 @@ impl Renderer {
             /// A skinned primitive's vertices' joints and weights.
             skin: Option<Skin>,
             morphed: Vec<f32>,
+            moved: Vec<u32>,
         }
         type Deformed = (Vec<[f32; 3]>, Vec<[f32; 3]>);
         type Skin = (Vec<[u16; 4]>, Vec<[f32; 4]>);
@@ -277,6 +280,7 @@ impl Renderer {
                     deformed,
                     skin,
                     morphed: pose.weights[n].clone(),
+                    moved: anim::morphed_vertices(p),
                 });
             }
         }
@@ -332,6 +336,7 @@ impl Renderer {
                     instance,
                     own,
                     morphed: plan.morphed,
+                    moved: plan.moved,
                 }),
                 Err(e) => {
                     if let Some(m) = own {
@@ -481,12 +486,27 @@ impl Renderer {
             }
             let weights = &e.pose.weights[part.node];
             if !p.targets.is_empty() && part.morphed != *weights {
-                let (pos, nrm) = anim::deform(p, weights, None);
-                morphs.push((k, own, pos, nrm, weights.clone()));
+                match (part.moved.first(), part.moved.last()) {
+                    // Without normals of its own the whole mesh is shaded again.
+                    _ if p.normals.is_empty() => {
+                        let (pos, nrm) = anim::deform(p, weights, None);
+                        morphs.push((k, own, None, pos, nrm, weights.clone()));
+                    }
+                    // Only the span of the vertices its targets move is morphed and rewritten.
+                    (Some(&lo), Some(&hi)) => {
+                        let (first, count) = (lo as usize, (hi - lo) as usize + 1);
+                        let (pos, nrm) = anim::morph_range(p, weights, &part.moved, first, count);
+                        morphs.push((k, own, Some(first), pos, nrm, weights.clone()));
+                    }
+                    _ => morphs.push((k, own, Some(0), vec![], vec![], weights.clone())),
+                }
             }
         }
-        for (k, mesh, pos, nrm, weights) in morphs {
-            self.update_prop_mesh(device, mesh, &pos, &nrm)?;
+        for (k, mesh, first, pos, nrm, weights) in morphs {
+            match first {
+                Some(first) => self.update_prop_mesh_range(device, mesh, first, &pos, &nrm)?,
+                None => self.update_prop_mesh(device, mesh, &pos, &nrm)?,
+            }
             if let Some(part) = self.model_instance_entry(i)?.parts.get_mut(k) {
                 part.morphed = weights;
             }

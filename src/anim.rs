@@ -198,6 +198,66 @@ pub fn deform(p: &Primitive, weights: &[f32], joints: Option<&[M4]>) -> (Vec<V3>
     (pos, nrm)
 }
 
+/// The vertices of `p` that some morph target moves (by position or normal), ascending: a face's
+/// targets move a few hundred vertices of a whole figure.
+pub fn morphed_vertices(p: &Primitive) -> Vec<u32> {
+    let mut moved = vec![false; p.positions.len()];
+    for t in &p.targets {
+        for deltas in [&t.positions, &t.normals] {
+            for (m, d) in moved.iter_mut().zip(deltas.iter()) {
+                if d.iter().any(|x| *x != 0.0) {
+                    *m = true;
+                }
+            }
+        }
+    }
+    moved
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &m)| m.then_some(i as u32))
+        .collect()
+}
+
+/// Positions and normals of `p`'s vertices `first..first + count` under morph `weights` (not
+/// skinned), where only `moved` ([`morphed_vertices`]) differ from the mesh: what
+/// [`deform`] gives for that range, without visiting the rest.
+pub fn morph_range(
+    p: &Primitive,
+    weights: &[f32],
+    moved: &[u32],
+    first: usize,
+    count: usize,
+) -> (Vec<V3>, Vec<V3>) {
+    let end = (first + count).min(p.positions.len());
+    let mut pos = p.positions[first..end].to_vec();
+    let mut nrm = if p.normals.is_empty() {
+        vec![]
+    } else {
+        p.normals[first..end].to_vec()
+    };
+    for &v in moved {
+        let v = v as usize;
+        if v < first || v >= end {
+            continue;
+        }
+        for (t, &w) in p.targets.iter().zip(weights) {
+            if w == 0.0 {
+                continue;
+            }
+            if let Some(d) = t.positions.get(v) {
+                pos[v - first] = math::add(pos[v - first], math::scale(*d, w));
+            }
+            if let (Some(n), Some(d)) = (nrm.get_mut(v - first), t.normals.get(v)) {
+                *n = math::add(*n, math::scale(*d, w));
+            }
+        }
+    }
+    for n in &mut nrm {
+        *n = math::normalize(*n);
+    }
+    (pos, nrm)
+}
+
 /// Translation, rotation, scale to a column-major matrix.
 pub fn compose(t: V3, q: Quat, s: V3) -> M4 {
     let [x, y, z, w] = q;
@@ -427,6 +487,32 @@ mod tests {
             duration: 1.0,
         });
         m
+    }
+
+    #[test]
+    fn a_morph_range_matches_the_whole_mesh_morphed() {
+        let mut p = arm().meshes[0].primitives[0].clone();
+        // The target moves only the middle vertex now (the others' deltas are zero).
+        p.targets = vec![
+            MorphTarget {
+                positions: vec![[0.0; 3], [0.0, 0.0, 1.0], [0.0; 3]],
+                normals: vec![[0.0; 3], [0.0, 1.0, 0.0], [0.0; 3]],
+            },
+            MorphTarget {
+                positions: vec![[0.0; 3]; 3],
+                normals: vec![],
+            },
+        ];
+        let moved = morphed_vertices(&p);
+        assert_eq!(moved, vec![1]);
+        let weights = [0.5, 1.0];
+        let (all_pos, all_nrm) = deform(&p, &weights, None);
+        let (pos, nrm) = morph_range(&p, &weights, &moved, 1, 1);
+        assert!(close(&pos[0], &all_pos[1]), "{pos:?}");
+        assert!(close(&nrm[0], &all_nrm[1]), "{nrm:?}");
+        // A wider range carries its unmoved vertices as modelled.
+        let (pos, _) = morph_range(&p, &weights, &moved, 0, 3);
+        assert!(close(&pos.concat(), &all_pos.concat()));
     }
 
     #[test]

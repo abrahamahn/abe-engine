@@ -743,6 +743,42 @@ impl Renderer {
         Ok(())
     }
 
+    /// New positions and normals for the vertices `first..first + positions.len()` of a mesh
+    /// (a morphed face: only the vertices its targets move), written in place; the rest stay.
+    pub fn update_prop_mesh_range(
+        &mut self,
+        device: &mut Device<'_>,
+        mesh: PropMesh,
+        first: usize,
+        positions: &[V3],
+        normals: &[V3],
+    ) -> Result<()> {
+        let m = self
+            .props
+            .meshes
+            .get_mut(mesh.0)
+            .ok_or_else(|| format!("{mesh:?} was destroyed"))?;
+        let end = first + positions.len();
+        if end > m.positions.len() || normals.len() != positions.len() {
+            return Err(
+                "update_prop_mesh_range: the range must lie in the mesh, a normal a vertex".into(),
+            );
+        }
+        if positions.is_empty() {
+            return Ok(());
+        }
+        let mut data = Vec::with_capacity(positions.len() * 8);
+        for ((p, n), uv) in positions.iter().zip(normals).zip(&m.uvs[first..end]) {
+            data.extend_from_slice(p);
+            data.extend_from_slice(n);
+            data.extend_from_slice(uv);
+        }
+        device.write_buffer(m.vertices, first as u64 * 32, &f32_bytes(&data))?;
+        m.positions[first..end].copy_from_slice(positions);
+        (m.min, m.max) = bounds(&m.positions);
+        Ok(())
+    }
+
     /// Destroys a mesh and every instance of it.
     pub fn destroy_prop_mesh(&mut self, device: &mut Device<'_>, mesh: PropMesh) {
         self.drop_prop_mesh_skin(mesh);
