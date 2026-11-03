@@ -231,6 +231,8 @@ async function main() {
     await page.frameLocator('#project-tool-frame').getByRole('heading', { name: 'Level rules' }).waitFor();
     check('project tool opens without forwarding the editor URL', sentReferrer === undefined);
     await page.click('#project-tool-close');
+    await page.waitForFunction(() => !document.getElementById('project-tool-frame').hasAttribute('src'));
+    check('closing the panel unloads the game workspace', await page.locator('#project-tool-frame').getAttribute('src') === null);
     check('closing a game tool keeps the open scene', (await page.locator('#outliner-tree .node').count()) === names.length);
 
     // 0. The interface speaks Korean on request (and back).

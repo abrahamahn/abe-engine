@@ -15,7 +15,7 @@ export function resolveProjectTools(manifest, studioOrigin, override) {
   const requested = override && configured.local ? webOrigin(override) : configured;
   if (override && configured.local && !requested.local) throw new Error('A local tool origin must stay local.');
   // Cookies are host-scoped, not port-scoped. A paired Studio's HttpOnly cookie belongs only to Studio.
-  if (new URL(requested.origin).hostname === new URL(studioOrigin).hostname) {
+  if (new URL(requested.origin).hostname.replace(/\.$/, '') === new URL(studioOrigin).hostname.replace(/\.$/, '')) {
     throw new Error('Use different hostnames for Studio and the game, e.g. localhost and 127.0.0.1.');
   }
   return manifest.tools.map(tool => {
@@ -41,11 +41,14 @@ export function projectToolsPanel(onError) {
     const option = select.selectedOptions[0];
     title.textContent = frame.title = option.textContent;
     external.href = select.value;
-    if (frame.src !== select.value) frame.src = select.value;
+    frame.src = select.value;
     dialog.showModal();
     select.selectedIndex = 0;
   });
   document.getElementById('project-tool-close').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => {
+    if (!dialog.open) frame.removeAttribute('src');
+  });
   return async (project, advertisedCatalogs) => {
     const current = ++projectLoad;
     try {
