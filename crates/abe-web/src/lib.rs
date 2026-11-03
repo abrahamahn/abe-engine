@@ -13,6 +13,7 @@
 //! (start of the animation clock), `paused=1`, `quality=high`.
 #![cfg(target_arch = "wasm32")]
 
+mod physics;
 mod runtime;
 mod selftest;
 
@@ -151,6 +152,7 @@ pub unsafe extern "C" fn abe_load_world(ptr: *mut u8, len: usize) -> u32 {
     match world {
         Ok((w, table)) => {
             ENTITIES.with(|cell| *cell.borrow_mut() = entities_json(&table));
+            physics::prepare(&w, &table);
             say(
                 0,
                 &format!(

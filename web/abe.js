@@ -1985,6 +1985,44 @@ export async function createEngine(options) {
     setWorldLight(index, position) {
       ok('setWorldLight', x.abe_rt_set_world_light(index >>> 0, position[0], position[1], position[2]));
     },
+    /**
+     * Starts (or restarts) simulating the cooked world's physics (its `rigid_body` and
+     * `collider` components) from the authored state. Returns false when it has none, or when
+     * they could not be built: `physicsError()` then says why.
+     */
+    physicsStart() { return x.abe_rt_physics_start() !== 0; },
+    /**
+     * Steps the simulation `steps` times (default 1, at most 64 a call) by `dt` seconds each (at
+     * most 1/15), then moves the instances and lamps of the bodies that moved (with their
+     * children's). Sleeping and still bodies cost nothing; several steps in one call move things
+     * once. Steps past 64 are not run, so a host that fell further behind (or passes a frame
+     * count or milliseconds) loses that time instead of freezing the page while it catches up.
+     */
+    physicsStep(dt, steps = 1) {
+      const n = Math.floor(steps);
+      // NaN and negative counts take no step; huge ones stay huge (the engine caps them at 64).
+      return x.abe_rt_physics_step(dt, n > 0 ? Math.min(n, 0xffffffff) : 0) !== 0;
+    },
+    /** Stops simulating and puts every moved instance and lamp back where it was cooked. */
+    physicsStop() { x.abe_rt_physics_stop(); },
+    /**
+     * Why the cooked world's physics components could not be built (the entity named), or null
+     * when they were or it has none.
+     */
+    physicsError() {
+      const len = x.abe_rt_physics_error(0, 0);
+      if (!len) return null;
+      const p = reserve(len);
+      x.abe_rt_physics_error(p, len);
+      return new TextDecoder().decode(new Uint8Array(x.memory.buffer, p, len));
+    },
+    /** The simulation's state hash as 16 hexadecimal digits (equal to a native run's), or null. */
+    physicsHash() {
+      const p = out(2).byteOffset;
+      if (!x.abe_rt_physics_hash(p)) return null;
+      const b = new Uint8Array(x.memory.buffer, p, 8);
+      return Array.from(b).reverse().map((v) => v.toString(16).padStart(2, '0')).join('');
+    },
     /** The cooked world's instance under a CSS pixel: `{instance, distance, point}` or null. */
     pickWorld(cssX, cssY) {
       const { sx, sy } = cssScale();

@@ -218,6 +218,38 @@ fn main() -> Result<(), String> {
             comp("camera", r#"{"fov":50}"#),
         ]),
     ))?;
+    // Physics: the ground is static scenery, and a tilted crate (Block A's mesh) falls onto it
+    // when the editor simulates.
+    let ground = scene::entities(doc.root())
+        .iter()
+        .find(|(_, e)| e.get("name").and_then(|n| n.string().ok()) == Some("Ground"))
+        .map(|(id, _)| id.clone())
+        .ok_or("the sample model has a Ground")?;
+    doc.apply_all(&[scene::set_field(
+        &ground,
+        "collider",
+        &[],
+        json::parse(br#"{"center":[0,-0.1,0],"half_extents":[15,0.1,15]}"#)?,
+    )])?;
+    let crate_id = ids.entity();
+    doc.apply_all(&scene::create(
+        &crate_id,
+        "Crate",
+        None,
+        None,
+        BTreeMap::from([
+            comp(
+                "transform",
+                r#"{"translation":[0,4,-3],"rotation":[0.1001,0.2003,0.0501,0.9733]}"#,
+            ),
+            comp(
+                "mesh",
+                &format!(r#"{{"model":"{model}","node":"Block A"}}"#),
+            ),
+            comp("rigid_body", "{}"),
+            comp("collider", r#"{"shape":"box"}"#),
+        ]),
+    ))?;
     let issues = scene::check(doc.root(), &abe_scene::schema::engine_registry());
     if let Some(i) = issues.first() {
         return Err(format!("{}: {}", i.path, i.message));

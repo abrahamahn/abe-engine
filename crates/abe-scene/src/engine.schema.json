@@ -80,6 +80,128 @@
         "ko": "카메라"
       }
     },
+    "collider": {
+      "doc": "The entity's collision shape, in its own frame and scaled with it. Without a rigid_body on the entity it is part of the nearest body above it and moves with it, or, with no body above it, is static scenery. hull and mesh use the entity's own mesh geometry; mesh only on a static body or as scenery.",
+      "fields": {
+        "center": {
+          "doc": "Offset from the entity's origin.",
+          "labels": {
+            "ko": "중심"
+          },
+          "type": "vec3",
+          "unit": "m"
+        },
+        "density": {
+          "default": 1000,
+          "doc": "Mass per volume (water is 1000).",
+          "labels": {
+            "ko": "밀도"
+          },
+          "min": 0,
+          "type": "float",
+          "unit": "kg/m³"
+        },
+        "friction": {
+          "default": 0.6,
+          "labels": {
+            "ko": "마찰"
+          },
+          "min": 0,
+          "type": "float"
+        },
+        "half_extents": {
+          "default": [0.5, 0.5, 0.5],
+          "doc": "Box half size.",
+          "labels": {
+            "ko": "반 크기"
+          },
+          "type": "vec3",
+          "unit": "m"
+        },
+        "half_height": {
+          "default": 0.5,
+          "doc": "Half the length of a capsule's straight part, along its Y axis.",
+          "labels": {
+            "ko": "반 높이"
+          },
+          "min": 0,
+          "type": "float",
+          "unit": "m"
+        },
+        "layers": {
+          "default": 1,
+          "doc": "Bits of the layers this collider is on.",
+          "labels": {
+            "ko": "레이어"
+          },
+          "max": 4294967295,
+          "min": 0,
+          "type": "int"
+        },
+        "mask": {
+          "default": 4294967295,
+          "doc": "Bits of the layers it collides with.",
+          "labels": {
+            "ko": "충돌 대상"
+          },
+          "max": 4294967295,
+          "min": 0,
+          "type": "int"
+        },
+        "radius": {
+          "default": 0.5,
+          "doc": "Sphere and capsule radius.",
+          "labels": {
+            "ko": "반지름"
+          },
+          "min": 0.0001,
+          "type": "float",
+          "unit": "m"
+        },
+        "restitution": {
+          "default": 0,
+          "doc": "Bounciness: 0 stops dead, 1 bounces back to the same height.",
+          "labels": {
+            "ko": "탄성"
+          },
+          "max": 1,
+          "min": 0,
+          "type": "float"
+        },
+        "rotation": {
+          "doc": "Turn relative to the entity.",
+          "labels": {
+            "ko": "회전"
+          },
+          "type": "quat"
+        },
+        "sensor": {
+          "doc": "Reports what enters and leaves without colliding.",
+          "labels": {
+            "ko": "감지 영역"
+          },
+          "type": "bool"
+        },
+        "shape": {
+          "doc": "box, sphere and capsule take their sizes from these fields; hull and mesh take the entity's own mesh. mesh only on a static body or as scenery: moving bodies use hull.",
+          "labels": {
+            "ko": "모양"
+          },
+          "type": "enum",
+          "values": [
+            "box",
+            "sphere",
+            "capsule",
+            "hull",
+            "mesh"
+          ]
+        }
+      },
+      "label": "Collider",
+      "labels": {
+        "ko": "충돌체"
+      }
+    },
     "environment": {
       "doc": "The scene's time, weather and Look. One per scene, usually on its root.",
       "fields": {
@@ -232,6 +354,134 @@
       "label": "Mesh",
       "labels": {
         "ko": "메시"
+      }
+    },
+    "rigid_body": {
+      "doc": "Makes the entity a physics body. A descendant without a rigid_body of its own is part of the nearest body above it: its collider adds to that body's shape, and its meshes and lights move with it. A collider with no body above it is static scenery.",
+      "fields": {
+        "angular_damping": {
+          "default": 0.05,
+          "labels": {
+            "ko": "회전 감쇠"
+          },
+          "min": 0,
+          "type": "float"
+        },
+        "angular_velocity": {
+          "doc": "Starting spin.",
+          "labels": {
+            "ko": "회전 속도"
+          },
+          "type": "vec3",
+          "unit": "rad/s"
+        },
+        "bullet": {
+          "doc": "Swept against static geometry every step, so even a fast small body cannot pass through walls.",
+          "labels": {
+            "ko": "총알(연속 충돌)"
+          },
+          "type": "bool"
+        },
+        "gravity_scale": {
+          "default": 1,
+          "labels": {
+            "ko": "중력 배율"
+          },
+          "type": "float"
+        },
+        "kind": {
+          "doc": "dynamic: moved by gravity, contacts and joints; kinematic: moved only by its velocity or by the game; static: never moves.",
+          "labels": {
+            "ko": "종류"
+          },
+          "type": "enum",
+          "values": [
+            "dynamic",
+            "kinematic",
+            "static"
+          ]
+        },
+        "linear_damping": {
+          "default": 0,
+          "labels": {
+            "ko": "이동 감쇠"
+          },
+          "min": 0,
+          "type": "float"
+        },
+        "lock_rotation": {
+          "doc": "World axes the body may not turn about.",
+          "fields": {
+            "x": {
+              "labels": {
+                "ko": "X"
+              },
+              "type": "bool"
+            },
+            "y": {
+              "labels": {
+                "ko": "Y"
+              },
+              "type": "bool"
+            },
+            "z": {
+              "labels": {
+                "ko": "Z"
+              },
+              "type": "bool"
+            }
+          },
+          "labels": {
+            "ko": "회전 잠금"
+          },
+          "type": "object"
+        },
+        "lock_translation": {
+          "doc": "World axes the body may not move along.",
+          "fields": {
+            "x": {
+              "labels": {
+                "ko": "X"
+              },
+              "type": "bool"
+            },
+            "y": {
+              "labels": {
+                "ko": "Y"
+              },
+              "type": "bool"
+            },
+            "z": {
+              "labels": {
+                "ko": "Z"
+              },
+              "type": "bool"
+            }
+          },
+          "labels": {
+            "ko": "이동 잠금"
+          },
+          "type": "object"
+        },
+        "never_sleeps": {
+          "doc": "Keeps simulating even when still.",
+          "labels": {
+            "ko": "잠들지 않음"
+          },
+          "type": "bool"
+        },
+        "velocity": {
+          "doc": "Starting velocity.",
+          "labels": {
+            "ko": "속도"
+          },
+          "type": "vec3",
+          "unit": "m/s"
+        }
+      },
+      "label": "Rigid body",
+      "labels": {
+        "ko": "강체"
       }
     },
     "transform": {

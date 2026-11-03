@@ -221,6 +221,8 @@ function onMessage(msg) {
     case 'cooked':
       if (msg.doc !== state.doc?.id) break; // a cook of a document closed since
       state.cooking = false;
+      // A new world replaces the simulated one; the simulation starts again only when asked.
+      state.simulating = false;
       for (const w of msg.warnings) log(1, w);
       loadWorld(msg).catch((e) => log(2, `viewport: ${e.message}`));
       break;
@@ -342,6 +344,11 @@ async function loadWorld(cooked) {
     if (state.records.has(id)) placeEntity(id, worldFromDoc(id));
   }
   log(0, `viewport: ${cooked.entities.length} entities, ${state.inst.length} instances (${engine.api})`);
+  drawSimulateButton();
+  if (state.simulateAfterCook) {
+    state.simulateAfterCook = false;
+    startSimulation();
+  }
   if (!state.framed) {
     state.framed = true;
     frameAll();
@@ -569,7 +576,87 @@ function drawOverlay() {
   });
 }
 
+// ---- Physics -------------------------------------------------------------------------------
+
+const PHYSICS_STEP = 1 / 60;
+
+/** Simulate re-cooks first, so the simulation starts from what the viewport shows now. A press
+ * while that cook is still coming takes the press back. */
+function toggleSimulation() {
+  if (state.simulating) {
+    stopSimulation();
+    return;
+  }
+  if (state.simulateAfterCook) {
+    state.simulateAfterCook = false;
+    drawSimulateButton();
+    return;
+  }
+  state.simulateAfterCook = true;
+  drawSimulateButton();
+  requestCook(0);
+}
+
+function startSimulation() {
+  if (!state.engine) return;
+  if (!state.engine.physicsStart()) {
+    // Either the scene has no rigid bodies or colliders, or one of them could not be built.
+    const why = state.engine.physicsError();
+    log(why ? 2 : 1, why ? `${t('simulate')}: ${why}` : t('noPhysics'));
+    return;
+  }
+  state.simulating = true;
+  state.simClock = null;
+  state.simCarry = 0;
+  state.simSteps = 0;
+  drawSimulateButton();
+}
+
+function stopSimulation() {
+  if (state.engine) {
+    state.engine.physicsStop();
+    // Back to the document's placement (the cooked one, with any moves since).
+    for (const id of state.records.keys()) {
+      if (entity(id)) placeEntity(id, worldFromDoc(id));
+    }
+  }
+  state.simulating = false;
+  drawSimulateButton();
+}
+
+/** Fixed 1/60 s steps, at most four a frame, whatever the display's rate. */
+function stepSimulation(now) {
+  const dt = state.simClock === null ? 0 : Math.min(0.25, (now - state.simClock) / 1000);
+  state.simClock = now;
+  state.simCarry += dt;
+  // Up to four steps a frame, in one call, so the instances move once.
+  const n = Math.min(4, Math.floor(state.simCarry / PHYSICS_STEP));
+  if (n > 0) {
+    state.engine.physicsStep(PHYSICS_STEP, n);
+    state.simCarry -= n * PHYSICS_STEP;
+    state.simSteps += n;
+  }
+  state.simCarry = Math.min(state.simCarry, PHYSICS_STEP);
+}
+
+function drawSimulateButton() {
+  const b = $('#simulate');
+  if (!b) return;
+  const on = state.simulating || state.simulateAfterCook;
+  b.textContent = on ? t('stopSimulation') : t('simulate');
+  b.classList.toggle('active', !!on);
+}
+
 function renderLoop(t) {
+  if (state.engine && state.simulating) {
+    try {
+      stepSimulation(t);
+    } catch (e) {
+      log(2, `physics: ${e.message}`);
+      state.simulating = false;
+      drawSimulateButton();
+    }
+  }
   if (state.engine) {
     try {
       state.engine.setView({ eye: eye(), target: state.view.target, fov: state.view.fov });
@@ -588,6 +675,8 @@ function renderLoop(t) {
 }
 
 function startDrag(axis, x, y) {
+  // The simulation owns the placement while it runs.
+  if (state.simulating) return;
   const id = state.selection;
   const r = state.records.get(id);
   const start = state.current[r].slice();
@@ -1031,6 +1120,7 @@ function commands() {
   $('#duplicate-entity').onclick = duplicateSelection;
   $('#frame').onclick = () => frameBounds(state.selection ? boundsOf(state.selection) : null);
   $('#recook').onclick = () => requestCook(0);
+  $('#simulate').onclick = toggleSimulation;
   $('#new-scene').onclick = () => {
     const path = prompt(t('newSceneFile'), 'content/scenes/new.scene.json');
     if (path) state.host.send({ type: 'create', kind: 'scene', path, name: path.split('/').pop().replace('.scene.json', '') });
@@ -1043,28 +1133,34 @@ function commands() {
   window.addEventListener('keydown', (e) => {
     const typing = ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName);
     const mod = e.ctrlKey || e.metaKey;
-    if (mod && e.key.toLowerCase() === 's') {
+    // A letter shortcut matches the key's position (so Caps Lock and a Korean input method do not
+    // change it) or the letter it types (other layouts).
+    const letter = (c) => e.code === `Key${c.toUpperCase()}` || (e.key.length === 1 && e.key.toLowerCase() === c);
+    if (mod && letter('s')) {
       e.preventDefault();
       save();
       return;
     }
     if (typing) return;
-    if (mod && e.key.toLowerCase() === 'z') {
+    if (mod && letter('z')) {
       e.preventDefault();
       undoRedo(e.shiftKey ? 'redo' : 'undo');
-    } else if (mod && e.key.toLowerCase() === 'y') {
+    } else if (mod && letter('y')) {
       e.preventDefault();
       undoRedo('redo');
-    } else if (mod && e.key.toLowerCase() === 'd') {
+    } else if (mod && letter('d')) {
       e.preventDefault();
       duplicateSelection();
     } else if (e.key === 'Delete' || e.key === 'Backspace') {
       if (inScene(document.activeElement)) deleteSelection();
-    } else if (e.key === 'f') {
+    } else if (mod || e.altKey) {
+      // Other modified keys belong to the browser.
+    } else if (letter('f')) {
       frameBounds(state.selection ? boundsOf(state.selection) : null);
-    } else if (e.key === 'w') setMode('move');
-    else if (e.key === 'e') setMode('rotate');
-    else if (e.key === 'r') setMode('scale');
+    } else if (letter('w')) setMode('move');
+    else if (letter('e')) setMode('rotate');
+    else if (letter('r')) setMode('scale');
+    else if (letter('p')) toggleSimulation();
     else if (e.key === 'Escape') select(null);
   });
 }
@@ -1081,6 +1177,7 @@ async function main() {
   $('#language').onclick = () => {
     setLang(lang() === 'ko' ? 'en' : 'ko');
     translate();
+    drawSimulateButton();
     drawAll();
     drawAssets();
   };

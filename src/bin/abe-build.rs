@@ -269,14 +269,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  material {i}: {} [{}]", m.name, traits.join(", "));
             }
         }
+        [cmd, file, steps] if cmd == "simulate" => {
+            simulate(Path::new(file), steps.to_str().unwrap_or(""))?;
+        }
         _ => {
             return Err(
                 "usage: abe-build cook [--compact] [--keep-images] source.glb output.abew \
                         | cook-scene [--compact] [--keep-images] [--force] PROJECT SCENE output.abew \
                         | import [--force] PROJECT content/model.glb content/new.scene.json \
-                        | inspect file.abew | model file.glb"
+                        | inspect file.abew | model file.glb | simulate file.abew STEPS"
                     .into(),
             );
+        }
+    }
+    Ok(())
+}
+
+/// Steps a cooked world's authored physics `steps` times at 60 Hz, as ABE Studio's Simulate does,
+/// and prints the state hash and where every moving body ended up. A browser that steps the same
+/// world the same number of times reports the same hash (`physicsHash()` in the web library).
+fn simulate(file: &Path, steps: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let steps: u32 = steps
+        .parse()
+        .map_err(|_| format!("STEPS must be a whole number, not {steps:?}"))?;
+    let data = read_asset(file)?;
+    let (w, table) = cooked::decode_scene(&data)?;
+    let mut physics = abe_physics::scene::build(&w, &table, abe_physics::Settings::default())?;
+    // The web library receives 1/60 as a JavaScript number and narrows it to f32 the same way.
+    let dt = (1.0f64 / 60.0) as f32;
+    for _ in 0..steps {
+        physics.world.step(dt);
+    }
+    println!("hash {:016x}", physics.world.state_hash());
+    println!(
+        "{} bodies, {} awake, {} contacts after {steps} steps",
+        physics.world.body_count(),
+        physics.world.awake_body_count(),
+        physics.world.contact_count()
+    );
+    for b in &physics.bodies {
+        if physics.world.body_kind(b.body) == Some(abe_physics::BodyKind::Static) {
+            continue;
+        }
+        let name = &table.entities[b.record as usize].name;
+        if let Some(pose) = physics.world.body_pose(b.body) {
+            let p = pose.position;
+            println!("  {name:?}: at {:.4} {:.4} {:.4}", p.x, p.y, p.z);
         }
     }
     Ok(())

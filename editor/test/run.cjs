@@ -17,8 +17,10 @@
 // headless Chromium and, through real pointer and key events: selects an entity by clicking
 // it, drags it along X with the gizmo, undoes and redoes, moves a parent and checks its child
 // follows, renames through the inspector, adds a component (which re-cooks the scene), saves,
-// reloads the page and finds the edits, then cooks the saved scene with `abe-build cook-scene`
-// and renders it with `abe-render`. OUT gets screenshots, the saved scene and results.json.
+// reloads the page and finds the edits, simulates the scene's physics and stops, then cooks the
+// saved scene with `abe-build cook-scene`, renders it with `abe-render` and checks that the
+// browser's simulation ends in the same state as `abe-build simulate`, bit for bit. OUT gets
+// screenshots, the saved scene and results.json.
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -84,8 +86,10 @@ export async function createEngine(options) {
   await new Promise((r) => setTimeout(r, delay));
   const destroy = engine.destroy;
   engine.destroy = () => {
-    rec.destroyed = true;
     destroy();
+    rec.destroyed = true;
+    rec.engine = null;
+    rec.canvas = null;
   };
   rec.engine = engine;
   return engine;
@@ -343,7 +347,14 @@ async function main() {
 
     // 5b. A flattened scale (0) and back: the viewport draws it again (cooked anew).
     const sy = fieldInputs(page, 'transform.scale').nth(1);
-    const scaleY = () => instanceMatrix(page, a).then((m) => Math.hypot(m[4], m[5], m[6]));
+    // Restoring a singular transform can rebuild the viewport asynchronously. Watch the
+    // drawn instance: live transform edits can also reach the requested scale without a cook.
+    const waitForScaleY = (id, value) => waitFor(page, ({ id, value }) => {
+      const s = window.__studio;
+      if (!s.engine || !s.records.has(id)) return false;
+      const m = s.engine.worldInstance(s.cooked.entities[s.records.get(id)].instances[0]).matrix;
+      return Math.abs(Math.hypot(m[4], m[5], m[6]) - value) < 1e-4;
+    }, { id, value }, `the viewport to draw scale y ${value}`);
     // A re-cook of the delete's undo may still be loading.
     await waitFor(page, (r) => window.__studio.engine && window.__studio.cooked.rev >= r, await revision(page), 'the re-cook');
     for (const v of ['0', '1']) {
@@ -351,17 +362,15 @@ async function main() {
       await sy.fill(v);
       await sy.press('Enter');
       await waitFor(page, (r) => window.__studio.doc.rev > r, rev, `scale y ${v}`);
+      await waitForScaleY(a, Number(v));
     }
-    const restored = await settle(page, (id) => {
-      const s = window.__studio;
-      const m = s.engine && s.records.has(id) && s.engine.worldInstance(s.cooked.entities[s.records.get(id)].instances[0]).matrix;
-      return m && Math.abs(Math.hypot(m[4], m[5], m[6]) - 1) < 1e-4;
-    }, a);
-    check('a scale set to 0 and back to 1 is drawn at 1 again', restored, await scaleY().catch((e) => e.message));
+    const restored = await instanceMatrix(page, a);
+    check('a scale set to 0 and back to 1 is drawn at 1 again',
+      Math.abs(Math.hypot(restored[4], restored[5], restored[6]) - 1) < 1e-4);
     await focusViewport(page);
     await pressAndWait(page, 'Control+z', 'undoing scale y 1');
     await pressAndWait(page, 'Control+z', 'undoing scale y 0');
-    await waitFor(page, (r) => window.__studio.engine && window.__studio.cooked.rev >= r, await revision(page), 'the re-cook');
+    await waitForScaleY(a, 1);
     // Left at 0 on a rotated block (whose cooked matrix differs from the document's in the last
     // digits), a scale does not keep the viewport cooking.
     const b = await entityId(page, 'Block B');
@@ -373,13 +382,17 @@ async function main() {
     await waitFor(page, (r) => window.__studio.doc.rev > r, rev, 'scale y 0 of Block B');
     const gen0 = await page.evaluate(() => window.__studio.loadGen);
     await page.click('#recook');
-    await waitFor(page, (g) => window.__studio.loadGen > g, gen0, 'the refresh');
+    await waitFor(page, ({ gen, rev }) => {
+      const s = window.__studio;
+      return s.loadGen > gen && s.engine && s.cooked.rev >= rev;
+    }, { gen: gen0, rev: await revision(page) }, 'the refresh to finish');
+    await waitForScaleY(b, 0);
     await page.waitForTimeout(3000);
     const loadsMade = (await page.evaluate(() => window.__studio.loadGen)) - gen0;
     check('a block left flattened does not keep the viewport cooking', loadsMade === 1, loadsMade);
     await focusViewport(page);
     await pressAndWait(page, 'Control+z', 'undoing scale y 0 of Block B');
-    await waitFor(page, (r) => window.__studio.engine && window.__studio.cooked.rev >= r, await revision(page), 'the re-cook');
+    await waitForScaleY(b, 1);
 
     // 5c. Undo after edits the host has not answered yet (it answers slowly, as while it cooks):
     // the undo waits for them, so it undoes the last one and none is refused.
@@ -451,10 +464,14 @@ async function main() {
       return window.__engines.length;
     });
     await page.click('#recook');
-    await page.waitForTimeout(300);
+    await waitFor(page, (n) => window.__engines.length > n, made, 'the first overlapping load to start');
     await page.click('#recook');
-    await settle(page, (n) => window.__engines.length >= n + 2 && window.__engines.every((e) => e.engine), made);
-    await page.waitForTimeout(500);
+    await waitFor(page, (n) => {
+      const list = window.__engines;
+      const latest = list[list.length - 1].engine;
+      return list.length >= n + 2 && latest && window.__studio.engine === latest
+        && list.slice(0, -1).every((e) => e.destroyed);
+    }, made, 'both overlapping loads to finish');
     const loads = await page.evaluate(() => {
       const list = window.__engines;
       const last = list[list.length - 1];
@@ -551,7 +568,24 @@ async function main() {
 
     await page.screenshot({ path: path.join(o.out, 'studio-reopened.png') });
 
-    // 8. The same scene, cooked by the command-line cooker, for the standalone player.
+    // 8. Physics: Simulate drops the crate onto the ground; Stop puts it back.
+    const crate = await entityId(page, 'Crate');
+    const y0 = (await instanceMatrix(page, crate))[13];
+    await page.click('#simulate');
+    await waitFor(page, () => window.__studio.simulating, null, 'the simulation to start');
+    // Simulated time, not wall time: software rendering may draw only a frame or two a second.
+    await waitFor(page, () => window.__studio.simSteps >= 180, null, 'three simulated seconds');
+    const y1 = (await instanceMatrix(page, crate))[13];
+    await page.screenshot({ path: path.join(o.out, 'studio-simulated.png') });
+    check('simulating drops the crate onto the ground', y0 - y1 > 2.5 && y1 > 0.3 && y1 < 0.8, { y0, y1 });
+    const hash = await page.evaluate(() => window.__studio.engine.physicsHash());
+    check('the simulation reports its state hash', /^[0-9a-f]{16}$/.test(hash || ''), hash);
+    await page.click('#simulate');
+    await waitFor(page, () => !window.__studio.simulating, null, 'the simulation to stop');
+    const y2 = (await instanceMatrix(page, crate))[13];
+    check('stopping puts the crate back', Math.abs(y2 - y0) < 1e-4, { y0, y2 });
+
+    // 9. The same scene, cooked by the command-line cooker, for the standalone player.
     const abew = path.join(o.out, 'blocks.abew');
     const cookOut = execFileSync(path.join(BIN, 'abe-build'), ['cook-scene', project, 'content/scenes/blocks.scene.json', abew]).toString();
     const inspect = execFileSync(path.join(BIN, 'abe-build'), ['inspect', abew]).toString();
@@ -560,6 +594,25 @@ async function main() {
     execFileSync(path.join(BIN, 'abe-render'), ['--scene', abew, '--look', look, '--view', 'overview',
       '--width', '640', '--height', '360', '--samples', '1', '--out', path.join(o.out, 'player-still.png')], { stdio: 'inherit' });
     check('abe-render draws the cooked scene', fs.existsSync(path.join(o.out, 'player-still.png')));
+
+    // 10. Determinism: the browser's simulation of the saved scene, stepped 120 times at 60 Hz,
+    // ends in exactly the state a native run of the command-line cook reaches.
+    const steps = 120;
+    const wasmHash = await page.evaluate((n) => {
+      const e = window.__studio.engine;
+      if (!e.physicsStart()) return null;
+      // Cross the JS-to-wasm u32 boundary. This call must take 64 steps, even when
+      // its requested count would wrap to zero if converted directly to a wasm i32.
+      e.physicsStep(1 / 60, 2 ** 32);
+      for (let i = 64; i < n; i++) e.physicsStep(1 / 60);
+      const h = e.physicsHash();
+      e.physicsStop();
+      return h;
+    }, steps);
+    const simulated = execFileSync(path.join(BIN, 'abe-build'), ['simulate', abew, String(steps)]).toString();
+    const nativeHash = (simulated.match(/^hash ([0-9a-f]{16})$/m) || [])[1];
+    check('the browser simulation matches a native run bit for bit', !!wasmHash && wasmHash === nativeHash,
+      { wasmHash, nativeHash, native: simulated.trim().split('\n').slice(1, 4) });
   } catch (e) {
     failed = e.message;
     console.log(`FAIL ${e.message}`);

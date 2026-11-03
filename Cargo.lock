@@ -31,6 +31,7 @@ version = "0.2.0"
 dependencies = [
  "abe-assets",
  "abe-core",
+ "abe-physics",
  "abe-pipeline",
  "abe-scene",
  "abe-shader",
@@ -78,4 +79,5 @@ name = "abe-web"
 version = "0.2.0"
 dependencies = [
  "abe-engine",
+ "abe-physics",
 ]

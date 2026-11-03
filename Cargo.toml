@@ -16,3 +16,4 @@ abe-assets = { path = "crates/abe-assets" }
 abe-pipeline = { path = "crates/abe-pipeline" }
 abe-scene = { path = "crates/abe-scene" }
 abe-shader = { path = "crates/abe-shader" }
+abe-physics = { path = "crates/abe-physics" }

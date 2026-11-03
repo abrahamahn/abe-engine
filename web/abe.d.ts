@@ -248,6 +248,26 @@ export interface AbeEngine {
   setWorldInstance(index: number, matrix: Matrix4, visible?: boolean): void;
   /** Moves world lamp `index` (a cooked point light). */
   setWorldLight(index: number, position: Vec3): void;
+  /**
+   * Starts (or restarts) simulating the cooked world's physics (its `rigid_body` and `collider`
+   * components) from the authored state. Returns false when the world has none, or when they
+   * could not be built: `physicsError()` then says why.
+   */
+  physicsStart(): boolean;
+  /**
+   * Steps the simulation `steps` times (default 1, at most 64 a call) by `dt` seconds each (at
+   * most 1/15), then moves the instances and lamps of the bodies that moved (with their
+   * children's). Sleeping and still bodies cost nothing; several steps in one call move things
+   * once. Steps past 64 are not run, so a host that fell further behind (or passes a frame count
+   * or milliseconds) loses that time instead of freezing the page while it catches up.
+   */
+  physicsStep(dt: number, steps?: number): boolean;
+  /** Stops simulating and puts every moved instance and lamp back where it was cooked. */
+  physicsStop(): void;
+  /** Why the world's physics components could not be built (the entity named), or null. */
+  physicsError(): string | null;
+  /** The simulation's state hash as 16 hexadecimal digits (equal to a native run's), or null. */
+  physicsHash(): string | null;
   /** The cooked world's instance under a CSS pixel of the canvas, or null. */
   pickWorld(cssX: number, cssY: number): { instance: number; distance: number; point: [number, number, number] } | null;
   /** The world's entity table, or null when it was cooked without one. */

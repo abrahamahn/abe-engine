@@ -136,6 +136,7 @@ pub unsafe extern "C" fn abe_rt_start(
         abe_engine::assets::cooked::decode_scene(&owned)
             .map(|(w, table)| {
                 crate::ENTITIES.with(|cell| *cell.borrow_mut() = crate::entities_json(&table));
+                crate::physics::prepare(&w, &table);
                 w
             })
             .map_err(|e| format!("world: {e}"))
@@ -843,6 +844,22 @@ pub unsafe extern "C" fn abe_rt_set_world_instance(
         let m = matrix(&m)?;
         rt.renderer
             .set_world_instance(&mut rt.device, index as usize, m, visible != 0)?;
+        Ok(1)
+    })
+}
+
+/// Moves world instances to new matrices, keeping whether each is shown (what physics does after
+/// a step). Returns 1, or 0 after logging why not.
+pub(crate) fn move_world_instances(moves: &[(u32, [f32; 16])]) -> u32 {
+    with(0, |rt| {
+        for &(index, m) in moves {
+            let visible = rt
+                .renderer
+                .world_instance(index as usize)
+                .is_none_or(|(_, v)| v);
+            rt.renderer
+                .set_world_instance(&mut rt.device, index as usize, m, visible)?;
+        }
         Ok(1)
     })
 }

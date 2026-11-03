@@ -12,3 +12,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 abe-engine = { path = "../.." }
+abe-physics = { path = "../abe-physics" }

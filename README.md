@@ -139,6 +139,26 @@ Open a scene from Assets (a static model imports as a scene with "Import as scen
 
 From the command line, `abe-build import PROJECT content/model.glb content/model.scene.json` imports a model as a scene, and `abe-build cook-scene PROJECT content/model.scene.json out.abew` cooks a scene into an ABEW v4 world that keeps its entities (`abe-build inspect` lists them). In a page, `engine.worldEntities()` returns the table, and `setWorldInstance`, `pickWorld` and `setWorldLight` move, hide and pick a cooked world's objects.
 
+## Simulate physics
+
+`crates/abe-physics` is the engine's own rigid-body physics, with no dependency beyond `abe-core`: spheres,
+capsules, boxes, convex hulls, triangle meshes and heightfields; static, kinematic and dynamic bodies; ball, hinge,
+slider, fixed and distance joints with limits, motors and springs; sensors and contact events; ray, shape-cast and
+overlap queries; continuous collision for fast bodies; sleeping islands; and a kinematic character controller that
+slides, climbs steps, keeps off steep slopes and rides platforms. It steps in fixed slices with a soft-step solver and
+is deterministic: only `+`, `−`, `×`, `÷` and `sqrt` run in a step, so a browser and a native build reach the same
+state hash ([physics design](docs/design/06-physics.md)).
+
+Scenes author it with `rigid_body` and `collider` components (a collider with no rigid body on its entity or above it is static scenery; one under a body is part of that body).
+In ABE Studio, **Simulate** (P) re-cooks the scene, runs it at 60 Hz and puts everything back on a second press; in
+a page, `physicsStart()`, `physicsStep(dt, steps)` (at most 64 steps of at most 1/15 s per call), `physicsStop()`, `physicsHash()` and `physicsError()` do the same for any cooked world.
+
+```sh
+cargo run --release --bin abe-build -- simulate scene.abew 120   # state hash and resting places after 2 s
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
+  cargo run --release --example physics_demo -- physics.png       # a pyramid hit by a ball, five moments
+```
+
 [Explore the six architecture layers](docs/architecture.html) (download and open the self-contained HTML to use the selectors; the [design](docs/design/README.md) is current where they differ). [Engine milestones](docs/roadmap.md).
 
 ## For agents: the abe command
