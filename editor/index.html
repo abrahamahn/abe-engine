@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ABE Studio</title>
+<link rel="stylesheet" href="/editor/studio.css">
+</head>
+<body>
+<header id="toolbar">
+  <strong id="project-name">ABE Studio</strong>
+  <span id="doc-name" data-i18n="noDocument">No document</span>
+  <span class="sep"></span>
+  <button id="save" data-i18n="save" data-i18n-title="saveTip">Save</button>
+  <button id="undo" data-i18n="undo">Undo</button>
+  <button id="redo" data-i18n="redo">Redo</button>
+  <span class="sep"></span>
+  <button id="mode-move" data-i18n="move" data-i18n-title="moveTip">Move</button>
+  <button id="mode-rotate" data-i18n="rotate" data-i18n-title="rotateTip">Rotate</button>
+  <button id="mode-scale" data-i18n="scale" data-i18n-title="scaleTip">Scale</button>
+  <button id="frame" data-i18n="frame" data-i18n-title="frameTip">Frame</button>
+  <span class="sep"></span>
+  <label class="time"><span data-i18n="time">Time</span> <input id="time" type="range" min="0" max="24" step="0.1" value="17.5"> <span id="time-label">17.5 h</span></label>
+  <button id="recook" data-i18n="refresh" data-i18n-title="refreshTip">Refresh</button>
+  <span class="grow"></span>
+  <span id="fps"></span>
+  <button id="language" class="mini" data-i18n="language">한국어</button>
+  <span id="connection" data-i18n="connecting">connecting</span>
+</header>
+<main>
+  <section id="left">
+    <div class="panel" id="assets">
+      <h2><span data-i18n="assets">Assets</span> <button id="new-scene" class="mini" data-i18n="newScene" data-i18n-title="newSceneTip">+ Scene</button></h2>
+      <div id="assets-list"></div>
+    </div>
+    <div class="panel" id="outliner">
+      <h2><span data-i18n="outliner">Outliner</span>
+        <span>
+          <button id="add-entity" class="mini" data-i18n-title="addEntityTip">+</button>
+          <button id="duplicate-entity" class="mini" data-i18n-title="duplicateTip">⧉</button>
+          <button id="delete-entity" class="mini" data-i18n-title="deleteTip">✕</button>
+        </span>
+      </h2>
+      <input id="outliner-filter" type="search" data-i18n-placeholder="filter" placeholder="Filter">
+      <div id="outliner-tree" tabindex="0"></div>
+    </div>
+  </section>
+  <section id="viewport" tabindex="0">
+    <canvas id="overlay"></canvas>
+  </section>
+  <section id="right" class="panel">
+    <h2 data-i18n="inspector">Inspector</h2>
+    <div id="inspector-body" tabindex="-1"></div>
+  </section>
+</main>
+<footer class="panel" id="console">
+  <h2 data-i18n="console">Console</h2>
+  <div id="console-lines"></div>
+</footer>
+<script type="module" src="/editor/studio.js"></script>
+</body>
+</html>

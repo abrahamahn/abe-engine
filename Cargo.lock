@@ -45,6 +45,16 @@ name = "abe-shader"
 version = "0.2.0"
 
 [[package]]
+name = "abe-studio"
+version = "0.2.0"
+dependencies = [
+ "abe-assets",
+ "abe-core",
+ "abe-pipeline",
+ "abe-scene",
+]
+
+[[package]]
 name = "abe-web"
 version = "0.2.0"
 dependencies = [

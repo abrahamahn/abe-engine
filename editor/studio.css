@@ -1,0 +1,64 @@
+:root {
+  --bg: #16171b;
+  --panel: #1e2025;
+  --line: #2c2f36;
+  --text: #d9dce3;
+  --dim: #8a909c;
+  --accent: #e8b44a;
+  --error: #ff6b6b;
+  --warn: #e8c86a;
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); }
+body { display: grid; grid-template-rows: auto 1fr 140px; overflow: hidden; }
+button {
+  background: #2a2d34; color: var(--text); border: 1px solid var(--line); border-radius: 4px;
+  padding: 3px 9px; font: inherit; cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.4; cursor: default; }
+button.on { background: var(--accent); color: #1a1a1a; border-color: var(--accent); }
+button.mini { padding: 0 6px; font-size: 12px; margin-left: 4px; }
+input, select { background: #121317; color: var(--text); border: 1px solid var(--line); border-radius: 3px; font: inherit; padding: 2px 4px; min-width: 0; }
+#toolbar { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--line); }
+#toolbar .sep { width: 1px; height: 18px; background: var(--line); margin: 0 4px; }
+#toolbar .grow { flex: 1; }
+#doc-name { color: var(--dim); }
+#connection.connected { color: #7fd17f; }
+#connection.disconnected { color: var(--error); }
+.time input { width: 120px; vertical-align: middle; }
+main { display: grid; grid-template-columns: 260px 1fr 300px; min-height: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); overflow: auto; }
+.panel h2 { display: flex; justify-content: space-between; align-items: center; margin: 0; padding: 6px 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
+#left { display: grid; grid-template-rows: 40% 60%; min-height: 0; }
+#assets-list .group { padding: 6px 8px 2px; color: var(--dim); font-size: 11px; text-transform: uppercase; }
+#assets-list .asset { display: flex; align-items: center; justify-content: space-between; padding: 2px 8px; cursor: default; white-space: nowrap; overflow: hidden; }
+#assets-list .asset:hover { background: #262930; }
+#outliner-filter { margin: 6px 8px; width: calc(100% - 16px); }
+.node { padding: 2px 8px; cursor: pointer; white-space: nowrap; }
+.node:hover { background: #262930; }
+.node.selected { background: #3a3220; color: #fff; }
+.node.dim { opacity: 0.35; }
+.node .twisty { display: inline-block; width: 14px; color: var(--dim); }
+.badge { margin-left: 6px; font-size: 10px; color: var(--accent); border: 1px solid var(--accent); border-radius: 3px; padding: 0 3px; }
+#viewport { position: relative; min-width: 0; min-height: 0; background: #0d0e11; overflow: hidden; }
+#viewport canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+#overlay { pointer-events: none; z-index: 2; }
+#viewport:focus, #inspector-body:focus { outline: none; }
+#inspector-body { padding: 6px 8px; }
+.field { display: grid; grid-template-columns: 96px 1fr auto; gap: 6px; align-items: center; margin: 3px 0; }
+.field label { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.field.default label { opacity: 0.7; }
+.field input[type=number] { width: 100%; }
+.vec { display: flex; gap: 3px; }
+.vec input { flex: 1; width: 0; }
+.component { display: flex; justify-content: space-between; align-items: center; margin: 10px 0 4px; padding-bottom: 2px; border-bottom: 1px solid var(--line); font-weight: 600; }
+.meta { color: var(--dim); font-size: 11px; margin-bottom: 6px; }
+.hint { color: var(--dim); }
+select.add { margin-top: 12px; width: 100%; }
+#console { overflow: hidden; display: grid; grid-template-rows: auto 1fr; }
+#console-lines { overflow: auto; padding: 4px 8px; font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+.log.warn { color: var(--warn); }
+.log.error { color: var(--error); }

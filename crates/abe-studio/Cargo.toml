@@ -1,0 +1,13 @@
+[package]
+name = "abe-studio"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "ABE Studio's host: the project folder, documents with undo, and the edit protocol"
+
+[dependencies]
+abe-core = { path = "../abe-core" }
+abe-assets = { path = "../abe-assets" }
+abe-pipeline = { path = "../abe-pipeline" }
+abe-scene = { path = "../abe-scene" }
