@@ -916,6 +916,9 @@ fn terrain_beaches_and_distant_shallows() {
     let red_shallows = [1.0, 0.0, 0.0];
     let grassy = count(&frame(DetailPreset::Grass, &near, red_shallows), &blue);
     let sandy = count(&frame(DetailPreset::Terrain, &near, red_shallows), &blue);
+    // Red shallows along the far shore. Out there the red mixes with the water's blue into a
+    // magenta band (sharpening, which fades out by 18 m, no longer saturates it), so count
+    // red-leaning pixels.
     let far = View {
         name: "offshore".into(),
         eye: [0.0, 25.0, 190.0],
@@ -923,7 +926,7 @@ fn terrain_beaches_and_distant_shallows() {
         fov: 40.0,
         ..View::default()
     };
-    let red = |r: f32, g: f32, b: f32| r > 1.4 * g + 8.0 && r > 1.4 * b + 8.0;
+    let red = |r: f32, g: f32, b: f32| r > 1.2 * g + 6.0 && r > 1.2 * b + 6.0;
     let shallows = count(&frame(DetailPreset::Terrain, &far, red_shallows), &red);
     let plain = count(
         &frame(DetailPreset::Terrain, &far, Look::default().water_shallow),

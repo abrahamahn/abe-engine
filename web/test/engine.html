@@ -134,7 +134,11 @@ function count(px, box, test) {
   }
   return n;
 }
-/** How much neighbouring pixels' luminance differs across a CSS-pixel box: its edges. */
+/**
+ * How sharp a CSS-pixel box is: the energy of its luminance steps between neighbouring pixels.
+ * Squared, because a blur keeps an edge's total rise (it only spreads it over more pixels) but
+ * lowers the energy of every step.
+ */
 function edges(px, box) {
   const l = (x, y) => {
     const i = (y * px.width + x) * 4;
@@ -143,7 +147,7 @@ function edges(px, box) {
   let sum = 0;
   for (let y = Math.max(0, box[1] | 0); y < Math.min(px.height - 1, box[3] | 0); y++) {
     for (let x = Math.max(0, box[0] | 0); x < Math.min(px.width - 1, box[2] | 0); x++) {
-      sum += Math.abs(l(x + 1, y) - l(x, y)) + Math.abs(l(x, y + 1) - l(x, y));
+      sum += (l(x + 1, y) - l(x, y)) ** 2 + (l(x, y + 1) - l(x, y)) ** 2;
     }
   }
   return sum;
