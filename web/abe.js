@@ -1966,6 +1966,42 @@ export async function createEngine(options) {
       const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
       return { instance, distance, point: [px, py, pz] };
     },
+    /** How many instances the cooked world has. */
+    worldInstances() { return x.abe_rt_world_instances(); },
+    /** World instance `index`'s matrix (16 numbers) and whether it is shown. */
+    worldInstance(index) {
+      const p = out(16).byteOffset;
+      const r = x.abe_rt_world_instance(index >>> 0, p);
+      if (!r) throw fail('worldInstance');
+      return { matrix: Array.from(new Float32Array(x.memory.buffer, p, 16)), visible: r === 1 };
+    },
+    /** Moves world instance `index` to `matrix` and shows or hides it (an object of a cooked
+     * scene: `worldEntities()` lists each entity's instances). */
+    setWorldInstance(index, matrix, visible = true) {
+      const [p] = place(f32(matrix));
+      ok('setWorldInstance', x.abe_rt_set_world_instance(index >>> 0, p, visible ? 1 : 0));
+    },
+    /** Moves world lamp `index` (a cooked point light) to `position`. */
+    setWorldLight(index, position) {
+      ok('setWorldLight', x.abe_rt_set_world_light(index >>> 0, position[0], position[1], position[2]));
+    },
+    /** The cooked world's instance under a CSS pixel: `{instance, distance, point}` or null. */
+    pickWorld(cssX, cssY) {
+      const { sx, sy } = cssScale();
+      const p = out(4).byteOffset;
+      const hit = x.abe_rt_pick_world(cssX / sx, cssY / sy, p);
+      if (!hit) return null;
+      const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
+      return { instance: hit - 1, distance, point: [px, py, pz] };
+    },
+    /** The world's entity table, `{entities, data}`, or null when it was cooked without one. */
+    worldEntities() {
+      const len = x.abe_world_entities(0, 0);
+      if (!len) return null;
+      const p = reserve(len);
+      x.abe_world_entities(p, len);
+      return JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, p, len)));
+    },
     /**
      * Loads a glTF model (GLB): `source` is a URL, ArrayBuffer or Uint8Array. Its images are
      * decoded by the browser into textures. Resolves with `{model, info, textures}`, where

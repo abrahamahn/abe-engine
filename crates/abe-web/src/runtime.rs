@@ -133,7 +133,12 @@ pub unsafe extern "C" fn abe_rt_start(
     } else {
         // SAFETY: the caller hands over an initialized allocation of `world_len` bytes.
         let owned = unsafe { Vec::from_raw_parts(world, world_len, world_len) };
-        abe_engine::assets::cooked::decode(&owned).map_err(|e| format!("world: {e}"))
+        abe_engine::assets::cooked::decode_scene(&owned)
+            .map(|(w, table)| {
+                crate::ENTITIES.with(|cell| *cell.borrow_mut() = crate::entities_json(&table));
+                w
+            })
+            .map_err(|e| format!("world: {e}"))
     };
     // SAFETY: the caller passes a readable range.
     let look = unsafe { bytes(look, look_len) };
@@ -794,6 +799,81 @@ pub unsafe extern "C" fn abe_rt_project(x: f32, y: f32, z: f32, out: *mut u8) ->
         // SAFETY: the caller passes 12 writable bytes.
         unsafe { write_floats(out, &p) };
         Ok(1)
+    })
+}
+
+/// How many instances the cooked world has.
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_world_instances() -> u32 {
+    with(0, |rt| Ok(rt.renderer.world_instances() as u32))
+}
+
+/// Writes world instance `index`'s matrix (16 floats, column-major) at `out`; returns 1 when it
+/// is shown, 2 when hidden, 0 (after logging) when there is no such instance.
+///
+/// # Safety
+/// `out` must address 64 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_world_instance(index: u32, out: *mut u8) -> u32 {
+    with(0, |rt| {
+        let (m, visible) = rt
+            .renderer
+            .world_instance(index as usize)
+            .ok_or_else(|| format!("world_instance: no world instance {index}"))?;
+        // SAFETY: the caller passes 64 writable bytes.
+        unsafe { write_floats(out, &m) };
+        Ok(if visible { 1 } else { 2 })
+    })
+}
+
+/// Moves world instance `index` to the matrix at `matrix` (16 floats) and shows (`visible` 1)
+/// or hides (0) it. Returns 1, or 0 after logging why not.
+///
+/// # Safety
+/// `matrix` must address 64 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_set_world_instance(
+    index: u32,
+    matrix_at: *const u8,
+    visible: u32,
+) -> u32 {
+    // SAFETY: the caller passes 16 readable floats.
+    let m = unsafe { floats(matrix_at, 16) };
+    with(0, |rt| {
+        let m = matrix(&m)?;
+        rt.renderer
+            .set_world_instance(&mut rt.device, index as usize, m, visible != 0)?;
+        Ok(1)
+    })
+}
+
+/// Moves world lamp `index` to (`x`, `y`, `z`). Returns 1, or 0 after logging why not.
+#[unsafe(no_mangle)]
+pub extern "C" fn abe_rt_set_world_light(index: u32, x: f32, y: f32, z: f32) -> u32 {
+    with(0, |rt| {
+        rt.renderer
+            .set_world_light(&mut rt.device, index as usize, [x, y, z])?;
+        Ok(1)
+    })
+}
+
+/// The cooked world's instance under device pixel (`x`, `y`): returns its index plus one and
+/// writes the distance in metres and the world point (4 floats) at `out`; returns 0 when no
+/// instance is there.
+///
+/// # Safety
+/// `out` must address 16 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_rt_pick_world(x: f32, y: f32, out: *mut u8) -> u32 {
+    with(0, |rt| {
+        let size = rt.renderer.size();
+        let Some(hit) = rt.renderer.pick_world(&rt.view, size, (x, y)) else {
+            return Ok(0);
+        };
+        let p = hit.point;
+        // SAFETY: the caller passes 16 writable bytes.
+        unsafe { write_floats(out, &[hit.distance, p[0], p[1], p[2]]) };
+        Ok(hit.instance as u32 + 1)
     })
 }
 

@@ -36,7 +36,7 @@ pub use look::{DetailPreset, DetailRule, Focus, Grass, Look, LookFile, Terrain, 
 pub use models::{ModelId, ModelInstance};
 pub use props::{
     BlendMode, MaterialDesc, MeshData, PROP_SHADER_PARAMS, Pick, PropInstance, PropMaterial,
-    PropMesh, PropShader, PropTexture,
+    PropMesh, PropShader, PropTexture, WorldPick,
 };
 pub use renderer::{Output, Quality, Renderer};
 pub use sky::{Environment, Palette, SkyKey, TimeOfDay, Weather};

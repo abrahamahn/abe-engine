@@ -107,6 +107,8 @@ struct App {
 thread_local! {
     /// The world decoded by `abe_load_world`, until the player or the engine starts with it.
     pub(crate) static WORLD: RefCell<Option<World>> = const { RefCell::new(None) };
+    /// The loaded world's entity table as JSON (empty for worlds cooked without entities).
+    pub(crate) static ENTITIES: RefCell<String> = const { RefCell::new(String::new()) };
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
@@ -144,10 +146,11 @@ pub unsafe extern "C" fn abe_load_world(ptr: *mut u8, len: usize) -> u32 {
     install_panic_hook();
     // SAFETY: the caller hands over an initialized allocation of `len` bytes.
     let bytes = unsafe { Vec::from_raw_parts(ptr, len, len.max(1)) };
-    let world = abe_engine::assets::cooked::decode(&bytes);
+    let world = abe_engine::assets::cooked::decode_scene(&bytes);
     drop(bytes);
     match world {
-        Ok(w) => {
+        Ok((w, table)) => {
+            ENTITIES.with(|cell| *cell.borrow_mut() = entities_json(&table));
             say(
                 0,
                 &format!(
@@ -167,6 +170,68 @@ pub unsafe extern "C" fn abe_load_world(ptr: *mut u8, len: usize) -> u32 {
             0
         }
     }
+}
+
+/// An entity table as JSON: `{"entities": [{"id", "name", "parent", "transform", "instances":
+/// [first, count], "lights": [first, count]}], "data": {...}}`, or `""` when it is empty.
+pub(crate) fn entities_json(table: &abe_engine::world::EntityTable) -> String {
+    use abe_engine::json::{Value, to_compact};
+    use std::collections::BTreeMap;
+    if table.entities.is_empty() && table.data.is_empty() {
+        return String::new();
+    }
+    let n = |v: u32| Value::Number(f64::from(v));
+    let entities = table
+        .entities
+        .iter()
+        .map(|e| {
+            Value::Object(BTreeMap::from([
+                ("id".to_string(), Value::String(format!("{:016x}", e.id))),
+                ("name".into(), Value::String(e.name.clone())),
+                ("parent".into(), e.parent.map_or(Value::Null, n)),
+                (
+                    "transform".into(),
+                    Value::Array(
+                        e.transform
+                            .0
+                            .iter()
+                            .map(|v| Value::Number(f64::from(*v)))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "instances".into(),
+                    Value::Array(vec![
+                        n(e.instances.start),
+                        n(e.instances.end - e.instances.start),
+                    ]),
+                ),
+                (
+                    "lights".into(),
+                    Value::Array(vec![n(e.lights.start), n(e.lights.end - e.lights.start)]),
+                ),
+            ]))
+        })
+        .collect();
+    let data = abe_engine::json::parse(table.data.as_bytes()).unwrap_or(Value::Null);
+    to_compact(&Value::Object(BTreeMap::from([
+        ("entities".to_string(), Value::Array(entities)),
+        ("data".into(), data),
+    ])))
+    .unwrap_or_default()
+}
+
+/// Writes the loaded world's entity table as JSON (see `entities_json`) to `out` when it fits
+/// in `cap` bytes; returns its length (0: the world has none).
+///
+/// # Safety
+/// `out` must address `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abe_world_entities(out: *mut u8, cap: usize) -> u32 {
+    ENTITIES.with(|cell| {
+        // SAFETY: forwarded from the caller.
+        unsafe { give(cell.borrow().as_bytes(), out, cap) }
+    })
 }
 
 /// Copies `bytes` to `out` when they fit in `cap`; returns their length either way.

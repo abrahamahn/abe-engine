@@ -154,6 +154,25 @@ export interface AbeNodeTransform {
   readonly scale: Vec3;
 }
 
+/** One authored entity of a cooked scene: its instances and lamps are runs of the world's. */
+export interface AbeEntityRecord {
+  /** 16 hexadecimal digits, as in the scene file. */
+  readonly id: string;
+  readonly name: string;
+  /** Index of the parent record (parents come first). */
+  readonly parent: number | null;
+  /** World matrix when cooked; moving the entity to `m` moves each of its instances `i` to `m * transform⁻¹ * i`. */
+  readonly transform: readonly number[];
+  readonly instances: readonly [number, number];
+  readonly lights: readonly [number, number];
+}
+
+export interface AbeEntityTable {
+  readonly entities: readonly AbeEntityRecord[];
+  /** The components the renderer does not draw, by entity id, and the scene's id and name. */
+  readonly data: { readonly entities: Record<string, { readonly components: Record<string, unknown> }>; readonly scene?: string; readonly name?: string } | null;
+}
+
 export interface AbeEngine {
   readonly api: 'webgpu' | 'webgl2';
   readonly adapter: string;
@@ -216,6 +235,23 @@ export interface AbeEngine {
   project(point: Vec3): { x: number; y: number; depth: number } | null;
   /** The visible prop under a CSS pixel on one of `layers`. */
   pick(cssX: number, cssY: number, layers?: number): { instance: number; distance: number; point: [number, number, number] } | null;
+
+  /** How many instances the cooked world has. */
+  worldInstances(): number;
+  /** World instance `index`'s matrix and whether it is shown. */
+  worldInstance(index: number): { matrix: number[]; visible: boolean };
+  /**
+   * Moves world instance `index` (an object of a cooked scene; `worldEntities` lists each
+   * entity's instances) and shows or hides it. It stays lit, shadowed and mapped like the rest
+   * of the world.
+   */
+  setWorldInstance(index: number, matrix: Matrix4, visible?: boolean): void;
+  /** Moves world lamp `index` (a cooked point light). */
+  setWorldLight(index: number, position: Vec3): void;
+  /** The cooked world's instance under a CSS pixel of the canvas, or null. */
+  pickWorld(cssX: number, cssY: number): { instance: number; distance: number; point: [number, number, number] } | null;
+  /** The world's entity table, or null when it was cooked without one. */
+  worldEntities(): AbeEntityTable | null;
 
   /** Loads a GLB; its images are decoded into textures. */
   loadModel(source: string | ArrayBuffer | Uint8Array): Promise<{ model: number; info: AbeModelInfo; textures: number[] }>;

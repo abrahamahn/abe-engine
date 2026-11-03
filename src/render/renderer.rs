@@ -234,11 +234,14 @@ pub struct Renderer {
     pub(super) ground_depth: TextureId,
     pub(super) ground_mask: TextureId,
     /// The world map: the whole land seen from above once, for shallows and foam on shores
-    /// beyond the ground map. Drawn on the first frame and again when the Look changes.
+    /// beyond the ground map. Drawn on the first frame and again when the Look changes or a
+    /// world instance moves.
     pub(super) world_depth: TextureId,
     pub(super) world_mask: TextureId,
     world: Ground,
     pub(super) world_drawn: bool,
+    /// A world instance moved since the last frame: bounds and the world map follow.
+    pub(super) world_moved: bool,
     /// Per material: the procedural detail block pushed with each draw (see `Draw` in
     /// scene.wgsl), from the Look's detail rules.
     pub(super) details: Vec<[f32; 16]>,
@@ -917,6 +920,7 @@ impl Renderer {
             world_mask,
             world,
             world_drawn: false,
+            world_moved: false,
             details,
             grassy,
             dummy,
@@ -1731,7 +1735,13 @@ impl Renderer {
             Output::Still => 0,
             Output::Surface(_) => device.frame_slot() % self.slots.len(),
         };
-        // The world map is drawn in this frame's first passes, before anything reads it.
+        // The world map is drawn in this frame's first passes, before anything reads it. After
+        // a move it is drawn again, over the land's new bounds (as a cook of the moved world).
+        if std::mem::take(&mut self.world_moved) {
+            self.scene.refresh_bounds();
+            self.world = world_view(&self.scene, self.world.size);
+            self.world_drawn = false;
+        }
         let draw_world = !self.world_drawn;
         self.world_drawn = true;
         // Every layer of the light shadow map holds depth before any is read.

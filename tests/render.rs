@@ -916,7 +916,6 @@ fn terrain_beaches_and_distant_shallows() {
     let red_shallows = [1.0, 0.0, 0.0];
     let grassy = count(&frame(DetailPreset::Grass, &near, red_shallows), &blue);
     let sandy = count(&frame(DetailPreset::Terrain, &near, red_shallows), &blue);
-    // Red shallows along the far shore.
     let far = View {
         name: "offshore".into(),
         eye: [0.0, 25.0, 190.0],
@@ -2447,6 +2446,199 @@ fn focus_softens_what_lies_past_it() {
     let b = ((at[1] as u32 * W + at[0] as u32) * 4) as usize;
     assert_eq!(&soft[b..b + 3], &[0, 255, 0], "the badge stays sharp");
     assert_eq!(&soft[b..b + 3], &sharp[b..b + 3]);
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}
+
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn world_instances_move_hide_and_pick_like_a_recooked_world() {
+    let mut device = Device::headless().expect("device");
+    let base = world();
+    let look = || Look::default();
+    let still = |device: &mut Device<'_>, w: &World| {
+        let mut r = Renderer::new(device, w, look(), Quality::still(), (W, H), Output::Still)
+            .expect("renderer");
+        render(device, &mut r, 15.0, "clear")
+    };
+    // The red box (instance 1) 2.5 m to the right and 0.5 m up, cooked that way.
+    let moved_at = Transform::from_trs([2.5, 0.5, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0; 3]).unwrap();
+    let mut recooked = base.clone();
+    recooked.instances[1].transform = moved_at;
+    let expected_moved = still(&mut device, &recooked);
+    // The same box hidden: cooked without it.
+    let mut without = base.clone();
+    without.instances.remove(1);
+    let expected_hidden = still(&mut device, &without);
+    // Instances in another cooked order draw the same picture (draws group by material).
+    let mut shuffled = base.clone();
+    shuffled.instances.reverse();
+    let original = still(&mut device, &base);
+    let reordered = still(&mut device, &shuffled);
+    assert!(
+        difference(&original, &reordered) < 0.01,
+        "order changed the picture: {}",
+        difference(&original, &reordered)
+    );
+
+    let mut r = Renderer::new(
+        &mut device,
+        &base,
+        look(),
+        Quality::still(),
+        (W, H),
+        Output::Still,
+    )
+    .expect("renderer");
+    assert_eq!(r.world_instances(), base.instances.len());
+    let first = render(&mut device, &mut r, 15.0, "clear");
+    assert!(difference(&first, &original) < 0.01);
+    // Pick the box where it stands, then move it.
+    let at = r
+        .project(&view(), (W, H), [0.0, 1.0, 1.0])
+        .expect("in view");
+    let hit = r
+        .pick_world(&view(), (W, H), (at[0], at[1]))
+        .expect("the box is under its projection");
+    assert_eq!(hit.instance, 1, "{hit:?}");
+    r.set_world_instance(&mut device, 1, moved_at.0, true)
+        .expect("move");
+    assert_eq!(r.world_instance(1), Some((moved_at.0, true)));
+    let moved = render(&mut device, &mut r, 15.0, "clear");
+    let d = difference(&moved, &expected_moved);
+    assert!(d < 0.05, "moved world differs from the recooked one by {d}");
+    assert!(difference(&moved, &first) > 0.2, "nothing moved");
+    // The old place now picks the ground; the new one the box.
+    let old = r
+        .pick_world(&view(), (W, H), (at[0], at[1]))
+        .expect("ground");
+    assert_ne!(old.instance, 1);
+    let new_at = r
+        .project(&view(), (W, H), [2.5, 1.5, 1.0])
+        .expect("in view");
+    assert_eq!(
+        r.pick_world(&view(), (W, H), (new_at[0], new_at[1]))
+            .map(|p| p.instance),
+        Some(1)
+    );
+    // Hidden, it is gone from the picture and from picking.
+    r.set_world_instance(&mut device, 1, moved_at.0, false)
+        .expect("hide");
+    let hidden = render(&mut device, &mut r, 15.0, "clear");
+    let d = difference(&hidden, &expected_hidden);
+    assert!(
+        d < 0.05,
+        "hidden world differs from one cooked without it by {d}"
+    );
+    assert_ne!(
+        r.pick_world(&view(), (W, H), (new_at[0], new_at[1]))
+            .map(|p| p.instance),
+        Some(1)
+    );
+    // Moving the lamp moves its light.
+    r.set_world_instance(&mut device, 1, Transform::IDENTITY.0, true)
+        .expect("back");
+    r.set_world_light(&mut device, 0, [-3.0, 1.6, 1.0])
+        .expect("lamp");
+    assert!(
+        r.set_world_instance(&mut device, 99, Transform::IDENTITY.0, true)
+            .is_err()
+    );
+    assert!(r.set_world_light(&mut device, 5, [0.0; 3]).is_err());
+    let mut bad = Transform::IDENTITY.0;
+    bad[0] = f32::NAN;
+    assert!(r.set_world_instance(&mut device, 1, bad, true).is_err());
+    let errors = device.validation_errors();
+    assert!(errors.is_empty(), "validation: {errors:?}");
+}
+
+#[test]
+#[ignore = "requires a Vulkan driver"]
+fn moved_land_keeps_its_distant_shallows() {
+    // The world map (shallows and foam past the ground map) follows land moved with
+    // `set_world_instance`: moved 150 m along X, beyond where the map first reached, the land's
+    // far shallows (red here) show as in a world cooked with the land there.
+    let mut device = Device::headless().expect("device");
+    let (w, h) = (256, 144);
+    let look = || Look {
+        details: vec![DetailRule {
+            patterns: vec!["land".into()],
+            preset: DetailPreset::Terrain,
+            scale: [0.3, 0.3],
+            strength: 1.0,
+            variation: 0.1,
+            color: None,
+            gloss: 0.0,
+        }],
+        fog: 0.0,
+        water_reflection: 0.0,
+        water_shallow: [1.0, 0.0, 0.0],
+        ..Look::default()
+    };
+    let quality = || {
+        let mut q = Quality::realtime();
+        q.shadow_size = 512;
+        q.ground_size = 256;
+        q.world_size = 512;
+        q
+    };
+    let shift = 150.0;
+    let far = View {
+        name: "offshore".into(),
+        eye: [shift, 25.0, 190.0],
+        target: [shift, 0.0, 0.0],
+        fov: 40.0,
+        ..View::default()
+    };
+    let noon = TimeOfDay {
+        hours: 12.0,
+        ..TimeOfDay::default()
+    };
+    let red = |image: &[u8]| {
+        image
+            .chunks(4)
+            .filter(|p| {
+                let (r, g, b) = (f32::from(p[0]), f32::from(p[1]), f32::from(p[2]));
+                r > 1.2 * g + 6.0 && r > 1.2 * b + 6.0
+            })
+            .count()
+    };
+    let moved_at = Transform::from_trs([shift, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0; 3]).unwrap();
+    let mut cooked = shore();
+    cooked.instances[0].transform = moved_at;
+    let mut r = Renderer::new(
+        &mut device,
+        &cooked,
+        look(),
+        quality(),
+        (w, h),
+        Output::Still,
+    )
+    .expect("renderer");
+    let env = Environment::resolve(&noon, &Weather::default(), &r.look().palette, 2.0);
+    let expected = r.render_still(&mut device, &far, &env, 1).expect("render");
+    // Cooked where it was and drawn once (the world map included), then moved.
+    let mut r = Renderer::new(
+        &mut device,
+        &shore(),
+        look(),
+        quality(),
+        (w, h),
+        Output::Still,
+    )
+    .expect("renderer");
+    r.render_still(&mut device, &far, &env, 1).expect("render");
+    r.set_world_instance(&mut device, 0, moved_at.0, true)
+        .expect("move");
+    let moved = r.render_still(&mut device, &far, &env, 1).expect("render");
+    let (want, got) = (red(&expected), red(&moved));
+    let d = difference(&moved, &expected);
+    eprintln!("far red pixels: {want} cooked there, {got} moved there; difference {d}");
+    assert!(want > 40, "no shallows in the cooked world: {want}");
+    assert!(
+        d < 0.05,
+        "moved land differs from land cooked there by {d} ({got} / {want} red pixels)"
+    );
     let errors = device.validation_errors();
     assert!(errors.is_empty(), "validation: {errors:?}");
 }

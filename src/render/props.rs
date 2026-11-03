@@ -471,7 +471,7 @@ fn normal_matrix(m: &M4) -> M4 {
     t
 }
 
-fn bounds(points: &[V3]) -> (V3, V3) {
+pub(super) fn bounds(points: &[V3]) -> (V3, V3) {
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
     for p in points {
@@ -513,7 +513,7 @@ fn interleave(positions: &[V3], normals: &[V3], uvs: &[[f32; 2]], indices: &[u32
 }
 
 /// Ray–triangle distance (Möller–Trumbore), both faces.
-fn ray_triangle(o: V3, d: V3, a: V3, b: V3, c: V3) -> Option<f32> {
+pub(super) fn ray_triangle(o: V3, d: V3, a: V3, b: V3, c: V3) -> Option<f32> {
     let e1 = math::sub(b, a);
     let e2 = math::sub(c, a);
     let p = math::cross(d, e2);
@@ -537,7 +537,7 @@ fn ray_triangle(o: V3, d: V3, a: V3, b: V3, c: V3) -> Option<f32> {
 }
 
 /// Ray–box entry distance (slab test), or `None` when the ray misses.
-fn ray_box(o: V3, d: V3, min: V3, max: V3) -> Option<f32> {
+pub(super) fn ray_box(o: V3, d: V3, min: V3, max: V3) -> Option<f32> {
     let (mut near, mut far) = (0.0f32, f32::INFINITY);
     for k in 0..3 {
         if d[k].abs() < 1e-12 {
@@ -554,6 +554,16 @@ fn ray_box(o: V3, d: V3, min: V3, max: V3) -> Option<f32> {
         }
     }
     Some(near)
+}
+
+/// A cooked world instance under a point (`Renderer::pick_world`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldPick {
+    /// Index into the cooked world's instances.
+    pub instance: usize,
+    /// Distance from the eye along the ray, in metres.
+    pub distance: f32,
+    pub point: V3,
 }
 
 /// A pick: the nearest prop under a screen point.
@@ -1211,20 +1221,7 @@ impl Renderer {
         (x, y): (f32, f32),
         layers: u32,
     ) -> Option<Pick> {
-        let eye = self.eye(view, [0.0, 0.0], size);
-        let ndc = [
-            2.0 * x / size.0.max(1) as f32 - 1.0,
-            2.0 * y / size.1.max(1) as f32 - 1.0,
-        ];
-        let unproject = |z: f32| {
-            let p = math::transform(&eye.inv, [ndc[0], ndc[1], z, 1.0]);
-            [p[0] / p[3], p[1] / p[3], p[2] / p[3]]
-        };
-        // Reversed depth: 1 is the near plane.
-        let near = unproject(1.0);
-        let far = unproject(0.5);
-        let dir = math::normalize(math::sub(far, near));
-        let origin = view.eye;
+        let (origin, dir) = self.pick_ray(view, size, (x, y));
         // (on top, order, distance) of the best hit so far.
         let mut best: Option<(Pick, bool, f32)> = None;
         let better = |top: bool, order: f32, dist: f32, b: &Option<(Pick, bool, f32)>| match b {
@@ -1293,6 +1290,79 @@ impl Renderer {
             }
         }
         best.map(|b| b.0)
+    }
+
+    /// The ray from the eye through pixel (`x`, `y`) of a `size` image of `view`: its origin
+    /// and unit direction.
+    fn pick_ray(&self, view: &View, size: (u32, u32), (x, y): (f32, f32)) -> (V3, V3) {
+        let eye = self.eye(view, [0.0, 0.0], size);
+        let ndc = [
+            2.0 * x / size.0.max(1) as f32 - 1.0,
+            2.0 * y / size.1.max(1) as f32 - 1.0,
+        ];
+        let unproject = |z: f32| {
+            let p = math::transform(&eye.inv, [ndc[0], ndc[1], z, 1.0]);
+            [p[0] / p[3], p[1] / p[3], p[2] / p[3]]
+        };
+        // Reversed depth: 1 is the near plane.
+        let near = unproject(1.0);
+        let far = unproject(0.5);
+        (view.eye, math::normalize(math::sub(far, near)))
+    }
+
+    /// The cooked world's instance under pixel (`x`, `y`) of a `size` image of `view`, tested
+    /// against its triangles where they are drawn now: the nearest hit. Hidden instances are
+    /// skipped. Props are picked with [`Renderer::pick`].
+    pub fn pick_world(&self, view: &View, size: (u32, u32), at: (f32, f32)) -> Option<WorldPick> {
+        let (origin, dir) = self.pick_ray(view, size, at);
+        self.scene
+            .pick(origin, dir)
+            .map(|(instance, distance, point)| WorldPick {
+                instance,
+                distance,
+                point,
+            })
+    }
+
+    /// How many instances the cooked world has (its `World::instances`, in their order).
+    pub fn world_instances(&self) -> usize {
+        self.scene.edit.instances.len()
+    }
+
+    /// Where world instance `index` is drawn now (column-major model-to-world) and whether it
+    /// is shown.
+    pub fn world_instance(&self, index: usize) -> Option<([f32; 16], bool)> {
+        self.scene
+            .edit
+            .instances
+            .get(index)
+            .map(|i| (i.transform, i.visible))
+    }
+
+    /// Moves world instance `index` to `matrix` and shows or hides it: how a tool or game moves
+    /// an object of a cooked scene (its entity table names the instances). Only that instance's
+    /// vertices are rewritten; it stays lit, shadowed and mapped like the rest of the world, and
+    /// the ground and world maps follow from the next frame.
+    pub fn set_world_instance(
+        &mut self,
+        device: &mut Device<'_>,
+        index: usize,
+        matrix: [f32; 16],
+        visible: bool,
+    ) -> Result<()> {
+        self.scene.set_instance(device, index, matrix, visible)?;
+        self.world_moved = true;
+        Ok(())
+    }
+
+    /// Moves world lamp `index` (a cooked point light) to `position`.
+    pub fn set_world_light(
+        &mut self,
+        device: &mut Device<'_>,
+        index: usize,
+        position: V3,
+    ) -> Result<()> {
+        self.scene.set_light(device, index, position)
     }
 
     /// A skinned mesh's vertices moved by `joints` as the vertex stages move them, or `None`
