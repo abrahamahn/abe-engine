@@ -118,8 +118,8 @@ Look files, with props, overlays, prop shaders and game lights for game-drawn co
 
 | Subsystem | Status | Evidence | Why | Priority |
 | --- | --- | --- | --- | --- |
-| Physics: collision shapes, broad and narrow phase, rigid bodies, character controller | absent | | A second, non-card game with movement and collision; open worlds. The first game authors its trajectories | P1 |
-| Raycasts and overlaps against scene geometry | partial | CPU picking against triangles | Placement in the editor, gameplay queries | P0 |
+| Physics: collision shapes, broad and narrow phase, rigid bodies, joints, queries, character controller | present | `crates/abe-physics` ([physics](06-physics.md)) | A second, non-card game with movement and collision; open worlds; props that fall, roll and swing in any game | P1 (built ahead of M9) |
+| Raycasts and overlaps against scene geometry | present | the renderer's picking against triangles; the physics world's `raycast`, `shape_cast`, `overlap` and `contacts_with` (`crates/abe-physics/src/query.rs`) against its colliders | Placement in the editor, gameplay queries | P0 |
 | Audio engine: buses, mixing, voices, scheduling, streaming, 3D panning | absent | the game's web audio lives in the game | Native apps have no Web Audio; one event-keyed audio system with buses, voice limits per family, music arrangements, ambience beds and ducking for every game | P0 (M7) |
 | Haptics | absent | | Turn and table-feel channels on phones | P1 |
 | Input actions and rebinding | absent | | Keyboard, touch and gamepad mapped to actions; gamepad focus for native and console | P1 |
@@ -168,10 +168,11 @@ Look files, with props, overlays, prop shaders and game lights for game-drawn co
 1. **Now (milestones 1-4; P0 to leave the old renderer):** scene identity and the editor loop (done), Look, light, material and camera
    editing with live link, sequences and anchors, device loss, render on demand, profiler scopes, cooked model
    compression, the remaining parity gaps of the first game, and device qualification.
-2. **Next (milestones 5-7; P0 to build the first game's content in the editor):** landscape and vegetation; animation graphs, look-at and IK, spring bones, character
-   assembly; the audio engine and the particle system.
+2. **Next (milestones 5-7; P0 to build the first game's content in the editor):** landscape and vegetation;
+   animation graphs, look-at and IK, spring bones, character assembly; the audio engine and the particle system.
 3. **Then (P1):** native app shells on iOS and Android, input actions, text rendering, texture compression,
-   streaming, jobs, physics and navigation for a second game.
+   streaming, jobs and navigation for a second game (its physics came early: rigid bodies, joints, queries and a
+   character controller are done).
 4. **Later (P2):** open-world cells and HLOD, GPU-driven rendering, console platform modules, scripting.
 
 The [roadmap](../roadmap.md) turns this into milestones with acceptance tests.

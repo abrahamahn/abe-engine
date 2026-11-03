@@ -17,6 +17,7 @@ This folder is the design. It is written to be read in order; each page starts w
 | [3. Editor](03-editor.md) | ABE Studio's shape (a local Rust host plus a browser interface whose viewport is the engine), panels, tools and shared machinery |
 | [4. Data](04-data.md) | Projects, documents (scene, prefab, schema, material, Look...), ids, the cook, platform packages and immutable publication |
 | [5. Boundary](05-boundary.md) | What belongs to the engine and what to a game, the extension points, and how a game's current code is sorted |
+| [6. Physics](06-physics.md) | Rigid bodies, collision, the soft-step solver, determinism, queries, characters, and physics in the editor |
 | [Roadmap](../roadmap.md) | Milestones that interleave "replace the game's old renderer" with "build the editors", each with a shippable result and acceptance tests |
 
 ## The decisions in one screen

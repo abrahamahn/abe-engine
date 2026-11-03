@@ -7,7 +7,7 @@ publish = false
 description = "ABE studio's native 3D renderer"
 
 [workspace]
-members = ["crates/abe-agent", "crates/abe-core", "crates/abe-assets", "crates/abe-pipeline", "crates/abe-scene", "crates/abe-shader", "crates/abe-studio", "crates/abe-web"]
+members = ["crates/abe-agent", "crates/abe-core", "crates/abe-assets", "crates/abe-physics", "crates/abe-pipeline", "crates/abe-scene", "crates/abe-shader", "crates/abe-studio", "crates/abe-web"]
 resolver = "3"
 
 [dependencies]

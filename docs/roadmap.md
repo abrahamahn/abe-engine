@@ -20,6 +20,7 @@ and ends with tests that prove it. The [design](design/README.md) explains the p
 | M7 Effects and audio | Particle system and editor; audio engine with buses, banks and mixes | |
 | M8 Native apps | iOS and Android app shells, text, native interface with accessibility, haptics | |
 | M9 Prove reuse and open worlds | A second, non-card game with movement and collision; streaming cells, HLOD, jobs | |
+| Physics (ahead of M9) | Rigid bodies, colliders, joints, queries, a character controller; Simulate in ABE Studio; native and browser state-hash checks | done |
 | M10 Consoles | Private platform modules and certification work | |
 
 The six milestones this roadmap replaces map onto it: *Player* is M0 (native presentation on Linux; Windows
@@ -40,6 +41,31 @@ is M1 to M3, *Platform qualification* is M4 and M8, *Prove reuse* is M9.
   with `abe-build` and renders it with `abe-render`. The driver test
   `world_instances_move_hide_and_pick_like_a_recooked_world` shows a moved world draws the same pixels as one
   cooked that way.
+
+## Physics verification (2026-11-03)
+
+The Linux x86-64 run used Rust 1.94.0 on Ubuntu 24.04 under WSL2. All 698 default workspace tests passed,
+including all 439 physics tests. The 43 tests that require a driver or display ran separately in release mode.
+Mesa lavapipe with Vulkan validation passed 41 driver tests and the agent command's PNG render test.
+The window presentation test passed under Xvfb, including resizing, hiding and restoring the window.
+The shader tests passed with `glslangValidator` and `spirv-val` available.
+
+The physics regressions include a turntable spun for ten simulated minutes, a thin rod hinged across its width,
+a closed mesh room hit from 96 starting throws, and a rider separated from a platform by a 5 mm teleport.
+A resting hexagonal prism kept the same four contact IDs for 300 settled steps at each of three positions on a
+triangle mesh. The native `physics_demo` rendered the ball striking its pyramid of 15 blocks at five points
+over three simulated seconds (final state hash `664d75dcfa0fa7de`).
+
+ABE Studio passed all 50 end-to-end checks on each of WebGPU and WebGL 2 in headless Chromium 156.
+The saved scene produced the same state hash, `c9df1e2e6456329b`, on both graphics backends and in the native
+`abe-build simulate` command after 120 steps. The first browser call requested 2³² steps and exercised
+the 64-step cap. Both editor runs included overlapping scene loads and a host disconnect and reconnect.
+The web renderer also passed 35 API checks on each backend. For the synthetic scene, the images matched
+the native Vulkan reference at 47.7 dB PSNR on WebGPU (SwiftShader) and 51.6 dB on WebGL 2 (ANGLE on llvmpipe).
+
+The workspace passed formatting and native Clippy. The WebAssembly build passed Clippy. Windows x86-64,
+macOS arm64, iOS arm64 and Android arm64 passed Rust compile checks. Physical-device qualification remains
+part of M4 and M8.
 
 ## M2 Look, light, material and camera
 
@@ -157,8 +183,9 @@ is M1 to M3, *Platform qualification* is M4 and M8, *Prove reuse* is M9.
 ## M9 Prove reuse and open worlds
 
 - A second sample game, not a card game, with movement and collision: a runtime entity world and gameplay framework
-  (spawning, components at run time, game-loop hooks), the character controller over the physics, navigation, input
-  actions and gamepads, a network transport for multiplayer.
+  (spawning, components at run time, game-loop hooks), navigation, input actions and gamepads, a network transport for
+  multiplayer. Physics and the character controller were built ahead of this milestone (see
+  [physics](design/06-physics.md)).
 - Streaming cells, HLOD, large-world coordinates (origin shifting per region), a job system, a semantic three-way
   merge driver for scene files.
 - **Acceptance:** two unrelated games built from the same engine revision with no game names in the engine API;
