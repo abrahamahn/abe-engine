@@ -29,7 +29,7 @@ module.exports = async function verifyLook(page, project, check) {
   const records = await page.evaluate(() => {
     const s = window.__studio;
     window.testLookEngine = s.engine;
-    return {scene: s.doc.id, env: Object.entries(s.doc.root.entities).find(([, e]) => e.components?.environment)[0]};
+    return {scene: s.doc.id, selection: s.selection, env: Object.entries(s.doc.root.entities).find(([, e]) => e.components?.environment)[0]};
   });
   await page.locator(`#outliner-tree .node[data-id="${records.env}"]`).click();
   await page.locator('[data-key="edit-look"]').click();
@@ -119,4 +119,5 @@ module.exports = async function verifyLook(page, project, check) {
   // The following scene reloads should open the default scene, as a normal project launch would.
   url.searchParams.delete('asset');
   await page.evaluate(path => history.replaceState(null, '', path), url.pathname + url.search + url.hash);
+  await page.evaluate(id => window.__studioView.select(id), records.selection);
 };
