@@ -49,8 +49,13 @@ export class Host {
       };
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
+        if (msg.type === 'welcome') this.client = msg.client;
         const w = this.waiting;
-        if (w && ((msg.req === w.req && (msg.type === 'ops' || msg.type === 'error')) || w.answers?.(msg))) {
+        // Request counters are local to a connection. Another editor may broadcast a
+        // transaction or save with the same counter while ours is still pending.
+        const own = msg.by === undefined || msg.by === this.client;
+        if (w && own && ((msg.req === w.req && ['ops', 'saved', 'error'].includes(msg.type)) ||
+            (msg.req == null && w.answers?.(msg)))) {
           this.waiting = null;
           try {
             this.onMessage(msg);
@@ -108,18 +113,19 @@ export function applyOps(root, ops) {
     const path = op.set || op.remove;
     let v = root;
     for (let i = 0; i < path.length - 1; i++) {
-      if (v[path[i]] === undefined || typeof v[path[i]] !== 'object' || Array.isArray(v[path[i]])) {
+      if (!Object.hasOwn(v, path[i]) || v[path[i]] === null || typeof v[path[i]] !== 'object' || Array.isArray(v[path[i]])) {
         if (op.remove) {
           v = null;
           break;
         }
-        v[path[i]] = {};
+        Object.defineProperty(v, path[i], { value: {}, writable: true, enumerable: true, configurable: true });
       }
       v = v[path[i]];
     }
     if (!v) continue;
     const last = path[path.length - 1];
-    if (op.set) v[last] = structuredClone(op.value);
+    // JSON keys are data, including "__proto__" in a project-supplied document.
+    if (op.set) Object.defineProperty(v, last, { value: structuredClone(op.value), writable: true, enumerable: true, configurable: true });
     else delete v[last];
   }
 }

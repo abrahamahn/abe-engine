@@ -3,7 +3,9 @@
 // owns the files and the undo history; this page shows a document, turns gestures into ops and
 // applies the ops the host confirms.
 import { Host, applyOps } from './protocol.js';
+import { drawLookInspector } from './look-inspector.js';
 import * as M from './math.js';
+import { cameraWorld, captureCamera, orbitBasis, orbitFromCamera } from './cameras.js';
 import { t, label, lang, setLang, translate } from './i18n.js';
 
 import { projectToolsPanel } from './project-tools.js';
@@ -28,6 +30,9 @@ const state = {
   assets: [],
   doc: null, // {id, rev, path, kind, root, dirty, undo, redo, issues}
   selection: null,
+  looks: new Map(), // Looks watched in this project; the scene stays open while editing its Look.
+  inspectedLook: null,
+  lookSection: 'shading',
   ids: [],
   mode: 'move',
   view: { target: [0, 1, 0], yaw: 0.7, pitch: 0.35, distance: 22, fov: 50 },
@@ -118,15 +123,23 @@ async function takeIds(n) {
 
 /** Queues a request about the open document behind the ones before it (see `Host.edit`):
  * `make(doc)` builds it when its turn comes. It is skipped once that document is closed. */
-function queued(make, answers) {
-  const id = state.doc?.id;
+function documentById(id) {
+  return state.doc?.id === id ? state.doc : state.looks.get(id);
+}
+function activeDocument() {
+  return state.inspectedLook ? state.looks.get(state.inspectedLook) : state.doc;
+}
+function queued(make, answers, id = state.doc?.id) {
   if (!id) return Promise.resolve(null);
-  return state.host.edit(() => (state.doc?.id === id && !state.doc.closed ? make(state.doc) : null), answers);
+  return state.host.edit(() => {
+    const doc = documentById(id);
+    return doc && !doc.closed ? make(doc) : null;
+  }, answers);
 }
 
 /** Sends one edit to the open document; resolves with the host's answer. */
-function edit(label, ops, merge) {
-  return queued((doc) => ({ type: 'edit', doc: doc.id, rev: doc.rev, label, merge, ops }))
+function edit(label, ops, merge, id = state.doc?.id) {
+  return queued((doc) => ({ type: 'edit', doc: doc.id, rev: doc.rev, label, merge, ops }), undefined, id)
     .then((answer) => {
       if (answer?.type === 'error') {
         log(2, `${label}: ${answer.message}`);
@@ -141,19 +154,22 @@ function edit(label, ops, merge) {
  * answers only when there is something to undo or redo: nothing is sent when its last word was
  * that there is not, and the queue moves on when another client's change leaves nothing. */
 function undoRedo(type) {
+  const id = activeDocument()?.id;
+  if (!id) return;
   return queued((doc) => (doc[type] != null ? { type, doc: doc.id } : null),
-    (m) => m.type === 'ops' && m.doc === state.doc?.id && m[type] === null);
+    (m) => m.type === 'ops' && m.doc === id && m[type] === null, id);
 }
 
 /** Saves the open document after the edits made before it, the field being typed into too.
  * When another tool changed the file since it was opened, asks before overwriting it. */
-async function save(force = false) {
+async function save(force = false, id = activeDocument()?.id) {
+  if (!id) return;
   commitTyping();
   const answer = await queued((doc) => ({ type: 'save', doc: doc.id, ...(force ? { force: true } : {}) }),
-    (m) => m.type === 'saved' && m.doc === state.doc?.id);
+    (m) => m.type === 'saved' && m.doc === id, id);
   if (answer?.type === 'error' && answer.code === 'changed-on-disk' && !force
       && window.confirm(t('overwriteChanged'))) {
-    return save(true);
+    return save(true, id);
   }
   return answer;
 }
@@ -179,6 +195,7 @@ function onMessage(msg) {
       state.kinds = {};
       for (const file of msg.schemas) Object.assign(state.kinds, file.components);
       state.assets = msg.assets;
+      state.looks.clear();
       $('#project-name').textContent = msg.project.name || 'Project';
       drawAssets();
       void loadProjectTools(msg.project, msg.toolCatalogs);
@@ -188,34 +205,64 @@ function onMessage(msg) {
       if (state.wanted) state.host.send({ type: 'open', doc: state.wanted });
       else if (asset && (asset.kind === 'scene' || asset.kind === 'prefab')) openDoc(asset.id);
       else if (msg.project.startup) openDoc(msg.project.startup);
+      if (state.inspectedLook) watchLook(state.inspectedLook);
+      else if (asset?.kind === 'look') inspectLook(asset.id);
       if (asset) document.querySelector(`#assets-list [data-id="${CSS.escape(asset.id)}"]`)?.scrollIntoView({ block: 'nearest' });
       break;
     }
     case 'assets':
       state.assets = msg.assets;
+      watchLook(state.inspectedLook);
       drawAssets();
       break;
-    case 'doc':
-      state.doc = { id: msg.doc, rev: msg.rev, path: msg.path, kind: msg.kind, root: msg.root, dirty: msg.dirty, undo: msg.undo, redo: msg.redo, issues: msg.issues };
-      if (state.selection && !entity(state.selection)) state.selection = null;
+    case 'doc': {
+      const doc = { id: msg.doc, rev: msg.rev, path: msg.path, kind: msg.kind, root: msg.root, dirty: msg.dirty, undo: msg.undo, redo: msg.redo, issues: msg.issues };
       for (const i of msg.issues) log(1, `${i.path}: ${i.message}`);
+      if (doc.kind === 'look') {
+        const before = state.looks.get(doc.id)?.root;
+        state.looks.set(doc.id, doc);
+        if (doc.id === previewLookId() && !doc.issues.length) updateViewportLook(before, doc.root);
+        drawInspector();
+        drawToolbar();
+        drawAssets();
+        break;
+      }
+      state.doc = doc;
+      watchLook(lookAsset()?.look);
+      if (state.selection && !entity(state.selection)) state.selection = null;
       drawAll();
       requestCook(0);
       break;
-    case 'ops':
-      if (!state.doc || msg.doc !== state.doc.id) break;
-      applyOps(state.doc.root, msg.ops);
-      Object.assign(state.doc, { rev: msg.rev, dirty: msg.dirty, undo: msg.undo, redo: msg.redo });
+    }
+    case 'ops': {
+      const doc = documentById(msg.doc);
+      if (!doc) break;
+      applyOps(doc.root, msg.ops);
+      Object.assign(doc, { rev: msg.rev, dirty: msg.dirty, undo: msg.undo, redo: msg.redo });
+      if (doc.kind === 'look') {
+        doc.issues = msg.issues || [];
+        if (doc.id === previewLookId() && !doc.issues.length) refreshLook(msg.ops.map(op => (op.set || op.remove)[0]));
+        drawInspector();
+        drawToolbar();
+        drawAssets();
+        break;
+      }
       if (state.selection && !entity(state.selection)) state.selection = null;
       followOps(msg.ops);
+      if (msg.ops.some(op => (op.set || op.remove).includes('environment'))) {
+        watchLook(lookAsset()?.look);
+        refreshLook(['time', 'weather']);
+      }
       drawAll();
       break;
+    }
     case 'saved':
       // A save of an older revision leaves later edits unsaved.
-      if (state.doc && msg.doc === state.doc.id && msg.rev === state.doc.rev) {
-        state.doc.dirty = false;
+      if (documentById(msg.doc)?.rev === msg.rev) {
+        documentById(msg.doc).dirty = false;
         log(0, `saved ${msg.path}`);
         drawToolbar();
+        drawAssets();
       }
       break;
     case 'ids':
@@ -224,7 +271,8 @@ function onMessage(msg) {
       break;
     case 'created':
       log(0, `created ${msg.path}`);
-      openDoc(msg.doc);
+      if (msg.kind === 'look') inspectLook(msg.doc);
+      else openDoc(msg.doc);
       break;
     case 'cooked':
       if (msg.doc !== state.doc?.id) break; // a cook of a document closed since
@@ -237,6 +285,12 @@ function onMessage(msg) {
     case 'select':
       break;
     case 'error':
+      if (typeof msg.req === 'string' && msg.req.startsWith('look-open:')) {
+        const id = msg.req.slice('look-open:'.length);
+        state.looks.set(id, { id, path: state.assets.find(a => a.id === id)?.path || id, error: msg.message });
+        drawInspector();
+        drawToolbar();
+      }
       log(2, msg.message);
       break;
     default:
@@ -245,6 +299,7 @@ function onMessage(msg) {
 }
 
 function openDoc(id) {
+  state.inspectedLook = null;
   if (state.doc && state.doc.id !== id) {
     state.doc.closed = true; // what is still queued for it is dropped (see `queued`)
     state.host.send({ type: 'close', doc: state.doc.id });
@@ -296,6 +351,57 @@ function lookAsset() {
   return null;
 }
 
+// The scene and its Look have independent revisions and undo stacks. Watching rather than
+// fetching the Look also picks up edits from another open editor before they are saved.
+function watchLook(id, reopen = false) {
+  if (!id || !state.assets.some(a => a.id === id && a.kind === 'look')) return;
+  if (state.looks.has(id) && (!reopen || state.looks.get(id) === null)) return;
+  if (!state.looks.has(id)) state.looks.set(id, null);
+  state.host.send({ type: 'open', doc: id, req: 'look-open:' + id });
+}
+function previewLookId() {
+  return state.inspectedLook || lookAsset()?.look;
+}
+function inspectLook(id) {
+  const previous = state.looks.get(previewLookId())?.root;
+  state.inspectedLook = id;
+  watchLook(previewLookId(), !!id);
+  const next = state.looks.get(previewLookId());
+  if (!previewLookId() || (next?.root && !next.issues.length)) updateViewportLook(previous, next?.root);
+  drawInspector();
+  drawToolbar();
+  drawAssets();
+}
+function previewLook() {
+  const look = state.looks.get(previewLookId())?.root || {};
+  const env = lookAsset();
+  // A scene may override the hour and preset while retaining the Look's weather parameters.
+  const result = { ...look };
+  if (env?.time !== undefined) result.time = { ...look.time, hours: env.time };
+  if (env?.weather) result.weather = { ...look.weather, preset: env.weather };
+  return result;
+}
+function updateViewportLook(previous, next) {
+  if (previous && JSON.stringify(previous) === JSON.stringify(next)) return;
+  const sections = ['shading', 'post', 'time', 'weather'].filter(section =>
+    previous === undefined || JSON.stringify(previous[section]) !== JSON.stringify(next?.[section]));
+  // setLook also updates terrain, grass, details and sky, regardless of which panel is visible.
+  refreshLook(sections);
+}
+function refreshLook(sections) {
+  const look = previewLook();
+  if (sections.includes('time')) setTime(look.time?.hours ?? 17.5);
+  state.weather = look.weather?.preset || 'clear';
+  if (!state.engine || state.cooked?.doc !== state.doc?.id) return;
+  // The pinned runtime hot-applies shading and post. Its location and custom weather are set
+  // at creation; reload the same cooked bytes for changes to those sections, without a recook.
+  if (sections.some(section => section === 'time' || section === 'weather')) {
+    loadWorld(state.cooked).catch(e => log(2, `viewport: ${e.message}`));
+  } else {
+    try { state.engine.setLook(look); } catch (e) { log(2, `Look: ${e.message}`); }
+  }
+}
+
 function setTime(hours) {
   state.time = hours;
   $('#time').value = String(hours);
@@ -306,19 +412,9 @@ async function loadWorld(cooked) {
   // Cooks can arrive while an earlier one is still loading: only the newest load shows its
   // world, and every engine a newer load replaces or overtakes is destroyed.
   const gen = ++state.loadGen;
-  const env = lookAsset();
-  let look = {};
-  if (env?.look) {
-    const a = state.assets.find((x) => x.id === env.look);
-    if (a) {
-      const r = await fetch(`/project/${a.path.split('/').map(encodeURIComponent).join('/')}`);
-      if (!r.ok) throw new Error(`${a.path}: HTTP ${r.status}`);
-      look = await r.json();
-    }
-  }
-  if (gen !== state.loadGen) return;
-  if (env?.time !== undefined) setTime(env.time);
-  if (env?.weather) state.weather = env.weather;
+  const look = previewLook();
+  setTime(look.time?.hours ?? 17.5);
+  state.weather = look.weather?.preset || 'clear';
   const name = cooked.file.split('/').pop();
   const old = state.canvas;
   const canvas = el('canvas', { id: 'viewport-canvas' });
@@ -345,8 +441,16 @@ async function loadWorld(cooked) {
     return;
   }
   engine.fitCanvas(Math.min(window.devicePixelRatio || 1, 2));
-  engine.setWeather(state.weather);
   state.engine = engine;
+  // Paint the latest authored Look if it changed while the graphics device was opening.
+  const latest = previewLook();
+  if (JSON.stringify(latest) !== JSON.stringify(look)) {
+    if (JSON.stringify([latest.time, latest.weather]) !== JSON.stringify([look.time, look.weather])) {
+      await loadWorld(cooked);
+      return;
+    }
+    engine.setLook(latest);
+  }
   state.cooked = cooked;
   state.records = new Map(cooked.entities.map((r, i) => [r.id, i]));
   state.current = cooked.entities.map((r) => r.transform.slice());
@@ -679,7 +783,7 @@ function renderLoop(t) {
   }
   if (state.engine) {
     try {
-      state.engine.setView({ eye: eye(), target: state.view.target, fov: state.view.fov });
+      state.engine.setView({ eye: eye(), target: state.view.target, up: orbitBasis(state.view).up, fov: state.view.fov });
       state.engine.setClock(state.time, t / 1000);
       state.engine.render();
     } catch (e) {
@@ -793,8 +897,8 @@ function viewportEvents() {
       const v = state.view;
       if (orbit.pan) {
         const k = v.distance * 0.0015;
-        const right = [Math.cos(v.yaw), 0, -Math.sin(v.yaw)];
-        v.target = [v.target[0] - right[0] * dx * k, v.target[1] + dy * k, v.target[2] - right[2] * dx * k];
+        const { right, up } = orbitBasis(v);
+        v.target = v.target.map((x, i) => x + k * (up[i] * dy - right[i] * dx));
       } else {
         v.yaw -= dx * 0.005;
         v.pitch = Math.max(-1.5, Math.min(1.5, v.pitch + dy * 0.005));
@@ -821,7 +925,7 @@ function viewportEvents() {
 /** Marks the inspector field that holds typing not yet committed (see drawInspector). */
 function inspectorEvents() {
   const box = $('#inspector-body');
-  box.addEventListener('input', (e) => { e.target.dataset.typed = '1'; });
+  box.addEventListener('input', (e) => { e.target.dataset.typed = '1'; drawToolbar(); });
   box.addEventListener('change', (e) => { delete e.target.dataset.typed; }, true);
   box.addEventListener('focusout', (e) => {
     delete e.target.dataset.typed;
@@ -833,6 +937,7 @@ function inspectorEvents() {
 // ---- Panels ----------------------------------------------------------------------------------
 
 function select(id) {
+  if (state.inspectedLook) inspectLook(null);
   state.selection = id;
   drawOutliner();
   drawInspector();
@@ -846,13 +951,14 @@ function drawAll() {
 }
 
 function drawToolbar() {
-  const d = state.doc;
+  const d = activeDocument();
   $('#doc-name').textContent = d ? `${d.path}${d.dirty ? ' •' : ''}` : t('noDocument');
   $('#undo').disabled = !d?.undo;
   $('#undo').title = d?.undo ? t('undoX', d.undo) : t('nothingToUndo');
   $('#redo').disabled = !d?.redo;
   $('#redo').title = d?.redo ? t('redoX', d.redo) : t('nothingToRedo');
-  $('#save').disabled = !d?.dirty;
+  $('#save').disabled = !d || (!d.dirty && !document.activeElement?.dataset.typed);
+  $('#bookmark-camera').disabled = !d?.root.entities;
   for (const m of ['move', 'rotate', 'scale']) $(`#mode-${m}`).classList.toggle('on', state.mode === m);
 }
 
@@ -867,11 +973,16 @@ function drawAssets() {
     list.append(el('div', { class: 'group' }, kind));
     for (const a of items) {
       const name = a.path.split('/').pop();
-      const selected = a.path === requested;
+      const selected = a.id === state.inspectedLook || a.path === requested;
       const row = el('div', { class: selected ? 'asset requested-asset' : 'asset', title: a.path, 'data-id': a.id }, name);
       if (kind === 'scene' || kind === 'prefab') {
         row.addEventListener('dblclick', () => openDoc(a.id));
         row.append(el('button', { class: 'mini', onclick: () => openDoc(a.id) }, t('open')));
+      }
+      if (kind === 'look') {
+        if (state.looks.get(a.id)?.dirty) row.append(el('span', { class: 'badge' }, '•'));
+        row.addEventListener('dblclick', () => inspectLook(a.id));
+        row.append(el('button', { type: 'button', class: 'mini', onclick: () => inspectLook(a.id) }, t('editLook')));
       }
       if (kind === 'model') {
         row.append(el('button', {
@@ -1032,7 +1143,7 @@ function fieldWidget(id, kind, name, schema, stored) {
     el('label', {}, `${label(schema, name)}${unit}`), input, reset);
 }
 
-const CONTROLS = 'input, select, button';
+const CONTROLS = 'input, select, textarea, button';
 const controlsOf = (row) => (row.matches(CONTROLS) ? [row] : [...row.querySelectorAll(CONTROLS)]);
 const valuesOf = (row) => JSON.stringify(controlsOf(row).map((c) => [c.tagName, c.type, c.value, c.checked]));
 
@@ -1047,7 +1158,7 @@ function drawInspector() {
   const box = $('#inspector-body');
   const id = state.selection;
   const focused = box.contains(document.activeElement) ? document.activeElement : null;
-  const same = box.dataset.entity === id && !!entity(id);
+  const same = state.inspectedLook ? box.dataset.entity === 'look:' + state.inspectedLook : box.dataset.entity === id && !!entity(id);
   if (focused?.dataset.typed && same) {
     state.inspectorStale = true;
     return;
@@ -1070,6 +1181,17 @@ function drawInspector() {
 
 function buildInspector(box, id) {
   box.replaceChildren();
+  if (state.inspectedLook) {
+    const lookId = state.inspectedLook;
+    box.dataset.entity = 'look:' + lookId;
+    drawLookInspector(box, {
+      doc: state.looks.get(lookId), environment: lookAsset(), section: state.lookSection, el, t, retry: () => watchLook(lookId, true),
+      changeSection: section => { state.lookSection = section; drawInspector(); },
+      change: (path, value) => edit(t('vSet') + ' ' + path.join('.'), [value === undefined ? {remove: path} : {set: path, value}], undefined, lookId),
+      back: () => inspectLook(null),
+    });
+    return;
+  }
   const e = id && entity(id);
   box.dataset.entity = e ? id : '';
   if (!e) {
@@ -1092,9 +1214,17 @@ function buildInspector(box, id) {
     for (const [name, f] of Object.entries(schema.fields || {}).sort(([a], [b]) => a.localeCompare(b))) {
       if (f.hidden) continue;
       box.append(fieldWidget(id, kind, name, f, stored[name]));
+      if (f.type === 'asset' && f.kind === 'look' && stored[name]) {
+        const exists = state.assets.some(asset => asset.kind === 'look' && asset.id === stored[name]);
+        box.append(el('button', {type: 'button', 'data-key': 'edit-look', disabled: !exists,
+          title: exists ? t('editLook') : t('missingLook'), onclick: () => inspectLook(stored[name])}, t('editLook')));
+      }
     }
     if (kind === 'camera') {
-      box.append(el('button', { 'data-key': `${kind}#look`, onclick: () => lookThrough(id) }, t('lookThrough')));
+      box.append(
+        el('button', { 'data-key': `${kind}#look`, onclick: () => lookThrough(id) }, t('lookThrough')),
+        el('button', { 'data-key': `${kind}#align`, onclick: () => alignCamera(id) }, t('alignCamera')),
+      );
     }
   }
   const missing = Object.keys(state.kinds).filter((k) => !comps[k]).sort();
@@ -1111,17 +1241,34 @@ function buildInspector(box, id) {
 }
 
 function lookThrough(id) {
-  const m = state.current[state.records.get(id)];
-  if (!m) return;
-  const o = [m[12], m[13], m[14]];
-  const f = M.vector(m, [0, 0, -1]);
-  const n = Math.hypot(...f) || 1;
-  state.view.target = o.map((v, i) => v + (f[i] / n) * 5);
-  state.view.distance = 5;
-  state.view.yaw = Math.atan2(-f[0], -f[2]);
-  state.view.pitch = Math.asin(Math.max(-1, Math.min(1, -f[1] / n)));
-  const cam = entity(id).components.camera;
-  if (cam.fov) state.view.fov = cam.fov;
+  const view = orbitFromCamera(cameraWorld(entities(), id), entity(id).components.camera.fov);
+  if (!view) return log(1, t('cameraSingular'));
+  state.view = view;
+  $('#viewport-fov').value = String(view.fov);
+}
+
+function alignCamera(id) {
+  const e = entity(id);
+  const transform = captureCamera(state.view, cameraWorld(entities(), e.parent), e.components.transform);
+  if (!transform) return log(1, t('cameraSingular'));
+  return edit(t('alignCamera'), [
+    { set: ['entities', id, 'components', 'transform'], value: transform },
+    { set: ['entities', id, 'components', 'camera', 'fov'], value: state.view.fov },
+  ]);
+}
+
+async function bookmarkCamera() {
+  const doc = state.doc;
+  if (!doc?.root.entities) return;
+  const name = prompt(t('cameraName'), t('camera'));
+  if (!name?.trim()) return;
+  const transform = captureCamera(state.view, M.IDENTITY);
+  const camera = { fov: state.view.fov };
+  const [id] = (await takeIds(1)) || [];
+  if (!id || state.doc?.id !== doc.id || !transform) return;
+  const value = { name: name.trim(), components: { transform, camera } };
+  const answer = await edit(t('bookmarkCamera'), [{ set: ['entities', id], value }]);
+  if (answer?.type === 'ops' && state.doc?.id === doc.id) select(id);
 }
 
 // ---- Commands and keys ------------------------------------------------------------------------
@@ -1131,18 +1278,31 @@ function lookThrough(id) {
 const inScene = (node) => !!node && ($('#viewport').contains(node) || $('#outliner').contains(node));
 
 function commands() {
-  $('#save').onclick = save;
+  $('#save').onclick = () => save();
   $('#undo').onclick = () => undoRedo('undo');
   $('#redo').onclick = () => undoRedo('redo');
   $('#mode-move').onclick = () => setMode('move');
   $('#mode-rotate').onclick = () => setMode('rotate');
   $('#mode-scale').onclick = () => setMode('scale');
   $('#add-entity').onclick = addEntity;
+  $('#bookmark-camera').onclick = bookmarkCamera;
+  $('#viewport-fov').onchange = (event) => {
+    const input = event.target;
+    if (input.value && input.validity.valid) state.view.fov = input.valueAsNumber;
+    input.value = String(state.view.fov);
+  };
   $('#delete-entity').onclick = deleteSelection;
   $('#duplicate-entity').onclick = duplicateSelection;
   $('#frame').onclick = () => frameBounds(state.selection ? boundsOf(state.selection) : null);
   $('#recook').onclick = () => requestCook(0);
   $('#simulate').onclick = toggleSimulation;
+  $('#new-look').onclick = () => {
+    if (!state.project) return;
+    const previous = state.assets.find(asset => asset.kind === 'look');
+    const dir = previous ? previous.path.slice(0, previous.path.lastIndexOf('/')) : state.project.content[0];
+    const path = prompt(t('newLookFile'), dir + '/new.look.json');
+    if (path) state.host.send({type: 'create', kind: 'look', path});
+  };
   $('#new-scene').onclick = () => {
     const path = prompt(t('newSceneFile'), 'content/scenes/new.scene.json');
     if (path) state.host.send({ type: 'create', kind: 'scene', path, name: path.split('/').pop().replace('.scene.json', '') });

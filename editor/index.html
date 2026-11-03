@@ -19,6 +19,7 @@
   <button id="mode-rotate" data-i18n="rotate" data-i18n-title="rotateTip">Rotate</button>
   <button id="mode-scale" data-i18n="scale" data-i18n-title="scaleTip">Scale</button>
   <button id="frame" data-i18n="frame" data-i18n-title="frameTip">Frame</button>
+  <label class="view-lens"><span data-i18n="viewLens">Lens</span> <input id="viewport-fov" type="number" min="1" max="170" step="any" value="50" data-i18n-title="viewLensTip">°</label>
   <span class="sep"></span>
   <label class="time"><span data-i18n="time">Time</span> <input id="time" type="range" min="0" max="24" step="0.1" value="17.5"> <span id="time-label">17.5 h</span></label>
   <button id="recook" data-i18n="refresh" data-i18n-title="refreshTip">Refresh</button>
@@ -33,12 +34,13 @@
 <main>
   <section id="left">
     <div class="panel" id="assets">
-      <h2><span data-i18n="assets">Assets</span> <button id="new-scene" class="mini" data-i18n="newScene" data-i18n-title="newSceneTip">+ Scene</button></h2>
+      <h2><span data-i18n="assets">Assets</span><span><button id="new-scene" class="mini" data-i18n="newScene" data-i18n-title="newSceneTip">+ Scene</button><button id="new-look" class="mini" data-i18n="newLook" data-i18n-title="newLookFile">+ Look</button></span></h2>
       <div id="assets-list"></div>
     </div>
     <div class="panel" id="outliner">
       <h2><span data-i18n="outliner">Outliner</span>
         <span>
+          <button id="bookmark-camera" class="mini" data-i18n="bookmarkCamera" data-i18n-title="bookmarkCameraTip">+ Camera</button>
           <button id="add-entity" class="mini" data-i18n-title="addEntityTip">+</button>
           <button id="duplicate-entity" class="mini" data-i18n-title="duplicateTip">⧉</button>
           <button id="delete-entity" class="mini" data-i18n-title="deleteTip">✕</button>

@@ -7,6 +7,7 @@ publish = false
 description = "ABE Studio's host: the project folder, documents with undo, and the edit protocol"
 
 [dependencies]
+abe-engine = { path = "../.." }
 abe-core = { path = "../abe-core" }
 abe-assets = { path = "../abe-assets" }
 abe-pipeline = { path = "../abe-pipeline" }

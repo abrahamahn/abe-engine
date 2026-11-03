@@ -24,6 +24,23 @@ pub fn read_asset(path: &std::path::Path) -> Result<Vec<u8>, String> {
 /// Replace an output only after its complete bytes are on disk. A failed cook leaves the
 /// prior asset usable, and concurrent invocations never share a partial file.
 pub fn write_asset(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    write_atomically(path, data, |tmp| std::fs::rename(tmp, path))
+}
+
+/// Installs a complete new asset without replacing a file created by another writer.
+pub fn create_asset(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    write_atomically(path, data, |tmp| {
+        std::fs::hard_link(tmp, path)?;
+        let _ = std::fs::remove_file(tmp);
+        Ok(())
+    })
+}
+
+fn write_atomically(
+    path: &std::path::Path,
+    data: &[u8],
+    install: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -52,7 +69,7 @@ pub fn write_asset(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
             let mut f = f;
             f.write_all(data).and_then(|()| f.sync_all())
         };
-        let res = res.and_then(|()| std::fs::rename(&tmp, path));
+        let res = res.and_then(|()| install(&tmp));
         if res.is_err() {
             let _ = std::fs::remove_file(tmp);
         }

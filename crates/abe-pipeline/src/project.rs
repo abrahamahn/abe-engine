@@ -391,7 +391,7 @@ impl Project {
     /// kind's do (`.scene.json`, `.prefab.json`, `.material.json`).
     pub fn check_document_path(&self, rel: &str, kind: Kind) -> Result<(), String> {
         relative_folder(rel)?;
-        if !kind.self_identified() {
+        if !kind.self_identified() && kind != Kind::Look {
             return Err(format!("{rel}: {} files are not documents", kind.name()));
         }
         let path = Path::new(rel);
@@ -446,6 +446,9 @@ impl Project {
         overwrite: bool,
     ) -> Result<(), String> {
         self.check_document_path(rel, kind)?;
+        if kind == Kind::Look {
+            return Err("a Look has a sidecar id; use create_look or save_look".into());
+        }
         let id = doc
             .get("id")
             .and_then(|x| x.string().ok())
@@ -478,6 +481,65 @@ impl Project {
             },
         );
         Ok(())
+    }
+
+    /// Creates an empty Look in a content folder. Install the sidecar before the source,
+    /// without replacing either file. If creation stopped between the two, retrying reuses
+    /// that sidecar so references retain their original identity.
+    pub fn create_look(&mut self, rel: &str, proposed_id: &str) -> Result<String, String> {
+        self.check_document_path(rel, Kind::Look)?;
+        if !is_asset_id(proposed_id) {
+            return Err("invalid Look id".into());
+        }
+        if self
+            .entry(proposed_id)
+            .is_some_and(|entry| entry.path != rel)
+        {
+            return Err(format!(
+                "asset id {proposed_id} is already used by another file"
+            ));
+        }
+        let file = self.root.join(rel);
+        if std::fs::symlink_metadata(&file).is_ok() {
+            return Err(format!("{rel} already exists"));
+        }
+        let parent = file.parent().ok_or("a Look needs a content folder")?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        let meta = sidecar_path(&file);
+        let text = json::to_canonical(&new_sidecar(proposed_id, Kind::Look))?;
+        match abe_assets::create_asset(&meta, text.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: {e}", meta.display())),
+        }
+        let id = sidecar_id(&read_json(&meta)?, Kind::Look)?;
+        if self.entry(&id).is_some_and(|other| other.path != rel) {
+            return Err(format!("asset id {id} is already used by another file"));
+        }
+        abe_assets::create_asset(&file, b"{}\n").map_err(|e| format!("{rel}: {e}"))?;
+        self.by_id.insert(
+            id.clone(),
+            Entry {
+                id: id.clone(),
+                kind: Kind::Look,
+                path: rel.into(),
+            },
+        );
+        Ok(id)
+    }
+
+    /// Saves a Look under its existing sidecar identity. Its JSON has no embedded asset id.
+    pub fn save_look(&self, id: &str, doc: &Value) -> Result<(), String> {
+        let entry = self.entry(id).ok_or_else(|| format!("no asset {id}"))?;
+        if entry.kind != Kind::Look {
+            return Err(format!("{} is not a Look", entry.path));
+        }
+        let file = self.root.join(&entry.path);
+        let meta = read_json(&sidecar_path(&file))?;
+        if sidecar_id(&meta, Kind::Look)? != id {
+            return Err(format!("{} no longer has asset id {id}", entry.path));
+        }
+        write_json(&file, doc)
     }
 
     /// Whether the file at `rel` is document `id`'s own: indexed there, or holding that id.

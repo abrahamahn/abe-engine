@@ -217,6 +217,7 @@ async function main() {
     // Let the first frames draw.
     await page.waitForTimeout(1500);
     await page.screenshot({ path: path.join(o.out, 'studio-open.png') });
+    await require('./look.cjs')(page, project, check);
     const names = await page.evaluate(() => Object.values(window.__studio.doc.root.entities).map((e) => e.name).sort());
     check('the scene opens with its entities', names.includes('Block A') && names.includes('Tower top'), names);
     check('the outliner lists them', (await page.locator('#outliner-tree .node').count()) === names.length);
@@ -634,6 +635,7 @@ async function main() {
     const nativeHash = (simulated.match(/^hash ([0-9a-f]{16})$/m) || [])[1];
     check('the browser simulation matches a native run bit for bit', !!wasmHash && wasmHash === nativeHash,
       { wasmHash, nativeHash, native: simulated.trim().split('\n').slice(1, 4) });
+    await require('./camera-authoring.cjs')(page, check);
   } catch (e) {
     failed = e.message;
     console.log(`FAIL ${e.message}`);

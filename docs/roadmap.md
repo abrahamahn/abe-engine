@@ -69,6 +69,8 @@ part of M4 and M8.
 
 ## M2 Look, light, material and camera
 
+The Studio can create, edit, undo and save Look assets while previewing them in the scene. Its Outliner can save a viewport as a named camera or update an existing shot. The [editor design](design/03-editor.md) describes both workflows. The remaining M2 work includes material documents, screen-shape profiles, live linking and packaging.
+
 - Look editor with every Look field in the inspector, a time-of-day and weather scrubber, view bookmarks.
 - Light entities edited live (point and spot, follow-the-lamps, shadows); material documents and a material editor
   (colours, textures, shading model, alpha, detail preset, prop shader parameters).

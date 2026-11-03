@@ -167,6 +167,20 @@ A game extends the editor with JavaScript modules listed in its manifest. The pl
 
 Plugins are project code, trusted like the game's own code. They never write files directly; they send ops.
 
+### Authoring a camera
+
+Orbit the viewport and set **Lens** to the desired vertical field of view. **+ Camera** in the Outliner saves that view as a named scene entity. To change an existing shot, select its camera and choose **Align camera to view**. The transform and lens undo together. **Look through** restores the saved view, including roll. A camera under a transformed parent keeps its local scale when aligned.
+
+### Authoring a Look
+
+In **Assets**, choose **+ Look** to create a style, or **Edit Look** beside an existing one.
+A scene's environment also offers **Edit Look** for its assigned asset. The scene stays in
+the viewport while the inspector edits shading, post-processing, sky, weather, time, terrain,
+grass, detail rules and named views. Undo, redo and save apply to the document shown in the
+toolbar. **Back to scene** returns to the scene's own history. Look identity stays in its
+`.meta.json` sidecar, so saving an existing style keeps references to it intact.
+A scene hour or weather preset takes precedence over that part of the Look.
+
 ## 8. First slice (M1)
 
 The first release is the smallest editor that ends script-driven placement:

@@ -70,6 +70,7 @@ version = "0.2.0"
 dependencies = [
  "abe-assets",
  "abe-core",
+ "abe-engine",
  "abe-pipeline",
  "abe-scene",
 ]

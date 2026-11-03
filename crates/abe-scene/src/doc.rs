@@ -68,6 +68,16 @@ impl Document {
         }
         Ok(Self { root, revision: 0 })
     }
+    /// Reopens a document changed outside the editor. In-flight edits to its old contents
+    /// must see a different revision, even when both files had never been edited in Studio.
+    pub fn reload(&mut self, root: Value) -> Result<(), String> {
+        if !matches!(root, Value::Object(_)) {
+            return Err("a document is a JSON object".into());
+        }
+        self.root = root;
+        self.revision += 1;
+        Ok(())
+    }
     pub fn root(&self) -> &Value {
         &self.root
     }

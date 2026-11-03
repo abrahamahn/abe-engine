@@ -387,7 +387,11 @@ impl LookFile {
     /// Parse a Look file. Every field is optional; unknown keys are ignored so files can carry
     /// notes. Colours are `"#rrggbb"` (sRGB) or `[r, g, b]` (linear).
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let root = abe_assets::json::parse(bytes)?;
+        Self::from_value(&abe_assets::json::parse(bytes)?)
+    }
+
+    /// Parses an already decoded Look, for editors that validate a transaction before saving it.
+    pub fn from_value(root: &Value) -> Result<Self, String> {
         let mut file = Self::default();
         if let Some(s) = root.get("shading") {
             let l = &mut file.look;

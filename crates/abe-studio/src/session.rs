@@ -121,13 +121,36 @@ pub fn op_to_json(op: &Op) -> Value {
     }
 }
 
+/// A Look uses the renderer's format, with a sidecar id and optional sections.
+fn validate_look(root: &Value) -> Result<(), String> {
+    for section in [
+        "shading", "post", "sky", "grass", "terrain", "time", "weather",
+    ] {
+        if root
+            .get(section)
+            .is_some_and(|v| !matches!(v, Value::Object(_)))
+        {
+            return Err(format!("{section}: expected an object"));
+        }
+    }
+    abe_engine::render::LookFile::from_value(root).map(|_| ())
+}
+
 /// Every problem of `root`, including what only expanding its prefabs shows (a parent cycle
 /// through what an instance shows, a missing or broken prefab).
 fn issue_set(
+    kind: Kind,
     root: &Value,
     registry: &Registry,
     load: &dyn Fn(&str) -> Option<Value>,
 ) -> BTreeSet<(String, String)> {
+    if kind == Kind::Look {
+        return validate_look(root)
+            .err()
+            .map(|error| ("look".into(), error))
+            .into_iter()
+            .collect();
+    }
     scene::check_with_prefabs(root, registry, load)
         .into_iter()
         .map(|i| (i.path, i.message))
@@ -234,7 +257,7 @@ impl Studio {
         let label = |l: Option<&str>| l.map_or(Value::Null, s);
         let open = self.open_prefabs();
         let load = |a: &str| load_prefab(&open, &self.project, &self.real_root, a);
-        let issues = scene::check_with_prefabs(o.doc.root(), &self.registry, &load);
+        let issues = issue_set(o.kind, o.doc.root(), &self.registry, &load);
         obj(vec![
             ("type", s("doc")),
             ("doc", s(id)),
@@ -250,7 +273,9 @@ impl Studio {
                 Value::Array(
                     issues
                         .iter()
-                        .map(|i| obj(vec![("path", s(&i.path)), ("message", s(&i.message))]))
+                        .map(|(path, message)| {
+                            obj(vec![("path", s(path)), ("message", s(message))])
+                        })
                         .collect(),
                 ),
             ),
@@ -279,6 +304,19 @@ impl Studio {
             ("undo", label_or(o.history.can_undo())),
             ("redo", label_or(o.history.can_redo())),
         ];
+        if o.kind == Kind::Look {
+            m.push((
+                "issues",
+                Value::Array(
+                    o.known_issues
+                        .iter()
+                        .map(|(path, message)| {
+                            obj(vec![("path", s(path)), ("message", s(message))])
+                        })
+                        .collect(),
+                ),
+            ));
+        }
         if let Some(r) = req {
             m.push(("req", r.clone()));
         }
@@ -309,9 +347,9 @@ impl Studio {
             }
             let open = self.open_prefabs();
             let load = |a: &str| load_prefab(&open, &self.project, &self.real_root, a);
-            let known_issues = issue_set(&disk, &self.registry, &load);
+            let known_issues = issue_set(o.kind, &disk, &self.registry, &load);
             let o = self.open.get_mut(id).expect("open");
-            o.doc = Document::new(disk.clone())?;
+            o.doc.reload(disk.clone())?;
             o.history = History::new(HISTORY_LIMIT);
             o.known_issues = known_issues;
             o.on_disk = disk;
@@ -322,14 +360,14 @@ impl Studio {
             .entry(id)
             .ok_or_else(|| format!("no asset {id}"))?
             .clone();
-        if !matches!(entry.kind, Kind::Scene | Kind::Prefab) {
+        if !matches!(entry.kind, Kind::Scene | Kind::Prefab | Kind::Look) {
             return Err(format!("{} is not an editable document", entry.path));
         }
         self.inside(&entry.path)?;
         let root = self.project.read_document(id)?;
         let open = self.open_prefabs();
         let load = |a: &str| load_prefab(&open, &self.project, &self.real_root, a);
-        let known_issues = issue_set(&root, &self.registry, &load);
+        let known_issues = issue_set(entry.kind, &root, &self.registry, &load);
         self.open.insert(
             id.to_string(),
             Open {
@@ -426,6 +464,9 @@ impl Studio {
                 // was added under the entities a prefab instance shows goes with the instance.
                 let id = Self::doc_id(msg)?.to_string();
                 let o = self.open.get(&id).ok_or("open the document first")?;
+                if o.kind == Kind::Look {
+                    return Err("a Look has no entities".into());
+                }
                 let ids = msg
                     .get("ids")
                     .ok_or("a delete has ids")?
@@ -475,7 +516,7 @@ impl Studio {
                         let root = o.doc.root().clone();
                         let open = self.open_prefabs();
                         let load = |a: &str| load_prefab(&open, &self.project, &self.real_root, a);
-                        let known = issue_set(&root, &self.registry, &load);
+                        let known = issue_set(self.open[&id].kind, &root, &self.registry, &load);
                         self.open.get_mut(&id).expect("open").known_issues = known;
                         Ok(self.broadcast_ops(&id, &ops, &label, from, msg.get("req")))
                     }
@@ -509,12 +550,20 @@ impl Studio {
                     }
                     return Ok(vec![(from, e)]);
                 }
-                self.project.write_document(&path, kind, &root)?;
+                if kind == Kind::Look {
+                    self.inside(&format!("{path}.meta.json"))?;
+                    validate_look(&root)?;
+                    self.project.save_look(&id, &root)?;
+                } else {
+                    self.project.write_document(&path, kind, &root)?;
+                }
                 let o = self.open.get_mut(&id).expect("open");
                 o.on_disk = root;
                 o.history.mark_saved();
                 let msg = obj(vec![
                     ("type", s("saved")),
+                    ("by", n(from)),
+                    ("req", msg.get("req").cloned().unwrap_or(Value::Null)),
                     ("doc", s(&id)),
                     ("rev", n(o.doc.revision())),
                     ("path", s(&path)),
@@ -534,10 +583,16 @@ impl Studio {
                 )])
             }
             "create" => {
+                if msg.get("kind").and_then(|k| k.string().ok()) == Some("look") {
+                    let path = self.new_path(msg, "look")?;
+                    self.inside(&format!("{path}.meta.json"))?;
+                    let id = self.project.create_look(&path, &self.ids.asset())?;
+                    return Ok(self.created(from, &id, &path));
+                }
                 let kind = match msg.get("kind").and_then(|k| k.string().ok()) {
                     Some("scene") => scene::Kind::Scene,
                     Some("prefab") => scene::Kind::Prefab,
-                    _ => return Err("create a scene or a prefab".into()),
+                    _ => return Err("create a scene, prefab or Look".into()),
                 };
                 let path = self.new_path(msg, kind.name())?;
                 let name = msg
@@ -649,6 +704,10 @@ impl Studio {
             from,
             obj(vec![
                 ("type", s("created")),
+                (
+                    "kind",
+                    s(self.project.entry(id).expect("created asset").kind.name()),
+                ),
                 ("doc", s(id)),
                 ("path", s(path)),
             ]),
@@ -686,7 +745,9 @@ impl Studio {
             return Err("an edit has at least one op".into());
         }
         for op in &ops {
-            if !matches!(op.path()[0].as_str(), "entities" | "name") {
+            if self.open[&id].kind != Kind::Look
+                && !matches!(op.path()[0].as_str(), "entities" | "name")
+            {
                 return Err(format!(
                     "{:?} cannot be edited (only entities and name)",
                     op.path()[0]
@@ -712,7 +773,7 @@ impl Studio {
                 return Err(e);
             }
         };
-        let after = issue_set(o.doc.root(), registry, &load);
+        let after = issue_set(o.kind, o.doc.root(), registry, &load);
         let fresh: Vec<&(String, String)> = after.difference(&o.known_issues).collect();
         if let Some((path, message)) = fresh.first() {
             let e = format!("{path}: {message}");
@@ -742,6 +803,13 @@ impl Studio {
 
     fn cook(&mut self, from: ClientId, msg: &Value) -> Result<Outbox, String> {
         let id = Self::doc_id(msg)?.to_string();
+        if self
+            .project
+            .entry(&id)
+            .is_some_and(|asset| asset.kind == Kind::Look)
+        {
+            return Err("cook a scene or prefab to preview a Look".into());
+        }
         // A document read again from disk goes to everyone watching it before the cook.
         let mut out: Outbox = if self.ensure_open(&id)? {
             let doc = self.doc_message(&id);
@@ -954,6 +1022,103 @@ mod tests {
     }
 
     #[test]
+    fn a_look_is_a_shared_undoable_document_with_its_existing_sidecar() {
+        let (_, t) = studio("look");
+        let path = t.0.join("content/orchard.look.json");
+        let original =
+            msg(r##"{"shading":{"rim_strength":0.2},"notes":{"vendor":"leave intact"}}"##);
+        abe_pipeline::project::write_json(&path, &original).unwrap();
+        let (mut st, _) = Studio::open(&t.0, Ids::seeded(9)).unwrap();
+        let id = st
+            .project
+            .find_path("content/orchard.look.json")
+            .unwrap()
+            .id
+            .clone();
+        let sidecar = abe_pipeline::project::sidecar_path(&path);
+        let meta = std::fs::read(&sidecar).unwrap();
+        let a = st.connect("artist");
+        let b = st.connect("viewer");
+        let send = |st: &mut Studio, who, message: &str| {
+            st.handle(who, &msg(&message.replace("$id", &id)))
+        };
+        for client in [a, b] {
+            let opened = send(&mut st, client, r#"{"type":"open","doc":"$id"}"#);
+            assert_eq!(opened[0].1.get("kind"), Some(&s("look")));
+            assert!(
+                opened[0]
+                    .1
+                    .get("issues")
+                    .unwrap()
+                    .array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let edit = r#"{"type":"edit","doc":"$id","rev":0,"label":"Rim","ops":[{"set":["shading","rim_strength"],"value":0.75}]}"#;
+        assert_eq!(of_type(&send(&mut st, a, edit), "ops").len(), 2);
+        assert_eq!(of_type(&send(&mut st, b, edit), "doc").len(), 1);
+        let bad = r#"{"type":"edit","doc":"$id","rev":1,"ops":[{"set":["post"],"value":3}]}"#;
+        assert_eq!(of_type(&send(&mut st, a, bad), "error").len(), 1);
+        assert_eq!(st.open[&id].doc.revision(), 1);
+        send(&mut st, b, r#"{"type":"undo","doc":"$id"}"#);
+        assert_eq!(st.open[&id].doc.root(), &original);
+        send(&mut st, a, r#"{"type":"redo","doc":"$id"}"#);
+        let saved = send(&mut st, a, r#"{"type":"save","doc":"$id"}"#);
+        assert_eq!(of_type(&saved, "saved").len(), 2);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), meta);
+        let (mut reopened, _) = Studio::open(&t.0, Ids::seeded(11)).unwrap();
+        let c = reopened.connect("new");
+        send(&mut reopened, c, r#"{"type":"open","doc":"$id"}"#);
+        let root = reopened.open[&id].doc.root();
+        assert_eq!(root.get("notes"), original.get("notes"));
+        assert_eq!(
+            root.get("shading").unwrap().get("rim_strength"),
+            Some(&Value::Number(0.75))
+        );
+        assert!(root.get("id").is_none());
+        // Changes on disk need explicit overwrite. Even that cannot overwrite another asset.
+        abe_pipeline::project::write_json(&path, &original).unwrap();
+        let err = send(&mut reopened, c, r#"{"type":"save","doc":"$id"}"#);
+        assert_eq!(err[0].1.get("code"), Some(&s(CHANGED_ON_DISK)));
+        let other =
+            abe_pipeline::project::new_sidecar("0123456789abcdef0123456789abcdef", Kind::Look);
+        abe_pipeline::project::write_json(&sidecar, &other).unwrap();
+        let err = send(
+            &mut reopened,
+            c,
+            r#"{"type":"save","force":true,"doc":"$id"}"#,
+        );
+        assert_eq!(of_type(&err, "error").len(), 1);
+        assert_eq!(abe_pipeline::project::read_json(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn new_looks_are_registered_once_and_can_finish_an_interrupted_creation() {
+        let (mut st, t) = studio("new-look");
+        let a = st.connect("artist");
+        let rel = "content/looks/morning.look.json";
+        let interrupted_id = "abcdef0123456789abcdef0123456789";
+        let sidecar = abe_pipeline::project::sidecar_path(&t.0.join(rel));
+        let meta = abe_pipeline::project::new_sidecar(interrupted_id, Kind::Look);
+        abe_pipeline::project::write_json(&sidecar, &meta).unwrap();
+        let out = create(&mut st, a, "look", rel);
+        assert_eq!(created_doc(&out), interrupted_id);
+        let file = t.0.join(rel);
+        assert_eq!(abe_pipeline::project::read_json(&file).unwrap(), msg("{}"));
+        assert!(error_of(&create(&mut st, a, "look", rel)).contains("already exists"));
+        assert_eq!(abe_pipeline::project::read_json(&sidecar).unwrap(), meta);
+        let new = create(&mut st, a, "look", "content/new.look.json");
+        let id = created_doc(&new);
+        assert!(is_asset_id(&id));
+        let (reopened, _) = Studio::open(&t.0, Ids::seeded(32)).unwrap();
+        assert_eq!(
+            reopened.project.entry(&id).unwrap().path,
+            "content/new.look.json"
+        );
+    }
+
+    #[test]
     fn create_edit_undo_save_and_reopen() {
         let (mut st, t) = studio("edit");
         let a = st.connect("editor");
@@ -1068,8 +1233,12 @@ mod tests {
             Some(&Value::String("Renamed outside".into()))
         );
         // An unsaved edit, then the file changes again: the save is refused, not lost.
+        let stale = format!(
+            r#"{{"type":"edit","doc":"{doc}","rev":0,"ops":[{{"set":["name"],"value":"Old file"}}]}}"#
+        );
+        assert_eq!(of_type(&st.handle(b, &msg(&stale)), "error").len(), 1);
         let ok = format!(
-            r#"{{"type":"edit","doc":"{doc}","rev":0,"ops":[{{"set":["name"],"value":"Mine"}}]}}"#
+            r#"{{"type":"edit","doc":"{doc}","rev":1,"ops":[{{"set":["name"],"value":"Mine"}}]}}"#
         );
         assert_eq!(of_type(&st.handle(a, &msg(&ok)), "ops").len(), 2);
         if let Value::Object(m) = &mut disk {
