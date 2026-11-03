@@ -194,7 +194,7 @@ async function main() {
   execFileSync(path.join(BIN, 'examples', 'studio_sample'), [project], { stdio: 'inherit' });
   fs.mkdirSync(path.join(project, 'editor'), { recursive: true });
   fs.writeFileSync(path.join(project, 'editor', 'project-tools.json'), JSON.stringify({
-    version: 1, origin: 'http://127.0.0.1:5173', tools: [{ label: 'Level rules', path: '/tools/levels' }],
+    version: 1, origin: 'http://127.0.0.1:5173', tools: [{ label: 'Level rules', path: '/tools/levels' }, { label: 'Playtest control', path: '/playtest', open: 'tab' }],
   }));
   const port = 7400 + Math.floor(Math.random() * 500);
   const lines = [];
@@ -221,6 +221,9 @@ async function main() {
     check('the scene opens with its entities', names.includes('Block A') && names.includes('Tower top'), names);
     check('the outliner lists them', (await page.locator('#outliner-tree .node').count()) === names.length);
 
+    const tabTool = page.locator('#project-tab-tools a');
+    check('a top-level tool gets an isolated link', await tabTool.getAttribute('href') === 'http://127.0.0.1:5173/playtest' &&
+      await tabTool.getAttribute('target') === '_blank' && (await tabTool.getAttribute('rel')).includes('noreferrer'));
     // A project tool gets its own game origin and the scene survives the round trip.
     let sentReferrer;
     await page.route('http://127.0.0.1:5173/tools/levels', async route => {

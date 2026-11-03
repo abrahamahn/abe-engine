@@ -16,3 +16,9 @@ test('rejects script and cross-origin paths, host self-embedding and nonlocal ov
   assert.throws(() => resolveProjectTools(manifest, host, 'http://localhost:5173'));
   assert.throws(() => resolveProjectTools(manifest, host, 'https://example.test'));
 });
+
+test('a workspace needing a top-level game session can declare a link', () => {
+  const tools = [{label:'Playtest control',path:'/playtest',open:'tab'}];
+  assert.equal(resolveProjectTools({...manifest, tools}, host)[0].open, 'tab');
+  assert.throws(() => resolveProjectTools({...manifest, tools:[{...tools[0],open:'javascript'}]}, host));
+});

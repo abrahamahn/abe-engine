@@ -72,3 +72,6 @@ select.add { margin-top: 12px; width: 100%; }
 #project-tool-frame { width: 100%; height: 100%; min-height: 0; border: 0; }
 
 #assets-list .requested-asset { background: #334961; }
+
+#project-tab-tools { display: inline-flex; gap: .6rem; }
+#project-tab-tools a { color: var(--accent); }

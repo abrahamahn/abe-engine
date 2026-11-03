@@ -25,12 +25,14 @@ export function resolveProjectTools(manifest, studioOrigin, override) {
     }
     const url = new URL(tool.path, requested.origin);
     if (url.origin !== requested.origin) throw new Error('Project tool leaves its configured origin.');
-    return { label: tool.label, href: url.href };
+    if (tool.open !== undefined && tool.open !== 'panel' && tool.open !== 'tab') throw new Error('Invalid project tool target.');
+    return { label: tool.label, href: url.href, open: tool.open ?? 'panel' };
   });
 }
 
 export function projectToolsPanel(onError) {
   const select = document.getElementById('project-tools');
+  const tabs = document.getElementById('project-tab-tools');
   const dialog = document.getElementById('project-tool-panel');
   const frame = document.getElementById('project-tool-frame');
   const title = document.getElementById('project-tool-title');
@@ -64,10 +66,23 @@ export function projectToolsPanel(onError) {
       }));
       if (current !== projectLoad) return;
       select.length = 1;
-      for (const tool of groups.flat()) select.add(new Option(tool.label, tool.href));
+      tabs.replaceChildren();
+      for (const tool of groups.flat()) {
+        if (tool.open === 'panel') {
+          select.add(new Option(tool.label, tool.href));
+          continue;
+        }
+        // Use a real top-level navigation for tools that require the game's own session.
+        const link = document.createElement('a');
+        link.href = tool.href;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = tool.label;
+        tabs.append(link);
+      }
       select.hidden = select.length === 1;
     } catch (error) {
-      if (current === projectLoad) { select.hidden = true; onError(String(error)); }
+      if (current === projectLoad) { select.hidden = true; tabs.replaceChildren(); onError(String(error)); }
     }
   };
 }
