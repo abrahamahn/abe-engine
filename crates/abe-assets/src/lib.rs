@@ -2,7 +2,8 @@
 pub mod cooked;
 pub mod glb;
 pub mod image;
-pub mod json;
+/// The JSON reader and writer now live in `abe-core`; this keeps `abe_assets::json` working.
+pub use abe_core::json;
 pub mod mip;
 pub mod model;
 pub mod png;

@@ -351,3 +351,107 @@ impl World {
         Ok(out)
     }
 }
+
+impl Transform {
+    /// The inverse of an affine transform, or `None` when it is singular.
+    pub fn inverse(self) -> Option<Self> {
+        let m = self.0;
+        // The 3x3 part, row r column c at m[c * 4 + r].
+        let a = |r: usize, c: usize| m[c * 4 + r];
+        let det = a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1))
+            - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0))
+            + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
+        if !det.is_finite() || det.abs() < 1e-20 {
+            return None;
+        }
+        let inv_det = 1.0 / det;
+        let mut r = [[0.0f32; 3]; 3];
+        r[0][0] = (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1)) * inv_det;
+        r[0][1] = (a(0, 2) * a(2, 1) - a(0, 1) * a(2, 2)) * inv_det;
+        r[0][2] = (a(0, 1) * a(1, 2) - a(0, 2) * a(1, 1)) * inv_det;
+        r[1][0] = (a(1, 2) * a(2, 0) - a(1, 0) * a(2, 2)) * inv_det;
+        r[1][1] = (a(0, 0) * a(2, 2) - a(0, 2) * a(2, 0)) * inv_det;
+        r[1][2] = (a(0, 2) * a(1, 0) - a(0, 0) * a(1, 2)) * inv_det;
+        r[2][0] = (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0)) * inv_det;
+        r[2][1] = (a(0, 1) * a(2, 0) - a(0, 0) * a(2, 1)) * inv_det;
+        r[2][2] = (a(0, 0) * a(1, 1) - a(0, 1) * a(1, 0)) * inv_det;
+        let t = [m[12], m[13], m[14]];
+        let mut out = [0.0f32; 16];
+        for row in 0..3 {
+            for col in 0..3 {
+                out[col * 4 + row] = r[row][col];
+            }
+            out[12 + row] = -(r[row][0] * t[0] + r[row][1] * t[1] + r[row][2] * t[2]);
+        }
+        out[15] = 1.0;
+        let inv = Self(out);
+        inv.valid().then_some(inv)
+    }
+}
+
+/// One authored entity of a cooked scene: its identity, and the run of the world's instances
+/// and lights it produced, so tools and games can find, move and hide objects of a world.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntityRecord {
+    /// The entity's 64-bit id (its 16-digit hexadecimal id in the scene file).
+    pub id: u64,
+    pub name: String,
+    /// Index of the parent record; parents come before their children.
+    pub parent: Option<u32>,
+    /// The entity's world transform when cooked. Moving the entity to `m` moves each of its
+    /// instances `i` to `m * transform⁻¹ * i`.
+    pub transform: Transform,
+    /// The entity's own instances and lights (not its children's): runs of `World::instances`
+    /// and `World::lights`.
+    pub instances: std::ops::Range<u32>,
+    pub lights: std::ops::Range<u32>,
+}
+
+/// Where a cooked world came from: one record per entity, plus the data the renderer does not
+/// draw (game components, cameras, markers, the scene's settings) as canonical JSON.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EntityTable {
+    pub entities: Vec<EntityRecord>,
+    pub data: String,
+}
+
+pub const MAX_ENTITIES: usize = 250_000;
+/// Largest `EntityTable::data`.
+pub const MAX_ENTITY_DATA: usize = 16 * 1024 * 1024;
+
+impl EntityTable {
+    /// Checks the table against the world it describes.
+    pub fn validate(&self, world: &World) -> Result<(), String> {
+        if self.entities.len() > MAX_ENTITIES || self.data.len() > MAX_ENTITY_DATA {
+            return Err("entity table too large".into());
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for (i, e) in self.entities.iter().enumerate() {
+            if !ids.insert(e.id) {
+                return Err(format!("entity {:016x} appears twice", e.id));
+            }
+            if e.name.len() > MAX_NAME_BYTES {
+                return Err(format!("entity {i}: name too long"));
+            }
+            if e.parent.is_some_and(|p| p as usize >= i) {
+                return Err(format!("entity {i}: its parent does not come before it"));
+            }
+            if !e.transform.valid() {
+                return Err(format!("entity {i}: invalid transform"));
+            }
+            if e.instances.start > e.instances.end
+                || e.instances.end as usize > world.instances.len()
+                || e.lights.start > e.lights.end
+                || e.lights.end as usize > world.lights.len()
+            {
+                return Err(format!("entity {i}: instances or lights out of range"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The record of entity `id`.
+    pub fn find(&self, id: u64) -> Option<(usize, &EntityRecord)> {
+        self.entities.iter().enumerate().find(|(_, e)| e.id == id)
+    }
+}

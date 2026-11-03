@@ -19,7 +19,25 @@ version = "0.2.0"
 dependencies = [
  "abe-assets",
  "abe-core",
+ "abe-pipeline",
+ "abe-scene",
  "abe-shader",
+]
+
+[[package]]
+name = "abe-pipeline"
+version = "0.2.0"
+dependencies = [
+ "abe-assets",
+ "abe-core",
+ "abe-scene",
+]
+
+[[package]]
+name = "abe-scene"
+version = "0.2.0"
+dependencies = [
+ "abe-core",
 ]
 
 [[package]]

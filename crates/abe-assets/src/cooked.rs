@@ -11,7 +11,9 @@
 //!   (0 for the next new vertex, otherwise how far below it); positions on a 0.5 mm grid; then
 //!   octahedral normals with 12-bit components; then UVs on a 1/8192 grid. Each attribute is
 //!   coded as zigzag deltas from the previous vertex, stored byte plane by byte plane (all low
-//!   bytes first): 4 planes per position or UV component, 2 per normal component.
+//!   bytes first): 4 planes per position or UV component, 2 per normal component. An index
+//!   code takes at most 5 bytes, and a file's coded meshes decode to at most `MAX_BYTES`
+//!   together (as much mesh data as an exact file holds).
 //! - instance: mesh, column-major affine transform (16 f32).
 //! - material: name byte length, UTF-8 name zero-padded to 4 bytes, base colour (4 f32),
 //!   base colour texture, normal texture, normal scale, emissive (3 f32), emissive texture,
@@ -23,6 +25,12 @@
 //!   type length, the type zero-padded to 4 bytes, data length, the data zero-padded to 4).
 //! - light: position (3 f32), colour (3 f32), intensity, range.
 //!
+//! Version 4 (written by `encode_scene`): version 3 followed by an entity table: the entity
+//! count, then per entity its 64-bit id (low then high word), name (byte length, UTF-8 zero-padded
+//! to 4 bytes), parent (`u32::MAX` for none), world transform (16 f32), first instance and
+//! instance count, first light and light count; then the table's data (byte length, UTF-8
+//! canonical JSON zero-padded to 4 bytes). `decode` reads version 4 and ignores the table.
+//!
 //! Version 2 (read only): as version 3 with mesh flags 1 and 2 only (f32 positions and
 //! normals, u32 indices) and textures without a kind (always the complete chain).
 //!
@@ -31,13 +39,15 @@
 use abe_core::{
     Vec3,
     world::{
-        AlphaMode, Emission, EncodedImage, IMAGE_TYPES, Instance, MAX_LIGHTS, MAX_MATERIALS,
-        MAX_NAME_BYTES, MAX_TEXTURE_SIZE, MAX_TEXTURES, Material, Mesh, PointLight, Shading,
-        Texture, Transform, World,
+        AlphaMode, Emission, EncodedImage, EntityRecord, EntityTable, IMAGE_TYPES, Instance,
+        MAX_ENTITIES, MAX_ENTITY_DATA, MAX_LIGHTS, MAX_MATERIALS, MAX_NAME_BYTES, MAX_TEXTURE_SIZE,
+        MAX_TEXTURES, Material, Mesh, PointLight, Shading, Texture, Transform, World,
     },
 };
 const MAGIC: &[u8; 4] = b"ABEW";
 pub const VERSION: u32 = 3;
+/// The version of a world with an entity table (`encode_scene`).
+pub const SCENE_VERSION: u32 = 4;
 /// Mesh flags.
 const NORMALS: u32 = 1;
 const UVS: u32 = 2;
@@ -51,7 +61,8 @@ const NORMAL_RANGE: f32 = 2047.0;
 const GRID_LIMIT: f64 = 1_073_741_823.0;
 pub const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_MESHES: usize = 65_536;
-const MAX_INSTANCES: usize = 250_000;
+/// Most instances a cooked world holds.
+pub const MAX_INSTANCES: usize = 250_000;
 const NONE: u32 = u32::MAX;
 // Smallest encoded records, for validating counts before allocation.
 const MESH_BYTES: u64 = 28;
@@ -59,6 +70,7 @@ const INSTANCE_BYTES: u64 = 68;
 const MATERIAL_BYTES: u64 = 76;
 const TEXTURE_BYTES: u64 = 20;
 const LIGHT_BYTES: u64 = 32;
+const ENTITY_BYTES: u64 = 96;
 
 fn put_u32(v: &mut Vec<u8>, n: usize) -> Result<(), String> {
     v.extend_from_slice(
@@ -76,8 +88,29 @@ fn put_floats(v: &mut Vec<u8>, values: &[f32]) {
 fn put_index(v: &mut Vec<u8>, i: Option<u32>) {
     v.extend_from_slice(&i.unwrap_or(NONE).to_le_bytes());
 }
+/// `len` rounded up to a multiple of 4, in 64 bits (a 32-bit length near `u32::MAX` would
+/// wrap in a 32-bit `usize`).
 fn padded(len: usize) -> u64 {
-    len.next_multiple_of(4) as u64
+    (len as u64).next_multiple_of(4)
+}
+/// Bytes of `k` 16-bit indices, zero-padded to 4.
+fn short_index_bytes(k: usize) -> u64 {
+    (2 * k as u64).next_multiple_of(4)
+}
+
+/// Bytes per vertex of a coded mesh's attribute planes.
+fn plane_bytes(normals: bool, uvs: bool) -> u64 {
+    12 + 4 * u64::from(normals) + 8 * u64::from(uvs)
+}
+/// Most bytes a coded mesh's stream inflates to: an index code of a 32-bit value takes at most
+/// 5 bytes, then the attribute planes.
+fn stream_bytes(n: usize, k: usize, normals: bool, uvs: bool) -> u64 {
+    5 * k as u64 + n as u64 * plane_bytes(normals, uvs)
+}
+/// Bytes a coded mesh decodes to. The coded meshes of one file decode to at most `MAX_BYTES`
+/// together, as much mesh data as an exact file can hold.
+fn decoded_bytes(n: usize, k: usize, normals: bool, uvs: bool) -> u64 {
+    n as u64 * (12 + 12 * u64::from(normals) + 8 * u64::from(uvs)) + 4 * k as u64
 }
 
 /// Version of an ABEW file, if it has the ABEW magic.
@@ -225,6 +258,11 @@ fn decode_mesh(
     normals: bool,
     uvs: bool,
 ) -> Result<(Vec<Vec3>, Vec<Vec3>, Vec<[f32; 2]>, Vec<u32>), String> {
+    // Each index code takes at least a byte and each vertex its planes: counts the stream
+    // cannot hold fail before anything is reserved for them.
+    if (data.len() as u64) < k as u64 + n as u64 * plane_bytes(normals, uvs) {
+        return Err("truncated coded mesh".into());
+    }
     let mut at = 0usize;
     let mut indices = Vec::with_capacity(k);
     let mut next: u64 = 0;
@@ -234,7 +272,7 @@ fn decode_mesh(
         loop {
             let b = *data.get(at).ok_or("truncated mesh indices")?;
             at += 1;
-            if shift > 56 {
+            if shift > 28 {
                 return Err("overlong index code".into());
             }
             code |= u64::from(b & 0x7F) << shift;
@@ -259,10 +297,12 @@ fn decode_mesh(
         return Err("coded mesh has unused vertices".into());
     }
     let mut planes = |count: usize, width: usize| -> Result<Vec<u32>, String> {
-        let bytes = data
-            .get(at..at + count * width)
+        let end = count
+            .checked_mul(width)
+            .and_then(|b| b.checked_add(at))
             .ok_or("truncated mesh attributes")?;
-        at += count * width;
+        let bytes = data.get(at..end).ok_or("truncated mesh attributes")?;
+        at = end;
         Ok((0..count)
             .map(|i| {
                 (0..width).fold(0u32, |acc, p| {
@@ -332,6 +372,39 @@ pub fn encode_compact(w: &World) -> Result<Vec<u8>, String> {
     encode_with(w, true)
 }
 
+/// Encodes a cooked scene: the world (compactly when `compact`) and its entity table, as
+/// version 4. Readers of version 3 cannot load it; `encode` still writes version 3.
+pub fn encode_scene(w: &World, table: &EntityTable, compact: bool) -> Result<Vec<u8>, String> {
+    table.validate(w)?;
+    let mut v = encode_with(w, compact)?;
+    v[4..8].copy_from_slice(&SCENE_VERSION.to_le_bytes());
+    put_u32(&mut v, table.entities.len())?;
+    for e in &table.entities {
+        v.extend_from_slice(&(e.id as u32).to_le_bytes());
+        v.extend_from_slice(&((e.id >> 32) as u32).to_le_bytes());
+        put_u32(&mut v, e.name.len())?;
+        v.extend_from_slice(e.name.as_bytes());
+        pad4(&mut v);
+        put_index(&mut v, e.parent);
+        put_floats(&mut v, &e.transform.0);
+        for n in [
+            e.instances.start,
+            e.instances.end - e.instances.start,
+            e.lights.start,
+            e.lights.end - e.lights.start,
+        ] {
+            v.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+    put_u32(&mut v, table.data.len())?;
+    v.extend_from_slice(table.data.as_bytes());
+    pad4(&mut v);
+    if v.len() > MAX_BYTES {
+        return Err("cooked file too large".into());
+    }
+    Ok(v)
+}
+
 fn encode_with(w: &World, compact: bool) -> Result<Vec<u8>, String> {
     w.validate()?;
     if w.meshes.len() > MAX_MESHES || w.instances.len() > MAX_INSTANCES {
@@ -349,6 +422,8 @@ fn encode_with(w: &World, compact: bool) -> Result<Vec<u8>, String> {
     ] {
         put_u32(&mut v, n)?;
     }
+    // What the coded meshes decode to, as `decode` counts it.
+    let mut budget = MAX_BYTES as u64;
     for m in &w.meshes {
         let mut flags = 0;
         if !m.normals.is_empty() {
@@ -359,6 +434,10 @@ fn encode_with(w: &World, compact: bool) -> Result<Vec<u8>, String> {
         }
         if compact {
             let (n, stream) = code_mesh(m)?;
+            let size = decoded_bytes(n, m.indices.len(), flags & NORMALS != 0, flags & UVS != 0);
+            budget = budget
+                .checked_sub(size)
+                .ok_or("compact meshes decode to more than a file may hold")?;
             put_u32(&mut v, n)?;
             put_u32(&mut v, m.indices.len())?;
             put_u32(&mut v, (flags | CODED) as usize)?;
@@ -580,6 +659,7 @@ fn decode_v2(r: &mut Read, version: u32) -> Result<World, String> {
     } else {
         NORMALS | UVS
     };
+    let mut budget = MAX_BYTES as u64;
     for _ in 0..meshes {
         let n = r.uint()? as usize;
         let k = r.uint()? as usize;
@@ -603,13 +683,19 @@ fn decode_v2(r: &mut Read, version: u32) -> Result<World, String> {
             if n > k || k > MAX_BYTES {
                 return Err("invalid coded mesh counts".into());
             }
-            let limit = k * 10 + n * (12 + 4 * usize::from(normals) + 8 * usize::from(uvs));
+            // What the mesh decodes to comes out of the file's budget before its stream is
+            // inflated, so a small file cannot claim (or inflate to) more than it may hold.
+            budget = budget
+                .checked_sub(decoded_bytes(n, k, normals, uvs))
+                .ok_or("coded meshes decode to more than a file may hold")?;
+            let limit = usize::try_from(stream_bytes(n, k, normals, uvs))
+                .map_err(|_| "invalid coded mesh counts")?;
             let data = crate::zlib::decompress(&raw[..len], limit)?;
             decode_mesh(&data, n, k, normals, uvs)?
         } else {
             let n64 = n as u64;
             let index_bytes = if flags & SHORT_INDICES != 0 {
-                padded(k * 2)
+                short_index_bytes(k)
             } else {
                 4 * k as u64
             };
@@ -623,7 +709,7 @@ fn decode_v2(r: &mut Read, version: u32) -> Result<World, String> {
                 vec![]
             };
             let indices = if flags & SHORT_INDICES != 0 {
-                let raw = r.bytes(padded(k * 2))?;
+                let raw = r.bytes(short_index_bytes(k))?;
                 raw.chunks_exact(2)
                     .take(k)
                     .map(|c| u32::from(u16::from_le_bytes([c[0], c[1]])))
@@ -765,8 +851,67 @@ fn decode_v2(r: &mut Read, version: u32) -> Result<World, String> {
     Ok(world)
 }
 
-/// Decode an ABEW file of version 1, 2 or 3.
+fn entity_table(r: &mut Read, w: &World) -> Result<EntityTable, String> {
+    let count = r.uint()? as usize;
+    if count > MAX_ENTITIES {
+        return Err("too many entities".into());
+    }
+    r.holds(ENTITY_BYTES * count as u64)?;
+    let mut entities = Vec::with_capacity(count);
+    for _ in 0..count {
+        let lo = u64::from(r.uint()?);
+        let hi = u64::from(r.uint()?);
+        let len = r.uint()? as usize;
+        if len > MAX_NAME_BYTES {
+            return Err("entity name too long".into());
+        }
+        let raw = r.bytes(padded(len))?;
+        if raw[len..].iter().any(|&b| b != 0) {
+            return Err("nonzero entity name padding".into());
+        }
+        let name =
+            String::from_utf8(raw[..len].to_vec()).map_err(|_| "entity name is not UTF-8")?;
+        let parent = r.index()?;
+        let transform = Transform(r.floats()?);
+        let [first, n, first_light, lights] = [(); 4].map(|()| r.uint());
+        let (first, n, first_light, lights) = (first?, n?, first_light?, lights?);
+        let end = first
+            .checked_add(n)
+            .ok_or("entity instances out of range")?;
+        let light_end = first_light
+            .checked_add(lights)
+            .ok_or("entity lights out of range")?;
+        entities.push(EntityRecord {
+            id: lo | hi << 32,
+            name,
+            parent,
+            transform,
+            instances: first..end,
+            lights: first_light..light_end,
+        });
+    }
+    let len = r.uint()? as usize;
+    if len > MAX_ENTITY_DATA {
+        return Err("entity data too large".into());
+    }
+    let raw = r.bytes(padded(len))?;
+    if raw[len..].iter().any(|&b| b != 0) {
+        return Err("nonzero entity data padding".into());
+    }
+    let data = String::from_utf8(raw[..len].to_vec()).map_err(|_| "entity data is not UTF-8")?;
+    let table = EntityTable { entities, data };
+    table.validate(w)?;
+    Ok(table)
+}
+
+/// Decode an ABEW file of version 1, 2, 3 or 4 (a version 4 file's entity table is checked and
+/// dropped; `decode_scene` keeps it).
 pub fn decode(data: &[u8]) -> Result<World, String> {
+    decode_scene(data).map(|(w, _)| w)
+}
+
+/// Decode an ABEW file with its entity table (empty before version 4).
+pub fn decode_scene(data: &[u8]) -> Result<(World, EntityTable), String> {
     if data.len() > MAX_BYTES {
         return Err("cooked file too large".into());
     }
@@ -774,14 +919,20 @@ pub fn decode(data: &[u8]) -> Result<World, String> {
     if &r.word()? != MAGIC {
         return Err("unsupported ABEW header or version".into());
     }
-    let world = match r.uint()? {
+    let version = r.uint()?;
+    let world = match version {
         1 => decode_v1(&mut r)?,
-        v @ (2 | 3) => decode_v2(&mut r, v)?,
+        v @ (2..=4) => decode_v2(&mut r, v)?,
         _ => return Err("unsupported ABEW header or version".into()),
+    };
+    world.validate()?;
+    let table = if version == SCENE_VERSION {
+        entity_table(&mut r, &world)?
+    } else {
+        EntityTable::default()
     };
     if !r.0.is_empty() {
         return Err("trailing bytes after scene".into());
     }
-    world.validate()?;
-    Ok(world)
+    Ok((world, table))
 }

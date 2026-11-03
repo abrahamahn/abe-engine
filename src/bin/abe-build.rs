@@ -3,6 +3,7 @@ use abe_engine::{
     assets::{cooked, glb, read_asset},
     world::{AlphaMode, Emission, Shading, World},
 };
+use abe_pipeline::project::{Kind, MANIFEST, Project};
 use std::{ffi::OsString, path::Path};
 
 fn summary(w: &World) -> Result<String, String> {
@@ -34,16 +35,47 @@ fn summary(w: &World) -> Result<String, String> {
     ))
 }
 
+/// What `dest` is, if it is a file of project `p` that already exists (its manifest, or anything
+/// in its content, schema or editor folders): a cook must not replace authored files.
+fn project_file(p: &Project, dest: &Path) -> Option<String> {
+    let dest = dest.canonicalize().ok()?;
+    if p.root
+        .join(MANIFEST)
+        .canonicalize()
+        .is_ok_and(|m| m == dest)
+    {
+        return Some("the project's manifest".into());
+    }
+    let m = &p.manifest;
+    for (what, folders) in [
+        ("content", &m.content),
+        ("schema", &m.schemas),
+        ("editor", &m.editor),
+    ] {
+        for f in folders {
+            if p.root
+                .join(f)
+                .canonicalize()
+                .is_ok_and(|d| dest.starts_with(d))
+            {
+                return Some(format!("a file in the project's {what} folder {f}"));
+            }
+        }
+    }
+    None
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
     // Cook options: --compact quantizes geometry, --keep-images keeps PNG, JPEG and WebP
-    // images encoded (for hosts that decode them, such as browsers).
+    // images encoded (for hosts that decode them, such as browsers). --force lets import and
+    // cook-scene replace a file of the project that already exists.
     let mut flag = |name: &str| {
         let before = args.len();
         args.retain(|a| a != name);
         args.len() != before
     };
-    let (compact, keep_images) = (flag("--compact"), flag("--keep-images"));
+    let (compact, keep_images, force) = (flag("--compact"), flag("--keep-images"), flag("--force"));
     match args.as_slice() {
         [cmd, source, dest] if cmd == "cook" => {
             let w = glb::import_with(&read_asset(Path::new(source))?, keep_images)?;
@@ -109,11 +141,103 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+        [cmd, project, scene, dest] if cmd == "cook-scene" => {
+            // A scene of a project (by asset id or path) into a world that keeps its entities.
+            let mut p = Project::open(Path::new(project))?;
+            if let Some(what) = project_file(&p, Path::new(dest)).filter(|_| !force) {
+                return Err(format!(
+                    "{} is {what}; write the cooked scene elsewhere (such as build/), or pass --force to replace it",
+                    Path::new(dest).display()
+                )
+                .into());
+            }
+            p.scan(None)?;
+            let s = scene.to_str().ok_or("scene is not UTF-8")?;
+            let id = if abe_engine::id::is_asset_id(s) {
+                s.to_string()
+            } else {
+                let rel = s.replace('\\', "/");
+                p.find_path(&rel)
+                    .ok_or_else(|| format!("no scene {s} in the project"))?
+                    .id
+                    .clone()
+            };
+            let mut registry = abe_scene::schema::engine_registry();
+            for (path, file) in p.schema_files()? {
+                registry
+                    .add(&file, false)
+                    .map_err(|e| format!("{path}: {e}"))?;
+            }
+            let cooked = abe_pipeline::cook::cook_scene(&p, &registry, &id, keep_images)?;
+            for w in &cooked.warnings {
+                eprintln!("warning: {w}");
+            }
+            let data = cooked::encode_scene(&cooked.world, &cooked.table, compact)?;
+            if let Some(dir) = Path::new(dest)
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            }
+            abe_engine::assets::write_asset(Path::new(dest), &data)?;
+            println!(
+                "{} | {} entities | {} bytes",
+                summary(&cooked.world)?,
+                cooked.table.entities.len(),
+                data.len()
+            );
+        }
+        [cmd, project, model, dest] if cmd == "import" => {
+            // A model of a project as a new scene of separate objects (one entity per node).
+            let mut p = Project::open(Path::new(project))?;
+            let mut ids = abe_engine::id::Ids::from_os();
+            p.scan(Some(&mut ids))?;
+            let m = model
+                .to_str()
+                .ok_or("model is not UTF-8")?
+                .replace('\\', "/");
+            let entry = p
+                .find_path(&m)
+                .filter(|e| e.kind == Kind::Model)
+                .ok_or_else(|| format!("no model {m} in the project"))?
+                .clone();
+            let rel = dest
+                .to_str()
+                .ok_or("destination is not UTF-8")?
+                .replace('\\', "/");
+            // Checked before the import, which can take a while.
+            p.check_document_path(&rel, Kind::Scene)?;
+            if !force && p.root.join(&rel).exists() {
+                return Err(format!("{rel} already exists; pass --force to replace it").into());
+            }
+            let bytes = read_asset(&p.root.join(&entry.path))?;
+            let nodes = abe_engine::assets::glb::import_nodes(&bytes, keep_images)?;
+            let name = Path::new(&rel)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("scene")
+                .trim_end_matches(".scene.json")
+                .to_string();
+            let scene_id = ids.asset();
+            let doc =
+                abe_pipeline::cook::scene_from_model(&nodes, &entry.id, &scene_id, &name, &mut ids);
+            p.write_document_with(&rel, Kind::Scene, &doc, force)?;
+            println!("{rel}: {} entities from {}", nodes.nodes.len(), entry.path);
+        }
         [cmd, file] if cmd == "inspect" => {
             let data = read_asset(Path::new(file))?;
-            let w = cooked::decode(&data)?;
+            let (w, table) = cooked::decode_scene(&data)?;
             let version = cooked::version(&data).unwrap_or_default();
             println!("ABEW v{version} | {} | {} bytes", summary(&w)?, data.len());
+            if !table.entities.is_empty() {
+                println!("  {} entities", table.entities.len());
+                for e in table.entities.iter().take(64) {
+                    println!(
+                        "  entity {:016x} {:?}: instances {:?}, lamps {:?}",
+                        e.id, e.name, e.instances, e.lights
+                    );
+                }
+            }
             for (i, m) in w.materials.iter().enumerate() {
                 let mut traits = vec![
                     match m.shading {
@@ -148,6 +272,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {
             return Err(
                 "usage: abe-build cook [--compact] [--keep-images] source.glb output.abew \
+                        | cook-scene [--compact] [--keep-images] [--force] PROJECT SCENE output.abew \
+                        | import [--force] PROJECT content/model.glb content/new.scene.json \
                         | inspect file.abew | model file.glb"
                     .into(),
             );

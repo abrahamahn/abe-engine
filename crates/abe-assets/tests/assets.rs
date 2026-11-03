@@ -1,7 +1,9 @@
 use abe_assets::{cooked, glb, json, mip, png, zlib};
 use abe_core::{
     Vec3,
-    world::{AlphaMode, Emission, Mesh, Shading, Texture, World},
+    world::{
+        AlphaMode, Emission, EntityRecord, EntityTable, Mesh, Shading, Texture, Transform, World,
+    },
 };
 
 fn glb_file(doc: &str, bytes: &[u8]) -> Vec<u8> {
@@ -57,7 +59,7 @@ fn source_to_cooked_roundtrip_preserves_hierarchy_and_sharing() {
         assert!(cooked::decode(&b[..n]).is_err())
     }
     let mut future = b.clone();
-    future[4] = 4;
+    future[4] = 5;
     assert!(cooked::decode(&future).is_err());
     let mut extra = b;
     extra.push(0);
@@ -1164,4 +1166,127 @@ fn octahedral_normals_survive_every_direction() {
         let dot = n.0 * m.0 + n.1 * m.1 + n.2 * m.2;
         assert!(dot > 0.99999, "{n:?} vs {m:?}");
     }
+}
+
+const NAMED: &str = r#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":54}],"bufferViews":[{"buffer":0,"byteLength":48,"byteStride":16},{"buffer":0,"byteOffset":48,"byteLength":6}],"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}],"meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1}]}],"extensions":{"KHR_lights_punctual":{"lights":[{"type":"point","intensity":3,"range":5}]}},"nodes":[{"name":"Stand","mesh":0,"translation":[1,0,0],"children":[1,2]},{"name":"Top","mesh":0,"translation":[0,2,0]},{"name":"Lamp","translation":[0,3,0],"extensions":{"KHR_lights_punctual":{"light":0}}}],"scenes":[{"nodes":[0]}],"scene":0}"#;
+
+#[test]
+fn node_import_keeps_names_hierarchy_and_local_transforms() {
+    let n = glb::import_nodes(&glb_file(NAMED, &bytes()), false).unwrap();
+    assert_eq!(n.world.meshes.len(), 1);
+    assert!(n.world.instances.is_empty() && n.world.lights.is_empty());
+    let names: Vec<&str> = n.nodes.iter().map(|x| x.name.as_str()).collect();
+    assert_eq!(names, ["Stand", "Top", "Lamp"]);
+    assert_eq!(n.nodes[1].parent, Some(0));
+    assert_eq!(n.nodes[1].local.0[13], 2.0);
+    assert_eq!(n.nodes[0].meshes, 0..1);
+    assert_eq!(n.nodes[2].meshes, 0..0);
+    let lamp = n.nodes[2].light.unwrap();
+    assert_eq!((lamp.intensity, lamp.range), (3.0, 5.0));
+    // The flattening import of the same file places the same geometry.
+    let w = glb::import(&glb_file(NAMED, &bytes())).unwrap();
+    assert_eq!(w.instances.len(), 2);
+    assert_eq!(w.lights[0].position, Vec3(1., 3., 0.));
+}
+
+#[test]
+fn node_import_refuses_matrices_that_shear() {
+    let with_matrix = |m: &str| {
+        glb_file(
+            &NAMED.replace(r#""translation":[1,0,0]"#, &format!(r#""matrix":{m}"#)),
+            &bytes(),
+        )
+    };
+    // x leans into y: no translation, rotation and scale make this.
+    let sheared = with_matrix("[1,0,0,0,0.5,1,0,0,0,0,1,0,0,0,0,1]");
+    let err = glb::import_nodes(&sheared, false).unwrap_err();
+    assert!(err.contains("Stand") && err.contains("shear"), "{err}");
+    // The flattening import keeps the matrix as it is.
+    assert_eq!(
+        glb::import(&sheared).unwrap().instances[0].transform.0[4],
+        0.5
+    );
+    // Matrices that split into translation, rotation and scale import: turned and scaled,
+    // mirrored, scaled to nothing along an axis, and with rounding noise.
+    for m in [
+        "[2,0,0,0,0,0,3,0,0,-1,0,0,4,5,6,1]",
+        "[-1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]",
+        "[1,0,0,0,0,0,0,0,0,0,1,0,0,0,0,1]",
+        "[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]",
+        "[1,0.0000001,0,0,0,1,0.0000002,0,0.0000001,0,1,0,0,0,0,1]",
+        "[1,0,0,0,0,0.0000001,0.0000002,0,0,0,1,0,0,0,0,1]",
+    ] {
+        let n = glb::import_nodes(&with_matrix(m), false).unwrap();
+        assert_eq!(n.nodes.len(), 3, "{m}");
+    }
+}
+
+#[test]
+fn scenes_cook_with_their_entity_table() {
+    let w = glb::import(&glb_file(NAMED, &bytes())).unwrap();
+    let t = |x: f32| {
+        let mut m = Transform::IDENTITY;
+        m.0[12] = x;
+        m
+    };
+    let table = EntityTable {
+        entities: vec![
+            EntityRecord {
+                id: 0x0123_4567_89ab_cdef,
+                name: "Stand".into(),
+                parent: None,
+                transform: t(1.0),
+                instances: 0..1,
+                lights: 0..0,
+            },
+            EntityRecord {
+                id: 0xfedc_ba98_7654_3210,
+                name: "Top 桜".into(),
+                parent: Some(0),
+                transform: t(1.0),
+                instances: 1..2,
+                lights: 0..1,
+            },
+        ],
+        data: "{\"camera\": 1}\n".into(),
+    };
+    for compact in [false, true] {
+        let b = cooked::encode_scene(&w, &table, compact).unwrap();
+        assert_eq!(cooked::version(&b), Some(4));
+        let (w2, t2) = cooked::decode_scene(&b).unwrap();
+        assert_eq!(t2, table);
+        assert_eq!(w2.instances, w.instances);
+        // A version 3 reader's view: `decode` gives the same world.
+        assert_eq!(cooked::decode(&b).unwrap(), w2);
+        assert_eq!(cooked::encode_scene(&w2, &t2, compact).unwrap(), b);
+        for n in [0, b.len() / 2, b.len() - 1] {
+            assert!(cooked::decode_scene(&b[..n]).is_err());
+        }
+    }
+    // Version 3 files have an empty table.
+    let (_, empty) = cooked::decode_scene(&cooked::encode(&w).unwrap()).unwrap();
+    assert_eq!(empty, EntityTable::default());
+    // Bad tables are refused.
+    let mut bad = table.clone();
+    bad.entities[1].instances = 1..3;
+    assert!(cooked::encode_scene(&w, &bad, false).is_err());
+    let mut bad = table.clone();
+    bad.entities[0].parent = Some(1);
+    assert!(cooked::encode_scene(&w, &bad, false).is_err());
+    let mut bad = table;
+    bad.entities[1].id = bad.entities[0].id;
+    assert!(cooked::encode_scene(&w, &bad, false).is_err());
+}
+
+#[test]
+fn affine_inverses_undo_their_transforms() {
+    let m = Transform::from_trs([1.0, -2.0, 3.0], [0.2, 0.5, -0.1, 0.83], [2.0, 0.5, 1.5]).unwrap();
+    let inv = m.inverse().unwrap();
+    let p = Vec3(0.3, 4.0, -7.0);
+    let back = inv.point(m.point(p));
+    for (a, b) in [(back.0, p.0), (back.1, p.1), (back.2, p.2)] {
+        assert!((a - b).abs() < 1e-4, "{back:?} vs {p:?}");
+    }
+    let flat = Transform::from_trs([0.0; 3], [0.0, 0.0, 0.0, 1.0], [1.0, 0.0, 1.0]).unwrap();
+    assert!(flat.inverse().is_none());
 }

@@ -24,6 +24,13 @@ const SUPPORTED: [&str; 3] = [
 ];
 const MAX_MESHES: usize = 65_536;
 const MAX_INSTANCES: usize = 250_000;
+/// An axis of a node matrix no longer than this fraction of its longest axis is scaled to
+/// (almost) nothing, and its direction is rounding noise: `import_nodes` leaves it out when it
+/// checks that a matrix does not shear, and a decomposition into translation, rotation and
+/// scale builds it from the other axes.
+pub const FLAT_AXIS: f32 = 1e-6;
+/// Largest cosine between two axes of a node matrix that still counts as a right angle.
+const SKEW: f64 = 1e-4;
 
 fn arr<'a>(o: &'a Value, k: &str) -> Result<&'a [Value], String> {
     o.get(k).map_or(Ok(&[][..]), Value::array)
@@ -255,6 +262,20 @@ fn node_transform(n: &Value) -> Result<Transform, String> {
         .unwrap_or([0., 0., 0., 1.]);
     let s = n.get("scale").map(floats).transpose()?.unwrap_or([1.; 3]);
     Transform::from_trs(t, r, s)
+}
+
+/// Whether a matrix shears: two of its axes (each longer than `FLAT_AXIS` of the longest) are
+/// not at right angles. glTF requires node matrices to split into translation, rotation and
+/// scale, which a sheared matrix cannot.
+fn shears(t: &Transform) -> bool {
+    let m = t.0.map(f64::from);
+    let axes = [[m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]];
+    let dot = |a: &[f64; 3], b: &[f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let len = axes.map(|a| dot(&a, &a).sqrt());
+    let floor = len[0].max(len[1]).max(len[2]) * f64::from(FLAT_AXIS);
+    [(0, 1), (0, 2), (1, 2)].into_iter().any(|(i, j)| {
+        len[i] > floor && len[j] > floor && dot(&axes[i], &axes[j]).abs() > SKEW * len[i] * len[j]
+    })
 }
 
 /// Point lights declared by KHR_lights_punctual: colour, intensity and range (0 = unlimited).
@@ -652,20 +673,149 @@ pub fn import(data: &[u8]) -> Result<World, String> {
 /// `EXT_texture_webp` included) for the host to decode, instead of being decoded to mip chains.
 pub fn import_with(data: &[u8], keep_images: bool) -> Result<World, String> {
     let (doc, bin) = chunks(data)?;
-    if need(need(&doc, "asset")?, "version")?.string()? != "2.0" {
+    let (mut w, ranges, lights) = load(&doc, bin, keep_images)?;
+    let nodes = arr(&doc, "nodes")?;
+    let mut scene = Scene {
+        nodes,
+        ranges,
+        lights,
+        seen: vec![false; nodes.len()],
+    };
+    let selected = index(arr(&doc, "scenes")?, opt_u(&doc, "scene", 0)?)?;
+    for root in arr(selected, "nodes")? {
+        scene.visit(&mut w, root.integer()?, Transform::IDENTITY, 0)?;
+    }
+    w.validate()?;
+    Ok(w)
+}
+
+/// A static GLB with its node tree kept, for importing it as a scene of separate objects.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NodeWorld {
+    /// Meshes, materials and textures as [`import`] makes them; no instances or lights.
+    pub world: World,
+    /// The default scene's nodes, parents before children.
+    pub nodes: Vec<SourceNode>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceNode {
+    pub name: String,
+    /// Index into [`NodeWorld::nodes`].
+    pub parent: Option<usize>,
+    /// Relative to the parent.
+    pub local: Transform,
+    /// The engine meshes this node's glTF mesh became (one per primitive); empty for none.
+    pub meshes: std::ops::Range<u32>,
+    /// A KHR_lights_punctual point light at the node's origin (`position` is zero).
+    pub light: Option<PointLight>,
+}
+
+/// Imports a static GLB keeping every node: names, hierarchy and local transforms survive, so
+/// a scene built from it can move each object on its own. The same features as [`import`] are
+/// accepted and refused, and node matrices that shear are refused too, since a node's local
+/// transform is kept as translation, rotation and scale.
+pub fn import_nodes(data: &[u8], keep_images: bool) -> Result<NodeWorld, String> {
+    let (doc, bin) = chunks(data)?;
+    let (world, ranges, lights) = load(&doc, bin, keep_images)?;
+    let nodes = arr(&doc, "nodes")?;
+    let selected = index(arr(&doc, "scenes")?, opt_u(&doc, "scene", 0)?)?;
+    let mut seen = vec![false; nodes.len()];
+    let mut out: Vec<SourceNode> = vec![];
+    // Depth-first, parents first: (glTF node, parent's index in `out`, depth).
+    let mut todo: Vec<(usize, Option<usize>, usize)> = arr(selected, "nodes")?
+        .iter()
+        .rev()
+        .map(|r| r.integer().map(|i| (i, None, 0)))
+        .collect::<Result<_, _>>()?;
+    while let Some((id, parent, depth)) = todo.pop() {
+        if depth > 128 || out.len() >= MAX_INSTANCES {
+            return Err("node hierarchy exceeds limits".into());
+        }
+        let node = index(nodes, id)?;
+        if std::mem::replace(index_mut(&mut seen, id)?, true) {
+            return Err("cyclic or multiply-parented glTF node".into());
+        }
+        if node.get("skin").is_some() || node.get("weights").is_some() {
+            return Err("skinned or morphed nodes require the animation importer".into());
+        }
+        if ext(node, "EXT_mesh_gpu_instancing").is_some() {
+            return Err(
+                "EXT_mesh_gpu_instancing is unsupported; expand instances into nodes".into(),
+            );
+        }
+        let meshes = match node.get("mesh") {
+            Some(m) => index(&ranges, m.integer()?)?.clone(),
+            None => 0..0,
+        };
+        let light = match ext(node, "KHR_lights_punctual") {
+            Some(l) => {
+                let (color, intensity, range) = *index(&lights, need(l, "light")?.integer()?)?;
+                Some(PointLight {
+                    position: Vec3(0., 0., 0.),
+                    color,
+                    intensity,
+                    range,
+                })
+            }
+            None => None,
+        };
+        let name = match node.get("name") {
+            Some(n) => n.string()?.to_string(),
+            None => String::new(),
+        };
+        if name.len() > MAX_NAME_BYTES {
+            return Err("node name too long".into());
+        }
+        let local = node_transform(node)?;
+        if node.get("matrix").is_some() && shears(&local) {
+            return Err(format!(
+                "node {id} {name:?}: its matrix shears; glTF node matrices must split into translation, rotation and scale"
+            ));
+        }
+        let here = out.len();
+        out.push(SourceNode {
+            name,
+            parent,
+            local,
+            meshes,
+            light,
+        });
+        for child in arr(node, "children")?.iter().rev() {
+            todo.push((child.integer()?, Some(here), depth + 1));
+        }
+    }
+    world.validate()?;
+    Ok(NodeWorld { world, nodes: out })
+}
+
+fn index_mut<T>(a: &mut [T], i: usize) -> Result<&mut T, String> {
+    let n = a.len();
+    a.get_mut(i)
+        .ok_or_else(|| format!("glTF index {i} outside collection of {n}"))
+}
+
+/// Checks the document and imports its meshes, materials, textures and light definitions.
+#[allow(clippy::type_complexity)]
+fn load(
+    doc: &Value,
+    bin: &[u8],
+    keep_images: bool,
+) -> Result<(World, Vec<std::ops::Range<u32>>, Vec<(Rgb, f32, f32)>), String> {
+    if need(need(doc, "asset")?, "version")?.string()? != "2.0" {
         return Err("expected glTF 2.0".into());
     }
-    for name in arr(&doc, "extensionsRequired")? {
+    for name in arr(doc, "extensionsRequired")? {
         let name = name.string()?;
         let webp = keep_images && name == "EXT_texture_webp";
         if !(SUPPORTED.contains(&name) || webp) {
             return Err(format!("unsupported required glTF extension: {name}"));
         }
     }
-    if !arr(&doc, "animations")?.is_empty() {
+    if !arr(doc, "animations")?.is_empty() {
         return Err("animated source requires the animation importer".into());
     }
-    let buffers = arr(&doc, "buffers")?;
+    let buffers = arr(doc, "buffers")?;
     let declared = match buffers {
         [] => 0,
         [b] if b.get("uri").is_none() => need(b, "byteLength")?.integer()?,
@@ -678,7 +828,7 @@ pub fn import_with(data: &[u8], keep_images: bool) -> Result<World, String> {
         return Err("unexpected excess BIN data".into());
     }
     let mut im = Importer {
-        doc: &doc,
+        doc,
         bin: bytes,
         world: World::default(),
         materials: HashMap::new(),
@@ -687,7 +837,7 @@ pub fn import_with(data: &[u8], keep_images: bool) -> Result<World, String> {
         keep_images,
     };
     let mut ranges = Vec::new();
-    for gltf_mesh in arr(&doc, "meshes")? {
+    for gltf_mesh in arr(doc, "meshes")? {
         let start = im.world.meshes.len() as u32;
         for p in need(gltf_mesh, "primitives")?.array()? {
             let mesh = im.primitive(p)?;
@@ -695,18 +845,5 @@ pub fn import_with(data: &[u8], keep_images: bool) -> Result<World, String> {
         }
         ranges.push(start..(im.world.meshes.len() as u32));
     }
-    let nodes = arr(&doc, "nodes")?;
-    let mut scene = Scene {
-        nodes,
-        ranges,
-        lights: punctual_lights(&doc)?,
-        seen: vec![false; nodes.len()],
-    };
-    let selected = index(arr(&doc, "scenes")?, opt_u(&doc, "scene", 0)?)?;
-    let mut w = im.world;
-    for root in arr(selected, "nodes")? {
-        scene.visit(&mut w, root.integer()?, Transform::IDENTITY, 0)?;
-    }
-    w.validate()?;
-    Ok(w)
+    Ok((im.world, ranges, punctual_lights(doc)?))
 }

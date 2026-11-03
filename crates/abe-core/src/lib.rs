@@ -1,4 +1,8 @@
-//! Portable scene math, geometry and object transforms.
+//! Portable scene math, geometry and object transforms, plus the data layer every tool shares:
+//! JSON (read and canonical write), content digests and identifiers.
+pub mod digest;
+pub mod id;
+pub mod json;
 pub mod timing;
 pub mod world;
 

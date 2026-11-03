@@ -1,0 +1,268 @@
+{
+  "abe": "schema",
+  "components": {
+    "camera": {
+      "doc": "A viewpoint: the scene's views, a game's camera profiles, a sequence's shots. It looks along its transform's -Z with +Y up.",
+      "fields": {
+        "focus": {
+          "doc": "Depth of field: nothing nearer than distance blurs; past it the image softens to its full blur, depth metres further on.",
+          "fields": {
+            "blur": {
+              "default": 0.006,
+              "doc": "Full blur as a share of the image height (capped at 24 pixels).",
+              "labels": {
+                "ko": "흐림"
+              },
+              "max": 0.1,
+              "min": 0,
+              "type": "float"
+            },
+            "depth": {
+              "default": 4,
+              "labels": {
+                "ko": "깊이"
+              },
+              "min": 0,
+              "type": "float",
+              "unit": "m"
+            },
+            "distance": {
+              "default": 0,
+              "labels": {
+                "ko": "거리"
+              },
+              "min": 0,
+              "type": "float",
+              "unit": "m"
+            },
+            "enabled": {
+              "labels": {
+                "ko": "사용"
+              },
+              "type": "bool"
+            }
+          },
+          "labels": {
+            "ko": "초점(피사계 심도)"
+          },
+          "type": "object"
+        },
+        "fov": {
+          "default": 50,
+          "doc": "Vertical field of view.",
+          "labels": {
+            "ko": "시야각"
+          },
+          "max": 170,
+          "min": 1,
+          "type": "float",
+          "unit": "deg"
+        },
+        "near": {
+          "default": 0.08,
+          "labels": {
+            "ko": "가까운 면"
+          },
+          "min": 0.0001,
+          "type": "float",
+          "unit": "m"
+        },
+        "shift": {
+          "doc": "Where the target lands in the image, in half-viewports with y up: frames a subject around an interface without turning.",
+          "labels": {
+            "ko": "렌즈 이동"
+          },
+          "type": "vec2"
+        }
+      },
+      "label": "Camera",
+      "labels": {
+        "ko": "카메라"
+      }
+    },
+    "environment": {
+      "doc": "The scene's time, weather and Look. One per scene, usually on its root.",
+      "fields": {
+        "look": {
+          "doc": "The Look file that styles the scene.",
+          "kind": "look",
+          "labels": {
+            "ko": "룩"
+          },
+          "type": "asset"
+        },
+        "time": {
+          "default": 12,
+          "labels": {
+            "ko": "시각"
+          },
+          "max": 24,
+          "min": 0,
+          "type": "float",
+          "unit": "h"
+        },
+        "weather": {
+          "labels": {
+            "ko": "날씨"
+          },
+          "type": "enum",
+          "values": [
+            "clear",
+            "cloudy",
+            "overcast",
+            "mist",
+            "rain",
+            "storm",
+            "petals"
+          ]
+        }
+      },
+      "label": "Environment",
+      "labels": {
+        "ko": "환경"
+      }
+    },
+    "light": {
+      "doc": "A point or spot lamp, shaded like the world's lamps.",
+      "fields": {
+        "color": {
+          "labels": {
+            "ko": "색"
+          },
+          "type": "rgb"
+        },
+        "follows_lamps": {
+          "doc": "Lit only as the evening lights the lamps.",
+          "labels": {
+            "ko": "저녁에 켜짐"
+          },
+          "type": "bool"
+        },
+        "inner": {
+          "default": 20,
+          "doc": "A spot is at full strength within this angle of its axis (-Z).",
+          "labels": {
+            "ko": "안쪽 각도"
+          },
+          "max": 89,
+          "min": 0,
+          "type": "float",
+          "unit": "deg"
+        },
+        "intensity": {
+          "default": 1,
+          "labels": {
+            "ko": "세기"
+          },
+          "min": 0,
+          "type": "float"
+        },
+        "kind": {
+          "labels": {
+            "ko": "종류"
+          },
+          "type": "enum",
+          "values": [
+            "point",
+            "spot"
+          ]
+        },
+        "outer": {
+          "default": 35,
+          "doc": "A spot fades to nothing at this angle.",
+          "labels": {
+            "ko": "바깥 각도"
+          },
+          "max": 89,
+          "min": 0,
+          "type": "float",
+          "unit": "deg"
+        },
+        "range": {
+          "default": 6,
+          "doc": "How far the light reaches; 0 is unlimited.",
+          "labels": {
+            "ko": "범위"
+          },
+          "min": 0,
+          "type": "float",
+          "unit": "m"
+        },
+        "shadow": {
+          "doc": "How much of a spot's light the props' shadows take (0: no shadow).",
+          "labels": {
+            "ko": "그림자"
+          },
+          "max": 1,
+          "min": 0,
+          "type": "float"
+        }
+      },
+      "label": "Light",
+      "labels": {
+        "ko": "조명"
+      }
+    },
+    "mesh": {
+      "doc": "Geometry from a model asset: one node's mesh, or the whole model when node is empty.",
+      "fields": {
+        "model": {
+          "kind": "model",
+          "labels": {
+            "ko": "모델"
+          },
+          "type": "asset"
+        },
+        "node": {
+          "doc": "The model node whose mesh this entity draws.",
+          "labels": {
+            "ko": "노드"
+          },
+          "type": "string"
+        },
+        "static": {
+          "default": true,
+          "doc": "Cooked into the world (lit, shadowed and mapped like the land); otherwise drawn as a prop the game can move.",
+          "labels": {
+            "ko": "월드에 굽기"
+          },
+          "type": "bool"
+        }
+      },
+      "label": "Mesh",
+      "labels": {
+        "ko": "메시"
+      }
+    },
+    "transform": {
+      "doc": "Where the entity is, relative to its parent.",
+      "fields": {
+        "rotation": {
+          "labels": {
+            "ko": "회전"
+          },
+          "type": "quat"
+        },
+        "scale": {
+          "default": [1, 1, 1],
+          "labels": {
+            "ko": "크기"
+          },
+          "type": "vec3"
+        },
+        "translation": {
+          "labels": {
+            "ko": "위치"
+          },
+          "type": "vec3",
+          "unit": "m"
+        }
+      },
+      "label": "Transform",
+      "labels": {
+        "ko": "변환"
+      }
+    }
+  },
+  "version": 1
+}
