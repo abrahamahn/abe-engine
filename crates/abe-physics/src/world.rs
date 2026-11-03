@@ -10,7 +10,7 @@
 //! produced and those of calls since the last step. Everything runs in index order with
 //! deterministic tie breaks, so the same calls give the same results.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::collide::{self, MAX_MANIFOLD_POINTS, Manifold};
 use crate::gjk;
@@ -484,32 +484,84 @@ impl Body {
     }
 }
 
+/// Paths of translating kinematic colliders through this step. The ordinary broad phase only
+/// needs their final extents for overlap queries and the next step's discrete contacts.
+#[derive(Default)]
+struct KinematicSweeps {
+    tree: DynamicTree<u32>,
+    travel: BTreeMap<u32, Vec3>,
+    sleepers: BTreeSet<u32>,
+}
+
+type HitEventIndex = Option<BTreeMap<(u32, u32), usize>>;
+
+struct SweepInterval {
+    center: Vec3,
+    travel: Vec3,
+    remaining: f32,
+    after_hit: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CcdHit {
+    impact: Impact,
+    moving: u32,
+    collider: u32,
+    target_travel: Vec3,
+}
+
+/// Cancel only the part closing on a surface, using the dynamic body's free translation axes.
+/// A moving obstacle can push a body outward without towing it along the face.
+fn remove_closing(motion: &mut Vec3, target: Vec3, normal: Vec3, mask: Vec3) {
+    let free = normal.mul_elem(mask);
+    let weight = free.length_squared();
+    let closing = (target - *motion).dot(normal);
+    if closing > 0.0 && weight >= 1e-12 {
+        *motion += free * (closing / weight);
+    }
+}
+
 /// What continuous collision takes from one sweep (see [`PhysicsWorld::continuous`]).
 #[derive(Clone, Copy, Debug)]
-enum Impact {
-    /// The shape comes within the target after this fraction of the motion.
-    Shape(f32),
-    /// The shape starts within the target, and its core, a small ball inside it, comes within
-    /// the target after this fraction of the motion; the surface's normal there.
-    Core(f32, Vec3),
+struct Impact {
+    fraction: f32,
+    normal: Vec3,
+    point: Vec3,
+    /// A shape already within tolerance was swept using its inner core.
+    core: bool,
+}
+
+impl Impact {
+    fn cast(hit: gjk::CastHit, core: bool) -> Self {
+        Self {
+            fraction: hit.fraction,
+            normal: hit.normal,
+            point: hit.point,
+            core,
+        }
+    }
 }
 
 /// How `moving` (with its `core`) meets `other` when moved by `d`, when that is a time of impact
-/// continuous collision should take: a cast that touches at once gives way to the same cast of
-/// the core, and only a fraction above zero counts.
+/// continuous collision should take. An initial touch gives way to the same cast of the core;
+/// inside a step, contacts reached simultaneously may close at zero in the remaining interval.
 fn time_of_impact(
     moving: &Convex,
     core: &Convex,
     d: Vec3,
     other: &Convex,
     target: f32,
+    after_hit: bool,
 ) -> Option<Impact> {
     let hit = gjk::cast(moving, d, other, target)?;
-    if hit.fraction > 0.0 {
-        return Some(Impact::Shape(hit.fraction));
+    // A second face reached at the same time as the first can already touch at the
+    // start of the remaining interval. Keep it if still closing; waiting for the core
+    // would let the body sink part-way through the second face.
+    if hit.fraction > 0.0 || (after_hit && d.dot(hit.normal) < -1e-5 * d.length()) {
+        return Some(Impact::cast(hit, false));
     }
     let hit = gjk::cast(core, d, other, target)?;
-    (hit.fraction > 0.0).then_some(Impact::Core(hit.fraction, hit.normal))
+    (hit.fraction > 0.0).then(|| Impact::cast(hit, true))
 }
 
 /// Where a centre moving from `c0` by `d` passes through one-sided triangle `t` (placed at `at`)
@@ -526,7 +578,12 @@ fn centre_through(t: &TriangleRef, at: &Iso, c0: Vec3, d: Vec3, keep: f32) -> Op
     let n = t.normal();
     // How much nearer the plane the whole motion brings the centre.
     let closing = -n.dot(dir);
-    (closing > 0.0).then(|| Impact::Core((cross - keep / closing).max(0.0), at.vector(n)))
+    (closing > 0.0).then(|| Impact {
+        fraction: (cross - keep / closing).max(0.0),
+        normal: at.vector(n),
+        point: c0 + d * cross,
+        core: true,
+    })
 }
 
 /// Hull `h` scaled about its centroid so that its farthest face plane moves in by `skin` and every
@@ -1673,7 +1730,7 @@ impl PhysicsWorld {
             self.refresh_body_proxies(b, false);
         }
         if self.settings.enable_continuous {
-            self.continuous();
+            self.continuous(&moved, dt);
         }
         std::mem::swap(&mut self.events, &mut self.pending);
         self.pending.contacts.clear();
@@ -2488,7 +2545,9 @@ impl PhysicsWorld {
     /// Continuous collision: a dynamic body that moved farther than half its smallest size this
     /// step (or any bullet) is swept from its start position, in its orientation at the end of
     /// the step, against static and kinematic geometry it collides with (the same filter as
-    /// contacts, joints included) and stopped at the first time of impact.
+    /// contacts, joints included). A translating kinematic collider can strike even a sleeping
+    /// body. Its sweep uses relative translation and pushes the body along the surface normal for
+    /// the remaining time; fixed geometry still limits that motion.
     ///
     /// Three kinds of hit are not taken, because the body's contacts already handle them and
     /// taking them would stop it for good (also sliding along): a time of impact of zero (the
@@ -2510,151 +2569,413 @@ impl PhysicsWorld {
     /// What the sweep does not see: a turn within the step. A thin body spinning fast enough to
     /// swing through a wall and back out of it within one step is not stopped (Box2D sweeps the
     /// rotation as well).
-    fn continuous(&mut self) {
-        let slop = self.settings.linear_slop;
-        for b in 0..self.bodies.len() as u32 {
+    fn continuous(&mut self, moved: &[u32], dt: f32) {
+        let kinematics = self.kinematic_sweeps(moved);
+        // Keep the same stable body order for solver members and newly reachable sleepers.
+        let mut members = moved.iter().copied().peekable();
+        let mut sleepers = kinematics.sleepers.iter().copied().peekable();
+        let candidates = std::iter::from_fn(|| {
+            if sleepers
+                .peek()
+                .is_some_and(|s| members.peek().is_none_or(|m| s < m))
+            {
+                sleepers.next().map(|b| (b, false))
+            } else {
+                members.next().map(|b| (b, true))
+            }
+        });
+        let mut hit_events = None;
+        for (b, integrated) in candidates {
+            self.sweep_body(b, integrated, dt, &kinematics, &mut hit_events);
+        }
+    }
+
+    fn kinematic_sweeps(&self, moved: &[u32]) -> KinematicSweeps {
+        // The normal broad phase indexes the end poses. A translating platform can cross a
+        // sleeping body and finish nowhere near it, so index the path of each moving platform.
+        let mut kinematics = KinematicSweeps::default();
+        let mut search_sleepers = false;
+        for &b in moved {
             let body = &self.bodies[b as usize];
-            if !(body.alive && body.awake && body.is_dynamic()) {
+            let travel = body.center - body.center0;
+            if body.kind != BodyKind::Kinematic || travel == Vec3::ZERO {
                 continue;
             }
-            let d = body.center - body.center0;
-            let fast = d.length() > 0.5 * body.min_extent.max(slop);
-            if !(fast || body.bullet) || d.length_squared() == 0.0 {
-                continue;
-            }
-            let start = Iso::new(
-                body.center0 - body.rotation.rotate(body.local_center),
-                body.rotation,
-            );
-            // The earliest impact, and the surface's normal when it is a core's.
-            let (mut best, mut core_normal) = (1.0f32, None);
+            kinematics.travel.insert(b, travel);
             for &c in &body.colliders {
-                let col = &self.colliders[c as usize];
-                if col.sensor {
+                if self.colliders[c as usize].sensor {
                     continue;
                 }
-                let Some(shape) = col.shape.as_convex() else {
-                    continue;
-                };
-                let from = start.mul(&col.local);
-                let swept = col.shape.aabb(&from).sweep(d).expand(slop);
-                let moving = Convex::new(shape, from);
-                let (center0, center1) = (moving.center(), moving.center() + d);
-                let core_radius = 0.25 * col.shape.inner_radius();
-                let core = Convex::new(
-                    ConvexShape::Sphere(core_radius),
-                    Iso::from_position(center0),
-                );
-                // The shape less an outer skin of the slop (three quarters of its inner radius
-                // at most, so never thinner than the core), moved ahead so that its front along
-                // the motion is the shape's own. A convex target only the skin beside the path
-                // reaches is grazed, not hit: the next of two flush floor boxes, which a body
-                // resting on the first has sunk into by a fraction of a millimetre, meets the
-                // body's front face at the seam, and taking that hit stopped the body short of
-                // every seam (the contacts handle a graze). Head-on, off-centre and tip-first
-                // hits all reach the inner shape.
-                let skin = slop.min(0.75 * col.shape.inner_radius());
-                let shrunk = match shape {
-                    ConvexShape::Hull(h) => Some(shrunk_hull(h, skin)),
-                    _ => None,
-                };
-                let inner_shape = match (shape, &shrunk) {
-                    (ConvexShape::Sphere(r), _) => ConvexShape::Sphere(r - skin),
-                    (
-                        ConvexShape::Capsule {
-                            half_height,
-                            radius,
-                        },
-                        _,
-                    ) => ConvexShape::Capsule {
-                        half_height,
-                        radius: radius - skin,
-                    },
-                    (ConvexShape::Box(h), _) => ConvexShape::Box(h - Vec3::splat(skin)),
-                    (ConvexShape::Hull(_), Some(h)) => ConvexShape::Hull(h),
-                    (other, _) => other,
-                };
-                let ahead = {
-                    let u = d * (1.0 / d.length());
-                    let front = |s: &Convex| s.support_core(u).dot(u) + s.radius();
-                    u * (front(&moving) - front(&Convex::new(inner_shape, from)))
-                };
-                let inner =
-                    Convex::new(inner_shape, Iso::new(from.position + ahead, from.rotation));
-                let mut take = |impact: Option<Impact>| match impact {
-                    Some(Impact::Shape(f)) if f < best => (best, core_normal) = (f, None),
-                    Some(Impact::Core(f, n)) if f < best => (best, core_normal) = (f, Some(n)),
-                    _ => {}
-                };
-                // Whether the sweep can tunnel through a one-sided triangle (Box2D v3.1's rule
-                // for chain segments): the centre starts in front of its plane, and comes within
-                // the core's radius of it or moves towards it by at least that much.
-                let crosses = |t: &TriangleRef, at: &Iso| {
-                    let (n, v0) = (at.vector(t.normal()), at.point(t.vertices[0]));
-                    let (s0, s1) = (n.dot(center0 - v0), n.dot(center1 - v0));
-                    s0 >= 0.0 && (s0 - s1 >= core_radius || s1 <= core_radius)
-                };
-                let mut check = |other: u32| {
-                    let oc = &self.colliders[other as usize];
-                    let ob = &self.bodies[oc.body as usize];
-                    if oc.sensor || ob.is_dynamic() || !self.should_collide(c, other) {
-                        return;
+                if kinematics.tree.is_empty() {
+                    // A scene containing only moving scenery needs no dynamic-response sweeps.
+                    let mut dynamics = self
+                        .bodies
+                        .iter()
+                        .filter(|b| b.alive && b.is_dynamic())
+                        .peekable();
+                    if dynamics.peek().is_none() {
+                        return kinematics;
                     }
-                    let oiso = self.collider_iso(other);
-                    let mut triangle = |t: &TriangleRef| {
-                        if crosses(t, &oiso) {
-                            let target = Convex::new(ConvexShape::Triangle(t.vertices), oiso);
-                            take(time_of_impact(&moving, &core, d, &target, slop));
-                            take(centre_through(t, &oiso, center0, d, core_radius + slop));
+                    search_sleepers = dynamics.any(|b| !b.awake);
+                }
+                let swept = self.collider_box(c).sweep(-travel);
+                kinematics.tree.insert(swept, c);
+                if !search_sleepers {
+                    continue;
+                }
+                // Collect unintegrated bodies at rest in the platform's path. Looking up the
+                // sleepers here avoids testing every sleeping collider against a distant lift.
+                self.moving_tree
+                    .query(&swept.expand(self.settings.linear_slop), &mut |_, o| {
+                        let other = &self.colliders[o as usize];
+                        let owner = &self.bodies[other.body as usize];
+                        if !other.sensor
+                            && owner.is_dynamic()
+                            && !owner.awake
+                            && moved.binary_search(&other.body).is_err()
+                        {
+                            kinematics.sleepers.insert(other.body);
                         }
                         true
-                    };
-                    match &oc.shape {
-                        Shape::Mesh(m) => {
-                            let local = crate::shape::transform_aabb(&swept, &oiso.inverse());
-                            m.query_aabb(&local, &mut triangle);
-                        }
-                        Shape::Heightfield(h) => {
-                            let local = crate::shape::transform_aabb(&swept, &oiso.inverse());
-                            h.query_aabb(&local, &mut triangle);
-                        }
-                        other_shape => {
-                            if let Some(os) = other_shape.as_convex() {
-                                let target = Convex::new(os, oiso);
-                                if gjk::cast(&inner, d, &target, 0.0).is_some() {
-                                    take(time_of_impact(&moving, &core, d, &target, slop));
-                                }
+                    });
+            }
+        }
+
+        kinematics
+    }
+
+    fn sweep_body(
+        &mut self,
+        b: u32,
+        integrated: bool,
+        dt: f32,
+        kinematics: &KinematicSweeps,
+        hit_events: &mut HitEventIndex,
+    ) {
+        let body = &self.bodies[b as usize];
+        if !body.is_dynamic() || (!body.awake && kinematics.tree.is_empty()) {
+            return;
+        }
+        // A contact can wake a whole island. Only a body integrated in this step refreshed
+        // its starting center; the other sleepers have not moved.
+        let start = if integrated {
+            body.center0
+        } else {
+            body.center
+        };
+        let mut path = SweepInterval {
+            center: start,
+            travel: body.center - start,
+            remaining: 1.0,
+            after_hit: false,
+        };
+        let threshold = 0.5 * body.min_extent.max(self.settings.linear_slop);
+        let mut check_fixed = body.bullet || path.travel.length() > threshold;
+        if !check_fixed && kinematics.tree.is_empty() {
+            return;
+        }
+        let mut velocity = body.linear_velocity;
+        let mask = body.translation_mask();
+        let mut pushed = false;
+        let mut travel_planes = Vec::new();
+        let mut speed_planes = Vec::new();
+        // Move chronologically. After a moving obstacle pushes the body, sweep its new
+        // path as well: the obstacle must not shove it through a second, fixed wall.
+        // If crowded between incompatible obstacles, keep the last safe position.
+        for _ in 0..8 {
+            let Some(hit) = self.first_ccd_hit(b, &path, check_fixed, kinematics) else {
+                path.center += path.travel;
+                break;
+            };
+            let impact = hit.impact;
+            let fixed = hit.target_travel == Vec3::ZERO;
+            if !fixed && path.remaining > 0.0 {
+                let approach = (hit.target_travel * path.remaining - path.travel)
+                    .dot(impact.normal)
+                    / (dt * path.remaining);
+                self.report_swept_hit(hit_events, hit, approach);
+            }
+            path.after_hit = true;
+            path.center += path.travel * impact.fraction;
+            path.remaining *= 1.0 - impact.fraction;
+            if fixed && !pushed {
+                // Preserve the fixed-geometry stop. A core hit also cancels the inward
+                // velocity so the next step's solver only has to push out the penetration.
+                if impact.core {
+                    remove_closing(&mut velocity, Vec3::ZERO, impact.normal, mask);
+                }
+                path.travel = Vec3::ZERO;
+                if kinematics.tree.is_empty() {
+                    break;
+                }
+            } else {
+                path.travel *= 1.0 - impact.fraction;
+            }
+            let target = self.colliders[hit.collider as usize].body;
+            if let Some(p) = crate::ccd::Plane::new(impact.normal, hit.target_travel, mask) {
+                travel_planes.push(p);
+            }
+            if let Some(p) = crate::ccd::Plane::new(
+                impact.normal,
+                self.bodies[target as usize].linear_velocity,
+                mask,
+            ) {
+                speed_planes.push(p);
+            }
+            pushed |= !fixed;
+            if pushed {
+                check_fixed = true;
+                let cap = self.settings.max_linear_speed;
+                let travel = if path.remaining > 0.0 {
+                    crate::ccd::permitted(path.travel / path.remaining, &travel_planes, cap * dt)
+                        .map(|v| v * path.remaining)
+                } else {
+                    Some(Vec3::ZERO)
+                };
+                let speed = crate::ccd::permitted(velocity, &speed_planes, cap);
+                let (Some(travel), Some(speed)) = (travel, speed) else {
+                    // A prescribed platform can overrun a body pinned by scenery, axis
+                    // locks or its speed cap. Keep the last safe pose in that case.
+                    velocity = Vec3::ZERO;
+                    break;
+                };
+                path.travel = travel;
+                velocity = speed;
+            }
+        }
+        if path.after_hit {
+            if pushed {
+                self.wake_body(b);
+            }
+            let body = &mut self.bodies[b as usize];
+            body.center = path.center;
+            body.position = body.center - body.rotation.rotate(body.local_center);
+            body.linear_velocity = velocity;
+            self.refresh_body_proxies(b, false);
+        }
+    }
+
+    /// CCD resolves a moving wall's approach after the discrete solver. Keep the strongest
+    /// impact per ordered pair from either source; Begin/End still follow the manifold.
+    fn report_swept_hit(&mut self, reported: &mut HitEventIndex, hit: CcdHit, speed: f32) {
+        if !speed.is_finite() || speed <= self.settings.hit_event_threshold {
+            return;
+        }
+        let index = reported.get_or_insert_with(|| {
+            self.pending
+                .contacts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, event)| match event {
+                    ContactEvent::Hit { a, b, .. } => Some(((a.index, b.index), i)),
+                    _ => None,
+                })
+                .collect()
+        });
+        let (a, b, normal) = if hit.collider < hit.moving {
+            (hit.collider, hit.moving, hit.impact.normal)
+        } else {
+            (hit.moving, hit.collider, -hit.impact.normal)
+        };
+        let event = ContactEvent::Hit {
+            a: self.collider_id(a),
+            b: self.collider_id(b),
+            point: hit.impact.point,
+            normal,
+            speed,
+        };
+        if let Some(&i) = index.get(&(a, b)) {
+            if matches!(self.pending.contacts[i], ContactEvent::Hit {speed: old, ..} if old < speed)
+            {
+                self.pending.contacts[i] = event;
+            }
+        } else {
+            index.insert((a, b), self.pending.contacts.len());
+            self.pending.contacts.push(event);
+        }
+    }
+
+    /// Earliest impact along the remaining interval, measured in the target's frame. We hold
+    /// both colliders at their end orientations as in the original fixed-geometry sweep.
+    fn first_ccd_hit(
+        &self,
+        b: u32,
+        path: &SweepInterval,
+        check_fixed: bool,
+        kinematics: &KinematicSweeps,
+    ) -> Option<CcdHit> {
+        let body = &self.bodies[b as usize];
+        let slop = self.settings.linear_slop;
+        let start = Iso::new(
+            path.center - body.rotation.rotate(body.local_center),
+            body.rotation,
+        );
+        let mut best: Option<CcdHit> = None;
+        let mut candidates = Vec::new();
+        for &c in &body.colliders {
+            let col = &self.colliders[c as usize];
+            if col.sensor {
+                continue;
+            }
+            let Some(shape) = col.shape.as_convex() else {
+                continue;
+            };
+            let from = start.mul(&col.local);
+            let swept = col.shape.aabb(&from).sweep(path.travel).expand(slop);
+            candidates.clear();
+            if check_fixed && path.travel != Vec3::ZERO {
+                let mut fixed = |_: u32, o: u32| {
+                    let owner = self.colliders[o as usize].body;
+                    if !self.bodies[owner as usize].is_dynamic()
+                        && !kinematics.travel.contains_key(&owner)
+                    {
+                        candidates.push((o, Vec3::ZERO));
+                    }
+                    true
+                };
+                self.static_tree.query(&swept, &mut fixed);
+                self.moving_tree.query(&swept, &mut fixed);
+            }
+            kinematics.tree.query(&swept, &mut |_, o| {
+                let owner = self.colliders[o as usize].body;
+                candidates.push((o, kinematics.travel[&owner]));
+                true
+            });
+            if candidates.is_empty() {
+                continue;
+            }
+            let moving = Convex::new(shape, from);
+            let center0 = moving.center();
+            let core_radius = 0.25 * col.shape.inner_radius();
+            let core = Convex::new(
+                ConvexShape::Sphere(core_radius),
+                Iso::from_position(center0),
+            );
+            // Shave the skin beside the path so a seam between flush boxes is not a wall.
+            let skin = slop.min(0.75 * col.shape.inner_radius());
+            let shrunk = match shape {
+                ConvexShape::Hull(h) => Some(shrunk_hull(h, skin)),
+                _ => None,
+            };
+            let inner_shape = match (shape, &shrunk) {
+                (ConvexShape::Sphere(r), _) => ConvexShape::Sphere(r - skin),
+                (
+                    ConvexShape::Capsule {
+                        half_height,
+                        radius,
+                    },
+                    _,
+                ) => ConvexShape::Capsule {
+                    half_height,
+                    radius: radius - skin,
+                },
+                (ConvexShape::Box(h), _) => ConvexShape::Box(h - Vec3::splat(skin)),
+                (ConvexShape::Hull(_), Some(h)) => ConvexShape::Hull(h),
+                (other, _) => other,
+            };
+            for &(other, target_travel) in &candidates {
+                let oc = &self.colliders[other as usize];
+                if oc.sensor || !self.should_collide(c, other) {
+                    continue;
+                }
+                let remaining_target = target_travel * path.remaining;
+                let relative = path.travel - remaining_target;
+                let (direction, distance) = relative.normalize_and_length();
+                if distance == 0.0
+                    || (!body.bullet && !check_fixed && distance <= 0.5 * body.min_extent.max(slop))
+                {
+                    continue;
+                }
+                let mut at = self.collider_iso(other);
+                at.position -= remaining_target;
+                let mut take = |impact: Option<Impact>| {
+                    let Some(impact) = impact else { return };
+                    if impact.fraction >= 1.0
+                        || (target_travel != Vec3::ZERO
+                            && impact
+                                .normal
+                                .mul_elem(body.translation_mask())
+                                .length_squared()
+                                < 1e-12)
+                    {
+                        return;
+                    }
+                    if best.is_none_or(|old| {
+                        impact.fraction < old.impact.fraction
+                            || (impact.fraction == old.impact.fraction && other < old.collider)
+                    }) {
+                        best = Some(CcdHit {
+                            impact: Impact {
+                                // The relative cast fixed B at its interval-start pose.
+                                // Bring its surface witness forward to the instant of contact.
+                                point: impact.point + remaining_target * impact.fraction,
+                                ..impact
+                            },
+                            moving: c,
+                            collider: other,
+                            target_travel,
+                        });
+                    }
+                };
+                let mut triangle = |t: &TriangleRef| {
+                    let (n, v0) = (at.vector(t.normal()), at.point(t.vertices[0]));
+                    let (s0, s1) = (n.dot(center0 - v0), n.dot((center0 + relative) - v0));
+                    if s0 >= 0.0 && (s0 - s1 >= core_radius || s1 <= core_radius) {
+                        let target = Convex::new(ConvexShape::Triangle(t.vertices), at);
+                        take(time_of_impact(
+                            &moving,
+                            &core,
+                            relative,
+                            &target,
+                            slop,
+                            path.after_hit,
+                        ));
+                        take(centre_through(
+                            t,
+                            &at,
+                            center0,
+                            relative,
+                            core_radius + slop,
+                        ));
+                    }
+                    true
+                };
+                match &oc.shape {
+                    Shape::Mesh(m) => {
+                        let local = crate::shape::transform_aabb(&swept, &at.inverse());
+                        m.query_aabb(&local, &mut triangle);
+                    }
+                    Shape::Heightfield(h) => {
+                        let local = crate::shape::transform_aabb(&swept, &at.inverse());
+                        h.query_aabb(&local, &mut triangle);
+                    }
+                    other_shape => {
+                        if let Some(os) = other_shape.as_convex() {
+                            let target = Convex::new(os, at);
+                            let front =
+                                |s: &Convex| s.support_core(direction).dot(direction) + s.radius();
+                            let ahead = direction
+                                * (front(&moving) - front(&Convex::new(inner_shape, from)));
+                            let inner = Convex::new(
+                                inner_shape,
+                                Iso::new(from.position + ahead, from.rotation),
+                            );
+                            if gjk::cast(&inner, relative, &target, 0.0).is_some() {
+                                take(time_of_impact(
+                                    &moving,
+                                    &core,
+                                    relative,
+                                    &target,
+                                    slop,
+                                    path.after_hit,
+                                ));
                             }
                         }
                     }
-                };
-                self.static_tree.query(&swept, &mut |_, o| {
-                    check(o);
-                    true
-                });
-                self.moving_tree.query(&swept, &mut |_, o| {
-                    check(o);
-                    true
-                });
-            }
-            if best < 1.0 {
-                let body = &mut self.bodies[b as usize];
-                body.center = body.center0 + d * best;
-                body.position = body.center - body.rotation.rotate(body.local_center);
-                // Stopped by its core, the shape is left deep in the surface (by up to three
-                // quarters of its inner radius): the velocity that drove it in goes, so the
-                // contacts only have to push it out. Kept, it carried the centre across the
-                // surface at the next step, whose core sweep started within the target (and so
-                // did not count): a spinning capsule or plank went through a thin wall.
-                if let Some(n) = core_normal {
-                    let into = body.linear_velocity.dot(n);
-                    if into < 0.0 {
-                        body.linear_velocity -= n * into;
-                    }
                 }
-                self.refresh_body_proxies(b, false);
             }
         }
+        best
     }
 
     /// A hash of every body's pose and velocity (bit patterns, index order): equal hashes after

@@ -13,6 +13,7 @@
 //! A simulation steps in fixed time slices and gives the same bits for the same inputs on every
 //! platform (see [`math`]).
 
+mod ccd;
 pub mod character;
 pub mod collide;
 pub mod gjk;

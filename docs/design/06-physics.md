@@ -51,8 +51,16 @@ Handles carry a generation, so a handle to a destroyed body never reaches whatev
 5. **Continuous collision.** A dynamic body that moved farther than half its smallest size in a step, or any body
    marked as a bullet, is swept from its start position (in its orientation at the end of the step) against static
    and kinematic geometry and stopped at the first time of impact, so a small fast ball cannot pass through a thin
-   wall. Only impacts after the start count, a one-sided triangle stops a sweep only when the body's centre crosses
-   it, a convex target only when the body's inner shape (the body less a skin of the linear slop, its front kept)
+   wall. Translating kinematic geometry is swept along its own path relative to each dynamic body. A fast
+   platform can wake and push a resting body along its surface normal. A platform moving alongside a bullet at
+   the same speed leaves the bullet alone. The rest of a pushed body's path is swept again against the scenery.
+   A simultaneous set of moving faces constrains the response together. A step handles up to eight
+   successive impacts and keeps the last reached pose if they exhaust it or a prescribed platform cannot be
+   followed within the body’s axis locks and maximum speed. A moving-platform impact above the hit threshold
+   reports its world-space witness and approach speed, at most once per collider pair in that step. Initial
+   contacts are handled by the solver. After an impact, another face reached simultaneously may stop the body
+   immediately. A one-sided triangle stops a sweep only when the body's centre crosses it, a convex target
+   only when the body's inner shape (the body less a skin of the linear slop, its front kept)
    reaches it, and pairs a joint keeps apart are skipped, so gliding over a mesh floor's seams, or over a floor of
    flush boxes, never sticks, while head-on, off-centre and tip-first hits all stop. A body that starts the step
    touching what it hits is swept as a small ball at its centre instead (a quarter of the largest that fits inside
