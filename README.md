@@ -1,6 +1,6 @@
 # ABE Engine
 
-ABE is a native Rust game engine in development. Its player, editor and build tools are intended for multiple games. Game assets, domain rules, network protocols and title-specific adapters belong in each game's repository.
+ABE is a native Rust game engine in development. Its player, editor and build tools are intended for multiple games. Game assets, domain rules, network protocols and title-specific adapters belong in each game's repository. The [design](docs/design/README.md) explains where it is going: one runtime, one editor (ABE Studio) and one content pipeline shared by several games; the [roadmap](docs/roadmap.md) orders the work.
 
 The core has zero third-party Cargo dependencies. The Vulkan backend calls the system loader directly and builds its shader programs as SPIR-V from Rust source.
 
@@ -125,7 +125,94 @@ The cooker accepts embedded glTF 2.0 triangle meshes (float positions, normals a
 
 For browsers, `abe-build cook --compact --keep-images` writes worlds about a fifth the size: `--compact` codes each mesh (vertices renumbered by first use, positions on a 0.5 mm grid, 12-bit octahedral normals, UVs on a 1/8192 grid, all delta-coded and deflated; about 7 bytes a triangle for a large estate), and `--keep-images` keeps PNG, JPEG and WebP images (WebP from `EXT_texture_webp`) as files instead of mip chains. The page decodes JPEG and WebP with the browser's decoders and the engine decodes PNG itself (a 2D canvas would premultiply transparent pixels away), and mip chains are made on the GPU. Natively, PNG is decoded and other encoded formats are refused with a message. The portable `abe-core` and `abe-assets` crates have no external dependencies.
 
-[Explore the six architecture layers](docs/architecture.html) (download and open the self-contained HTML to use the selectors). [Engine milestones](docs/roadmap.md).
+## Edit a scene in ABE Studio
+
+ABE Studio is the editor: a local host, `abe-studio`, that owns a project folder, and a browser interface whose viewport is the engine's web runtime. A project is a folder with `abe.project.json`; scenes and prefabs are canonical JSON documents, and every other asset has a `.meta.json` sidecar with its permanent id ([data design](docs/design/04-data.md)).
+
+```sh
+scripts/build-web.sh web/dist                                   # the runtime the viewport uses
+cargo run --release --example studio_sample -- ~/abe-sample     # a synthetic project
+cargo run --release -p abe-studio -- ~/abe-sample               # then open http://localhost:7480/
+```
+
+Open a scene from Assets (a static model imports as a scene with "Import as scene": one entity per glTF node, names and hierarchy kept; skinned, morphed and animated models stay run-time models). Click an object in the viewport to select it; W, E and R switch the gizmo between move, rotate and scale (hold Ctrl to snap); right-drag orbits, Shift+right-drag or the middle button pans, the wheel zooms, F frames the selection. The inspector is drawn from component schemas; Ctrl+Z and Ctrl+Shift+Z undo and redo (the host keeps the history), Ctrl+S saves, Ctrl+D duplicates, and Delete deletes when the viewport or the outliner has the keyboard (a field being typed into keeps Backspace and Delete). Structural changes re-cook the scene; moves apply at once. The interface is in English and Korean (the button at the top right), and the page reconnects by itself when the host restarts. The host answers only this machine at its own port (a port forward must keep the port number). `--lan` also listens on the local network and prints a URL with a pairing token, which every browser, this machine's included, opens once; a cookie keeps it after that.
+
+From the command line, `abe-build import PROJECT content/model.glb content/model.scene.json` imports a model as a scene, and `abe-build cook-scene PROJECT content/model.scene.json out.abew` cooks a scene into an ABEW v4 world that keeps its entities (`abe-build inspect` lists them). In a page, `engine.worldEntities()` returns the table, and `setWorldInstance`, `pickWorld` and `setWorldLight` move, hide and pick a cooked world's objects.
+
+[Explore the six architecture layers](docs/architecture.html) (download and open the self-contained HTML to use the selectors; the [design](docs/design/README.md) is current where they differ). [Engine milestones](docs/roadmap.md).
+
+## For agents: the abe command
+
+`abe` lets AI agents (and people) inspect, validate, edit, diff, undo and render scenes without touching engine source. Every command prints one line of JSON: `{"ok":true,...}`, or `{"ok":false,"error":{"code":"...","message":"..."}}` with exit code 1 (2 for a wrong command line). `--pretty` indents it, and `abe help` lists the commands. The error codes are stable: `not-found`, `ambiguous-ref`, `bad-edit`, `invalid`, `changed-since`, `io`, `cook`, `render` and `usage`. The same inputs give the same bytes.
+
+PROJECT is a project folder and SCENE a scene's (or prefab's) asset id or its path in the project. An entity reference (REF) is the entity's 16-hex id, its name when no other entity has it, or a `/`-separated path of names from a root (`Tower/Tower top`; `\/` is a slash inside a name). The examples use the synthetic studio sample:
+
+```sh
+cargo run --release --example studio_sample -- ~/abe-sample
+cargo build --release -p abe-agent --bin abe && export PATH="$PWD/target/release:$PATH"
+P=~/abe-sample S=content/scenes/blocks.scene.json
+```
+
+**Inspect** lists entities in tree order with their id, name, path, parent, depth, number of children and components. `--entity REF` starts at one entity, `--component KIND` keeps the entities that have that component (and shows only it), `--depth N` stops N levels down, and `--defaults` fills in every field a component leaves out from the schemas:
+
+```sh
+abe scene inspect $P $S --entity "Tower/Tower top" --defaults
+# {"ok":true,"scene":{"id":"002e3cec...","name":"Blocks","path":"content/scenes/blocks.scene.json","kind":"scene"},"total":8,"count":1,
+#  "entities":[{"id":"4146b57080b66538","name":"Tower top","path":"Tower/Tower top","depth":0,"parent":"7686dad007fbff4c","children":0,
+#  "components":{"mesh":{"model":"861cf008...","node":"Tower/Tower top","static":true},"transform":{"rotation":[0,0,0,1],"scale":[0.5,0.25,0.5],"translation":[0,0.75,0]}}}]}
+```
+
+**Validate** checks the scene against the engine's and the game's component schemas with `abe_scene::scene::check`, the rules ABE Studio applies to every edit and the cook applies before it builds. Those problems are errors. References to assets the project lacks (or of the wrong kind) and to entities the scene lacks are warnings. The exit code is 1 when there is an error:
+
+```sh
+abe scene validate $P $S
+# {"ok":true,"scene":{...},"errors":0,"warnings":0,"issues":[]}
+```
+
+**Apply** runs edits from a file, or from standard input with `-`, as one transaction. An edit is `set` (`entity`, `path`, `value`), `remove` (`entity`, `path`), `create` (`name`, optional `parent`, `components` and `id`), `delete` (`entity`, with what lies beneath it), `reparent` (`entity`, `parent`: a REF or `null` for the top level) or `duplicate` (`entity`, optional `name`). References resolve against the document as the earlier edits left it. A path is a dotted string below the entity (`name`, `order`, `components...`, `prefab...`) or an array of keys. A game's kinds keep their dot (`components.arena.spawn.team`), and arrays are set whole. The edits become the ops ABE Studio sends and are judged by the studio's rule that an edit may not add a problem the document did not have. The file is written with the project's canonical writer, so it reads exactly as if the edit had been made and saved in the studio. Every change is reported with its edit, entity, name, path, before and after:
+
+```sh
+abe scene apply $P $S - <<'EOF'
+{"label": "Brighter lamp, a bench", "edits": [
+  {"op": "set", "entity": "Lamp", "path": "components.light.intensity", "value": 30},
+  {"op": "create", "name": "Bench", "parent": "Tower", "components": {"transform": {"translation": [1, 0, 0]}}},
+  {"op": "reparent", "entity": "Block A", "parent": "Block B"},
+  {"op": "duplicate", "entity": "Tower", "name": "Tower 2"},
+  {"op": "remove", "entity": "Ground", "path": "components.mesh"},
+  {"op": "delete", "entity": "Block B"}]}
+EOF
+# {"ok":true,"scene":{...},"dry_run":false,"written":true,"edits":6,"changes":[{"edit":0,"entity":"0f0413101eb4ecef","name":"Lamp",
+#  "path":"components.light.intensity","before":18,"after":30},{"edit":1,"entity":"6ff31e963eaa6a60","name":"Bench","path":"","before":null,"after":{...}},...],
+#  "created":[{"edit":1,"entity":"6ff31e963eaa6a60","name":"Bench"},{"edit":3,"entity":"0e4700abbbdbd9fe","name":"Tower 2"}],"issues":[],"hash":"2c983daa..."}
+```
+
+If any edit fails, or the result has a problem the document did not have, nothing is written and the answer names the edit (`error.edit`) and the problems (`error.issues`), as in `{"ok":false,"error":{"code":"invalid","message":"...","edit":0,"issues":[{"path":"entities.0f0413101eb4ecef.components.light.intensity","message":"-1 is out of range","entity":"0f0413101eb4ecef","name":"Lamp","edit":0}]}}`. `--dry-run` gives the same answer without writing. New entity ids are drawn from a generator seeded by the document and the edits, so a dry run reports the ids a real run writes. A written transaction is recorded with its inverse ops and the hashes of the file before and after it in `PROJECT/.abe/history/<scene id>.jsonl`.
+
+**Undo** takes back the last transaction `abe` recorded for the scene, provided the file still has the bytes that transaction left. Otherwise it refuses with `changed-since`, for example after a save in ABE Studio or a hand edit. The original bytes come back exactly, even for a file written by hand. `--dry-run` reports without writing:
+
+```sh
+abe scene undo $P $S
+# {"ok":true,"scene":{...},"dry_run":false,"written":true,"undone":{"label":"Brighter lamp, a bench","edits":6},"changes":[...],"restored":true,"remaining":0,"hash":"15180ce4..."}
+```
+
+**Diff** compares two scene documents by entity id. It reports entities `added`, `removed`, `renamed` and `reparented`, every other `changed` field (path, before, after) and the document's own fields, in a fixed order. One side may be `-` (standard input), so in a project under git `git show HEAD:$S | abe scene diff - $S` reviews uncommitted work:
+
+```sh
+abe scene diff before.scene.json $P/$S
+# {"ok":true,"a":{"file":"before.scene.json",...},"b":{...},"equal":false,"document":[],"added":[{"id":"0e4700abbbdbd9fe","name":"Tower 2","parent":null,"value":{...}},...],
+#  "removed":[...],"renamed":[],"reparented":[...],"changed":[{"entity":"0f0413101eb4ecef","name":"Lamp","path":"components.light.intensity","before":18,"after":30},...]}
+```
+
+**Render** cooks the scene in memory as `abe-build cook-scene` would and draws a still with the offscreen renderer exactly as `abe-render` draws the cooked file (for the same view, time and weather the PNG is byte for byte the one `abe-render` writes). It needs a Vulkan driver; `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` selects Mesa's software lavapipe. The view is `--camera REF`, else the scene's first camera entity, else the Look file's first view, else an overview. A camera looks along its transform's -Z with +Y up. Time, weather and Look come from the scene's `environment` component, and `--time` and `--weather` override them. The defaults are those of `abe-render` (1920x1080, 8 samples; `--samples N` changes it):
+
+```sh
+abe render $P $S --out blocks.png --size 960x540 --samples 4
+# {"ok":true,"scene":{...},"file":"blocks.png","bytes":...,"sha256":"...","width":960,"height":540,"samples":4,
+#  "view":{"name":"Overview camera","eye":[10,7,12],"target":[...],"up":[...],"fov":50,"source":"camera","entity":"3571b98d187af3e5"},
+#  "time":16.5,"weather":"clear","look":"content/looks/day.look.json","entities":8,"device":"llvmpipe (LLVM 20.1.2, 256 bits)","warnings":[]}
+```
+
+The commands are a library too: `abe_agent::run` (`crates/abe-agent`) is the whole command line as a function, which its tests drive on synthetic projects. ABE Studio reads a document again when it is reopened (a page reload) with no unsaved edits, so changes `abe` made show up there; and it refuses to save over a file that changed on disk since it read it (the editor asks before overwriting). Until the command sends its transactions through a running host (planned), make a change in one of the two at a time.
 
 ## Verify
 
@@ -134,7 +221,12 @@ cargo test --workspace --locked --offline
 cargo test --locked --offline --test vulkan -- --ignored
 cargo test --locked --offline --test present -- --ignored
 cargo test --locked --offline --test gpu --test render -- --ignored
+cargo test --locked --offline -p abe-agent --test binary -- --ignored     # abe render through the binary
+node editor/test/run.cjs --out editor-test                 # ABE Studio end to end (release builds and web/dist first)
+node editor/test/run.cjs --api webgl2 --out editor-test-gl
 ```
+
+`editor/test/run.cjs` writes the synthetic sample, starts `abe-studio` and drives the interface in headless Chromium with real pointer and key events: select by clicking, move with the gizmo, undo and redo, a parent carrying its child, renaming, adding a component, saving, reloading, and cooking and rendering the saved scene. Its header lists the release builds it needs.
 
 Use `Presenter::set_static_scene` once for the environment and `draw_with_static` each frame for changing objects. The two draws share a depth buffer.
 
