@@ -228,6 +228,42 @@ fn a_kinematic_body_targeted_to_its_own_pose_stays_still_and_sleeps() {
     assert!(p.rotation.dot(turned.rotation).abs() > 1.0 - 1e-6, "{p:?}");
 }
 
+/// A door turning at a constant world angular velocity must reach its requested orientation
+/// for the frame, including on a world that uses only one solver substep.
+#[test]
+fn a_kinematic_rotation_reaches_its_target_for_any_substep_count() {
+    for substeps in [1, 4, 8] {
+        let mut w = PhysicsWorld::new(Settings {
+            substeps,
+            gravity: Vec3::ZERO,
+            ..Default::default()
+        });
+        let start = Quat::from_axis_angle(Vec3::X, 0.6);
+        let body = body_with(
+            &mut w,
+            BodyDesc {
+                kind: BodyKind::Kinematic,
+                rotation: start,
+                ..Default::default()
+            },
+            Shape::Box {
+                half_extents: Vec3::new(1.0, 0.5, 0.05),
+            },
+        );
+        let turn = Quat::from_axis_angle(Vec3::new(0.2, 1.0, -0.4), 2.7);
+        let target = abe_physics::Iso::new(Vec3::new(0.1, 0.2, 0.0), turn * start);
+        w.set_kinematic_target(body, target, DT);
+        for expected in [target.rotation, turn * target.rotation] {
+            w.step(DT);
+            let actual = w.body_pose(body).unwrap().rotation;
+            for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+                let error = (actual.rotate(axis) - expected.rotate(axis)).length();
+                assert!(error < 1e-4, "{substeps} substeps, {axis:?}: {error}");
+            }
+        }
+    }
+}
+
 fn all_finite(w: &PhysicsWorld) -> bool {
     w.bodies().all(|b| {
         let p = w.body_pose(b).unwrap();

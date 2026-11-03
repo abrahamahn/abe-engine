@@ -291,6 +291,21 @@ impl Quat {
         let a = axis.normalize_or_zero();
         Self::new(a.x * s, a.y * s, a.z * s, c).normalize()
     }
+    /// A kinematic body's angular velocity is prescribed, so its turn over a substep is a
+    /// rotation through |ω|·h. The normalized differential used for dynamic bodies instead
+    /// turns through 2·atan(|ω|·h/2), short of a door's requested angle.
+    pub(crate) fn from_angular_velocity(w: Vec3, h: f32) -> Self {
+        let [x, y, z] = w.to_array().map(f64::from);
+        // The length and angle of finite f32 inputs can exceed f32::MAX. Reduce the angle
+        // before passing it to the deterministic engine sine and cosine.
+        let speed = (x * x + y * y + z * z).sqrt();
+        if speed == 0.0 {
+            return Self::IDENTITY;
+        }
+        let axis = Vec3::new((x / speed) as f32, (y / speed) as f32, (z / speed) as f32);
+        let angle = (speed * f64::from(h)) % std::f64::consts::TAU;
+        Self::from_axis_angle(axis, angle as f32)
+    }
     /// The shortest rotation taking unit vector `from` onto unit vector `to`.
     pub fn from_rotation_arc(from: Vec3, to: Vec3) -> Self {
         let d = from.dot(to);

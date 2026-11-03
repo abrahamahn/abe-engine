@@ -174,27 +174,35 @@ pub(crate) struct ContactConstraint {
     pub rounding: (f32, f32),
 }
 
-/// Integrates the velocities of dynamic bodies over one substep.
-pub(crate) struct VelocityInputs<'a> {
+/// Constant inputs for one moving solver body over a step.
+pub(crate) struct BodyInput {
+    pub force: Vec3,
+    pub torque: Vec3,
+    pub gravity_scale: f32,
+    /// The damping multipliers 1/(1 + h·damping).
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+    /// A kinematic body's prescribed turn per substep. Dynamic bodies integrate their solved ω.
+    pub kinematic_turn: Option<Quat>,
+}
+
+pub(crate) struct IntegrationInputs<'a> {
     pub gravity: Vec3,
-    /// Per solver body: (force, torque, gravity scale, 1/(1 + h·linear damping),
-    /// 1/(1 + h·angular damping), dynamic).
-    pub per_body: &'a [(Vec3, Vec3, f32, f32, f32, bool)],
+    /// Inputs for solver body slots 1 onward; slot 0 is static.
+    pub per_body: &'a [BodyInput],
     pub max_linear_speed: f32,
     pub max_angular_speed: f32,
 }
 
-pub(crate) fn integrate_velocities(bodies: &mut [SolverBody], inputs: &VelocityInputs, h: f32) {
-    for (b, &(force, torque, gravity_scale, lin_damp, ang_damp, dynamic)) in
-        bodies.iter_mut().zip(inputs.per_body)
-    {
-        if !dynamic {
+pub(crate) fn integrate_velocities(bodies: &mut [SolverBody], inputs: &IntegrationInputs, h: f32) {
+    for (b, input) in bodies.iter_mut().skip(1).zip(inputs.per_body) {
+        if input.kinematic_turn.is_some() {
             continue;
         }
-        let accel =
-            b.inv_mass.mul_elem(force) + gravity_masked(inputs.gravity * gravity_scale, b.inv_mass);
-        let v = (b.v + accel * h) * lin_damp;
-        let w = (b.w + turn(&b.inv_inertia, torque) * h) * ang_damp;
+        let accel = b.inv_mass.mul_elem(input.force)
+            + gravity_masked(inputs.gravity * input.gravity_scale, b.inv_mass);
+        let v = (b.v + accel * h) * input.linear_damping;
+        let w = (b.w + turn(&b.inv_inertia, input.torque) * h) * input.angular_damping;
         b.v = clamp_length(v, inputs.max_linear_speed);
         b.w = clamp_length(w, inputs.max_angular_speed);
     }
@@ -262,10 +270,13 @@ fn gravity_masked(g: Vec3, inv_mass: Vec3) -> Vec3 {
 }
 
 /// Moves every non-static body by its velocity over one substep.
-pub(crate) fn integrate_positions(bodies: &mut [SolverBody], h: f32) {
-    for b in bodies.iter_mut().skip(1) {
+pub(crate) fn integrate_positions(bodies: &mut [SolverBody], inputs: &IntegrationInputs, h: f32) {
+    for (b, input) in bodies.iter_mut().skip(1).zip(inputs.per_body) {
         b.dp += b.v * h;
-        b.dq = b.dq.integrate(b.w, h);
+        b.dq = match input.kinematic_turn {
+            Some(turn) => (turn * b.dq).normalize(),
+            None => b.dq.integrate(b.w, h),
+        };
     }
 }
 

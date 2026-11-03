@@ -20,8 +20,8 @@ use crate::math::{Aabb, Iso, Mat3, Quat, Vec3};
 use crate::mesh::TriangleRef;
 use crate::shape::{Convex, ConvexShape, MassProperties, Shape};
 use crate::solver::{
-    self, BodyFrame, ConstraintPoint, ContactConstraint, Softness, SolverBody, StepContext,
-    VelocityInputs,
+    self, BodyFrame, BodyInput, ConstraintPoint, ContactConstraint, IntegrationInputs, Softness,
+    SolverBody, StepContext,
 };
 use crate::tree::DynamicTree;
 
@@ -1987,7 +1987,7 @@ impl PhysicsWorld {
         // Solver bodies: slot 0 is static; then every awake moving body in index order.
         let mut slot = vec![0usize; self.bodies.len()];
         let mut solver_bodies = vec![SolverBody::STATIC];
-        let mut per_body = vec![(Vec3::ZERO, Vec3::ZERO, 0.0, 1.0, 1.0, false)];
+        let mut per_body = Vec::new();
         let mut turning = vec![Turning::Fixed];
         let mut members: Vec<u32> = Vec::new();
         for (i, b) in self.bodies.iter_mut().enumerate() {
@@ -2012,14 +2012,15 @@ impl PhysicsWorld {
                 contact_inv_inertia: inv_inertia,
             });
             turning.push(b.turning());
-            per_body.push((
-                b.force,
-                b.torque,
-                b.gravity_scale,
-                1.0 / (1.0 + h * b.linear_damping),
-                1.0 / (1.0 + h * b.angular_damping),
-                b.kind == BodyKind::Dynamic,
-            ));
+            per_body.push(BodyInput {
+                force: b.force,
+                torque: b.torque,
+                gravity_scale: b.gravity_scale,
+                linear_damping: 1.0 / (1.0 + h * b.linear_damping),
+                angular_damping: 1.0 / (1.0 + h * b.angular_damping),
+                kinematic_turn: (b.kind == BodyKind::Kinematic)
+                    .then(|| Quat::from_angular_velocity(w, h)),
+            });
         }
         let frame = |w: &PhysicsWorld, b: u32| {
             let body = &w.bodies[b as usize];
@@ -2114,7 +2115,7 @@ impl PhysicsWorld {
             joint_constraints.push((j as u32, jc));
         }
 
-        let inputs = VelocityInputs {
+        let inputs = IntegrationInputs {
             gravity: self.settings.gravity,
             per_body: &per_body,
             max_linear_speed: self.settings.max_linear_speed,
@@ -2137,7 +2138,7 @@ impl PhysicsWorld {
                 true,
                 sub % 2 == 1,
             );
-            solver::integrate_positions(&mut solver_bodies, h);
+            solver::integrate_positions(&mut solver_bodies, &inputs, h);
             for (sb, t) in solver_bodies.iter_mut().zip(&turning) {
                 if let Some(m) = t.after(sb.dq) {
                     sb.inv_inertia = m;
