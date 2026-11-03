@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABE Studio</title>
+<title>ABE Editor</title>
 <link rel="stylesheet" href="/editor/studio.css">
 </head>
 <body>
@@ -24,6 +24,7 @@
   <button id="recook" data-i18n="refresh" data-i18n-title="refreshTip">Refresh</button>
   <button id="simulate" data-i18n="simulate" data-i18n-title="simulateTip">Simulate</button>
   <span class="grow"></span>
+  <select id="project-tools" aria-label="Project tools" hidden><option value="" data-i18n="projectTools">Project tools</option></select>
   <span id="fps"></span>
   <button id="language" class="mini" data-i18n="language">한국어</button>
   <span id="connection" data-i18n="connecting">connecting</span>
@@ -59,5 +60,12 @@
   <div id="console-lines"></div>
 </footer>
 <script type="module" src="/editor/studio.js"></script>
+<dialog id="project-tool-panel" aria-labelledby="project-tool-title">
+  <header><strong id="project-tool-title"></strong>
+    <a id="project-tool-external" target="_blank" rel="noopener noreferrer" data-i18n="openSeparately">Open separately</a>
+    <button type="button" id="project-tool-close" data-i18n="backToScene">Back to scene</button>
+  </header>
+  <iframe id="project-tool-frame" referrerpolicy="no-referrer" sandbox="allow-forms allow-scripts allow-same-origin allow-downloads allow-popups"></iframe>
+</dialog>
 </body>
 </html>

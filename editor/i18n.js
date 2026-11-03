@@ -4,6 +4,7 @@
 
 const STRINGS = {
   en: {
+    projectTools: 'Project tools', openSeparately: 'Open separately', backToScene: 'Back to scene',
     save: 'Save', saveTip: 'Save (Ctrl+S)',
     undo: 'Undo', undoTip: 'Undo (Ctrl+Z)', undoX: 'Undo {x}', nothingToUndo: 'Nothing to undo',
     redo: 'Redo', redoTip: 'Redo (Ctrl+Shift+Z)', redoX: 'Redo {x}', nothingToRedo: 'Nothing to redo',
@@ -24,6 +25,7 @@ const STRINGS = {
     overwriteChanged: 'This file changed on disk after it was opened (another tool, git or editor wrote it). Overwrite it with the version shown here?',
   },
   ko: {
+    projectTools: '프로젝트 도구', openSeparately: '새 탭에서 열기', backToScene: '장면으로 돌아가기',
     save: '저장', saveTip: '저장 (Ctrl+S)',
     undo: '실행 취소', undoTip: '실행 취소 (Ctrl+Z)', undoX: '실행 취소: {x}', nothingToUndo: '되돌릴 작업 없음',
     redo: '다시 실행', redoTip: '다시 실행 (Ctrl+Shift+Z)', redoX: '다시 실행: {x}', nothingToRedo: '다시 할 작업 없음',

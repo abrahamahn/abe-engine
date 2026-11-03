@@ -135,6 +135,14 @@ cargo run --release --example studio_sample -- ~/abe-sample     # a synthetic pr
 cargo run --release -p abe-studio -- ~/abe-sample               # then open http://localhost:7480/
 ```
 
+A project can register game-specific workspaces in `project-tools.json` inside any folder in the manifest’s `editor` list. The optional catalog contains a version, the web origin of the game tools, and their routes.
+
+```json
+{"version":1,"origin":"http://127.0.0.1:5173","tools":[{"label":"Level rules","path":"/tools/level-rules"}]}
+```
+
+Choose **Project tools** to open a workspace inside the editor or in its own tab. The game retains its own sign-in, permissions and storage. Closing the panel returns to the open scene. The game server must use a different hostname from Studio so the game never receives Studio’s pairing cookie. For a local Studio at `localhost`, a game on another local port can supply `?toolOrigin=http://127.0.0.1:5174`. An `asset` query parameter reveals a project-relative asset path and opens it if it is a scene or prefab. Both parameters are optional.
+
 Open a scene from Assets (a static model imports as a scene with "Import as scene": one entity per glTF node, names and hierarchy kept; skinned, morphed and animated models stay run-time models). Click an object in the viewport to select it; W, E and R switch the gizmo between move, rotate and scale (hold Ctrl to snap); right-drag orbits, Shift+right-drag or the middle button pans, the wheel zooms, F frames the selection. The inspector is drawn from component schemas; Ctrl+Z and Ctrl+Shift+Z undo and redo (the host keeps the history), Ctrl+S saves, Ctrl+D duplicates, and Delete deletes when the viewport or the outliner has the keyboard (a field being typed into keeps Backspace and Delete). Structural changes re-cook the scene; moves apply at once. The interface is in English and Korean (the button at the top right), and the page reconnects by itself when the host restarts. The host answers only this machine at its own port (a port forward must keep the port number). `--lan` also listens on the local network and prints a URL with a pairing token, which every browser, this machine's included, opens once; a cookie keeps it after that.
 
 From the command line, `abe-build import PROJECT content/model.glb content/model.scene.json` imports a model as a scene, and `abe-build cook-scene PROJECT content/model.scene.json out.abew` cooks a scene into an ABEW v4 world that keeps its entities (`abe-build inspect` lists them). In a page, `engine.worldEntities()` returns the table, and `setWorldInstance`, `pickWorld` and `setWorldLight` move, hide and pick a cooked world's objects.

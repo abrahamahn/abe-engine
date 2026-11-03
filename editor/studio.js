@@ -6,6 +6,9 @@ import { Host, applyOps } from './protocol.js';
 import * as M from './math.js';
 import { t, label, lang, setLang, translate } from './i18n.js';
 
+import { projectToolsPanel } from './project-tools.js';
+
+const loadProjectTools = projectToolsPanel(text => log(2, text));
 const $ = (sel) => document.querySelector(sel);
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
@@ -178,9 +181,14 @@ function onMessage(msg) {
       state.assets = msg.assets;
       $('#project-name').textContent = msg.project.name || 'Project';
       drawAssets();
+      void loadProjectTools(msg.project, msg.toolCatalogs);
       // After a reconnect, the document that was open (or being opened) opens again.
+      const requested = new URLSearchParams(location.search).get('asset');
+      const asset = msg.assets.find(a => a.path === requested);
       if (state.wanted) state.host.send({ type: 'open', doc: state.wanted });
+      else if (asset && (asset.kind === 'scene' || asset.kind === 'prefab')) openDoc(asset.id);
       else if (msg.project.startup) openDoc(msg.project.startup);
+      if (asset) document.querySelector(`#assets-list [data-id="${CSS.escape(asset.id)}"]`)?.scrollIntoView({ block: 'nearest' });
       break;
     }
     case 'assets':
@@ -288,6 +296,12 @@ function lookAsset() {
   return null;
 }
 
+function setTime(hours) {
+  state.time = hours;
+  $('#time').value = String(hours);
+  $('#time-label').textContent = `${hours.toFixed(1)} h`;
+}
+
 async function loadWorld(cooked) {
   // Cooks can arrive while an earlier one is still loading: only the newest load shows its
   // world, and every engine a newer load replaces or overtakes is destroyed.
@@ -303,7 +317,7 @@ async function loadWorld(cooked) {
     }
   }
   if (gen !== state.loadGen) return;
-  if (env?.time !== undefined) state.time = env.time;
+  if (env?.time !== undefined) setTime(env.time);
   if (env?.weather) state.weather = env.weather;
   const name = cooked.file.split('/').pop();
   const old = state.canvas;
@@ -648,6 +662,12 @@ function drawSimulateButton() {
 }
 
 function renderLoop(t) {
+  if ($('#project-tool-panel').open) {
+    state.simClock = t;
+    state.last = t;
+    requestAnimationFrame(renderLoop);
+    return;
+  }
   if (state.engine && state.simulating) {
     try {
       stepSimulation(t);
@@ -838,6 +858,7 @@ function drawToolbar() {
 
 function drawAssets() {
   const list = $('#assets-list');
+  const requested = new URLSearchParams(location.search).get('asset');
   list.replaceChildren();
   const kinds = ['scene', 'prefab', 'model', 'look', 'texture', 'material', 'sound'];
   for (const kind of kinds) {
@@ -846,7 +867,8 @@ function drawAssets() {
     list.append(el('div', { class: 'group' }, kind));
     for (const a of items) {
       const name = a.path.split('/').pop();
-      const row = el('div', { class: 'asset', title: a.path, 'data-id': a.id }, name);
+      const selected = a.path === requested;
+      const row = el('div', { class: selected ? 'asset requested-asset' : 'asset', title: a.path, 'data-id': a.id }, name);
       if (kind === 'scene' || kind === 'prefab') {
         row.addEventListener('dblclick', () => openDoc(a.id));
         row.append(el('button', { class: 'mini', onclick: () => openDoc(a.id) }, t('open')));
@@ -1126,11 +1148,9 @@ function commands() {
     if (path) state.host.send({ type: 'create', kind: 'scene', path, name: path.split('/').pop().replace('.scene.json', '') });
   };
   $('#outliner-filter').oninput = drawOutliner;
-  $('#time').oninput = (e) => {
-    state.time = Number(e.target.value);
-    $('#time-label').textContent = `${state.time.toFixed(1)} h`;
-  };
+  $('#time').oninput = (e) => setTime(Number(e.target.value));
   window.addEventListener('keydown', (e) => {
+    if ($('#project-tool-panel').open) return;
     const typing = ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName);
     const mod = e.ctrlKey || e.metaKey;
     // A letter shortcut matches the key's position (so Caps Lock and a Korean input method do not

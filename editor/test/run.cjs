@@ -192,6 +192,10 @@ async function main() {
   fs.mkdirSync(o.out, { recursive: true });
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'abe-studio-test-'));
   execFileSync(path.join(BIN, 'examples', 'studio_sample'), [project], { stdio: 'inherit' });
+  fs.mkdirSync(path.join(project, 'editor'), { recursive: true });
+  fs.writeFileSync(path.join(project, 'editor', 'project-tools.json'), JSON.stringify({
+    version: 1, origin: 'http://127.0.0.1:5173', tools: [{ label: 'Level rules', path: '/tools/levels' }],
+  }));
   const port = 7400 + Math.floor(Math.random() * 500);
   const lines = [];
   let host = await startHost(project, port, lines);
@@ -216,6 +220,18 @@ async function main() {
     const names = await page.evaluate(() => Object.values(window.__studio.doc.root.entities).map((e) => e.name).sort());
     check('the scene opens with its entities', names.includes('Block A') && names.includes('Tower top'), names);
     check('the outliner lists them', (await page.locator('#outliner-tree .node').count()) === names.length);
+
+    // A project tool gets its own game origin and the scene survives the round trip.
+    let sentReferrer;
+    await page.route('http://127.0.0.1:5173/tools/levels', async route => {
+      sentReferrer = route.request().headers()['referer'];
+      await route.fulfill({ contentType: 'text/html', body: '<h1>Level rules</h1>' });
+    });
+    await page.selectOption('#project-tools', { label: 'Level rules' });
+    await page.frameLocator('#project-tool-frame').getByRole('heading', { name: 'Level rules' }).waitFor();
+    check('project tool opens without forwarding the editor URL', sentReferrer === undefined);
+    await page.click('#project-tool-close');
+    check('closing a game tool keeps the open scene', (await page.locator('#outliner-tree .node').count()) === names.length);
 
     // 0. The interface speaks Korean on request (and back).
     await page.click('#language');

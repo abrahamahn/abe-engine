@@ -377,6 +377,22 @@ impl Studio {
                         ("type", s("welcome")),
                         ("client", n(from)),
                         ("project", self.project.manifest.to_value()),
+                        (
+                            "toolCatalogs",
+                            Value::Array(
+                                self.project
+                                    .manifest
+                                    .editor
+                                    .iter()
+                                    .map(|dir| format!("{dir}/project-tools.json"))
+                                    .filter(|path| {
+                                        self.inside(path).is_ok()
+                                            && self.project.root.join(path).is_file()
+                                    })
+                                    .map(|path| s(&path))
+                                    .collect(),
+                            ),
+                        ),
                         ("schemas", Value::Array(self.registry.sources().to_vec())),
                         ("assets", self.assets()),
                     ]),
