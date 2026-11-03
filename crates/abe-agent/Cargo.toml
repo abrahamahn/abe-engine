@@ -1,0 +1,23 @@
+[package]
+name = "abe-agent"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "ABE's agent-facing command line (abe): inspect, validate, edit, diff, undo and render scenes, answering in JSON"
+
+[[bin]]
+name = "abe"
+path = "src/main.rs"
+
+[dependencies]
+# The engine only for the `abe` binary's offscreen renderer (src/main.rs); the library does not use it.
+abe-engine = { path = "../.." }
+abe-core = { path = "../abe-core" }
+abe-assets = { path = "../abe-assets" }
+abe-pipeline = { path = "../abe-pipeline" }
+abe-scene = { path = "../abe-scene" }
+
+[dev-dependencies]
+# Only to prove that a CLI edit writes the same bytes as the same edit made in ABE Studio.
+abe-studio = { path = "../abe-studio" }

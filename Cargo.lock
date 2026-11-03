@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "abe-agent"
+version = "0.2.0"
+dependencies = [
+ "abe-assets",
+ "abe-core",
+ "abe-engine",
+ "abe-pipeline",
+ "abe-scene",
+ "abe-studio",
+]
+
+[[package]]
 name = "abe-assets"
 version = "0.2.0"
 dependencies = [
