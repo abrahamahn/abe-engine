@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod gbs;
 pub mod mcp;
 pub mod verify;
+pub mod world_graph;
 
 use std::collections::BTreeMap;
 

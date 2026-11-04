@@ -5,6 +5,7 @@ pub mod id;
 pub mod json;
 pub mod timing;
 pub mod world;
+pub mod xr;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vec3(pub f32, pub f32, pub f32);

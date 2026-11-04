@@ -86,7 +86,10 @@ pub fn tools_list() -> Value {
         tool_def(
             "project_context",
             "Read the <800-token L0/L1 AI Context Digest of the entire open game project (scenes, schemas, workspaces, @selection, top bricks, and .gbs grammar).",
-            obj([("limit", prop_num("Max top brick signatures to include (default 24)"))]),
+            obj([(
+                "limit",
+                prop_num("Max top brick signatures to include (default 24)"),
+            )]),
             &[],
         ),
         tool_def(
@@ -236,7 +239,49 @@ pub fn tools_list() -> Value {
             ]),
             &[],
         ),
+        tool_def(
+            "world_graph_fetch",
+            "Read the <400-token Tri-Modal Semantic World Graph (ganbate://context) persisted at world.semantic.json.",
+            obj([]),
+            &[],
+        ),
+        tool_def(
+            "world_graph_patch",
+            "Apply a structured JSON patch to the Semantic World Graph (ganbate://context) under 120Hz (8.33ms) and server-authoritative-readonly guardrails.",
+            obj([(
+                "patch",
+                obj([
+                    ("type", s("object")),
+                    (
+                        "description",
+                        s(
+                            "Partial SemanticWorldGraph JSON patch (play_mode, guardrails, environment, camera, entities)",
+                        ),
+                    ),
+                ]),
+            )]),
+            &["patch"],
+        ),
+        tool_def(
+            "world_graph_prompt",
+            "Deterministically compile a genre-agnostic bilingual (EN/KO) natural-language prompt into a validated Semantic World Graph patch and broadcast via Outbox.",
+            obj([(
+                "prompt",
+                prop_str("Natural-language instruction in English or Korean"),
+            )]),
+            &["prompt"],
+        ),
     ])
+}
+
+/// Dispatches an MCP tool call against `studio`, populating `outbox` with any live viewport broadcasts.
+pub fn call_tool(
+    studio: &mut Studio,
+    name: &str,
+    args: &Value,
+    outbox: &mut Outbox,
+) -> Result<Value, String> {
+    studio.call_mcp_tool(name, args, outbox)
 }
 
 fn wrap_tool_result(payload: Value, is_error: bool) -> Value {
@@ -319,6 +364,14 @@ pub fn handle_rpc_value(studio: &mut Studio, req: &Value) -> (Option<Value>, Out
             let resources = Value::Array(vec![
                 obj([
                     ("uri", s("ganbate://context")),
+                    (
+                        "name",
+                        s("Tri-Modal Semantic World Graph (<400 tokens, 120Hz guardrailed)"),
+                    ),
+                    ("mimeType", s("application/json")),
+                ]),
+                obj([
+                    ("uri", s("ganbate://project-context")),
                     ("name", s("Token-Compact L0/L1 Project Context Digest")),
                     ("mimeType", s("text/markdown")),
                 ]),
@@ -344,7 +397,24 @@ pub fn handle_rpc_value(studio: &mut Studio, req: &Value) -> (Option<Value>, Out
                 .and_then(|v| v.string().ok())
                 .unwrap_or("");
             match uri {
-                "ganbate://context" => match studio.mcp_project_context(24) {
+                "ganbate://context" => match studio.world_graph_read_or_init() {
+                    Ok((graph, _)) => match graph.to_canonical_json() {
+                        Ok(text) => {
+                            let res = obj([(
+                                "contents",
+                                Value::Array(vec![obj([
+                                    ("uri", s(uri)),
+                                    ("mimeType", s("application/json")),
+                                    ("text", Value::String(text)),
+                                ])]),
+                            )]);
+                            (Some(rpc_ok(id, res)), Vec::new())
+                        }
+                        Err(e) => (Some(rpc_err(id, -32603, &e)), Vec::new()),
+                    },
+                    Err(e) => (Some(rpc_err(id, -32603, &e)), Vec::new()),
+                },
+                "ganbate://project-context" => match studio.mcp_project_context(24) {
                     Ok(ctx) => {
                         let text = ctx
                             .get("digestText")
@@ -414,8 +484,11 @@ pub fn handle_rpc_value(studio: &mut Studio, req: &Value) -> (Option<Value>, Out
                 .cloned()
                 .unwrap_or_else(|| Value::Object(BTreeMap::new()));
             let mut outbox = Vec::new();
-            match studio.call_mcp_tool(name, &args, &mut outbox) {
-                Ok(payload) => (Some(rpc_ok(id, wrap_tool_result(payload, false))), outbox),
+            match call_tool(studio, name, &args, &mut outbox) {
+                Ok(payload) => {
+                    let blocked = payload.get("blocked_by_authority") == Some(&Value::Bool(true));
+                    (Some(rpc_ok(id, wrap_tool_result(payload, blocked))), outbox)
+                }
                 Err(err_msg) => {
                     let err_payload = obj([
                         ("ok", Value::Bool(false)),
@@ -432,5 +505,214 @@ pub fn handle_rpc_value(studio: &mut Studio, req: &Value) -> (Option<Value>, Out
             Some(rpc_err(id, -32601, &format!("method not found: {other}"))),
             Vec::new(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::world_graph::{WORLD_GRAPH_REL_PATH, WORLD_GRAPH_SCHEMA, WORLD_GRAPH_URI};
+    use ganbate_core::id::Ids;
+    use ganbate_pipeline::project::Project;
+
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open_test_studio() -> (Studio, TempDir) {
+        let dir = std::env::temp_dir().join(format!("ganbate-mcp-wg-{}", Ids::from_os().entity()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ids = Ids::seeded(19);
+        Project::create(&dir, "MCP World Graph Test", &mut ids).unwrap();
+        let (studio, _) = Studio::open(&dir, ids).unwrap();
+        (studio, TempDir(dir))
+    }
+
+    #[test]
+    fn mcp_ganbate_context_resource_and_world_graph_tools_sync_and_guardrail() {
+        let (mut studio, dir) = open_test_studio();
+        let client_a = studio.connect("living-canvas-a");
+        let client_b = studio.connect("living-canvas-b");
+
+        // 1. resources/list advertises ganbate://context as application/json.
+        let (list_resp, _) = handle_rpc_bytes(
+            &mut studio,
+            br#"{"jsonrpc":"2.0","id":1,"method":"resources/list","params":{}}"#,
+        );
+        let resources = list_resp
+            .unwrap()
+            .get("result")
+            .and_then(|r| r.get("resources"))
+            .and_then(|r| r.array().ok())
+            .unwrap()
+            .to_vec();
+        assert!(
+            resources
+                .iter()
+                .any(|r| r.get("uri") == Some(&s(WORLD_GRAPH_URI))
+                    && r.get("mimeType") == Some(&s("application/json")))
+        );
+
+        // 2. resources/read on ganbate://context initializes world.semantic.json on first read (<400 tokens).
+        assert!(!dir.0.join(WORLD_GRAPH_REL_PATH).exists());
+        let (read_resp, _) = handle_rpc_bytes(
+            &mut studio,
+            br#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"ganbate://context"}}"#,
+        );
+        assert!(dir.0.join(WORLD_GRAPH_REL_PATH).is_file());
+        let text = read_resp
+            .unwrap()
+            .get("result")
+            .and_then(|r| r.get("contents"))
+            .and_then(|c| c.array().ok())
+            .and_then(|a| a.first())
+            .and_then(|item| item.get("text"))
+            .and_then(|t| t.string().ok())
+            .unwrap()
+            .to_string();
+        assert!(text.len().div_ceil(4) < 400);
+        let parsed_ctx = json::parse(text.as_bytes()).unwrap();
+        assert_eq!(parsed_ctx.get("schema"), Some(&s(WORLD_GRAPH_SCHEMA)));
+        assert_eq!(parsed_ctx.get("uri"), Some(&s(WORLD_GRAPH_URI)));
+
+        // 3. tools/list includes world_graph_fetch, world_graph_patch, and world_graph_prompt.
+        let tools = tools_list();
+        let tool_names: Vec<&str> = tools
+            .array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.string().ok()))
+            .collect();
+        for expected in [
+            "world_graph_fetch",
+            "world_graph_patch",
+            "world_graph_prompt",
+        ] {
+            assert!(tool_names.contains(&expected), "missing tool {expected}");
+        }
+
+        // 4. world_graph_prompt compiles bilingual Korean prompt, persists, and broadcasts to both clients in <5ms.
+        let t0 = std::time::Instant::now();
+        let (prompt_resp, outbox) = handle_rpc_bytes(
+            &mut studio,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"world_graph_prompt","arguments":{"prompt":"노을 조명으로 바꾸고 천장 열어줘"}}}"#.as_bytes(),
+        );
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert!(
+            elapsed_ms < 50.0,
+            "expected fast prompt sync, took {elapsed_ms:.2}ms"
+        );
+
+        let p_res = prompt_resp.unwrap();
+        let structured = p_res
+            .get("result")
+            .and_then(|r| r.get("structuredContent"))
+            .unwrap();
+        assert_eq!(structured.get("applied"), Some(&Value::Bool(true)));
+        assert_eq!(
+            structured.get("blocked_by_authority"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(outbox.len(), 2);
+        assert_eq!(outbox[0].0, client_a);
+        assert_eq!(outbox[1].0, client_b);
+        assert_eq!(outbox[0].1.get("type"), Some(&s("world-graph-updated")));
+
+        // 5. world_graph_patch clamps 120Hz (8.33ms) light/FOV guardrails and records notices.
+        let (patch_resp, patch_outbox) = handle_rpc_bytes(
+            &mut studio,
+            br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"world_graph_patch","arguments":{"patch":{"guardrails":{"max_dynamic_lights":25,"frame_budget_ms":16.6},"camera":{"fov_y_deg":150}}}}}"#,
+        );
+        assert_eq!(patch_outbox.len(), 2);
+        let patch_sc = patch_resp
+            .unwrap()
+            .get("result")
+            .and_then(|r| r.get("structuredContent"))
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            patch_sc
+                .get("graph")
+                .and_then(|g| g.get("guardrails"))
+                .and_then(|gr| gr.get("max_dynamic_lights")),
+            Some(&Value::Number(8.0))
+        );
+        assert_eq!(
+            patch_sc
+                .get("graph")
+                .and_then(|g| g.get("camera"))
+                .and_then(|c| c.get("fov_y_deg")),
+            Some(&Value::Number(110.0))
+        );
+        assert!(
+            patch_sc
+                .get("guardrail_notices")
+                .and_then(|n| n.array().ok())
+                .is_some_and(|arr| arr.len() >= 3)
+        );
+
+        // 6. Server-authority prompt is blocked without mutating disk or broadcasting.
+        let disk_before = std::fs::read_to_string(dir.0.join(WORLD_GRAPH_REL_PATH)).unwrap();
+        let (blocked_resp, blocked_outbox) = handle_rpc_bytes(
+            &mut studio,
+            br#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"world_graph_prompt","arguments":{"prompt":"override rng seed and rig outcome"}}}"#,
+        );
+        assert!(blocked_outbox.is_empty());
+        let disk_after = std::fs::read_to_string(dir.0.join(WORLD_GRAPH_REL_PATH)).unwrap();
+        assert_eq!(disk_before, disk_after);
+
+        let b_res = blocked_resp.unwrap();
+        assert_eq!(
+            b_res.get("result").and_then(|r| r.get("isError")),
+            Some(&Value::Bool(true))
+        );
+        let b_sc = b_res
+            .get("result")
+            .and_then(|r| r.get("structuredContent"))
+            .unwrap();
+        assert_eq!(b_sc.get("blocked_by_authority"), Some(&Value::Bool(true)));
+        assert_eq!(b_sc.get("applied"), Some(&Value::Bool(false)));
+
+        // 7. world_graph_fetch tool and Studio WebSocket edit-protocol messages stay in sync.
+        let (fetch_resp, _) = handle_rpc_bytes(
+            &mut studio,
+            br#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"world_graph_fetch","arguments":{}}}"#,
+        );
+        let fetch_sc = fetch_resp
+            .unwrap()
+            .get("result")
+            .and_then(|r| r.get("structuredContent"))
+            .cloned()
+            .unwrap();
+        assert_eq!(fetch_sc.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(
+            fetch_sc
+                .get("graph")
+                .and_then(|g| g.get("environment"))
+                .and_then(|e| e.get("preset")),
+            Some(&s("sunset"))
+        );
+
+        let ws_out = studio.handle(
+            client_a,
+            &json::parse(
+                br#"{"type":"world-graph-prompt","prompt":"pause into edit mode","req":"wg-1"}"#,
+            )
+            .unwrap(),
+        );
+        assert!(
+            ws_out.iter().any(
+                |(cid, m)| *cid == client_b && m.get("type") == Some(&s("world-graph-updated"))
+            )
+        );
+        assert!(
+            ws_out
+                .iter()
+                .any(|(cid, m)| *cid == client_a
+                    && m.get("type") == Some(&s("world-graph-prompted")))
+        );
     }
 }

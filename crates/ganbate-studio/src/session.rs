@@ -1451,6 +1451,50 @@ impl Studio {
                 }
                 Ok(vec![(from, obj(resp))])
             }
+            "world-graph-fetch" => {
+                let mut payload = match self.world_graph_fetch()? {
+                    Value::Object(m) => m,
+                    _ => BTreeMap::new(),
+                };
+                payload.insert("type".into(), s("world-graph-result"));
+                if let Some(r) = msg.get("req") {
+                    payload.insert("req".into(), r.clone());
+                }
+                Ok(vec![(from, Value::Object(payload))])
+            }
+            "world-graph-patch" => {
+                let patch = msg.get("patch").ok_or("world-graph-patch requires patch")?;
+                let mut outbox = Vec::new();
+                let res = self.world_graph_patch(patch, &mut outbox)?;
+                let mut reply = match res {
+                    Value::Object(m) => m,
+                    _ => BTreeMap::new(),
+                };
+                reply.insert("type".into(), s("world-graph-patched"));
+                if let Some(r) = msg.get("req") {
+                    reply.insert("req".into(), r.clone());
+                }
+                outbox.push((from, Value::Object(reply)));
+                Ok(outbox)
+            }
+            "world-graph-prompt" => {
+                let prompt = msg
+                    .get("prompt")
+                    .and_then(|v| v.string().ok())
+                    .ok_or("world-graph-prompt requires prompt")?;
+                let mut outbox = Vec::new();
+                let res = self.world_graph_prompt(prompt, &mut outbox)?;
+                let mut reply = match res {
+                    Value::Object(m) => m,
+                    _ => BTreeMap::new(),
+                };
+                reply.insert("type".into(), s("world-graph-prompted"));
+                if let Some(r) = msg.get("req") {
+                    reply.insert("req".into(), r.clone());
+                }
+                outbox.push((from, Value::Object(reply)));
+                Ok(outbox)
+            }
             "preview" | "select" => {
                 let (id, _) = self.doc_target(msg)?;
                 let watchers = if let Some(o) = self.open.get(&id) {
@@ -2248,7 +2292,7 @@ cam frame <subject|@selection|all> [azimuth=<deg>] [elevation=<deg>]";
             }
         }
 
-        let est_tokens = ((digest.len() + 3) / 4) as u64;
+        let est_tokens = digest.len().div_ceil(4) as u64;
         let counts_obj = Value::Object(counts.into_iter().map(|(k, v)| (k, n(v))).collect());
 
         Ok(obj(vec![
@@ -2488,8 +2532,80 @@ cam frame <subject|@selection|all> [azimuth=<deg>] [elevation=<deg>]";
                     ("rev", n(rev)),
                 ]))
             }
+            "world_graph_fetch" => self.world_graph_fetch(),
+            "world_graph_patch" => {
+                let patch = args.get("patch").unwrap_or(args);
+                self.world_graph_patch(patch, outbox)
+            }
+            "world_graph_prompt" => {
+                let prompt = args
+                    .get("prompt")
+                    .and_then(|v| v.string().ok())
+                    .ok_or("world_graph_prompt requires prompt")?;
+                self.world_graph_prompt(prompt, outbox)
+            }
             other => Err(format!("unknown MCP tool {other:?}")),
         }
+    }
+
+    /// Reads `<project_root>/world.semantic.json` (initializing clean `120Hz` defaults on first read).
+    pub fn world_graph_read_or_init(
+        &mut self,
+    ) -> Result<(crate::ai::world_graph::SemanticWorldGraph, Vec<String>), String> {
+        self.inside(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)?;
+        crate::ai::world_graph::load_or_init_world_graph(&self.project.root)
+    }
+
+    /// Returns the structured `world_graph_fetch` payload for `ganbate://context`.
+    pub fn world_graph_fetch(&mut self) -> Result<Value, String> {
+        let (graph, notices) = self.world_graph_read_or_init()?;
+        Ok(obj(vec![
+            ("ok", Value::Bool(true)),
+            ("uri", s(crate::ai::world_graph::WORLD_GRAPH_URI)),
+            ("path", s(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)),
+            ("estimated_tokens", n(graph.estimated_tokens() as u64)),
+            (
+                "guardrail_notices",
+                Value::Array(notices.into_iter().map(|m| s(&m)).collect()),
+            ),
+            ("graph", graph.to_json_value()),
+        ]))
+    }
+
+    /// Applies a JSON patch to `world.semantic.json` under `120Hz` and server-authority guardrails,
+    /// persisting and broadcasting updates to all connected Living Canvas clients.
+    pub fn world_graph_patch(
+        &mut self,
+        patch: &Value,
+        outbox: &mut Outbox,
+    ) -> Result<Value, String> {
+        let (current, _) = self.world_graph_read_or_init()?;
+        let outcome = crate::ai::world_graph::apply_world_graph_patch(&current, patch)?;
+        if !outcome.blocked_by_authority && outcome.applied {
+            self.inside(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)?;
+            let _ = crate::ai::world_graph::save_world_graph(&self.project.root, &outcome.graph)?;
+            outbox.extend(outcome.build_outbox(self.clients.keys().copied()));
+        }
+        Ok(outcome.to_json_value())
+    }
+
+    /// Compiles a bilingual (EN/KO) natural-language prompt against `world.semantic.json` under
+    /// `120Hz` and server-authority guardrails, persisting and broadcasting updates via `outbox`.
+    pub fn world_graph_prompt(
+        &mut self,
+        prompt: &str,
+        outbox: &mut Outbox,
+    ) -> Result<Value, String> {
+        let (current, _) = self.world_graph_read_or_init()?;
+        let recipients: Vec<ClientId> = self.clients.keys().copied().collect();
+        let (outcome, prompt_outbox) =
+            crate::ai::world_graph::compile_world_graph_prompt(&current, prompt, &recipients);
+        if !outcome.blocked_by_authority && outcome.applied {
+            self.inside(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)?;
+            let _ = crate::ai::world_graph::save_world_graph(&self.project.root, &outcome.graph)?;
+            outbox.extend(prompt_outbox);
+        }
+        Ok(outcome.to_json_value())
     }
 }
 

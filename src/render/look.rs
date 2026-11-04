@@ -495,56 +495,7 @@ impl Look {
     }
 }
 
-/// A named camera. `fov` is the vertical field of view in degrees.
-#[derive(Clone, Debug, PartialEq)]
-pub struct View {
-    pub name: String,
-    pub eye: V3,
-    pub target: V3,
-    pub fov: f32,
-    /// Which way is up in the image (pick another than +Y to look straight down).
-    pub up: V3,
-    /// Lens shift: where the view axis (the target) lands in the image, in normalized device
-    /// units with x right and y up; `[0.0, 0.2]` puts it a tenth of the image height above the
-    /// centre. The frustum is skewed, not rotated, so verticals stay vertical.
-    pub shift: [f32; 2],
-    /// Near clip distance in metres.
-    pub near: f32,
-    /// Depth of field: what lies past the focus softens (`None`: everything sharp).
-    pub focus: Option<Focus>,
-}
-
-/// A lens focused `distance` metres from the eye: nothing nearer blurs, and past it the scene
-/// softens, reaching its full blur `depth` metres further on, `blur` (the blur's radius as a share
-/// of the image height) across. A foreground subject in focus keeps the scenery behind it soft.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Focus {
-    pub distance: f32,
-    pub depth: f32,
-    pub blur: f32,
-}
-
-impl Focus {
-    /// Whether it blurs anything: a positive depth and blur at a finite distance.
-    pub fn blurs(&self) -> bool {
-        self.distance.is_finite() && self.depth > 0.0 && self.blur > 0.0 && self.blur.is_finite()
-    }
-}
-
-impl Default for View {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            eye: [0.0, 0.0, 5.0],
-            target: [0.0; 3],
-            fov: 50.0,
-            up: [0.0, 1.0, 0.0],
-            shift: [0.0; 2],
-            near: 0.08,
-            focus: None,
-        }
-    }
-}
+pub use ganbate_core::xr::{Focus, View};
 
 /// A parsed Look file: the look plus where/when the scene is, its default weather and views.
 #[derive(Clone, Debug, PartialEq, Default)]
