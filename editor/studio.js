@@ -1748,7 +1748,6 @@ const ENGINE_WORKBENCHES = [
     labelKey: 'wb_code_xray',
     modulePath: './code-xray.js',
     cssPath: './code-xray.css',
-    optionalCss: true,
     exportName: 'mountCodeXray',
   },
 ];
@@ -1886,7 +1885,7 @@ function ensureWorkbenchStylesheet(relCssPath, optional = false) {
   };
   if (optional && typeof fetch === 'function') {
     void fetch(href, { method: 'HEAD' }).then((res) => {
-      if (res.ok) appendLink();
+      if (res.ok || res.status === 405) appendLink();
     }).catch(() => { /* optional stylesheet not yet present */ });
     return;
   }
