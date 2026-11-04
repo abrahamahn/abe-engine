@@ -320,8 +320,7 @@ struct CachedModel {
 
 /// Models already imported, with their meshes appended to the world being built.
 struct Library<'l> {
-    load_model: &'l dyn Fn(&str) -> Result<(String, Vec<u8>), String>,
-    keep_images: bool,
+    import_model: &'l mut dyn FnMut(&str) -> Result<NodeWorld, String>,
     models: HashMap<String, CachedModel>,
 }
 
@@ -330,9 +329,7 @@ impl Library<'_> {
     /// optimized meshes, materials and textures into `w`) the first time.
     fn model(&mut self, w: &mut World, id: &str) -> Result<&CachedModel, String> {
         if !self.models.contains_key(id) {
-            let (label, bytes) = (self.load_model)(id)?;
-            let nw =
-                glb::import_nodes(&bytes, self.keep_images).map_err(|e| format!("{label}: {e}"))?;
+            let nw = (self.import_model)(id)?;
             let (mesh0, mat0, tex0) = (
                 w.meshes.len() as u32,
                 w.materials.len() as u32,
@@ -353,7 +350,6 @@ impl Library<'_> {
             w.meshes.reserve(nw.world.meshes.len());
             for mut mesh in nw.world.meshes {
                 mesh.material = mesh.material.map(|i| i + mat0);
-                ganbate_assets::optimize_mesh(&mut mesh);
                 w.meshes.push(mesh);
             }
             let paths = node_paths(&nw.nodes);
@@ -489,7 +485,8 @@ pub fn flatten_checked(
     }
 }
 
-/// Cooks already-resolved entities (the editor cooks open, unsaved documents this way).
+/// Cooks already-resolved entities (the editor cooks open, unsaved documents this way), backed by
+/// `<project>/.ganbate/cache/ddc/` and each model's `.meta.json` import settings.
 pub fn cook_resolved(
     project: &Project,
     registry: &Registry,
@@ -497,29 +494,74 @@ pub fn cook_resolved(
     resolved: &[Resolved],
     keep_images: bool,
 ) -> Result<Cooked, String> {
-    cook_resolved_with(registry, doc, resolved, keep_images, &|id| {
+    let mut import_fn = |id: &str| {
         let path = project
             .path_of(id)
             .ok_or_else(|| format!("missing model {id}"))?;
         let bytes = ganbate_assets::read_asset(&path)?;
-        Ok((path.display().to_string(), bytes))
-    })
+        let settings = project.model_import_settings(id);
+        let label = path.display().to_string();
+        let (nw, _hit) =
+            crate::ddc::load_or_cook_disk(&project.root, &label, &bytes, &settings, keep_images)?;
+        Ok(nw)
+    };
+    cook_resolved_internal(registry, doc, resolved, &mut import_fn)
 }
 
+/// Callback fetching `(label, glb_bytes)` for a model asset id.
+pub type LoadModelFn<'a> = &'a dyn Fn(&str) -> Result<(String, Vec<u8>), String>;
+
+/// Callback fetching `(label, glb_bytes, import_settings)` for a model asset id.
+pub type LoadModelWithSettingsFn<'a> =
+    &'a dyn Fn(&str) -> Result<(String, Vec<u8>, crate::ddc::ModelImportSettings), String>;
+
 /// Cooks already-resolved entities using `load_model` to fetch each referenced model's `(label, bytes)`.
-/// Used by both disk-backed hosts (`cook_resolved`) and the pure-web Wasm Studio host.
+/// Used by both disk-backed hosts and the pure-web Wasm Studio host.
 pub fn cook_resolved_with(
     registry: &Registry,
     doc: &Value,
     resolved: &[Resolved],
     keep_images: bool,
-    load_model: &dyn Fn(&str) -> Result<(String, Vec<u8>), String>,
+    load_model: LoadModelFn<'_>,
+) -> Result<Cooked, String> {
+    let default_settings = crate::ddc::ModelImportSettings::default();
+    let mut import_fn = |id: &str| {
+        let (label, bytes) = (load_model)(id)?;
+        let mut nw = glb::import_nodes(&bytes, keep_images).map_err(|e| format!("{label}: {e}"))?;
+        crate::ddc::prepare_node_world(&mut nw, &default_settings);
+        Ok(nw)
+    };
+    cook_resolved_internal(registry, doc, resolved, &mut import_fn)
+}
+
+/// Pure in-memory / WASM cooker backed by [`crate::ddc::MemoryDdc`] and per-model
+/// [`crate::ddc::ModelImportSettings`] so browser Studio sessions cook unchanged models in `< 1 ms`
+/// without `std::fs`.
+pub fn cook_resolved_with_ddc(
+    registry: &Registry,
+    doc: &Value,
+    resolved: &[Resolved],
+    keep_images: bool,
+    ddc: &mut crate::ddc::MemoryDdc,
+    load_model: LoadModelWithSettingsFn<'_>,
+) -> Result<Cooked, String> {
+    let mut import_fn = |id: &str| {
+        let (label, bytes, settings) = (load_model)(id)?;
+        ddc.load_or_cook(&label, &bytes, &settings, keep_images)
+    };
+    cook_resolved_internal(registry, doc, resolved, &mut import_fn)
+}
+
+fn cook_resolved_internal(
+    registry: &Registry,
+    doc: &Value,
+    resolved: &[Resolved],
+    import_model: &mut dyn FnMut(&str) -> Result<NodeWorld, String>,
 ) -> Result<Cooked, String> {
     let transforms = scene::world_transforms(resolved);
     let mut w = World::default();
     let mut lib = Library {
-        load_model,
-        keep_images,
+        import_model,
         models: HashMap::new(),
     };
     let mut warnings = vec![];
@@ -686,7 +728,7 @@ pub fn content_name(stem: &str, ext: &str, bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::project::tests::TempDir;
     use crate::project::{Kind, new_sidecar, write_json};

@@ -85,6 +85,9 @@ pub struct Manifest {
     pub content: Vec<String>,
     pub schemas: Vec<String>,
     pub editor: Vec<String>,
+    /// Optional external or staging art directories (`ganbate-art`, `tripo3d-queue`, etc.)
+    /// inspected read-only by Studio's intake bridge and never auto-indexed into `content`.
+    pub intake: Vec<String>,
     pub startup: Option<String>,
     pub platforms: BTreeMap<String, Value>,
 }
@@ -113,6 +116,14 @@ fn relative_folder(f: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn intake_folder(f: &str) -> Result<(), String> {
+    let trimmed = f.trim();
+    if trimmed.is_empty() || trimmed.len() > 1024 || f.contains('\0') {
+        return Err(format!("{f:?} is not a valid intake directory path"));
+    }
+    Ok(())
+}
+
 impl Manifest {
     pub fn parse(v: &Value) -> Result<Self, String> {
         let Value::Object(map) = v else {
@@ -128,6 +139,7 @@ impl Manifest {
                     | "content"
                     | "schemas"
                     | "editor"
+                    | "intake"
                     | "startup"
                     | "platforms"
             ) {
@@ -154,8 +166,15 @@ impl Manifest {
         let content = strings(v.get("content"), "content")?;
         let schemas = strings(v.get("schemas"), "schemas")?;
         let editor = strings(v.get("editor"), "editor")?;
+        let intake = strings(v.get("intake"), "intake")?;
         for f in content.iter().chain(&schemas).chain(&editor) {
             relative_folder(f)?;
+        }
+        if intake.len() > 32 {
+            return Err("intake: at most 32 directories may be configured".into());
+        }
+        for f in &intake {
+            intake_folder(f)?;
         }
         if content.is_empty() {
             return Err("the manifest lists no content folders".into());
@@ -176,6 +195,7 @@ impl Manifest {
             content,
             schemas,
             editor,
+            intake,
             startup,
             platforms,
         })
@@ -192,6 +212,9 @@ impl Manifest {
             ("schemas".into(), list(&self.schemas)),
             ("editor".into(), list(&self.editor)),
         ]);
+        if !self.intake.is_empty() {
+            m.insert("intake".into(), list(&self.intake));
+        }
         if let Some(s) = &self.startup {
             m.insert("startup".into(), Value::String(s.clone()));
         }
@@ -258,6 +281,7 @@ impl Project {
             content: vec!["content".into()],
             schemas: vec!["schemas".into()],
             editor: vec!["editor".into()],
+            intake: vec![],
             startup: None,
             platforms: BTreeMap::new(),
         };
@@ -674,6 +698,54 @@ impl Project {
             }
         }
         Ok(out)
+    }
+
+    /// Reads the `.meta.json` sidecar of a sidecar-identified asset (`model`, `texture`, `sound`,
+    /// `look`), checking that neither the source nor its sidecar escapes the project folder.
+    pub fn read_sidecar(&self, id: &str) -> Result<Value, String> {
+        let entry = self.entry(id).ok_or_else(|| format!("no asset {id}"))?;
+        if entry.kind.self_identified() {
+            return Err(format!("{} has no .meta.json sidecar", entry.path));
+        }
+        let real_root = self
+            .root
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", self.root.display()))?;
+        let file = self.root.join(&entry.path);
+        within_project(&real_root, &file)?;
+        let meta = sidecar_path(&file);
+        within_project(&real_root, &meta)?;
+        let doc = read_json(&meta)?;
+        if sidecar_id(&doc, entry.kind)? != id {
+            return Err(format!("{} no longer has asset id {id}", entry.path));
+        }
+        Ok(doc)
+    }
+
+    /// Updates the editable authoring metadata (`import`, `lods`, `collider`, `sockets`) of a
+    /// sidecar-identified asset while strictly preserving its `id` and `kind`.
+    pub fn write_sidecar_meta(
+        &self,
+        id: &str,
+        meta: &crate::ddc::AssetMeta,
+    ) -> Result<Value, String> {
+        let existing = self.read_sidecar(id)?;
+        let entry = self.entry(id).expect("checked in read_sidecar");
+        let updated = meta.apply_to_sidecar(&existing)?;
+        if sidecar_id(&updated, entry.kind)? != id {
+            return Err("sidecar identity mismatch".into());
+        }
+        let meta_file = sidecar_path(&self.root.join(&entry.path));
+        write_json(&meta_file, &updated)?;
+        Ok(updated)
+    }
+
+    /// Reads the non-destructive [`crate::ddc::ModelImportSettings`] for model `id` (or defaults
+    /// when no custom settings are present).
+    pub fn model_import_settings(&self, id: &str) -> crate::ddc::ModelImportSettings {
+        self.read_sidecar(id)
+            .and_then(|v| crate::ddc::ModelImportSettings::from_sidecar(&v))
+            .unwrap_or_default()
     }
 }
 

@@ -240,6 +240,23 @@ export function kindCounts(
   return counts;
 }
 
+/** Filters external art intake items (`intake-list`) by kind and tokenized search query. */
+export function filterIntakeItems(items, { kind = 'all', query = '' } = {}) {
+  if (!Array.isArray(items)) return [];
+  const tokens = String(query || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  return items.filter((it) => {
+    if (!it) return false;
+    if (kind && kind !== 'all' && it.kind !== kind) return false;
+    if (tokens.length) {
+      const hay = `${it.rootLabel || ''} ${it.intakePath || ''} ${it.name || ''} ${it.kind || ''}`.toLowerCase();
+      for (const tok of tokens) {
+        if (!hay.includes(tok)) return false;
+      }
+    }
+    return true;
+  });
+}
+
 export function canPlaceAsset(asset, doc) {
   if (!asset || (asset.kind !== 'model' && asset.kind !== 'prefab')) {
     return { ok: false, reason: null };
@@ -387,6 +404,8 @@ export function createAssetLibrary({
   onImportFiles,
   onRequestUsage,
   onJumpToReference,
+  onOpenModelStudio,
+  onHostRequest,
   onStartDrag,
   onEndDrag,
 }) {
@@ -394,7 +413,7 @@ export function createAssetLibrary({
   const savedSort = readPref('ganbate.studio.assetSort', 'kind');
   const ui = {
     folder: '',
-    collection: 'all', // 'all' | 'favorites' | 'recent' | 'unused'
+    collection: 'all', // 'all' | 'favorites' | 'recent' | 'unused' | 'intake'
     kind: 'all',
     query: '',
     sort: ['kind', 'name', 'folder', 'size'].includes(savedSort) ? savedSort : 'kind',
@@ -413,8 +432,123 @@ export function createAssetLibrary({
     usageCounts: {},
     usageReady: false,
     usesByAsset: new Map(),
+    intakeRoots: [],
+    intakeItems: [],
+    intakeLoaded: false,
+    intakeNormalize: true,
     turntable: { yaw: 0.68, pitch: 0.42 },
   };
+
+  function trOr(key, fallback) {
+    const out = t ? t(key) : '';
+    return out && out !== key ? out : fallback;
+  }
+
+  function resolveHostRequest() {
+    if (typeof onHostRequest === 'function') return onHostRequest;
+    const ctx = getContext?.();
+    if (typeof ctx?.studioApi?.hostRequest === 'function') {
+      return (msg) => ctx.studioApi.hostRequest(msg);
+    }
+    return null;
+  }
+
+  function setIntakeCatalog(roots, items) {
+    ui.intakeRoots = Array.isArray(roots) ? roots : [];
+    ui.intakeItems = Array.isArray(items) ? items : [];
+    ui.intakeLoaded = true;
+    drawFoldersFromContext();
+    if (ui.collection === 'intake') draw();
+  }
+
+  async function refreshIntake() {
+    const reqFn = resolveHostRequest();
+    if (!reqFn) return;
+    try {
+      const reply = await reqFn({ type: 'asset-usage', op: 'intake-list' });
+      setIntakeCatalog(reply?.roots, reply?.items);
+    } catch {
+      /* ignore when offline/static */
+    }
+  }
+
+  async function ingestIntakeEntry(item) {
+    const reqFn = resolveHostRequest();
+    if (!reqFn || !item) return;
+    const { project } = getContext();
+    const rootDir = ui.folder || `${project?.content?.[0] || 'content'}/${item.kind === 'model' ? 'models/intake' : item.kind === 'texture' ? 'textures/intake' : 'audio/intake'}`;
+    const destPath = `${rootDir.replace(/\/+$/, '')}/${item.name}`;
+    try {
+      const meta = item.kind === 'model' && ui.intakeNormalize
+        ? { import: { pivot: 'bottom_center', scale: 1.0 } }
+        : undefined;
+      const res = await reqFn({
+        type: 'asset-import',
+        intakeIndex: item.intakeIndex,
+        intakePath: item.intakePath,
+        path: destPath,
+        ...(meta ? { meta } : {}),
+      });
+      if (res?.id) revealAsset(res.id);
+    } catch {
+      /* host notifies errors */
+    }
+  }
+
+  function openInModelStudio(asset = null) {
+    if (asset?.id) recordRecent(asset.id);
+    if (typeof onOpenModelStudio === 'function') {
+      onOpenModelStudio(asset);
+      return;
+    }
+    const ctx = getContext?.() || {};
+    if (typeof ctx.studioApi?.activateWorkbench === 'function') {
+      ctx.studioApi.activateWorkbench('model-studio', asset?.id ? { doc: asset.id } : undefined);
+      return;
+    }
+    if (typeof window !== 'undefined') {
+      const ev = new CustomEvent('ganbate:open-model-studio', {
+        cancelable: true,
+        detail: { assetId: asset?.id || null, asset },
+      });
+      if (!window.dispatchEvent(ev)) return;
+      import('./model-studio.js').then(({ openModelStudioModal }) => {
+        const fallbackApi = ctx.studioApi || {
+          getProject: () => getContext()?.project || null,
+          getAssets: () => getContext()?.assets || [],
+          listAssets: ({ kind } = {}) => {
+            const all = getContext()?.assets || [];
+            return kind ? all.filter((a) => a.kind === kind) : all;
+          },
+          assetUrl: (rel) => projectAssetUrl(typeof rel === 'string' ? rel : rel?.path || ''),
+          getSelection: () => ({ assetId: asset?.id || ui.selectedId }),
+          hostRequest: resolveHostRequest() || undefined,
+          t,
+        };
+        openModelStudioModal(fallbackApi, asset?.id || null);
+      }).catch(() => {});
+    }
+  }
+
+  function makeModelStudioChip(asset) {
+    const activate = (ev) => {
+      ev.stopPropagation();
+      openInModelStudio(asset);
+    };
+    return el('span', {
+      role: 'button',
+      tabindex: '0',
+      class: 'asset-studio-chip',
+      title: trOr('openModelStudioTip', 'Inspect LookDev, pivot, scale, LODs, colliders & sockets'),
+      onclick: activate,
+      onkeydown: (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault();
+          activate(ev);
+        }
+      },
+    }, trOr('modelStudioShort', '3D Studio'));
+  }
 
   function applyScaleCss() {
     if (typeof document === 'undefined') return;
@@ -805,6 +939,7 @@ export function createAssetLibrary({
       }, t('editLook')));
     } else if (asset.kind === 'model') {
       actions.append(
+        makeModelStudioChip(asset),
         makePlaceControl(asset, doc),
         el('button', {
           type: 'button',
@@ -868,6 +1003,7 @@ export function createAssetLibrary({
       item('+ ' + t('placeInScene'), () => { recordRecent(asset.id); onPlaceAsset(asset); }, { disabled: !check.ok });
     }
     if (asset.kind === 'model') {
+      item(trOr('openModelStudio', 'Open in 3D Studio'), () => openInModelStudio(asset));
       item(t('importAsScene'), () => { recordRecent(asset.id); onImportModel(asset); });
     }
 
@@ -969,6 +1105,27 @@ export function createAssetLibrary({
     addCollection('favorites', '★', t('favorites'), favCount);
     addCollection('recent', '◷', t('recentAssets'), recentCount);
     addCollection('unused', '◌', t('unusedAssets'), unusedCount);
+
+    const { project } = getContext();
+    const hasIntake = (Array.isArray(project?.intake) && project.intake.length > 0) ||
+      ui.intakeItems.length > 0 ||
+      !!resolveHostRequest();
+    if (hasIntake) {
+      const intakeActive = ui.collection === 'intake';
+      nav.append(el('div', {
+        class: `folder-row${intakeActive ? ' active' : ''}`,
+        'data-collection': 'intake',
+        onclick: () => {
+          ui.collection = 'intake';
+          if (!ui.intakeLoaded) refreshIntake();
+          draw();
+        },
+      },
+        el('span', { class: 'folder-twisty' }, '⬇'),
+        el('span', { class: 'folder-name' }, trOr('artIntake', 'Art Intake')),
+        el('span', { class: 'folder-count' }, String(ui.intakeItems.length)),
+      ));
+    }
 
     if (drafts.length) {
       nav.append(el('div', { class: 'folder-section' }, t('missingDrafts')));
@@ -1073,7 +1230,9 @@ export function createAssetLibrary({
         ? '★ ' + t('favorites')
         : ui.collection === 'recent'
           ? '◷ ' + t('recentAssets')
-          : '◌ ' + t('unusedAssets');
+          : ui.collection === 'intake'
+            ? '⬇ ' + trOr('artIntake', 'Art Intake')
+            : '◌ ' + t('unusedAssets');
       crumbs.append(
         el('span', { class: 'crumb-sep' }, '▸'),
         el('span', { class: 'crumb current' }, collLabel),
@@ -1128,6 +1287,14 @@ export function createAssetLibrary({
         },
       }, copied ? t('copiedId') : `id ${selected.id.slice(0, 8)}…`));
       const placeCheck = canPlaceAsset(selected, doc);
+      if (selected.kind === 'model') {
+        detail.append(el('button', {
+          type: 'button',
+          id: 'open-selected-model-studio',
+          class: 'mini',
+          onclick: () => openInModelStudio(selected),
+        }, trOr('modelStudioShort', '3D Studio')));
+      }
       if (selected.kind === 'model' || selected.kind === 'prefab') {
         detail.append(el('button', {
           type: 'button',
@@ -1191,6 +1358,12 @@ export function createAssetLibrary({
         const dims = meta.size.map((v) => M.tidy(v, 2)).join('×');
         stats.append(el('span', { class: 'stat-chip' }, t('boundsMeters', dims)));
       }
+      if (meta.bones > 0) {
+        stats.append(el('span', { class: 'stat-chip' }, `${meta.bones} bones`));
+      }
+      if (meta.estimatedVramBytes > 0) {
+        stats.append(el('span', { class: 'stat-chip' }, `~${formatBytes(meta.estimatedVramBytes)} VRAM`));
+      }
     } else if (selected.kind === 'texture' && meta?.width) {
       stats.append(el('span', { class: 'stat-chip' }, `${meta.width}×${meta.height} px`));
     } else if (selected.kind === 'sound' && meta?.durationSec !== undefined) {
@@ -1211,6 +1384,14 @@ export function createAssetLibrary({
         class: 'mini',
         onclick: () => { recordRecent(selected.id); onInspectLook(selected.id); },
       }, t('editLook')));
+    }
+    if (selected.kind === 'model') {
+      actions.append(el('button', {
+        type: 'button',
+        id: 'asset-detail-model-studio',
+        class: 'mini',
+        onclick: () => openInModelStudio(selected),
+      }, trOr('modelStudioShort', '3D Studio')));
     }
     if (selected.kind === 'model' || selected.kind === 'prefab') {
       const check = canPlaceAsset(selected, doc);
@@ -1331,6 +1512,76 @@ export function createAssetLibrary({
     const prevScroll = list.scrollTop;
     list.className = ui.view === 'grid' ? 'view-grid' : 'view-list';
     list.replaceChildren();
+
+    if (ui.collection === 'intake') {
+      const intakeFiltered = filterIntakeItems(ui.intakeItems, { kind: ui.kind, query: ui.query });
+      if (countBadge) countBadge.textContent = `${intakeFiltered.length} / ${ui.intakeItems.length}`;
+      const banner = el('div', { class: 'intake-banner' },
+        el('div', {},
+          el('strong', {}, trOr('artIntake', 'Art Intake')),
+          ' ',
+          ...ui.intakeRoots.map((r) => el('span', {
+            class: `intake-root-pill${r.available ? ' online' : ''}`,
+            title: r.path,
+          }, `${r.label} (${r.count || 0})`)),
+        ),
+        el('div', { style: 'display:flex;align-items:center;gap:8px' },
+          el('label', { style: 'display:inline-flex;align-items:center;gap:4px;font-size:11.5px' },
+            el('input', {
+              type: 'checkbox',
+              checked: ui.intakeNormalize ? 'checked' : null,
+              onchange: (ev) => { ui.intakeNormalize = !!ev.target.checked; },
+            }),
+            'Bottom-center pivot on ingest',
+          ),
+          el('button', { type: 'button', class: 'mini', onclick: refreshIntake }, '↻ Scan'),
+          el('button', { type: 'button', class: 'mini', onclick: () => openInModelStudio(null) }, '3D Studio'),
+        ),
+      );
+      list.append(banner);
+      if (!intakeFiltered.length) {
+        list.append(el('div', { class: 'assets-empty' },
+          el('p', { class: 'hint' }, ui.intakeRoots.length
+            ? 'No matching external assets in configured intake folders.'
+            : 'Add "intake": ["../ganbate-art"] to ganbate.project.json to browse external art queues.'),
+        ));
+        return;
+      }
+      for (const it of intakeFiltered) {
+        const card = el('div', {
+          class: `asset kind-${it.kind}`,
+          title: `${it.rootLabel}/${it.intakePath}`,
+          'data-kind': it.kind,
+        },
+          ui.view === 'grid' ? el('div', { class: `asset-thumb kind-${it.kind}` },
+            kindGraphic(it.kind),
+            el('span', { class: `kind-tag kind-${it.kind}` }, t('kind_' + it.kind)),
+          ) : null,
+          el('div', { class: 'asset-info' },
+            el('div', { class: 'asset-name' }, it.name),
+            el('div', { class: 'asset-sub' }, `${it.rootLabel}/${it.intakePath} · ${formatBytes(it.bytes)}`),
+          ),
+          el('span', { class: 'asset-actions' },
+            it.kind === 'model'
+              ? el('span', {
+                  role: 'button',
+                  tabindex: '0',
+                  class: 'asset-studio-chip',
+                  onclick: () => openInModelStudio(null),
+                }, '3D Studio')
+              : null,
+            el('button', {
+              type: 'button',
+              class: 'mini',
+              onclick: () => ingestIntakeEntry(it),
+            }, '+ Ingest'),
+          ),
+        );
+        list.append(card);
+      }
+      list.scrollTop = prevScroll;
+      return;
+    }
 
     if (drafts.length && ui.collection === 'all' && !ui.folder && ui.kind === 'all' && !ui.query) {
       for (const draft of drafts) {
@@ -1617,6 +1868,9 @@ export function createAssetLibrary({
     recordRecent,
     setUsageCounts,
     setAssetUses,
+    setIntakeCatalog,
+    refreshIntake,
+    openInModelStudio,
     notifyAssetMoved,
     stopAudio,
     state: ui,

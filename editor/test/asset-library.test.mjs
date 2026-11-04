@@ -9,6 +9,7 @@ import {
   buildRenamedPath,
   canPlaceAsset,
   filterAssets,
+  filterIntakeItems,
   formatBytes,
   inFolder,
   kindCounts,
@@ -264,6 +265,25 @@ test('parseGlbPreview extracts world-transformed bounds, counts, and material-ti
   assert.deepEqual(parsed.size, [2, 3, 0]);
   assert.equal(parsed.sampleTris.length, 1);
   assert.ok(Math.abs(parsed.sampleTris[0][9] - 0.9) < 1e-5);
+  assert.equal(parsed.bones, 0);
+  assert.ok(parsed.estimatedVramBytes >= 3 * 48 + 12);
+  assert.equal(parsed.fullMesh.positions.length, 9);
+  assert.equal(parsed.fullMesh.normals.length, 9);
+  assert.equal(parsed.fullMesh.indices.length, 3);
+  assert.equal(parsed.nodeHierarchy.length, 1);
+});
+
+test('filterIntakeItems filters external art queue items by kind and query tokens', () => {
+  const intake = [
+    { intakeIndex: 0, rootLabel: 'ganbate-art', intakePath: 'props/column.glb', name: 'column.glb', kind: 'model', bytes: 4096 },
+    { intakeIndex: 0, rootLabel: 'ganbate-art', intakePath: 'surfaces/granite.png', name: 'granite.png', kind: 'texture', bytes: 8192 },
+    { intakeIndex: 1, rootLabel: 'tripo3d-queue', intakePath: 'statue_raw.glb', name: 'statue_raw.glb', kind: 'model', bytes: 16384 },
+  ];
+  assert.equal(filterIntakeItems(intake, { kind: 'model' }).length, 2);
+  assert.deepEqual(
+    filterIntakeItems(intake, { kind: 'model', query: 'tripo statue' }).map((i) => i.name),
+    ['statue_raw.glb'],
+  );
 });
 
 test('extractWavPeaks parses PCM RIFF WAVE duration and normalized waveform peaks', () => {

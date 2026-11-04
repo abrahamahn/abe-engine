@@ -3,6 +3,7 @@
 // can exercise them directly.
 
 const MAX_PREVIEW_TRIS = 1800;
+const MAX_FULL_MESH_TRIS = 250000;
 
 function mulMat4(a, b) {
   const out = new Float32Array(16);
@@ -45,8 +46,92 @@ function transformVec3(m, x, y, z) {
   ];
 }
 
-/** Parses a binary glTF 2.0 (`.glb`) buffer to extract geometry counts, world bounds, and a
- * sampled triangle set for live 3D canvas thumbnails. Returns `null` if invalid. */
+function normalMat3(m) {
+  const a00 = m[0], a01 = m[4], a02 = m[8];
+  const a10 = m[1], a11 = m[5], a12 = m[9];
+  const a20 = m[2], a21 = m[6], a22 = m[10];
+  const b01 = a22 * a11 - a12 * a21;
+  const b11 = -a22 * a10 + a12 * a20;
+  const b21 = a21 * a10 - a11 * a20;
+  const det = a00 * b01 + a01 * b11 + a02 * b21;
+  if (Math.abs(det) < 1e-12) return [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  const inv = 1 / det;
+  // Inverse-transpose in column-major 3x3
+  return [
+    b01 * inv,
+    b11 * inv,
+    b21 * inv,
+    (-a22 * a01 + a02 * a21) * inv,
+    (a22 * a00 - a02 * a20) * inv,
+    (-a21 * a00 + a01 * a20) * inv,
+    (a12 * a01 - a02 * a11) * inv,
+    (-a12 * a00 + a02 * a10) * inv,
+    (a11 * a00 - a01 * a10) * inv,
+  ];
+}
+
+function transformDirMat3(m3, x, y, z) {
+  const nx = m3[0] * x + m3[3] * y + m3[6] * z;
+  const ny = m3[1] * x + m3[4] * y + m3[7] * z;
+  const nz = m3[2] * x + m3[5] * y + m3[8] * z;
+  const len = Math.hypot(nx, ny, nz);
+  return len > 1e-9 ? [nx / len, ny / len, nz / len] : [0, 1, 0];
+}
+
+function transformLinearDir(m4, x, y, z) {
+  const tx = m4[0] * x + m4[4] * y + m4[8] * z;
+  const ty = m4[1] * x + m4[5] * y + m4[9] * z;
+  const tz = m4[2] * x + m4[6] * y + m4[10] * z;
+  const len = Math.hypot(tx, ty, tz);
+  return len > 1e-9 ? [tx / len, ty / len, tz / len] : [1, 0, 0];
+}
+
+function parseEmbeddedImageDims(slice) {
+  if (!slice || slice.byteLength < 24) return null;
+  const dv = new DataView(slice.buffer, slice.byteOffset, slice.byteLength);
+  // PNG: 89 50 4E 47 0D 0A 1A 0A + IHDR
+  if (dv.getUint32(0, false) === 0x89504e47 && dv.getUint32(12, false) === 0x49484452) {
+    const w = dv.getUint32(16, false);
+    const h = dv.getUint32(20, false);
+    if (w > 0 && h > 0) return { width: w, height: h };
+  }
+  // JPEG: FF D8 ... SOF0/SOF1/SOF2
+  if (slice[0] === 0xff && slice[1] === 0xd8) {
+    let off = 2;
+    while (off + 9 < slice.byteLength) {
+      if (slice[off] !== 0xff) { off++; continue; }
+      const marker = slice[off + 1];
+      if (marker === 0xff) { off++; continue; }
+      if (marker === 0xd8 || marker === 0xd9) { off += 2; continue; }
+      const segLen = dv.getUint16(off + 2, false);
+      if (segLen < 2) break;
+      if (marker === 0xc0 || marker === 0xc1 || marker === 0xc2) {
+        const h = dv.getUint16(off + 5, false);
+        const w = dv.getUint16(off + 7, false);
+        if (w > 0 && h > 0) return { width: w, height: h };
+      }
+      off += 2 + segLen;
+    }
+  }
+  // WebP: RIFF....WEBP
+  if (dv.getUint32(0, false) === 0x52494646 && dv.getUint32(8, false) === 0x57454250 && slice.byteLength >= 30) {
+    const chunk = dv.getUint32(12, false);
+    if (chunk === 0x56503858) { // VP8X
+      const w = 1 + (slice[24] | (slice[25] << 8) | (slice[26] << 16));
+      const h = 1 + (slice[27] | (slice[28] << 8) | (slice[29] << 16));
+      return { width: w, height: h };
+    }
+    if (chunk === 0x5650384c && slice.byteLength >= 25) { // VP8L
+      const bits = dv.getUint32(21, true);
+      return { width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 };
+    }
+  }
+  return null;
+}
+
+/** Parses a binary glTF 2.0 (`.glb`) buffer to extract geometry counts, world bounds, a sampled
+ * triangle set for live 3D canvas thumbnails, and full mesh attributes / budget metrics for
+ * Model Studio LookDev. Returns `null` if invalid. */
 export function parseGlbPreview(input) {
   const bytes = input instanceof Uint8Array
     ? input
@@ -86,6 +171,17 @@ export function parseGlbPreview(input) {
   const accessors = Array.isArray(doc.accessors) ? doc.accessors : [];
   const views = Array.isArray(doc.bufferViews) ? doc.bufferViews : [];
   const materials = Array.isArray(doc.materials) ? doc.materials : [];
+  const skins = Array.isArray(doc.skins) ? doc.skins : [];
+  const textures = Array.isArray(doc.textures) ? doc.textures : [];
+  const images = Array.isArray(doc.images) ? doc.images : [];
+
+  const jointSet = new Set();
+  for (const sk of skins) {
+    if (Array.isArray(sk?.joints)) {
+      for (const j of sk.joints) if (typeof j === 'number') jointSet.add(j);
+    }
+  }
+  const bones = jointSet.size;
 
   const matColors = materials.map((mat) => {
     const f = mat?.pbrMetallicRoughness?.baseColorFactor;
@@ -105,13 +201,26 @@ export function parseGlbPreview(input) {
     const sc = doc.scenes[doc.scene ?? 0] || doc.scenes[0];
     if (Array.isArray(sc?.nodes)) rootIndices = sc.nodes;
   }
-  if (!rootIndices.length && nodes.length) {
-    const childSet = new Set();
-    for (const n of nodes) {
-      if (Array.isArray(n?.children)) for (const c of n.children) childSet.add(c);
+  const parentByNode = new Array(nodes.length).fill(null);
+  for (let ni = 0; ni < nodes.length; ni++) {
+    const kids = nodes[ni]?.children;
+    if (Array.isArray(kids)) {
+      for (const c of kids) if (typeof c === 'number' && c >= 0 && c < nodes.length) parentByNode[c] = ni;
     }
-    rootIndices = nodes.map((_, i) => i).filter((i) => !childSet.has(i));
   }
+  if (!rootIndices.length && nodes.length) {
+    rootIndices = nodes.map((_, i) => i).filter((i) => parentByNode[i] === null);
+  }
+
+  const nodeHierarchy = nodes.map((n, index) => ({
+    index,
+    name: typeof n?.name === 'string' && n.name ? n.name : `Node_${index}`,
+    parent: parentByNode[index],
+    mesh: typeof n?.mesh === 'number' ? n.mesh : null,
+    translation: Array.isArray(n?.translation) ? n.translation.slice(0, 3) : [0, 0, 0],
+    rotation: Array.isArray(n?.rotation) ? n.rotation.slice(0, 4) : [0, 0, 0, 1],
+    scale: Array.isArray(n?.scale) ? n.scale.slice(0, 3) : [1, 1, 1],
+  }));
 
   const instances = [];
   const visited = new Set();
@@ -124,7 +233,7 @@ export function parseGlbPreview(input) {
       : trsMat4(node.translation, node.rotation, node.scale);
     const world = parentMat ? mulMat4(parentMat, local) : local;
     if (typeof node.mesh === 'number' && meshes[node.mesh]) {
-      instances.push({ meshIndex: node.mesh, world });
+      instances.push({ meshIndex: node.mesh, world, nMat: normalMat3(world) });
     }
     if (Array.isArray(node.children)) {
       for (const child of node.children) walkNode(child, world);
@@ -133,26 +242,48 @@ export function parseGlbPreview(input) {
   for (const r of rootIndices) walkNode(r, null);
   if (!instances.length && meshes.length) {
     const idMat = trsMat4();
-    for (let i = 0; i < meshes.length; i++) instances.push({ meshIndex: i, world: idMat });
+    const idN = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    for (let i = 0; i < meshes.length; i++) instances.push({ meshIndex: i, world: idMat, nMat: idN });
   }
 
-  const readPositions = (accIdx) => {
+  const readFloatAccessor = (accIdx, arity) => {
+    if (typeof accIdx !== 'number') return null;
     const acc = accessors[accIdx];
-    if (!acc || acc.type !== 'VEC3' || acc.componentType !== 5126 || !bin) return null;
+    const expectedType = arity === 2 ? 'VEC2' : arity === 3 ? 'VEC3' : 'VEC4';
+    if (!acc || acc.type !== expectedType || !bin) return null;
     const bv = views[acc.bufferView];
     if (!bv) return null;
     const count = acc.count >>> 0;
-    const stride = bv.byteStride || 12;
+    const ct = acc.componentType;
+    const compBytes = ct === 5126 ? 4 : (ct === 5123 || ct === 5122) ? 2 : (ct === 5121 || ct === 5120) ? 1 : 0;
+    if (!compBytes) return null;
+    const elemBytes = compBytes * arity;
+    const stride = bv.byteStride || elemBytes;
     const start = (bv.byteOffset || 0) + (acc.byteOffset || 0);
-    if (start + (count > 0 ? (count - 1) * stride + 12 : 0) > bin.byteLength) return null;
+    if (start + (count > 0 ? (count - 1) * stride + elemBytes : 0) > bin.byteLength) return null;
     const viewDv = new DataView(bin.buffer, bin.byteOffset + start, bin.byteLength - start);
+    const readComp = (byteOff) => {
+      if (ct === 5126) return viewDv.getFloat32(byteOff, true);
+      if (ct === 5121) return viewDv.getUint8(byteOff) / 255;
+      if (ct === 5123) return viewDv.getUint16(byteOff, true) / 65535;
+      if (ct === 5120) return Math.max(-1, viewDv.getInt8(byteOff) / 127);
+      return Math.max(-1, viewDv.getInt16(byteOff, true) / 32767);
+    };
     return {
       count,
       at(i) {
         const o = i * stride;
-        return [viewDv.getFloat32(o, true), viewDv.getFloat32(o + 4, true), viewDv.getFloat32(o + 8, true)];
+        if (arity === 2) return [readComp(o), readComp(o + compBytes)];
+        if (arity === 3) return [readComp(o), readComp(o + compBytes), readComp(o + compBytes * 2)];
+        return [readComp(o), readComp(o + compBytes), readComp(o + compBytes * 2), readComp(o + compBytes * 3)];
       },
     };
+  };
+
+  const readPositions = (accIdx) => {
+    const acc = accessors[accIdx];
+    if (!acc || acc.componentType !== 5126) return null;
+    return readFloatAccessor(accIdx, 3);
   };
 
   const readIndices = (accIdx) => {
@@ -180,6 +311,9 @@ export function parseGlbPreview(input) {
 
   let totalVerts = 0;
   let totalTris = 0;
+  let hasNormals = false;
+  let hasTangents = false;
+  let hasUvs = false;
   const rawPrims = [];
   for (const inst of instances) {
     const mesh = meshes[inst.meshIndex];
@@ -192,12 +326,30 @@ export function parseGlbPreview(input) {
       const idx = typeof prim.indices === 'number' ? readIndices(prim.indices) : null;
       const triCount = idx ? Math.floor(idx.count / 3) : Math.floor(pos.count / 3);
       if (triCount <= 0) continue;
+      const norm = readFloatAccessor(prim.attributes?.NORMAL, 3);
+      const tan = readFloatAccessor(prim.attributes?.TANGENT, 4);
+      const uv = readFloatAccessor(prim.attributes?.TEXCOORD_0, 2);
+      const vcol = readFloatAccessor(prim.attributes?.COLOR_0, 4) || readFloatAccessor(prim.attributes?.COLOR_0, 3);
+      if (norm && norm.count === pos.count) hasNormals = true;
+      if (tan && tan.count === pos.count) hasTangents = true;
+      if (uv && uv.count === pos.count) hasUvs = true;
       totalVerts += pos.count;
       totalTris += triCount;
       const color = typeof prim.material === 'number' && matColors[prim.material]
         ? matColors[prim.material]
         : [0.64, 0.73, 0.9];
-      rawPrims.push({ pos, idx, triCount, world: inst.world, color });
+      rawPrims.push({
+        pos,
+        norm: norm && norm.count === pos.count ? norm : null,
+        tan: tan && tan.count === pos.count ? tan : null,
+        uv: uv && uv.count === pos.count ? uv : null,
+        vcol: vcol && vcol.count === pos.count ? vcol : null,
+        idx,
+        triCount,
+        world: inst.world,
+        nMat: inst.nMat,
+        color,
+      });
     }
   }
 
@@ -207,8 +359,17 @@ export function parseGlbPreview(input) {
   const step = Math.max(1, Math.ceil(totalTris / MAX_PREVIEW_TRIS));
   let globalTri = 0;
 
+  const buildFull = totalTris > 0 && totalTris <= MAX_FULL_MESH_TRIS;
+  const fullPos = buildFull ? new Float32Array(totalVerts * 3) : new Float32Array(0);
+  const fullNorm = buildFull ? new Float32Array(totalVerts * 3) : new Float32Array(0);
+  const fullTan = buildFull ? new Float32Array(totalVerts * 4) : new Float32Array(0);
+  const fullUv = buildFull ? new Float32Array(totalVerts * 2) : new Float32Array(0);
+  const fullCol = buildFull ? new Float32Array(totalVerts * 3) : new Float32Array(0);
+  const fullIdx = buildFull ? new Uint32Array(totalTris * 3) : new Uint32Array(0);
+  let vertBase = 0;
+  let idxWrite = 0;
+
   for (const p of rawPrims) {
-    // Expand bounds across all vertices of this primitive.
     for (let v = 0; v < p.pos.count; v++) {
       const [lx, ly, lz] = p.pos.at(v);
       const [wx, wy, wz] = transformVec3(p.world, lx, ly, lz);
@@ -218,13 +379,107 @@ export function parseGlbPreview(input) {
       if (wx > max[0]) max[0] = wx;
       if (wy > max[1]) max[1] = wy;
       if (wz > max[2]) max[2] = wz;
+
+      if (buildFull) {
+        const gv = vertBase + v;
+        fullPos[gv * 3] = wx;
+        fullPos[gv * 3 + 1] = wy;
+        fullPos[gv * 3 + 2] = wz;
+        if (p.norm) {
+          const [nx, ny, nz] = p.norm.at(v);
+          const wn = transformDirMat3(p.nMat, nx, ny, nz);
+          fullNorm[gv * 3] = wn[0];
+          fullNorm[gv * 3 + 1] = wn[1];
+          fullNorm[gv * 3 + 2] = wn[2];
+        }
+        if (p.uv) {
+          const [u, tv] = p.uv.at(v);
+          fullUv[gv * 2] = u;
+          fullUv[gv * 2 + 1] = tv;
+        } else {
+          // Triplanar-friendly fallback UV in world meters for UV-checker inspection
+          fullUv[gv * 2] = wx * 0.5 + wz * 0.5;
+          fullUv[gv * 2 + 1] = wy * 0.5;
+        }
+        if (p.tan) {
+          const [tx, ty, tz, tw] = p.tan.at(v);
+          const wt = transformLinearDir(p.world, tx, ty, tz);
+          fullTan[gv * 4] = wt[0];
+          fullTan[gv * 4 + 1] = wt[1];
+          fullTan[gv * 4 + 2] = wt[2];
+          fullTan[gv * 4 + 3] = tw < 0 ? -1 : 1;
+        }
+        if (p.vcol) {
+          const vc = p.vcol.at(v);
+          fullCol[gv * 3] = p.color[0] * vc[0];
+          fullCol[gv * 3 + 1] = p.color[1] * vc[1];
+          fullCol[gv * 3 + 2] = p.color[2] * vc[2];
+        } else {
+          fullCol[gv * 3] = p.color[0];
+          fullCol[gv * 3 + 1] = p.color[1];
+          fullCol[gv * 3 + 2] = p.color[2];
+        }
+      }
     }
+
+    const needSynthNorm = buildFull && !p.norm;
+    const needSynthTan = buildFull && !p.tan;
     for (let t = 0; t < p.triCount; t++, globalTri++) {
-      if (globalTri % step !== 0) continue;
       const i0 = p.idx ? p.idx.at(t * 3) : t * 3;
       const i1 = p.idx ? p.idx.at(t * 3 + 1) : t * 3 + 1;
       const i2 = p.idx ? p.idx.at(t * 3 + 2) : t * 3 + 2;
       if (i0 >= p.pos.count || i1 >= p.pos.count || i2 >= p.pos.count) continue;
+
+      if (buildFull) {
+        const g0 = vertBase + i0;
+        const g1 = vertBase + i1;
+        const g2 = vertBase + i2;
+        fullIdx[idxWrite++] = g0;
+        fullIdx[idxWrite++] = g1;
+        fullIdx[idxWrite++] = g2;
+
+        if (needSynthNorm || needSynthTan) {
+          const ax = fullPos[g0 * 3], ay = fullPos[g0 * 3 + 1], az = fullPos[g0 * 3 + 2];
+          const bx = fullPos[g1 * 3], by = fullPos[g1 * 3 + 1], bz = fullPos[g1 * 3 + 2];
+          const cx = fullPos[g2 * 3], cy = fullPos[g2 * 3 + 1], cz = fullPos[g2 * 3 + 2];
+          const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+          const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+          if (needSynthNorm) {
+            const fnx = e1y * e2z - e1z * e2y;
+            const fny = e1z * e2x - e1x * e2z;
+            const fnz = e1x * e2y - e1y * e2x;
+            for (const gv of [g0, g1, g2]) {
+              fullNorm[gv * 3] += fnx;
+              fullNorm[gv * 3 + 1] += fny;
+              fullNorm[gv * 3 + 2] += fnz;
+            }
+          }
+          if (needSynthTan) {
+            const du1 = fullUv[g1 * 2] - fullUv[g0 * 2];
+            const dv1 = fullUv[g1 * 2 + 1] - fullUv[g0 * 2 + 1];
+            const du2 = fullUv[g2 * 2] - fullUv[g0 * 2];
+            const dv2 = fullUv[g2 * 2 + 1] - fullUv[g0 * 2 + 1];
+            const denom = du1 * dv2 - du2 * dv1;
+            let tx = 1, ty = 0, tz = 0;
+            if (Math.abs(denom) > 1e-8) {
+              const r = 1 / denom;
+              tx = (e1x * dv2 - e2x * dv1) * r;
+              ty = (e1y * dv2 - e2y * dv1) * r;
+              tz = (e1z * dv2 - e2z * dv1) * r;
+            } else {
+              tx = e1x; ty = e1y; tz = e1z;
+            }
+            for (const gv of [g0, g1, g2]) {
+              fullTan[gv * 4] += tx;
+              fullTan[gv * 4 + 1] += ty;
+              fullTan[gv * 4 + 2] += tz;
+              fullTan[gv * 4 + 3] = 1;
+            }
+          }
+        }
+      }
+
+      if (globalTri % step !== 0) continue;
       const a = transformVec3(p.world, ...p.pos.at(i0));
       const b = transformVec3(p.world, ...p.pos.at(i1));
       const c = transformVec3(p.world, ...p.pos.at(i2));
@@ -235,7 +490,73 @@ export function parseGlbPreview(input) {
         p.color[0], p.color[1], p.color[2],
       ]);
     }
+
+    if (buildFull) {
+      if (needSynthNorm) {
+        for (let v = 0; v < p.pos.count; v++) {
+          const gv = vertBase + v;
+          const l = Math.hypot(fullNorm[gv * 3], fullNorm[gv * 3 + 1], fullNorm[gv * 3 + 2]);
+          if (l > 1e-9) {
+            fullNorm[gv * 3] /= l;
+            fullNorm[gv * 3 + 1] /= l;
+            fullNorm[gv * 3 + 2] /= l;
+          } else {
+            fullNorm[gv * 3 + 1] = 1;
+          }
+        }
+      }
+      if (needSynthTan) {
+        for (let v = 0; v < p.pos.count; v++) {
+          const gv = vertBase + v;
+          const nx = fullNorm[gv * 3], ny = fullNorm[gv * 3 + 1], nz = fullNorm[gv * 3 + 2];
+          let tx = fullTan[gv * 4], ty = fullTan[gv * 4 + 1], tz = fullTan[gv * 4 + 2];
+          // Gram-Schmidt orthogonalize tangent against normal
+          const dot = tx * nx + ty * ny + tz * nz;
+          tx -= nx * dot;
+          ty -= ny * dot;
+          tz -= nz * dot;
+          const l = Math.hypot(tx, ty, tz);
+          if (l > 1e-9) {
+            fullTan[gv * 4] = tx / l;
+            fullTan[gv * 4 + 1] = ty / l;
+            fullTan[gv * 4 + 2] = tz / l;
+          } else if (Math.abs(ny) < 0.9) {
+            const cl = Math.hypot(nz, -nx);
+            fullTan[gv * 4] = nz / cl;
+            fullTan[gv * 4 + 1] = 0;
+            fullTan[gv * 4 + 2] = -nx / cl;
+          } else {
+            fullTan[gv * 4] = 1;
+            fullTan[gv * 4 + 1] = 0;
+            fullTan[gv * 4 + 2] = 0;
+          }
+          fullTan[gv * 4 + 3] = 1;
+        }
+      }
+      vertBase += p.pos.count;
+    }
   }
+
+  let textureVramBytes = 0;
+  for (const img of images) {
+    if (bin && typeof img?.bufferView === 'number' && views[img.bufferView]) {
+      const bv = views[img.bufferView];
+      const start = bv.byteOffset || 0;
+      const len = bv.byteLength || 0;
+      if (start + len <= bin.byteLength && len > 0) {
+        const dims = parseEmbeddedImageDims(bin.subarray(start, start + len));
+        if (dims) {
+          textureVramBytes += Math.round(dims.width * dims.height * 4 * (4 / 3));
+          continue;
+        }
+        textureVramBytes += Math.max(4096, len * 4);
+      }
+    } else {
+      textureVramBytes += 256 * 256 * 4;
+    }
+  }
+  const geomVramBytes = totalVerts * 48 + totalTris * 12;
+  const estimatedVramBytes = geomVramBytes + textureVramBytes;
 
   const hasBounds = min[0] <= max[0];
   const bounds = hasBounds ? [min, max] : [[0, 0, 0], [0, 0, 0]];
@@ -249,9 +570,24 @@ export function parseGlbPreview(input) {
     meshes: meshes.length,
     nodes: nodes.length,
     materials: materials.length,
+    bones,
+    textures: textures.length,
+    estimatedVramBytes,
+    hasNormals,
+    hasTangents,
+    hasUvs,
+    nodeHierarchy,
     bounds,
     size,
     sampleTris,
+    fullMesh: {
+      positions: fullPos,
+      normals: fullNorm,
+      tangents: fullTan,
+      uvs: fullUv,
+      colors: fullCol,
+      indices: idxWrite === fullIdx.length ? fullIdx : fullIdx.subarray(0, idxWrite),
+    },
   };
 }
 
