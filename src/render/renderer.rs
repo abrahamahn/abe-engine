@@ -14,10 +14,10 @@ use crate::gpu::{
 };
 use ganbate_shader::{Compiled, Stage};
 
-use super::look::{DetailPreset, Focus, Look, View};
+use super::look::{DetailPreset, Focus, Look, ToneMap, View};
 use super::math::{
-    self, M4, V3, add, cross, invert, look_at, mul, normalize, ortho, perspective, reflect_y,
-    scale, sub, transform,
+    self, Frustum, M4, V3, aabb_distance, add, cross, invert, look_at, mul, normalize, ortho,
+    perspective, reflect_y, scale, sub, transform,
 };
 use super::scene::GpuScene;
 use super::sky::Environment;
@@ -29,6 +29,7 @@ const POST: &str = include_str!("shaders/post.wgsl");
 const PROP_SHADER_INPUT: &str = include_str!("shaders/prop_shader_input.wgsl");
 const PROP_SHADER: &str = include_str!("shaders/prop_shader.wgsl");
 const HDR: Format = Format::Rgba16Float;
+const LUT_SIZE: u32 = 16;
 const MAX_LIGHTS_PER_TILE: usize = 96;
 /// The near clip distance of `view`, kept positive.
 fn near(view: &View) -> f32 {
@@ -124,6 +125,40 @@ impl Quality {
             light_shadow_size: 1024,
         }
     }
+    /// Hybrid realtime budget tuned for interactive 60 fps stages: baked vertex AO instead of
+    /// SSAO, cached static shadow cascades, frustum + distance chunk culling, water-visibility
+    /// reflection skip, and single-pass fused 3D LUT tone mapping + output.
+    pub fn hybrid_stage() -> Self {
+        Self {
+            shadow_size: 1024,
+            reflection_scale: 0.35,
+            ao_scale: 0.25,
+            ao_samples: 0,
+            tile_size: 32,
+            bloom_levels: 4,
+            painterly: false,
+            fxaa: true,
+            particles: true,
+            ground_size: 512,
+            world_size: 1024,
+            grass: 0.4,
+            light_shadow_size: 512,
+        }
+    }
+}
+
+/// Per-frame visibility, cache, and pass-skip telemetry recorded by [`Renderer::encode`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameStats {
+    pub world_draws_total: u32,
+    pub world_draws_submitted: u32,
+    pub world_draws_culled: u32,
+    pub shadow_static_cached: bool,
+    pub shadow_world_draws: u32,
+    pub ground_cached: bool,
+    pub reflection_drawn: bool,
+    pub ssao_drawn: bool,
+    pub fused_tonemap: bool,
 }
 
 /// Where the final pass writes.
@@ -169,6 +204,7 @@ pub(super) struct Pipelines {
     bloom_down: PipelineId,
     bloom_up: PipelineId,
     tonemap: PipelineId,
+    tonemap_final: PipelineId,
     paint: PipelineId,
     output: PipelineId,
 }
@@ -183,8 +219,10 @@ pub(super) struct Targets {
     pub(super) refl_hdr: TextureId,
     refl_aux: TextureId,
     refl_depth: TextureId,
+    refl_cleared: bool,
     ao: (u32, u32),
     ao_tex: TextureId,
+    ao_cleared: bool,
     lit: TextureId,
     bloom: TextureId,
     bloom_size: (u32, u32),
@@ -211,6 +249,7 @@ pub(super) struct Slot {
     down: Vec<BindGroupId>,
     up: Vec<BindGroupId>,
     tonemap: BindGroupId,
+    tonemap_final: BindGroupId,
     paint: BindGroupId,
     output: BindGroupId,
 }
@@ -227,12 +266,15 @@ pub struct Renderer {
     /// Bind groups for alpha-masked materials in the masked shadow pipeline.
     pub(super) shadow_materials: Vec<Option<BindGroupId>>,
     pub(super) shadow_map: TextureId,
+    shadow_layers_ready: bool,
+    static_shadows_vp: Option<[M4; 2]>,
     /// The game lights' shadow maps, a layer for each light casting shadows.
     pub(super) light_shadow_map: TextureId,
     /// Every layer of the light shadow map has been written (cleared) once.
     light_shadows_ready: bool,
     pub(super) ground_depth: TextureId,
     pub(super) ground_mask: TextureId,
+    ground_cached_vp: Option<M4>,
     /// The world map: the whole land seen from above once, for shallows and foam on shores
     /// beyond the ground map. Drawn on the first frame and again when the Look changes or a
     /// world instance moves.
@@ -247,6 +289,8 @@ pub struct Renderer {
     pub(super) details: Vec<[f32; 16]>,
     /// Per material: grows grass (the ground map's mask).
     pub(super) grassy: Vec<bool>,
+    pub(super) lut: TextureId,
+    lut_dirty: bool,
     pub(super) dummy: TextureId,
     pub(super) linear_clamp: SamplerId,
     pub(super) shadow_sampler: SamplerId,
@@ -257,26 +301,35 @@ pub struct Renderer {
     pub(super) props: super::props::Props,
     pub(super) game_lights: super::lights::GameLights,
     pub(super) models: super::models::Models,
+    stats: FrameStats,
+}
+
+fn shader_modules() -> [(&'static str, &'static str); 2] {
+    let (common_mod, brdf_mod) = COMMON
+        .split_once("// --- module: brdf ---")
+        .expect("brdf module delimiter in common.wgsl");
+    [("common", common_mod), ("brdf", brdf_mod)]
 }
 
 fn compile(body: &str, stage: Stage, entry: &str) -> Result<Compiled> {
-    let source = format!("{COMMON}\n{body}");
+    let source = ganbate_shader::compose(body, &shader_modules()).map_err(|e| e.to_string())?;
     crate::gpu::compile_shader(&source, stage, entry)
 }
 
 /// The scene shader with a game's prop shader (`shade`) and the overlay entry point that calls it.
-pub(super) fn prop_shader_source(user: &str) -> String {
-    format!(
-        "{COMMON}\n{SCENE}\n{PROP_SHADER_INPUT}\n// --- prop shader\n{user}\n// --- prop shader \
+pub(super) fn prop_shader_source(user: &str) -> Result<String> {
+    let raw = format!(
+        "{SCENE}\n{PROP_SHADER_INPUT}\n// --- prop shader\n{user}\n// --- prop shader \
          entry\n{PROP_SHADER}"
-    )
+    );
+    ganbate_shader::compose(&raw, &shader_modules()).map_err(|e| e.to_string())
 }
 
 /// A game's prop shader's fragment stage compiled, checked to read only what its draw binds: an
 /// overlay's frame and a scene prop's material (its three textures). Its vertex stage is every
 /// prop's (`Pipelines::prop_vs`).
 pub(super) fn prop_shader_stage(pipelines: &Pipelines, user: &str) -> Result<Compiled> {
-    let source = prop_shader_source(user);
+    let source = prop_shader_source(user)?;
     let fs = crate::gpu::compile_shader(&source, Stage::Fragment, "fs_prop_shader")?;
     if sorted_bindings(&fs.bindings) != pipelines.prop_shader_bindings {
         return Err(
@@ -384,6 +437,19 @@ impl Pipelines {
                 },
             ],
         };
+        let world_layout = VertexLayout {
+            stride: 36,
+            attributes: vec![
+                layout.attributes[0],
+                layout.attributes[1],
+                layout.attributes[2],
+                VertexAttribute {
+                    location: 3,
+                    format: VertexFormat::F32,
+                    offset: 32,
+                },
+            ],
+        };
         let reverse_depth = |compare, write| DepthState {
             format: Format::Depth32Float,
             compare,
@@ -398,7 +464,7 @@ impl Pipelines {
         let scene = device.create_render_pipeline(&RenderPipelineDesc {
             vertex: &vs,
             fragment: Some(&fs),
-            vertex_layout: Some(layout.clone()),
+            vertex_layout: Some(world_layout),
             topology: Topology::TriangleList,
             cull: Cull::None,
             front_ccw: true,
@@ -523,7 +589,7 @@ impl Pipelines {
             vertex: &vs,
             fragment: None,
             vertex_layout: Some(VertexLayout {
-                stride: 32,
+                stride: 36,
                 attributes: vec![layout.attributes[0]],
             }),
             topology: Topology::TriangleList,
@@ -545,7 +611,7 @@ impl Pipelines {
             vertex: &vs,
             fragment: Some(&fs),
             vertex_layout: Some(VertexLayout {
-                stride: 32,
+                stride: 36,
                 attributes: vec![layout.attributes[0], layout.attributes[2]],
             }),
             topology: Topology::TriangleList,
@@ -567,7 +633,7 @@ impl Pipelines {
             vertex: &vs,
             fragment: Some(&fs),
             vertex_layout: Some(VertexLayout {
-                stride: 32,
+                stride: 36,
                 attributes: vec![layout.attributes[0], layout.attributes[1]],
             }),
             topology: Topology::TriangleList,
@@ -654,6 +720,7 @@ impl Pipelines {
             bloom_down: fullscreen(device, &fsvs, "fs_bloom_down", HDR, Blend::Replace)?,
             bloom_up: fullscreen(device, &fsvs, "fs_bloom_up", HDR, Blend::Additive)?,
             tonemap: fullscreen(device, &fsvs, "fs_tonemap", HDR, Blend::Replace)?,
+            tonemap_final: fullscreen(device, &fsvs, "fs_tonemap_final", output, Blend::Replace)?,
             paint: fullscreen(device, &fsvs, "fs_paint", HDR, Blend::Replace)?,
             output: fullscreen(device, &fsvs, "fs_final", output, Blend::Replace)?,
         })
@@ -751,7 +818,12 @@ pub(super) fn detail_block(look: &Look, name: &str) -> ([f32; 16], bool) {
     let rule = (!name.is_empty())
         .then(|| look.details.iter().find(|r| r.matches(name)))
         .flatten();
+    let srule = (!name.is_empty())
+        .then(|| look.surface_rules.iter().find(|r| r.matches(name)))
+        .flatten();
     let mut d = [0.0f32; 16];
+    d[11] = -1.0;
+    d[15] = -1.0;
     if let Some(r) = rule {
         let c = r.color.unwrap_or([0.0; 3]);
         // A lattice may leave out one direction of bars with a zero size.
@@ -770,9 +842,107 @@ pub(super) fn detail_block(look: &Look, name: &str) -> ([f32; 16], bool) {
         d[8] = if r.color.is_some() { 1.0 } else { 0.0 };
         d[9] = r.gloss;
     }
+    if let Some(sr) = srule {
+        if let Some(s) = sr.surface {
+            d[10] = (s as u32 + 1) as f32;
+        }
+        if let Some(w) = sr.clearcoat.or(sr.sheen).or(sr.subsurface) {
+            d[11] = w;
+        }
+        if let Some(p) = sr.clearcoat_roughness.or(sr.sheen_tint) {
+            d[15] = p;
+        }
+    }
     let grassy =
         rule.is_some_and(|r| matches!(r.preset, DetailPreset::Grass | DetailPreset::Terrain));
     (d, grassy)
+}
+
+#[allow(clippy::excessive_precision)]
+fn tonemap_cpu(c: V3, mode: ToneMap) -> V3 {
+    let dot3 = |a: V3, b: V3| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    match mode {
+        ToneMap::Stylized => c.map(|v| {
+            let x = (v * 0.8).max(0.0);
+            let a = x * (2.51 * x + 0.03);
+            let b = x * (2.43 * x + 0.59) + 0.14;
+            (a / b).clamp(0.0, 1.0)
+        }),
+        ToneMap::AgX => {
+            let x = c.map(|v| v.max(1e-10));
+            let inset = [
+                dot3(x, [0.84247906, 0.07843360, 0.07922375]),
+                dot3(x, [0.04232824, 0.87846864, 0.07916613]),
+                dot3(x, [0.04237565, 0.07843360, 0.87914297]),
+            ];
+            let lin = inset.map(|v| {
+                let ev = ((v.max(1e-10).log2() + 12.47393) / 16.5).clamp(0.0, 1.0);
+                let x2 = ev * ev;
+                let x4 = x2 * x2;
+                let p = 15.5 * x4 * x2 - 40.14 * x4 * ev + 31.96 * x4 - 6.868 * x2 * ev
+                    + 0.4298 * x2
+                    + 0.1191 * ev
+                    - 0.00232;
+                p.max(0.0).powf(2.2)
+            });
+            [
+                dot3(lin, [1.19687901, -0.09802088, -0.09902974]).clamp(0.0, 1.0),
+                dot3(lin, [-0.05289685, 1.15190313, -0.09896118]).clamp(0.0, 1.0),
+                dot3(lin, [-0.05297164, -0.09804345, 1.15107367]).clamp(0.0, 1.0),
+            ]
+        }
+        ToneMap::ACESFitted => {
+            let x = c.map(|v| v.max(0.0));
+            let ap1 = [
+                dot3(x, [0.59719, 0.35458, 0.04823]),
+                dot3(x, [0.07600, 0.90834, 0.01566]),
+                dot3(x, [0.02840, 0.13383, 0.83777]),
+            ];
+            let rrt = ap1.map(|v| {
+                (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.4329510) + 0.238081)
+            });
+            [
+                dot3(rrt, [1.60475, -0.53108, -0.07367]).clamp(0.0, 1.0),
+                dot3(rrt, [-0.10208, 1.10813, -0.00605]).clamp(0.0, 1.0),
+                dot3(rrt, [-0.00327, -0.07276, 1.07602]).clamp(0.0, 1.0),
+            ]
+        }
+    }
+}
+
+/// Bakes a `16x16x16` colour-grading 3D LUT into a `256x16` RGBA8 strip matching `fs_tonemap`.
+fn bake_lut(look: &Look) -> Vec<u8> {
+    let n = LUT_SIZE as usize;
+    let mut out = vec![0u8; n * n * n * 4];
+    for g_i in 0..n {
+        for b_i in 0..n {
+            for r_i in 0..n {
+                let u = [
+                    r_i as f32 / (n - 1) as f32,
+                    g_i as f32 / (n - 1) as f32,
+                    b_i as f32 / (n - 1) as f32,
+                ];
+                let hdr = u.map(|v| v / (1.0 - v).max(1e-4));
+                let mut col = tonemap_cpu(hdr, look.tonemap);
+                let lum = 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2];
+                for ch in &mut col {
+                    *ch = (lum + (*ch - lum) * look.saturation).max(0.0);
+                    let g = ch.powf(1.0 / 2.2);
+                    let c = ((g - 0.5) * look.contrast + 0.5).clamp(0.0, 1.0);
+                    *ch = c.powf(2.2);
+                }
+                for (k, ch) in col.iter_mut().enumerate() {
+                    *ch = (*ch * look.gain[k] + look.lift[k] * (1.0 - *ch)).clamp(0.0, 1.0);
+                }
+                let px = (g_i * (n * n) + b_i * n + r_i) * 4;
+                out[px] = (col[0] * 255.0).round() as u8;
+                out[px + 1] = (col[1] * 255.0).round() as u8;
+                out[px + 2] = (col[2] * 255.0).round() as u8;
+                out[px + 3] = 255;
+            }
+        }
+    }
+    out
 }
 
 /// The detail block of each world material and whether grass grows on it.
@@ -851,7 +1021,7 @@ impl Renderer {
         let shadow_map = device.create_texture(&TextureDesc {
             width: quality.shadow_size,
             height: quality.shadow_size,
-            layers: 2,
+            layers: 4,
             mips: 1,
             format: Format::Depth32Float,
             usage: TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED,
@@ -900,6 +1070,13 @@ impl Renderer {
         })?;
         let world = world_view(&scene, world_size);
         let (details, grassy) = material_details(&look, &scene);
+        let lut = device.create_texture(&TextureDesc::new(
+            LUT_SIZE * LUT_SIZE,
+            LUT_SIZE,
+            Format::Rgba8Unorm,
+            sampled,
+        ))?;
+        device.write_texture(lut, 0, 0, &bake_lut(&look))?;
         let targets = Self::create_targets(device, &quality, output, size)?;
         let mut r = Self {
             scene,
@@ -912,10 +1089,13 @@ impl Renderer {
             materials,
             shadow_materials,
             shadow_map,
+            shadow_layers_ready: false,
+            static_shadows_vp: None,
             light_shadow_map,
             light_shadows_ready: false,
             ground_depth,
             ground_mask,
+            ground_cached_vp: None,
             world_depth,
             world_mask,
             world,
@@ -923,6 +1103,8 @@ impl Renderer {
             world_moved: false,
             details,
             grassy,
+            lut,
+            lut_dirty: false,
             dummy,
             linear_clamp,
             shadow_sampler,
@@ -932,6 +1114,7 @@ impl Renderer {
             props: super::props::Props::default(),
             game_lights: super::lights::GameLights::default(),
             models: super::models::Models::default(),
+            stats: FrameStats::default(),
         };
         let slots = match output {
             Output::Still => 1,
@@ -951,7 +1134,13 @@ impl Renderer {
         (self.details, self.grassy) = material_details(&look, &self.scene);
         self.look = look;
         self.world_drawn = false;
+        self.ground_cached_vp = None;
+        self.lut_dirty = true;
         self.restyle_props();
+    }
+    /// Visibility, cache, and pass-skip telemetry recorded during the most recent [`Renderer::encode`].
+    pub fn last_frame_stats(&self) -> FrameStats {
+        self.stats
     }
     pub fn size(&self) -> (u32, u32) {
         (self.targets.width, self.targets.height)
@@ -1002,8 +1191,10 @@ impl Renderer {
             refl_hdr: tex(device, refl.0, refl.1, HDR, rt)?,
             refl_aux: tex(device, refl.0, refl.1, HDR, rt)?,
             refl_depth: tex(device, refl.0, refl.1, Format::Depth32Float, depth_usage)?,
+            refl_cleared: false,
             ao,
             ao_tex: tex(device, ao.0, ao.1, Format::R16Float, rt)?,
+            ao_cleared: false,
             lit: tex(device, width, height, HDR, rt)?,
             bloom: device.create_texture(&TextureDesc {
                 width: bloom_size.0,
@@ -1149,6 +1340,19 @@ impl Renderer {
             Resource::Texture(t.lit),
             Resource::TextureMip(t.bloom, 0),
         )?;
+        let tonemap_final = device.create_bind_group(
+            p.tonemap_final,
+            0,
+            &[
+                (0, buf(frame[0])),
+                (1, Resource::Texture(t.depth)),
+                (2, Resource::Texture(t.aux)),
+                (3, Resource::Texture(t.lit)),
+                (4, Resource::TextureMip(t.bloom, 0)),
+                (5, Resource::Sampler(self.linear_clamp)),
+                (6, Resource::Texture(self.lut)),
+            ],
+        )?;
         let paint = post(device, p.paint, Resource::Texture(t.ldr), none)?;
         let final_src = if self.quality.painterly {
             t.paint
@@ -1170,6 +1374,7 @@ impl Renderer {
             down,
             up,
             tonemap,
+            tonemap_final,
             paint,
             output,
         })
@@ -1191,7 +1396,7 @@ impl Renderer {
                 .into_iter()
                 .chain(s.sky)
                 .chain([s.grass, s.flower, s.particle, s.ssao, s.air])
-                .chain([s.tonemap, s.paint, s.output])
+                .chain([s.tonemap, s.tonemap_final, s.paint, s.output])
             {
                 device.destroy_bind_group(g);
             }
@@ -1485,10 +1690,12 @@ impl Renderer {
         (w, h): (u32, u32),
         tiles: (u32, u32),
         reflection: bool,
+        has_prop_shadows: bool,
+        has_reflection: bool,
         seed: u32,
     ) -> Vec<u8> {
         let l = &self.look;
-        let mut b = Block(Vec::with_capacity(240));
+        let mut b = Block(Vec::with_capacity(248));
         b.m(&eye.view_proj);
         b.m(&eye.inv);
         b.m(&cas.mats[0]);
@@ -1553,7 +1760,12 @@ impl Renderer {
         );
         b.f(l.brush, l.brush_scale.max(0.01), l.sun_shafts, 0.0);
         b.v(l.water_shallow, l.foam);
-        b.f(l.sparkle, self.grass_side() as f32, 0.0, 0.0);
+        b.f(
+            l.sparkle,
+            self.grass_side() as f32,
+            if has_prop_shadows { 1.0 } else { 0.0 },
+            if has_reflection { 1.0 } else { 0.0 },
+        );
         let g = &l.grass;
         b.f(g.height, g.width, g.flowers, g.sway);
         b.v(g.base, 0.0);
@@ -1575,7 +1787,7 @@ impl Renderer {
         b.v(t.wet_sand, 0.0);
         b.v(t.rock, 0.0);
         b.v(t.meadow, 0.0);
-        b.f(l.lamp_foliage, 0.0, 0.0, 0.0);
+        b.f(l.lamp_foliage, l.ambient_occlusion, 0.0, 0.0);
         let tide = if self.scene.water_level.is_some() {
             l.tide
         } else {
@@ -1592,8 +1804,8 @@ impl Renderer {
         ] {
             bytes.extend_from_slice(&u.to_le_bytes());
         }
-        // The game lights' shadow maps.
-        let mut b = Block(Vec::with_capacity(36));
+        // The game lights' shadow maps and unified surface model parameters.
+        let mut b = Block(Vec::with_capacity(44));
         let views = self.game_lights.shadow_views();
         for layer in 0..super::lights::MAX_SHADOWED_LIGHTS {
             b.m(views.get(layer).unwrap_or(&math::IDENTITY));
@@ -1604,6 +1816,13 @@ impl Renderer {
             0.0,
             0.0,
         );
+        b.f(
+            l.surface_model as u32 as f32,
+            l.clearcoat,
+            l.sheen,
+            l.subsurface,
+        );
+        b.v(l.subsurface_color, l.clearcoat_roughness);
         bytes.extend_from_slice(&f32_bytes(&b.0));
         debug_assert!(bytes.len() as u64 <= FRAME_BYTES);
         bytes
@@ -1644,9 +1863,13 @@ impl Renderer {
         gp[19] = self.scene.water_level.unwrap_or(-1.0e6);
         gp[20..].copy_from_slice(&[t.beach, t.rock_slope[0], t.rock_slope[1], t.patch_size]);
         let terrain = DetailPreset::Terrain as u32 as f32;
+        let frustum = Frustum::from_view_proj(vp);
         for d in self.scene.draws.iter() {
             let foliage = self.scene.materials[d.material].params[3] == 1.0;
             if d.water || foliage || self.shadow_materials[d.material].is_some() {
+                continue;
+            }
+            if !frustum.intersects_aabb_clamped(d.bounds.0, d.bounds.1) {
                 continue;
             }
             gp[16] = if self.grassy[d.material] { 1.0 } else { 0.0 };
@@ -1661,14 +1884,35 @@ impl Renderer {
         enc.end_pass();
     }
 
-    fn draw_world(&self, enc: &mut Encoder, model_push: &mut [f32; 32], water: bool) {
+    /// Draws visible static world chunks against `eye`, returning `(total, submitted)` chunk counts.
+    fn draw_world(
+        &self,
+        enc: &mut Encoder,
+        model_push: &mut [f32; 32],
+        eye: &Eye,
+        water: bool,
+    ) -> (u32, u32) {
         enc.set_vertex_buffer(self.scene.vertices, 0);
         enc.set_index_buffer(self.scene.indices, 0);
+        let frustum = Frustum::from_view_proj(&eye.view_proj);
+        let hybrid = self.quality.ao_samples == 0 && !self.quality.painterly;
         let mut bound = usize::MAX;
+        let (mut total, mut submitted) = (0u32, 0u32);
         for d in &self.scene.draws {
             if d.water && !water {
                 continue;
             }
+            total += 1;
+            if !frustum.intersects_aabb(d.bounds.0, d.bounds.1) {
+                continue;
+            }
+            if hybrid && !d.water && d.max_extent < 160.0 {
+                let dist = aabb_distance(eye.pos, d.bounds.0, d.bounds.1);
+                if (d.max_extent < 2.0 && dist > 140.0) || (d.max_extent < 12.0 && dist > 260.0) {
+                    continue;
+                }
+            }
+            submitted += 1;
             if bound != d.material {
                 enc.set_bind_group(1, self.materials[d.material]);
                 bound = d.material;
@@ -1689,6 +1933,7 @@ impl Renderer {
             enc.push_constants(&f32_bytes(model_push));
             enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
         }
+        (total, submitted)
     }
 
     fn post_pass(
@@ -1738,17 +1983,25 @@ impl Renderer {
         // The world map is drawn in this frame's first passes, before anything reads it. After
         // a move it is drawn again, over the land's new bounds (as a cook of the moved world).
         if std::mem::take(&mut self.world_moved) {
-            self.scene.refresh_bounds();
+            self.scene.refresh_world(device)?;
             self.world = world_view(&self.scene, self.world.size);
             self.world_drawn = false;
+            self.static_shadows_vp = None;
+            self.ground_cached_vp = None;
+        }
+        if std::mem::take(&mut self.lut_dirty) {
+            device.write_texture(self.lut, 0, 0, &bake_lut(&self.look))?;
         }
         let draw_world = !self.world_drawn;
         self.world_drawn = true;
+        let first_shadow_layers = !self.shadow_layers_ready;
+        self.shadow_layers_ready = true;
         // Every layer of the light shadow map holds depth before any is read.
         let first_light_shadows = !self.light_shadows_ready;
         self.light_shadows_ready = true;
         // Props first: their bounds widen the shadow cascades' depth range.
         self.prepare_props(device, slot_index, view.eye)?;
+        let has_prop_shadows = self.has_prop_shadows();
         // A game's lights after the lamps in the light buffer, written when they changed.
         if self.game_lights.dirty {
             let data: Vec<f32> = self
@@ -1764,17 +2017,23 @@ impl Renderer {
             }
             self.game_lights.dirty = false;
         }
-        let t = &self.targets;
-        let size = (t.width, t.height);
+        let size = (self.targets.width, self.targets.height);
         let eye = self.eye(view, jitter, size);
+        let main_frustum = Frustum::from_view_proj(&eye.view_proj);
         let cas = self.cascades(view, env);
         let ground = self.ground_view(view);
         let lamps_on = env.lamp_level > 0.001;
-        let water = self.scene.water_level;
-        // Mirror camera for the water reflection.
-        let refl_eye = water.map(|h| {
+        let water_visible = self.look.water_reflection > 0.001
+            && (self.has_water_props()
+                || self
+                    .scene
+                    .draws
+                    .iter()
+                    .any(|d| d.water && main_frustum.intersects_aabb(d.bounds.0, d.bounds.1)));
+        // Mirror camera for the water reflection (skipped when no water enters the view frustum).
+        let refl_eye = self.scene.water_level.filter(|_| water_visible).map(|h| {
             let r = reflect_y(h);
-            let base = self.eye(view, [0.0, 0.0], t.refl);
+            let base = self.eye(view, [0.0, 0.0], self.targets.refl);
             let view_proj = mul(&base.view_proj, &r);
             Eye {
                 view_proj,
@@ -1783,74 +2042,131 @@ impl Renderer {
                 near: base.near,
             }
         });
+        let has_reflection = refl_eye.is_some();
         {
+            let tiles_dim = self.targets.tiles;
+            let refl_size = self.targets.refl;
             let slot = &self.slots[slot_index];
-            let (tiles, index) = self.tile_lights(&eye, size, t.tiles[0], lamps_on);
+            let (tiles, index) = self.tile_lights(&eye, size, tiles_dim[0], lamps_on);
             device.write_buffer(slot.tiles[0], 0, &crate::gpu::u32_bytes(&tiles))?;
             device.write_buffer(slot.index[0], 0, &crate::gpu::u32_bytes(&index))?;
-            let block = self.frame_block(&eye, env, &cas, &ground, size, t.tiles[0], false, seed);
+            let block = self.frame_block(
+                &eye,
+                env,
+                &cas,
+                &ground,
+                size,
+                tiles_dim[0],
+                false,
+                has_prop_shadows,
+                has_reflection,
+                seed,
+            );
             device.write_buffer(slot.frame[0], 0, &block)?;
             if let Some(re) = &refl_eye {
-                let (tiles, index) = self.tile_lights(re, t.refl, t.tiles[1], lamps_on);
+                let (tiles, index) = self.tile_lights(re, refl_size, tiles_dim[1], lamps_on);
                 device.write_buffer(slot.tiles[1], 0, &crate::gpu::u32_bytes(&tiles))?;
                 device.write_buffer(slot.index[1], 0, &crate::gpu::u32_bytes(&index))?;
-                let block =
-                    self.frame_block(re, env, &cas, &ground, t.refl, t.tiles[1], true, seed);
+                let block = self.frame_block(
+                    re,
+                    env,
+                    &cas,
+                    &ground,
+                    refl_size,
+                    tiles_dim[1],
+                    true,
+                    has_prop_shadows,
+                    has_reflection,
+                    seed,
+                );
                 device.write_buffer(slot.frame[1], 0, &block)?;
             }
         }
-        let slot = &self.slots[slot_index];
-        let t = &self.targets;
-        let p = &self.pipelines;
+        let mut stats = FrameStats::default();
 
-        // Shadow cascades.
+        // Shadow cascades: layers 0..2 cache static world depth; layers 2..4 hold dynamic props.
         if env.key_intensity > 0.0 {
-            for (layer, m) in cas.mats.iter().enumerate() {
-                enc.begin_pass(PassDesc {
-                    colors: vec![],
-                    depth: Some(Attachment {
-                        texture: self.shadow_map,
-                        mip: 0,
-                        layer: layer as u32,
-                        load: Load::Clear([1.0; 4]),
-                        store: true,
-                    }),
-                });
-                enc.set_pipeline(p.shadow);
-                enc.set_vertex_buffer(self.scene.vertices, 0);
-                enc.set_index_buffer(self.scene.indices, 0);
-                enc.push_constants(&f32_bytes(m));
-                let masked =
-                    |d: &&super::scene::DrawItem| self.shadow_materials[d.material].is_some();
-                for d in self.scene.draws.iter().filter(|d| !d.water && !masked(d)) {
-                    enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
-                }
-                let mut bound = false;
-                for d in self.scene.draws.iter().filter(|d| !d.water && masked(d)) {
-                    if !bound {
-                        enc.set_pipeline(p.shadow_masked);
-                        bound = true;
+            if self.static_shadows_vp == Some(cas.mats) {
+                stats.shadow_static_cached = true;
+            } else {
+                for (layer, m) in cas.mats.iter().enumerate() {
+                    let shadow_frustum = Frustum::from_view_proj(m);
+                    enc.begin_pass(PassDesc {
+                        colors: vec![],
+                        depth: Some(Attachment {
+                            texture: self.shadow_map,
+                            mip: 0,
+                            layer: layer as u32,
+                            load: Load::Clear([1.0; 4]),
+                            store: true,
+                        }),
+                    });
+                    enc.set_pipeline(self.pipelines.shadow);
+                    enc.set_vertex_buffer(self.scene.vertices, 0);
+                    enc.set_index_buffer(self.scene.indices, 0);
+                    enc.push_constants(&f32_bytes(m));
+                    let masked =
+                        |d: &&super::scene::DrawItem| self.shadow_materials[d.material].is_some();
+                    for d in self.scene.draws.iter().filter(|d| {
+                        !d.water
+                            && !masked(d)
+                            && shadow_frustum.intersects_aabb_clamped(d.bounds.0, d.bounds.1)
+                    }) {
+                        stats.shadow_world_draws += 1;
+                        enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
                     }
-                    let mat = &self.scene.materials[d.material];
-                    if let Some(g) = self.shadow_materials[d.material] {
-                        enc.set_bind_group(1, g);
+                    let mut bound = false;
+                    for d in self.scene.draws.iter().filter(|d| {
+                        !d.water
+                            && masked(d)
+                            && shadow_frustum.intersects_aabb_clamped(d.bounds.0, d.bounds.1)
+                    }) {
+                        if !bound {
+                            enc.set_pipeline(self.pipelines.shadow_masked);
+                            bound = true;
+                        }
+                        let mat = &self.scene.materials[d.material];
+                        if let Some(g) = self.shadow_materials[d.material] {
+                            enc.set_bind_group(1, g);
+                        }
+                        let mut push = [0.0f32; 20];
+                        push[..16].copy_from_slice(m);
+                        push[16..].copy_from_slice(&[
+                            mat.params[0],
+                            mat.base_color[3],
+                            mat.flags[0],
+                            0.0,
+                        ]);
+                        enc.push_constants(&f32_bytes(&push));
+                        stats.shadow_world_draws += 1;
+                        enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
                     }
-                    let mut push = [0.0f32; 20];
-                    push[..16].copy_from_slice(m);
-                    push[16..].copy_from_slice(&[
-                        mat.params[0],
-                        mat.base_color[3],
-                        mat.flags[0],
-                        0.0,
-                    ]);
-                    enc.push_constants(&f32_bytes(&push));
-                    enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
+                    enc.end_pass();
                 }
-                self.draw_prop_shadows(enc, slot_index, m);
-                enc.end_pass();
+                self.static_shadows_vp = Some(cas.mats);
+            }
+            if has_prop_shadows || first_shadow_layers {
+                for (layer, m) in cas.mats.iter().enumerate() {
+                    enc.begin_pass(PassDesc {
+                        colors: vec![],
+                        depth: Some(Attachment {
+                            texture: self.shadow_map,
+                            mip: 0,
+                            layer: (layer + 2) as u32,
+                            load: Load::Clear([1.0; 4]),
+                            store: true,
+                        }),
+                    });
+                    if has_prop_shadows {
+                        self.draw_prop_shadows(enc, slot_index, m);
+                    }
+                    enc.end_pass();
+                }
             }
         } else {
-            for layer in 0..2 {
+            self.static_shadows_vp = None;
+            let clear_layers = if first_shadow_layers { 4 } else { 2 };
+            for layer in 0..clear_layers {
                 enc.begin_pass(PassDesc {
                     colors: vec![],
                     depth: Some(Attachment {
@@ -1891,8 +2207,13 @@ impl Renderer {
         // Rain and petals wrap around a box just ahead of the camera.
         let fwd = normalize(sub(view.target, view.eye));
         let boxes = [RAIN_BOX, PETAL_BOX].map(|b| add(view.eye, scale(fwd, b * 0.5 - 2.0)));
-        // The ground map around the view, and on the first frame the world map.
-        self.draw_ground(enc, self.ground_depth, self.ground_mask, &ground.vp);
+        // The ground map around the view (cached while snapped texel grid stays fixed), and the world map.
+        if self.ground_cached_vp == Some(ground.vp) {
+            stats.ground_cached = true;
+        } else {
+            self.draw_ground(enc, self.ground_depth, self.ground_mask, &ground.vp);
+            self.ground_cached_vp = Some(ground.vp);
+        }
         if draw_world {
             self.draw_ground(enc, self.world_depth, self.world_mask, &self.world.vp);
         }
@@ -1900,23 +2221,46 @@ impl Renderer {
         let mut push = [0.0f32; 32];
         let clear = [0.0, 0.0, 0.0, 0.0];
         // Water reflection.
-        if refl_eye.is_some() {
+        if let Some(re) = &refl_eye {
+            stats.reflection_drawn = true;
+            self.targets.refl_cleared = true;
+            let (refl_hdr, refl_aux, refl_depth) = (
+                self.targets.refl_hdr,
+                self.targets.refl_aux,
+                self.targets.refl_depth,
+            );
             enc.begin_pass(PassDesc {
                 colors: vec![
-                    Attachment::clear(t.refl_hdr, clear),
-                    Attachment::clear(t.refl_aux, clear),
+                    Attachment::clear(refl_hdr, clear),
+                    Attachment::clear(refl_aux, clear),
                 ],
-                depth: Some(Attachment::clear(t.refl_depth, clear)),
+                depth: Some(Attachment::clear(refl_depth, clear)),
             });
-            enc.set_pipeline(p.scene);
-            enc.set_bind_group(0, slot.scene[1]);
-            self.draw_world(enc, &mut push, false);
+            enc.set_pipeline(self.pipelines.scene);
+            enc.set_bind_group(0, self.slots[slot_index].scene[1]);
+            self.draw_world(enc, &mut push, re, false);
             self.draw_props(enc, slot_index, 1);
-            enc.set_pipeline(p.sky);
-            enc.set_bind_group(0, slot.sky[1]);
+            enc.set_pipeline(self.pipelines.sky);
+            enc.set_bind_group(0, self.slots[slot_index].sky[1]);
             enc.draw(3, 1, 0, 0);
             enc.end_pass();
+        } else if !self.targets.refl_cleared {
+            self.targets.refl_cleared = true;
+            enc.begin_pass(PassDesc {
+                colors: vec![Attachment::clear(self.targets.refl_hdr, clear)],
+                depth: None,
+            });
+            enc.end_pass();
         }
+
+        let need_ao_clear = self.quality.ao_samples == 0 && !self.targets.ao_cleared;
+        if need_ao_clear {
+            self.targets.ao_cleared = true;
+        }
+
+        let slot = &self.slots[slot_index];
+        let t = &self.targets;
+        let p = &self.pipelines;
 
         // Main pass: world, sky, weather.
         enc.begin_pass(PassDesc {
@@ -1928,7 +2272,10 @@ impl Renderer {
         });
         enc.set_pipeline(p.scene);
         enc.set_bind_group(0, slot.scene[0]);
-        self.draw_world(enc, &mut push, true);
+        let (total_draws, submitted_draws) = self.draw_world(enc, &mut push, &eye, true);
+        stats.world_draws_total = total_draws;
+        stats.world_draws_submitted = submitted_draws;
+        stats.world_draws_culled = total_draws.saturating_sub(submitted_draws);
         self.draw_props(enc, slot_index, 0);
         let blades = self.grass_instances();
         if blades > 0 {
@@ -1981,15 +2328,24 @@ impl Renderer {
 
         let l = &self.look;
         let px_scale = t.height as f32 / 1080.0;
-        // Ambient occlusion.
-        let mut pc = [0.0f32; 16];
-        pc[..4].copy_from_slice(&[
-            l.ao_radius,
-            self.quality.ao_samples as f32,
-            t.ao.0 as f32,
-            t.ao.1 as f32,
-        ]);
-        Self::post_pass(enc, t.ao_tex, 0, Load::DontCare, p.ssao, slot.ssao, pc);
+        // Ambient occlusion (skipped when `ao_samples == 0`, relying on baked vertex AO).
+        if self.quality.ao_samples > 0 {
+            stats.ssao_drawn = true;
+            let mut pc = [0.0f32; 16];
+            pc[..4].copy_from_slice(&[
+                l.ao_radius,
+                self.quality.ao_samples as f32,
+                t.ao.0 as f32,
+                t.ao.1 as f32,
+            ]);
+            Self::post_pass(enc, t.ao_tex, 0, Load::DontCare, p.ssao, slot.ssao, pc);
+        } else if need_ao_clear {
+            enc.begin_pass(PassDesc {
+                colors: vec![Attachment::clear(t.ao_tex, [1.0; 4])],
+                depth: None,
+            });
+            enc.end_pass();
+        }
         // Air.
         let mut pc = [0.0f32; 16];
         pc[..4].copy_from_slice(&[
@@ -2045,14 +2401,35 @@ impl Renderer {
                 pc,
             );
         }
-        // Tone mapping and grading.
-        let mut pc = [0.0f32; 16];
-        pc[..4].copy_from_slice(&[l.exposure * env.exposure, l.bloom, l.saturation, l.contrast]);
-        pc[4..7].copy_from_slice(&l.lift);
-        pc[7] = l.vignette;
-        pc[8..11].copy_from_slice(&l.gain);
-        Self::post_pass(enc, t.ldr, 0, Load::DontCare, p.tonemap, slot.tonemap, pc);
-        if self.quality.painterly {
+        let (dest, encode_srgb) = match self.output {
+            Output::Still => (t.still.ok_or("still target missing")?, false),
+            Output::Surface(f) => (target.ok_or("no surface texture")?, !f.is_srgb()),
+        };
+        let exposure = l.effective_exposure() * env.exposure;
+        if !self.quality.painterly {
+            stats.fused_tonemap = true;
+            let mut pc = [0.0f32; 16];
+            pc[..4].copy_from_slice(&[exposure, l.bloom, l.vignette, l.sharpen.max(0.0)]);
+            pc[4] = if encode_srgb { 1.0 } else { 0.0 };
+            pc[5] = if self.quality.fxaa { 1.0 } else { 0.0 };
+            Self::post_pass(
+                enc,
+                dest,
+                0,
+                Load::DontCare,
+                p.tonemap_final,
+                slot.tonemap_final,
+                pc,
+            );
+        } else {
+            // Tone mapping and grading.
+            let mut pc = [0.0f32; 16];
+            pc[..4].copy_from_slice(&[exposure, l.bloom, l.saturation, l.contrast]);
+            pc[4..7].copy_from_slice(&l.lift);
+            pc[7] = l.vignette;
+            pc[8..11].copy_from_slice(&l.gain);
+            pc[11] = l.tonemap as u32 as f32;
+            Self::post_pass(enc, t.ldr, 0, Load::DontCare, p.tonemap, slot.tonemap, pc);
             let mut pc = [0.0f32; 16];
             pc[..4].copy_from_slice(&[
                 (l.painterly * px_scale * 0.6).clamp(0.0, 6.0),
@@ -2070,16 +2447,12 @@ impl Renderer {
                 ]);
             }
             Self::post_pass(enc, t.paint, 0, Load::DontCare, p.paint, slot.paint, pc);
+            let mut pc = [0.0f32; 16];
+            pc[0] = if self.quality.fxaa { 1.0 } else { 0.0 };
+            pc[1] = if encode_srgb { 1.0 } else { 0.0 };
+            pc[2] = l.sharpen.max(0.0);
+            Self::post_pass(enc, dest, 0, Load::DontCare, p.output, slot.output, pc);
         }
-        let (dest, encode_srgb) = match self.output {
-            Output::Still => (t.still.ok_or("still target missing")?, false),
-            Output::Surface(f) => (target.ok_or("no surface texture")?, !f.is_srgb()),
-        };
-        let mut pc = [0.0f32; 16];
-        pc[0] = if self.quality.fxaa { 1.0 } else { 0.0 };
-        pc[1] = if encode_srgb { 1.0 } else { 0.0 };
-        pc[2] = l.sharpen.max(0.0);
-        Self::post_pass(enc, dest, 0, Load::DontCare, p.output, slot.output, pc);
         if self.has_overlays() {
             enc.begin_pass(PassDesc {
                 colors: vec![Attachment {
@@ -2103,6 +2476,7 @@ impl Renderer {
         if let (Output::Still, Some(still), Some(rb)) = (self.output, t.still, t.readback) {
             enc.copy_texture_to_buffer(still, 0, 0, rb, 0);
         }
+        self.stats = stats;
         Ok(())
     }
 
@@ -2153,5 +2527,271 @@ impl Renderer {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Vec3;
+    use crate::render::look::SurfaceModel;
+    use crate::render::props::{MaterialDesc, MeshData};
+    use crate::render::sky::{TimeOfDay, Weather};
+    use crate::world::{AlphaMode, Instance, Material, Mesh, Shading, Transform, World};
+    use ganbate_shader::{
+        CompileOptions, ShaderLibrary, SpecValue, compile_glsl_with_options,
+        compile_msl_with_options, compile_wgsl_with_options, compile_with_options,
+    };
+
+    #[test]
+    fn specialize_brdf_permutations_all_backends() {
+        let mut lib = ShaderLibrary::new();
+        for (name, src) in shader_modules() {
+            lib.add(name, src);
+        }
+        let composed = lib.compose(SCENE).expect("compose scene");
+
+        let full = compile_with_options(
+            &composed,
+            Stage::Fragment,
+            "fs_main",
+            &CompileOptions::default(),
+        )
+        .expect("full uber-shader");
+
+        for fixed in 0..6 {
+            let specs = [("FIXED_SURFACE_MODEL", SpecValue::I32(fixed))];
+            let opts = CompileOptions {
+                imports: &[],
+                specialize: &specs,
+            };
+            let spv = compile_with_options(&composed, Stage::Fragment, "fs_main", &opts)
+                .expect("specialized spirv");
+            assert!(
+                spv.words.len() < full.words.len(),
+                "fixed model {fixed} should prune unused BRDF lobes ({} vs {})",
+                spv.words.len(),
+                full.words.len()
+            );
+            compile_msl_with_options(&composed, Stage::Fragment, "fs_main", &opts)
+                .expect("specialized msl");
+            compile_wgsl_with_options(&composed, Stage::Fragment, "fs_main", &opts)
+                .expect("specialized wgsl");
+            compile_glsl_with_options(&composed, Stage::Fragment, "fs_main", &opts)
+                .expect("specialized glsl");
+        }
+    }
+
+    fn make_quad_mesh(y: f32, half: f32) -> Mesh {
+        Mesh {
+            positions: vec![
+                Vec3(-half, y, -half),
+                Vec3(-half, y, half),
+                Vec3(half, y, half),
+                Vec3(half, y, -half),
+            ],
+            normals: vec![Vec3(0.0, 1.0, 0.0); 4],
+            uvs: vec![[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+            color: [1.0, 1.0, 1.0],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            material: Some(0),
+        }
+    }
+
+    fn sphere_prop_data() -> (Vec<V3>, Vec<V3>, Vec<[f32; 2]>, Vec<u32>) {
+        let (stacks, slices) = (10u32, 16u32);
+        let (mut pos, mut nrm, mut uvs, mut idx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..=stacks {
+            let v = i as f32 / stacks as f32;
+            let phi = v * std::f32::consts::PI;
+            for j in 0..=slices {
+                let u = j as f32 / slices as f32;
+                let theta = u * std::f32::consts::TAU;
+                let n = [phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin()];
+                pos.push(math::scale(n, 0.85));
+                nrm.push(n);
+                uvs.push([u, v]);
+            }
+        }
+        let row = slices + 1;
+        for i in 0..stacks {
+            for j in 0..slices {
+                let a = i * row + j;
+                let b = a + row;
+                idx.extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
+            }
+        }
+        (pos, nrm, uvs, idx)
+    }
+
+    #[test]
+    fn hybrid_stage_culls_caches_and_renders_unified_surface_models() {
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut world = World::default();
+        world.materials.push(Material {
+            name: "pedestal".into(),
+            base_color: [0.55, 0.53, 0.50, 1.0],
+            roughness: 0.65,
+            metallic: 0.0,
+            alpha: AlphaMode::Opaque,
+            shading: Shading::Standard,
+            ..Material::default()
+        });
+        world.meshes.push(make_quad_mesh(0.0, 4.0));
+        let mut behind = math::IDENTITY;
+        behind[12] = 0.0;
+        behind[14] = 95.0; // Far behind the eye at z = 4 looking towards origin.
+        world.instances.push(Instance {
+            mesh: 0,
+            transform: Transform(math::IDENTITY),
+        });
+        world.instances.push(Instance {
+            mesh: 0,
+            transform: Transform(behind),
+        });
+
+        let mut look = Look::default();
+        let mut renderer = Renderer::new(
+            &mut device,
+            &world,
+            look.clone(),
+            Quality::hybrid_stage(),
+            (64, 64),
+            Output::Still,
+        )
+        .expect("create hybrid renderer");
+
+        let (sp, sn, suv, sidx) = sphere_prop_data();
+        let sphere_mesh = renderer
+            .create_prop_mesh(
+                &mut device,
+                &MeshData {
+                    positions: &sp,
+                    normals: &sn,
+                    uvs: &suv,
+                    indices: &sidx,
+                },
+            )
+            .expect("sphere mesh");
+        let sphere_mat = renderer
+            .create_prop_material(
+                &mut device,
+                &MaterialDesc {
+                    name: "probe".into(),
+                    base_color: [0.75, 0.22, 0.18, 1.0],
+                    roughness: 0.25,
+                    metallic: 0.1,
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("sphere mat");
+        let mut sphere_xf = math::IDENTITY;
+        sphere_xf[13] = 0.9;
+        let _sphere_inst = renderer
+            .create_prop_instance(sphere_mesh, sphere_mat, &sphere_xf)
+            .expect("sphere instance");
+
+        let view = View {
+            name: "probe".into(),
+            eye: [0.0, 1.8, 3.6],
+            target: [0.0, 0.85, 0.0],
+            fov: 45.0,
+            ..View::default()
+        };
+        let env = Environment::resolve(
+            &TimeOfDay {
+                hours: 14.5,
+                ..TimeOfDay::default()
+            },
+            &Weather::default(),
+            &look.palette,
+            1.0,
+        );
+
+        let img1 = renderer
+            .render_still(&mut device, &view, &env, 1)
+            .expect("frame 1");
+        let stats1 = renderer.last_frame_stats();
+        assert!(stats1.world_draws_culled >= 1);
+        assert!(!stats1.reflection_drawn);
+        assert!(!stats1.ssao_drawn);
+        assert!(stats1.fused_tonemap);
+        assert!(!stats1.shadow_static_cached);
+
+        let _img2 = renderer
+            .render_still(&mut device, &view, &env, 1)
+            .expect("frame 2");
+        let stats2 = renderer.last_frame_stats();
+        assert!(stats2.shadow_static_cached);
+        assert!(stats2.ground_cached);
+
+        // Verify unified surface models + tonemap curves + EV100 exposure produce distinct valid frames.
+        let avg_luma = |px: &[u8]| -> f64 {
+            px.chunks_exact(4)
+                .map(|c| 0.2126 * c[0] as f64 + 0.7152 * c[1] as f64 + 0.0722 * c[2] as f64)
+                .sum::<f64>()
+                / (px.len() / 4) as f64
+        };
+        assert!(avg_luma(&img1) > 5.0);
+
+        let mut model_renders = Vec::new();
+        for model in SurfaceModel::ALL {
+            renderer
+                .update_prop_material(
+                    &mut device,
+                    sphere_mat,
+                    &MaterialDesc {
+                        name: "probe".into(),
+                        base_color: [0.78, 0.24, 0.20, 1.0],
+                        roughness: 0.22,
+                        metallic: if model == SurfaceModel::StandardGGX {
+                            0.85
+                        } else {
+                            0.0
+                        },
+                        surface: Some(model),
+                        clearcoat: Some(0.95),
+                        clearcoat_roughness: Some(0.06),
+                        sheen: Some(0.9),
+                        subsurface: Some(0.8),
+                        ..MaterialDesc::default()
+                    },
+                )
+                .expect("update prop surface");
+            let px = renderer
+                .render_still(&mut device, &view, &env, 1)
+                .expect("render surface model");
+            assert!(avg_luma(&px) > 5.0);
+            model_renders.push(px);
+        }
+        assert_ne!(
+            model_renders[SurfaceModel::StylizedRamp as usize],
+            model_renders[SurfaceModel::StandardGGX as usize]
+        );
+        assert_ne!(
+            model_renders[SurfaceModel::StandardGGX as usize],
+            model_renders[SurfaceModel::CharlieCloth as usize]
+        );
+
+        look.tonemap = ToneMap::AgX;
+        look.ev100 = Some(13.0);
+        renderer.set_look(look.clone());
+        let agx_ev13 = renderer
+            .render_still(&mut device, &view, &env, 1)
+            .expect("agx ev13");
+
+        look.tonemap = ToneMap::ACESFitted;
+        look.ev100 = Some(11.5); // Brighter camera exposure (+1.5 EV stops).
+        renderer.set_look(look);
+        let aces_ev11 = renderer
+            .render_still(&mut device, &view, &env, 1)
+            .expect("aces ev11.5");
+        assert!(avg_luma(&aces_ev11) > avg_luma(&agx_ev13));
+
+        let errs = device.validation_errors();
+        assert!(errs.is_empty(), "validation errors: {errs:?}");
+        renderer.destroy_props(&mut device);
     }
 }

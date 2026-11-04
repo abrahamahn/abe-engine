@@ -20,6 +20,7 @@ macro_rules! handle {
     };
 }
 
+pub mod ao;
 mod lights;
 pub mod look;
 pub mod math;
@@ -32,11 +33,14 @@ pub mod sky;
 pub use lights::{
     GameLight, LightDesc, MAX_GAME_LIGHTS, MAX_SHADOW_CONE, MAX_SHADOWED_LIGHTS, SpotCone,
 };
-pub use look::{DetailPreset, DetailRule, Focus, Grass, Look, LookFile, Terrain, View};
+pub use look::{
+    CameraExposure, DetailPreset, DetailRule, Focus, Grass, Look, LookFile, SurfaceModel,
+    SurfaceRule, Terrain, ToneMap, View,
+};
 pub use models::{ModelId, ModelInstance};
 pub use props::{
     BlendMode, MaterialDesc, MeshData, PROP_SHADER_PARAMS, Pick, PropInstance, PropMaterial,
     PropMesh, PropShader, PropTexture, WorldPick,
 };
-pub use renderer::{Output, Quality, Renderer};
+pub use renderer::{FrameStats, Output, Quality, Renderer};
 pub use sky::{Environment, Palette, SkyKey, TimeOfDay, Weather};

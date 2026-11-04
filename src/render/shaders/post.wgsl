@@ -1,5 +1,7 @@
 // Full-screen passes: ambient occlusion, air (fog, outlines, occlusion), bloom, tone mapping and
-// grading, the painterly filter and the final anti-aliased output.
+// grading (Stylized ACES, AgX, ACES Fitted, or baked 3D LUT), the painterly filter and final output.
+
+#import common
 
 struct Screen {
   @builtin(position) clip: vec4f,
@@ -27,6 +29,7 @@ var<push_constant> pc: PostPush;
 @group(0) @binding(3) var src_tex: texture_2d<f32>;
 @group(0) @binding(4) var extra_tex: texture_2d<f32>;
 @group(0) @binding(5) var lin_sampler: sampler;
+@group(0) @binding(6) var lut_tex: texture_2d<f32>;
 
 fn world_at(uv: vec2f, depth: f32) -> vec3f {
   let ndc = vec2f(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0);
@@ -155,7 +158,10 @@ fn light_shafts(uv: vec2f, frag: vec2f) -> vec3f {
     return vec4f(col + shafts * 0.5, 1.0);
   }
   let aux = textureLoad(aux_tex, px, 0);
-  let ao = textureSampleLevel(extra_tex, lin_sampler, in.uv, 0.0).r;
+  var ao = textureSampleLevel(extra_tex, lin_sampler, in.uv, 0.0).r;
+  if (aux.w >= 0.99) {
+    ao = min(ao, clamp(aux.w - 1.0, 0.0, 1.0));
+  }
   let occl = mix(pc.b.rgb, vec3f(1.0), ao);
   col *= mix(vec3f(1.0), occl, pc.a.x);
 
@@ -176,7 +182,7 @@ fn light_shafts(uv: vec2f, frag: vec2f) -> vec3f {
     }
   }
   // Grass and flowers (aux.w = 0) get no outlines, and leaves and petals (aux.w = 0.5) only a
-  // trace: a line round every card of a canopy speckles it.
+  // trace: a line round every leaf cluster of a canopy speckles it.
   let weight = select(1.0, 0.15, aux.w < 0.6) * step(0.01, aux.w);
   edge *= pc.a.y * smoothstep(90.0, 15.0, dist) * weight;
   col = mix(col, pc.c.rgb * (0.4 + 0.6 * luminance(col)), edge);
@@ -238,14 +244,65 @@ fn aces(x: vec3f) -> vec3f {
   return clamp(a / b, vec3f(0.0), vec3f(1.0));
 }
 
+// Troy Sobotka's AgX transform: sRGB inset -> log2 shaper -> 6th-order sigmoid -> linear outset.
+fn tonemap_agx(x_in: vec3f) -> vec3f {
+  let c = max(x_in, vec3f(1e-10));
+  let inset = vec3f(
+    dot(c, vec3f(0.84247906, 0.07843360, 0.07922375)),
+    dot(c, vec3f(0.04232824, 0.87846864, 0.07916613)),
+    dot(c, vec3f(0.04237565, 0.07843360, 0.87914297)),
+  );
+  let ev = clamp((log2(max(inset, vec3f(1e-10))) + vec3f(12.47393)) / 16.5, vec3f(0.0), vec3f(1.0));
+  let x2 = ev * ev;
+  let x4 = x2 * x2;
+  let p = 15.5 * x4 * x2 - 40.14 * x4 * ev + 31.96 * x4 - 6.868 * x2 * ev + 0.4298 * x2 + 0.1191 * ev - vec3f(0.00232);
+  let lin = pow(max(p, vec3f(0.0)), vec3f(2.2));
+  let outset = vec3f(
+    dot(lin, vec3f(1.19687901, -0.09802088, -0.09902974)),
+    dot(lin, vec3f(-0.05289685, 1.15190313, -0.09896118)),
+    dot(lin, vec3f(-0.05297164, -0.09804345, 1.15107367)),
+  );
+  return clamp(outset, vec3f(0.0), vec3f(1.0));
+}
+
+// Stephen Hill's sRGB -> AP1 RRT+ODT fitted ACES transform -> linear sRGB.
+fn tonemap_aces_fitted(x_in: vec3f) -> vec3f {
+  let c = max(x_in, vec3f(0.0));
+  let v = vec3f(
+    dot(c, vec3f(0.59719, 0.35458, 0.04823)),
+    dot(c, vec3f(0.07600, 0.90834, 0.01566)),
+    dot(c, vec3f(0.02840, 0.13383, 0.83777)),
+  );
+  let a = v * (v + vec3f(0.0245786)) - vec3f(0.000090537);
+  let b = v * (0.983729 * v + vec3f(0.4329510)) + vec3f(0.238081);
+  let rrt = a / b;
+  let out = vec3f(
+    dot(rrt, vec3f(1.60475, -0.53108, -0.07367)),
+    dot(rrt, vec3f(-0.10208, 1.10813, -0.00605)),
+    dot(rrt, vec3f(-0.00327, -0.07276, 1.07602)),
+  );
+  return clamp(out, vec3f(0.0), vec3f(1.0));
+}
+
+fn apply_tonemap(x: vec3f, mode: i32) -> vec3f {
+  if (mode == 1) {
+    return tonemap_agx(x);
+  }
+  if (mode == 2) {
+    return tonemap_aces_fitted(x);
+  }
+  return aces(x * 0.8);
+}
+
 // Tone mapping and grading to display-referred linear colour.
-// pc.a = (exposure, bloom, saturation, contrast), pc.b = lift rgb + vignette, pc.c = gain rgb
+// pc.a = (exposure, bloom, saturation, contrast), pc.b = lift rgb + vignette,
+// pc.c = (gain rgb, tonemap operator: 0 stylized, 1 agx, 2 aces_fitted)
 @fragment fn fs_tonemap(in: Screen) -> @location(0) vec4f {
   let px = vec2i(in.clip.xy);
   var col = textureLoad(src_tex, px, 0).rgb;
   let bloom = textureSampleLevel(extra_tex, lin_sampler, in.uv, 0.0).rgb;
   col = (col + bloom * pc.a.y) * pc.a.x;
-  col = aces(col * 0.8);
+  col = apply_tonemap(col, i32(pc.c.w + 0.5));
   let l = luminance(col);
   col = max(mix(vec3f(l), col, pc.a.z), vec3f(0.0));
   // Contrast around mid grey in perceptual space.
@@ -268,7 +325,7 @@ fn defocus_radius(p: vec2i) -> f32 {
 }
 
 // A defocused pixel: a disc of taps as wide as its spread, each counted only where its own spread
-// reaches back here, so what is in focus (a table, its dealer) never smears into the soft scene
+// reaches back here, so what is in focus (a foreground subject) never smears into the soft scene
 // behind it.
 fn defocus(uv: vec2f, px: vec2i, r: f32) -> vec3f {
   let size = vec2i(frame.viewport.xy);
@@ -403,6 +460,64 @@ fn defocus(uv: vec2f, px: vec2i, r: f32) -> vec3f {
     }
   }
   if (pc.a.y > 0.5) {
+    col = select(1.055 * pow(col, vec3f(1.0 / 2.4)) - vec3f(0.055), col * 12.92, col <= vec3f(0.0031308));
+  }
+  return vec4f(col, 1.0);
+}
+
+// Samples a 16x16x16 colour-grading LUT packed as a 256x16 2D strip, parameterized by
+// `x / (1 + x)` so `[0, inf)` scene-linear HDR maps smoothly into `[0, 1]`.
+fn sample_lut(hdr: vec3f) -> vec3f {
+  let c = max(hdr, vec3f(0.0));
+  let u = c / (vec3f(1.0) + c);
+  let r = (u.r * 15.0 + 0.5) / 256.0;
+  let g = (u.g * 15.0 + 0.5) / 16.0;
+  let b = u.b * 15.0;
+  let b0 = floor(b);
+  let b1 = min(b0 + 1.0, 15.0);
+  let f = b - b0;
+  let c0 = textureSampleLevel(lut_tex, lin_sampler, vec2f(r + b0 / 16.0, g), 0.0).rgb;
+  let c1 = textureSampleLevel(lut_tex, lin_sampler, vec2f(r + b1 / 16.0, g), 0.0).rgb;
+  return mix(c0, c1, f);
+}
+
+// Fused single-pass tone mapping, 3D LUT colour grading, vignette, sharpening, and sRGB output
+// when the painterly Kuwahara pass is disabled (such as `Quality::hybrid_stage()`).
+// pc.a = (exposure, bloom, vignette, sharpen), pc.b = (encode sRGB, enable FXAA, unused, unused)
+@fragment fn fs_tonemap_final(in: Screen) -> @location(0) vec4f {
+  let px = vec2i(in.clip.xy);
+  let size = vec2i(frame.viewport.xy);
+  let bloom = textureSampleLevel(extra_tex, lin_sampler, in.uv, 0.0).rgb * pc.a.y;
+  var hdr = (textureLoad(src_tex, px, 0).rgb + bloom) * pc.a.x;
+  let d = depth_px(px);
+  let sharpen = pc.a.w * select(1.0 - smoothstep(6.0, 18.0, linear_depth(d)), 0.0, d <= 0.0);
+  if (sharpen > 0.0 || pc.b.y > 0.5) {
+    let n0 = (textureLoad(src_tex, clamp(px + vec2i(0, -1), vec2i(0), size - vec2i(1)), 0).rgb + bloom) * pc.a.x;
+    let s0 = (textureLoad(src_tex, clamp(px + vec2i(0, 1), vec2i(0), size - vec2i(1)), 0).rgb + bloom) * pc.a.x;
+    let e0 = (textureLoad(src_tex, clamp(px + vec2i(1, 0), vec2i(0), size - vec2i(1)), 0).rgb + bloom) * pc.a.x;
+    let w0 = (textureLoad(src_tex, clamp(px + vec2i(-1, 0), vec2i(0), size - vec2i(1)), 0).rgb + bloom) * pc.a.x;
+    if (sharpen > 0.0) {
+      let detail = hdr - (n0 + s0 + e0 + w0) * 0.25;
+      hdr = max(hdr + clamp(detail * sharpen, vec3f(-0.12), vec3f(0.12)), vec3f(0.0));
+    }
+    if (pc.b.y > 0.5) {
+      let ln = luminance(n0);
+      let ls = luminance(s0);
+      let le = luminance(e0);
+      let lw = luminance(w0);
+      let lc = luminance(hdr);
+      let lo = min(lc, min(min(ln, ls), min(le, lw)));
+      let hi = max(lc, max(max(ln, ls), max(le, lw)));
+      if (hi - lo > max(0.05, hi * 0.14)) {
+        hdr = mix(hdr, (n0 + s0 + e0 + w0) * 0.25, 0.35);
+      }
+    }
+  }
+  var col = sample_lut(hdr);
+  let v = length(in.uv - vec2f(0.5)) * 1.35;
+  col *= 1.0 - pc.a.z * pow(v, 2.6);
+  col = clamp(col, vec3f(0.0), vec3f(1.0));
+  if (pc.b.x > 0.5) {
     col = select(1.055 * pow(col, vec3f(1.0 / 2.4)) - vec3f(0.055), col * 12.92, col <= vec3f(0.0031308));
   }
   return vec4f(col, 1.0);

@@ -1,17 +1,19 @@
-// Stylized forward shading for world geometry: a soft two-tone key light with tinted shade,
-// hemispheric ambient, rim light, toon specular, foliage wrap and glow, tiled lamp lights,
-// lamp emission that follows the time of day, wet surfaces in rain, painted brushwork,
-// procedural surface detail (roof tiles, wood, plaster, stone, lacquer, grassy ground, terrain
-// with beaches and rock), reflective water with shallows, foam and glitter (near the camera from
-// the ground map, further out from the world map), and instanced grass and flowers.
+// Unified forward shading for world geometry and props: art-directed stylized cel/character
+// shading and physically-based microfacet BRDFs (GGX, ClearCoat, Charlie cloth, Subsurface skin),
+// hemispheric ambient, foliage wrap and glow, tiled lamp lights, lamp emission that follows the
+// time of day, wet surfaces in rain, painted brushwork, procedural surface detail, reflective
+// water with shallows, foam and glitter, and instanced grass and flowers.
 // The same shader draws the mirrored reflection pass (frame.water_color.w = 1).
 
-// Vertices are already in world space.
+#import common
+#import brdf
+
+// Vertices are already in world space for cooked world draws.
 struct Draw {
   detail0: vec4f,    // preset (0 none, 1 roof tiles, 2 wood, 3 plaster, 4 stone, 5 lacquer, 6 grass, 7 terrain, 8 lattice), size u, size v, strength
   detail1: vec4f,    // variation, rgb replacement colour
-  detail2: vec4f,    // has replacement colour, gloss, unused, unused
-  detail3: vec4f,    // props only: first instance, encode sRGB (overlays), premultiply alpha (blended), unused
+  detail2: vec4f,    // has replacement colour, gloss, surface model + 1 (0 = Look default), primary lobe weight (< 0 = default)
+  detail3: vec4f,    // props: first instance, encode sRGB (overlays), premultiply alpha (blended); w = secondary lobe param (< 0 = default)
   base_color: vec4f,
   emissive: vec4f,   // rgb, w = 1 for lamps (scaled by the lamp level)
   params: vec4f,     // alpha cutoff, roughness, metallic, shading (0 standard, 1 foliage, 2 water, 3 unlit)
@@ -43,6 +45,12 @@ struct Light {
 @group(1) @binding(2) var emissive_tex: texture_2d<f32>;
 @group(1) @binding(3) var material_sampler: sampler;
 
+struct VsWorldIn {
+  @location(0) position: vec3f,
+  @location(1) normal: vec3f,
+  @location(2) uv: vec2f,
+  @location(3) ao: f32,
+};
 struct VsIn {
   @location(0) position: vec3f,
   @location(1) normal: vec3f,
@@ -54,19 +62,21 @@ struct VsOut {
   @location(1) normal: vec3f,
   @location(2) uv: vec2f,
   @location(3) tint: vec4f,
+  @location(4) ao: f32,
 };
 struct FsOut {
   @location(0) color: vec4f,
   @location(1) aux: vec4f,
 };
 
-@vertex fn vs_main(v: VsIn) -> VsOut {
+@vertex fn vs_main(v: VsWorldIn) -> VsOut {
   var o: VsOut;
   o.clip = frame.view_proj * vec4f(v.position, 1.0);
   o.world = v.position;
   o.normal = v.normal;
   o.uv = v.uv;
   o.tint = vec4f(1.0);
+  o.ao = v.ao;
   return o;
 }
 
@@ -82,6 +92,7 @@ struct FsOut {
   o.normal = normalize((p.normal * vec4f(s.normal, 0.0)).xyz);
   o.uv = v.uv;
   o.tint = p.tint;
+  o.ao = 1.0;
   return o;
 }
 
@@ -113,8 +124,8 @@ const TAPS = array<vec2f, 16>(
 );
 
 // Percentage-closer filtering in one cascade with `count` of the 16 taps; returns -1 outside
-// the cascade.
-fn shadow_cascade(world: vec3f, n: vec3f, layer: i32, m: mat4x4f, offset: f32, radius: f32, bias: f32, spin: f32, count: i32) -> f32 {
+// the cascade. Static world shadows live in layers 0..2; dynamic prop shadows live in 2..4.
+fn shadow_cascade(world: vec3f, n: vec3f, layer: i32, m: mat4x4f, offset: f32, radius: f32, bias: f32, spin: f32, count: i32, prop_shadows: bool) -> f32 {
   let ndl = dot(n, frame.key_dir.xyz);
   let p = m * vec4f(world + n * (offset * (1.0 + 1.5 * (1.0 - abs(ndl)))), 1.0);
   let uv = p.xy * 0.5 + vec2f(0.5);
@@ -128,7 +139,11 @@ fn shadow_cascade(world: vec3f, n: vec3f, layer: i32, m: mat4x4f, offset: f32, r
   for (var i = 0; i < count; i++) {
     let t = TAPS[i * stride];
     let o = vec2f(t.x * cs - t.y * sn, t.x * sn + t.y * cs) * radius;
-    sum += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + o, layer, p.z - bias);
+    var sample = textureSampleCompareLevel(shadow_map, shadow_sampler, uv + o, layer, p.z - bias);
+    if (prop_shadows) {
+      sample = min(sample, textureSampleCompareLevel(shadow_map, shadow_sampler, uv + o, layer + 2, p.z - bias));
+    }
+    sum += sample;
   }
   return sum / f32(count);
 }
@@ -141,21 +156,22 @@ fn shadow_taps(world: vec3f, n: vec3f, dist: f32, frag: vec2f, count: i32) -> f3
   if (frame.key_dir.w <= 0.0) {
     return 1.0;
   }
+  let prop_shadows = frame.water2.z > 0.5;
   let spin = rand01(u32(frag.x) * 7919u + u32(frag.y) * 104729u + u32(frame.wind.w) * 15485863u) * 6.2831;
   let sp = frame.shadow_params;
   if (dist < frame.cascades.x) {
-    let s0 = shadow_cascade(world, n, 0, frame.shadow0, frame.cascades.y, sp.x, sp.z, spin, count);
+    let s0 = shadow_cascade(world, n, 0, frame.shadow0, frame.cascades.y, sp.x, sp.z, spin, count, prop_shadows);
     if (s0 >= 0.0) {
       // Blend into the far cascade over the last 15% of the near one.
       let edge = smoothstep(frame.cascades.x * 0.85, frame.cascades.x, dist);
       if (edge <= 0.0) {
         return s0;
       }
-      let s1 = shadow_cascade(world, n, 1, frame.shadow1, frame.cascades.z, sp.y, sp.w, spin, count);
+      let s1 = shadow_cascade(world, n, 1, frame.shadow1, frame.cascades.z, sp.y, sp.w, spin, count, prop_shadows);
       return mix(s0, select(s1, s0, s1 < 0.0), edge);
     }
   }
-  let s1 = shadow_cascade(world, n, 1, frame.shadow1, frame.cascades.z, sp.y, sp.w, spin, count);
+  let s1 = shadow_cascade(world, n, 1, frame.shadow1, frame.cascades.z, sp.y, sp.w, spin, count, prop_shadows);
   return select(s1, 1.0, s1 < 0.0);
 }
 
@@ -611,10 +627,12 @@ fn blended(c: vec4f) -> vec4f {
   let v = to_cam / max(dist, 1e-4);
   let l = frame.key_dir.xyz;
   let key = frame.key_color.rgb * frame.key_dir.w;
-  let hemi = mix(frame.amb_ground.rgb, frame.amb_sky.rgb, n.y * 0.5 + 0.5);
+  let baked_ao = clamp(in.ao, 0.0, 1.0);
+  let hemi = mix(frame.amb_ground.rgb, frame.amb_sky.rgb, n.y * 0.5 + 0.5)
+    * mix(1.0, baked_ao, frame.lamps.y * 0.35);
 
   var out: FsOut;
-  out.aux = vec4f(geo_n, 1.0);
+  out.aux = vec4f(geo_n, 1.0 + baked_ao);
 
   var emissive = draw.emissive.rgb;
   if (draw.flags.z > 0.5) {
@@ -659,7 +677,7 @@ fn blended(c: vec4f) -> vec4f {
     let cosv = clamp(dot(wn, v), 0.0, 1.0);
     let fres = 0.03 + 0.97 * pow(1.0 - cosv, 5.0);
     var refl = sky_color(reflect(-v, wn));
-    if (!reflection_pass) {
+    if (!reflection_pass && frame.water2.w > 0.5) {
       let uv = frag.xy * frame.viewport.zw + wn.xz * vec2f(0.06, 0.035);
       refl = textureSampleLevel(reflection, clamp_sampler, uv, 0.0).rgb;
     }
@@ -744,48 +762,36 @@ fn blended(c: vec4f) -> vec4f {
   let wet = frame.amb_ground.w * smoothstep(0.5, 0.9, geo_n.y);
   albedo = vec4f(albedo.rgb * (1.0 - 0.38 * wet), albedo.a);
 
-  let ndl = dot(n, l);
-  // Brushwork also breaks up the light/shade edge.
-  let half_l = ndl * 0.5 + 0.5 + brush * 0.45;
-  var lit = smoothstep(frame.ramp.x - frame.ramp.y, frame.ramp.x + frame.ramp.y, half_l) * sh;
-  var glow = vec3f(0.0);
-  if (foliage) {
-    let wrap = frame.style.z;
-    let soft = smoothstep(0.0, 1.0, (ndl + wrap) / (1.0 + wrap));
-    lit = mix(lit, soft * mix(0.3, 1.0, sh), 0.65);
-    let back = pow(clamp(dot(-l, v), 0.0, 1.0), 3.0);
-    glow = albedo.rgb * key * (back * frame.style.w * mix(0.25, 1.0, sh));
-    out.aux = vec4f(geo_n, 0.5);
-  }
-  let dark = mix(vec3f(1.0), frame.shadow_tint.rgb, frame.shadow_tint.w);
-  // Thin petals and leaves also pass sky light through from behind.
-  var ambient = hemi;
-  if (foliage) {
-    ambient = hemi * (1.0 + frame.style.w);
-  }
-  let diffuse = key * lit + ambient * mix(dark, vec3f(1.0), lit);
-  let metallic = draw.params.z;
-  var col = albedo.rgb * (diffuse + lamps) * (1.0 - 0.5 * metallic) + glow;
-
-  // Toon specular from the key light: a soft-edged highlight that grows with gloss.
   var rough = clamp(draw.params.y * (1.0 - 0.6 * wet), 0.05, 1.0);
   if (rough_override >= 0.0) {
     rough = min(rough, rough_override);
   }
-  let hv = normalize(l + v);
-  let nh = max(dot(n, hv), 0.0);
-  let size = frame.style.y * rough;
-  let spec_t = 1.0 - size * 0.12;
-  let gloss = 1.0 - rough;
-  let spec = smoothstep(spec_t - 0.004, spec_t + 0.004, nh) * frame.style.x * (gloss * gloss * gloss) * lit;
-  col += mix(vec3f(1.0), albedo.rgb, metallic) * key * spec;
-
-  // Rim light: brighter on the lit side, cooler on the shaded side. Kept off broad upward
-  // faces (roofs, decks) seen at grazing angles, where it would read as frost.
-  let fres = pow(1.0 - clamp(dot(n, v), 0.0, 1.0), frame.ramp.w);
-  let rim_col = mix(frame.amb_sky.rgb * 1.6, key, clamp(ndl * 0.5 + 0.5, 0.0, 1.0));
-  let upright = 1.0 - smoothstep(0.3, 0.75, geo_n.y);
-  col += rim_col * (fres * frame.ramp.z * (0.35 + 0.65 * sh) * upright);
+  if (foliage) {
+    out.aux = vec4f(geo_n, 0.5);
+  }
+  var model = i32(frame.surface_mode.x + 0.5);
+  if (draw.detail2.z > 0.5) {
+    model = i32(draw.detail2.z + 0.5) - 1;
+  }
+  var surf: SurfaceInput;
+  surf.albedo = albedo.rgb;
+  surf.n = n;
+  surf.geo_n = geo_n;
+  surf.v = v;
+  surf.l = l;
+  surf.key = key;
+  surf.hemi = hemi;
+  surf.lamps = lamps;
+  surf.sh = sh;
+  surf.rough = rough;
+  surf.metallic = draw.params.z;
+  surf.ao = baked_ao;
+  surf.brush = brush;
+  surf.foliage = foliage;
+  surf.model = model;
+  surf.lobe_weight = draw.detail2.w;
+  surf.lobe_param = draw.detail3.w;
+  var col = evaluate_surface(surf);
 
   // Wet sheen: the sky mirrored on puddled ground.
   if (wet > 0.0) {

@@ -197,7 +197,7 @@ pub fn invert(m: &M4) -> Option<M4> {
         - a[12] * a[3] * a[5];
     inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14]
         - a[4] * a[2] * a[13]
-        - a[12] * a[1] * a[6]
+        + a[12] * a[1] * a[6]
         + a[12] * a[2] * a[5];
     inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11]
         - a[5] * a[3] * a[10]
@@ -253,6 +253,108 @@ pub fn linear_to_srgb(c: f32) -> f32 {
     }
 }
 
+/// Six inward-facing clip planes `a*x + b*y + c*z + d >= 0` extracted from a column-major
+/// view-projection matrix whose clip volume is `-w <= x <= w`, `-w <= y <= w`, `0 <= z <= w`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frustum {
+    pub planes: [[f32; 4]; 6],
+}
+
+fn normalize_plane(p: [f32; 4]) -> [f32; 4] {
+    let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+    if len > 1e-12 {
+        let inv = 1.0 / len;
+        [p[0] * inv, p[1] * inv, p[2] * inv, p[3] * inv]
+    } else {
+        p
+    }
+}
+
+impl Frustum {
+    /// Extracts the six inward-pointing clip planes from `vp`.
+    pub fn from_view_proj(vp: &M4) -> Self {
+        let row = |r: usize| [vp[r], vp[4 + r], vp[8 + r], vp[12 + r]];
+        let r0 = row(0);
+        let r1 = row(1);
+        let r2 = row(2);
+        let r3 = row(3);
+        let plus = |a: [f32; 4], b: [f32; 4]| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]];
+        let minus = |a: [f32; 4], b: [f32; 4]| [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]];
+        Self {
+            planes: [
+                normalize_plane(plus(r3, r0)),
+                normalize_plane(minus(r3, r0)),
+                normalize_plane(plus(r3, r1)),
+                normalize_plane(minus(r3, r1)),
+                normalize_plane(r2),
+                normalize_plane(minus(r3, r2)),
+            ],
+        }
+    }
+
+    /// True when world-space point `p` lies inside or on the frustum boundary.
+    pub fn contains_point(&self, p: V3) -> bool {
+        self.planes
+            .iter()
+            .all(|pl| pl[0] * p[0] + pl[1] * p[1] + pl[2] * p[2] + pl[3] >= -1e-5)
+    }
+
+    /// Conservative AABB-frustum intersection test with zero false negatives. Empty AABBs
+    /// (`min > max`) return `false`.
+    pub fn intersects_aabb(&self, min: V3, max: V3) -> bool {
+        if min[0] > max[0] || min[1] > max[1] || min[2] > max[2] {
+            return false;
+        }
+        for pl in &self.planes {
+            let px = if pl[0] >= 0.0 { max[0] } else { min[0] };
+            let py = if pl[1] >= 0.0 { max[1] } else { min[1] };
+            let pz = if pl[2] >= 0.0 { max[2] } else { min[2] };
+            if pl[0] * px + pl[1] * py + pl[2] * pz + pl[3] < -1e-4 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Conservative AABB test for depth-clamped orthographic passes (shadow cascades and top-down
+    /// ground maps), omitting the `z >= 0` near plane so casters clamped to depth `0` are kept.
+    pub fn intersects_aabb_clamped(&self, min: V3, max: V3) -> bool {
+        if min[0] > max[0] || min[1] > max[1] || min[2] > max[2] {
+            return false;
+        }
+        for i in [0, 1, 2, 3, 5] {
+            let pl = &self.planes[i];
+            let px = if pl[0] >= 0.0 { max[0] } else { min[0] };
+            let py = if pl[1] >= 0.0 { max[1] } else { min[1] };
+            let pz = if pl[2] >= 0.0 { max[2] } else { min[2] };
+            if pl[0] * px + pl[1] * py + pl[2] * pz + pl[3] < -1e-4 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Shortest Euclidean distance from `eye` to axis-aligned box `(min, max)` (`0` inside).
+pub fn aabb_distance(eye: V3, min: V3, max: V3) -> f32 {
+    if min[0] > max[0] || min[1] > max[1] || min[2] > max[2] {
+        return f32::INFINITY;
+    }
+    let dx = (min[0] - eye[0]).max(0.0).max(eye[0] - max[0]);
+    let dy = (min[1] - eye[1]).max(0.0).max(eye[1] - max[1]);
+    let dz = (min[2] - eye[2]).max(0.0).max(eye[2] - max[2]);
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// World-space diagonal length of axis-aligned box `(min, max)` (`0` when empty).
+pub fn aabb_extent(min: V3, max: V3) -> f32 {
+    if min[0] > max[0] || min[1] > max[1] || min[2] > max[2] {
+        0.0
+    } else {
+        length(sub(max, min))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,8 +387,93 @@ mod tests {
         assert!(depth(-0.1).abs() < 1e-6);
         assert!((depth(-8.0) - 1.0).abs() < 1e-6);
         assert!(depth(-1.0) < depth(-2.0));
-        // The cone's edge lands on the map's edge, up being up.
         let up = transform(&p, [0.0, (0.6f32).tan(), -1.0, 1.0]);
         assert!((up[1] / up[3] - 1.0).abs() < 1e-5);
+    }
+    #[test]
+    fn perspective_frustum_matches_reversed_z_clip_volume() {
+        let v = look_at([2.0, 3.0, 10.0], [2.0, 2.5, 0.0], [0.0, 1.0, 0.0]);
+        let mut p = perspective(55f32.to_radians(), 16.0 / 9.0, 0.5);
+        p[8] += 0.12;
+        p[9] -= 0.08;
+        let vp = mul(&p, &v);
+        let f = Frustum::from_view_proj(&vp);
+
+        for ix in -8..=12 {
+            for iy in -6..=10 {
+                for iz in -30..=15 {
+                    let pt = [ix as f32 * 2.3, iy as f32 * 1.7, iz as f32 * 3.1];
+                    let c = transform(&vp, [pt[0], pt[1], pt[2], 1.0]);
+                    let clip_in = c[3] > 0.0
+                        && c[0] >= -c[3]
+                        && c[0] <= c[3]
+                        && c[1] >= -c[3]
+                        && c[1] <= c[3]
+                        && c[2] >= 0.0
+                        && c[2] <= c[3];
+                    if clip_in {
+                        assert!(f.contains_point(pt), "false negative on point {pt:?}");
+                        let min = [pt[0] - 0.25, pt[1] - 0.25, pt[2] - 0.25];
+                        let max = [pt[0] + 0.25, pt[1] + 0.25, pt[2] + 0.25];
+                        assert!(f.intersects_aabb(min, max), "false negative on box {pt:?}");
+                    }
+                    let well_out = c[3] < -0.5
+                        || c[0] < -c[3] - 2.0
+                        || c[0] > c[3] + 2.0
+                        || c[1] < -c[3] - 2.0
+                        || c[1] > c[3] + 2.0
+                        || c[2] > c[3] + 0.5;
+                    if well_out {
+                        assert!(!f.contains_point(pt), "false positive on point {pt:?}");
+                    }
+                }
+            }
+        }
+        assert!(f.contains_point([2.0, -45.0, -1000.0]) || f.contains_point([2.0, -47.0, -1000.0]));
+        assert!(!f.contains_point([2.0, 3.0, 12.0]));
+        assert!(!f.contains_point([2.0, 3.0, 9.8]));
+        assert!(!f.intersects_aabb([1.0, 1.0, 1.0], [-1.0, -1.0, -1.0]));
+    }
+    #[test]
+    fn ortho_and_mirrored_frusta_classify_inside_and_outside_accurately() {
+        let lv = look_at([20.0, 30.0, 20.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let vp = mul(&ortho(-15.0, 15.0, -12.0, 12.0, 2.0, 80.0), &lv);
+        let f = Frustum::from_view_proj(&vp);
+
+        assert!(f.contains_point([0.0, 0.0, 0.0]));
+        assert!(f.intersects_aabb([-1.0; 3], [1.0; 3]));
+        assert!(!f.intersects_aabb([60.0, 0.0, -60.0], [65.0, 5.0, -55.0]));
+        assert!(!f.intersects_aabb([-80.0, -80.0, -80.0], [-70.0, -70.0, -70.0]));
+        assert!(!f.contains_point([25.0, 38.0, 25.0]));
+        assert!(f.intersects_aabb_clamped([24.5, 37.0, 24.5], [25.5, 38.0, 25.5]));
+
+        let cam = mul(
+            &perspective(50f32.to_radians(), 1.5, 0.2),
+            &look_at([0.0, 3.0, 8.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+        );
+        let refl_vp = mul(&cam, &reflect_y(0.0));
+        let rf = Frustum::from_view_proj(&refl_vp);
+        for ix in -5..=5 {
+            for iy in -2..=8 {
+                for iz in -10..=4 {
+                    let pt = [ix as f32 * 1.5, iy as f32 * 1.2, iz as f32 * 1.8];
+                    let c = transform(&refl_vp, [pt[0], pt[1], pt[2], 1.0]);
+                    let clip_in = c[3] > 0.0
+                        && c[0].abs() <= c[3]
+                        && c[1].abs() <= c[3]
+                        && c[2] >= 0.0
+                        && c[2] <= c[3];
+                    if clip_in {
+                        assert!(
+                            rf.intersects_aabb(
+                                [pt[0] - 0.1, pt[1] - 0.1, pt[2] - 0.1],
+                                [pt[0] + 0.1, pt[1] + 0.1, pt[2] + 0.1],
+                            ),
+                            "mirrored frustum false negative at {pt:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -1,5 +1,6 @@
 // Shadow depth, the top-down ground map, the sky backdrop and GPU-generated weather particles
 // (rain, petals).
+#import common
 
 struct ShadowPush {
   light_vp: mat4x4f,

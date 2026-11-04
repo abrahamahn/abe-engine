@@ -1321,3 +1321,218 @@ fn pathological_declarations_are_errors_not_crashes() {
     );
     assert!(c.words.len() < 1000, "{}", c.words.len());
 }
+
+// ------------------------------------------------ #import & specialization v2
+
+#[test]
+fn import_diamond_dedup_and_error_reporting() {
+    let lib = crate::ShaderLibrary::new()
+        .with_module(
+            "math",
+            "const PI: f32 = 3.14159265;\nfn sq(x: f32) -> f32 { return x * x; }\n",
+        )
+        .with_module(
+            "brdf_a",
+            "#import math\nfn lobe_a(x: f32) -> f32 { return sq(x) / PI; }\n",
+        )
+        .with_module(
+            "brdf_b",
+            "#import \"math\";\nfn lobe_b(x: f32) -> f32 { return sq(x) * 2.0; }\n",
+        );
+
+    let src = r#"
+/* #import nonexistent_in_comment */
+// #import another_comment
+#import brdf_a
+#import brdf_b
+
+@fragment fn main(@location(0) uv: vec2f) -> @location(0) vec4f {
+    return vec4f(lobe_a(uv.x), lobe_b(uv.y), PI, 1.0);
+}
+"#;
+    let compiled = lib.compile_wgsl(src, Stage::Fragment, "main", &[]).unwrap();
+    assert!(!compiled.words.is_empty());
+    let wgsl = compiled.wgsl.as_ref().unwrap().source.as_str();
+    assert!(wgsl.contains("lobe_a") && wgsl.contains("lobe_b"));
+
+    // Unknown module reports 1-based line and column.
+    let missing = crate::compose("const X = 1;\n  #import missing_mod\n", &[]).unwrap_err();
+    assert_eq!(missing.line, 2);
+    assert_eq!(missing.column, 11);
+    assert!(missing.message.contains("missing_mod"), "{}", missing);
+
+    // Cyclic imports fail cleanly without recursion overflow.
+    let cyc =
+        crate::compose("#import a\n", &[("a", "#import b\n"), ("b", "#import a\n")]).unwrap_err();
+    assert!(cyc.message.contains("cyclic"), "{}", cyc);
+}
+
+#[test]
+fn specialize_prunes_dead_brdf_branches_and_unused_bindings_all_backends() {
+    let lib = crate::ShaderLibrary::new().with_module(
+        "brdf",
+        r#"
+@group(0) @binding(0) var<uniform> params: vec4f;
+@group(0) @binding(1) var lut_tex: texture_2d<f32>;
+@group(0) @binding(2) var lut_smp: sampler;
+
+fn eval_stylized(ndotl: f32) -> vec3f {
+    return vec3f(smoothstep(0.0, 0.15, ndotl)) * params.xyz;
+}
+
+fn eval_photoreal_lut(ndotl: f32, rough: f32) -> vec3f {
+    let sample_val = textureSampleLevel(lut_tex, lut_smp, vec2f(ndotl, rough), 0.0).xyz;
+    return sample_val * params.xyz;
+}
+"#,
+    );
+
+    let shader = r#"
+#import brdf
+
+const SHADING_MODE: u32 = 0u;
+const ENABLE_CLEARCOAT: bool = false;
+const COAT_STRENGTH: f32 = 0.25;
+
+@fragment fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
+    var col = vec3f(0.0);
+    if SHADING_MODE == 0u {
+        col = eval_stylized(uv.x);
+    } else {
+        col = eval_photoreal_lut(uv.x, uv.y);
+    }
+    if ENABLE_CLEARCOAT {
+        col += vec3f(COAT_STRENGTH * uv.y);
+    }
+    return vec4f(col, 1.0);
+}
+"#;
+
+    // Permutation A: Stylized (SHADING_MODE = 0u) -> `lut_tex`, `lut_smp`, and `eval_photoreal_lut`
+    // must be completely stripped from reflection and every backend output!
+    let spec_stylized = [
+        ("SHADING_MODE", crate::SpecValue::U32(0)),
+        ("ENABLE_CLEARCOAT", crate::SpecValue::Bool(false)),
+    ];
+    let spv_a = lib
+        .compile_msl(shader, Stage::Fragment, "fs_main", &spec_stylized)
+        .unwrap();
+    let wgsl_a = lib
+        .compile_wgsl(shader, Stage::Fragment, "fs_main", &spec_stylized)
+        .unwrap();
+    let glsl_a = lib
+        .compile_glsl(shader, Stage::Fragment, "fs_main", &spec_stylized)
+        .unwrap();
+
+    assert_eq!(
+        spv_a.bindings.len(),
+        1,
+        "stylized permutation should only reflect uniform binding 0: {:?}",
+        spv_a.bindings
+    );
+    assert_eq!(spv_a.bindings[0].binding, 0);
+    let msl_src_a = &spv_a.msl.as_ref().unwrap().source;
+    let wgsl_src_a = &wgsl_a.wgsl.as_ref().unwrap().source;
+    let glsl_src_a = &glsl_a.glsl.as_ref().unwrap().source;
+    assert!(!msl_src_a.contains("eval_photoreal_lut"), "{msl_src_a}");
+    assert!(!wgsl_src_a.contains("eval_photoreal_lut"), "{wgsl_src_a}");
+    assert!(!glsl_src_a.contains("eval_photoreal_lut"), "{glsl_src_a}");
+    assert!(wgsl_src_a.contains("eval_stylized"), "{wgsl_src_a}");
+
+    // Permutation B: Photoreal + ClearCoat -> reflects all 3 bindings, strips `eval_stylized`.
+    let spec_photo = [
+        ("SHADING_MODE", crate::SpecValue::U32(1)),
+        ("ENABLE_CLEARCOAT", crate::SpecValue::Bool(true)),
+        ("COAT_STRENGTH", crate::SpecValue::F32(0.75)),
+    ];
+    let wgsl_b = lib
+        .compile_wgsl(shader, Stage::Fragment, "fs_main", &spec_photo)
+        .unwrap();
+    let msl_b = lib
+        .compile_msl(shader, Stage::Fragment, "fs_main", &spec_photo)
+        .unwrap();
+    let glsl_b = lib
+        .compile_glsl(shader, Stage::Fragment, "fs_main", &spec_photo)
+        .unwrap();
+    assert_eq!(wgsl_b.bindings.len(), 3);
+    assert!(
+        !wgsl_b
+            .wgsl
+            .as_ref()
+            .unwrap()
+            .source
+            .contains("eval_stylized")
+    );
+    assert!(
+        wgsl_b
+            .wgsl
+            .as_ref()
+            .unwrap()
+            .source
+            .contains("eval_photoreal_lut")
+    );
+    assert!(!msl_b.msl.as_ref().unwrap().source.contains("eval_stylized"));
+    assert!(
+        !glsl_b
+            .glsl
+            .as_ref()
+            .unwrap()
+            .source
+            .contains("eval_stylized")
+    );
+    assert!(spv_a.words != wgsl_b.words);
+
+    // Dead branches are still type-checked so broken inactive permutations cannot hide bugs!
+    let broken_dead = r#"
+const USE_FAST: bool = true;
+@fragment fn fs_main() -> @location(0) vec4f {
+    if USE_FAST {
+        return vec4f(1.0);
+    } else {
+        return vec4f(unknown_ident);
+    }
+}
+"#;
+    let err = crate::compile(broken_dead, Stage::Fragment, "fs_main").unwrap_err();
+    assert!(err.message.contains("unknown_ident"), "{err}");
+
+    // Invalid specialization name or mismatched type produces a clean compile error.
+    let bad_name = lib
+        .compile(
+            shader,
+            Stage::Fragment,
+            "fs_main",
+            &[("NO_SUCH_CONST", crate::SpecValue::Bool(true))],
+        )
+        .unwrap_err();
+    assert!(bad_name.message.contains("NO_SUCH_CONST"), "{bad_name}");
+
+    let bad_type = lib
+        .compile(
+            shader,
+            Stage::Fragment,
+            "fs_main",
+            &[("ENABLE_CLEARCOAT", crate::SpecValue::U32(3))],
+        )
+        .unwrap_err();
+    assert!(bad_type.message.contains("ENABLE_CLEARCOAT"), "{bad_type}");
+}
+
+#[test]
+fn define_import_path_deduplicates_preconcatenated_and_library_modules() {
+    let common = "#define_import_path common\nfn base_val() -> f32 { return 0.25; }\n";
+    let brdf = "#define_import_path brdf\n#import common\nfn shade_val() -> f32 { return base_val() * 2.0; }\n";
+    let main = "#import common\n#import brdf\n@fragment fn fs_main() -> @location(0) vec4f { return vec4f(shade_val()); }\n";
+
+    // Pre-concatenated translation unit without ShaderLibrary imports.
+    let concat = format!("{common}\n{brdf}\n{main}");
+    crate::compile_glsl(&concat, Stage::Fragment, "fs_main").expect("concat glsl");
+    crate::compile_msl(&concat, Stage::Fragment, "fs_main").expect("concat msl");
+
+    // Library-composed translation unit.
+    let lib = crate::ShaderLibrary::new()
+        .with_module("common", common)
+        .with_module("brdf", brdf);
+    lib.compile(main, Stage::Fragment, "fs_main", &[])
+        .expect("library spirv");
+}

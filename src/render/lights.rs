@@ -1,4 +1,4 @@
-//! Lights a game places while it runs (a table's key light over the cards, a lantern it hangs):
+//! Lights a game places while it runs (a stage spotlight over foreground props, a lantern it hangs):
 //! point lights and spot lights, shaded like the cooked world's lamps in every pass, binned into
 //! the same screen tiles, and moved, recoloured or put out at any time. A game light shines at
 //! every hour unless it asks to follow the lamps (lit only as the evening lights the lamps).

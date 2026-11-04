@@ -16,7 +16,7 @@ struct ShadeInput {
   // samples it elsewhere (another uv, a mip bias), in uniform control flow.
   base: vec4f,
   // Its normal and emissive textures at `uv` (flat (0.5, 0.5, 1) and white without them): more
-  // pictures for the shader to use as it likes (a card's face under its back), sampled elsewhere
+  // pictures for the shader to use as it likes (an emblem layer over a base coat), sampled elsewhere
   // through `normal_tex` and `emissive_tex` with `material_sampler`.
   normal_map: vec4f,
   emissive_map: vec4f,

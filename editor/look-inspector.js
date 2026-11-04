@@ -1,12 +1,15 @@
 // Look values stay in their renderer-native form. Missing keys use the renderer's default.
 const fields = {
   shading: {
-    number: 'ramp_center ramp_softness shadow_strength rim_strength rim_power specular specular_size foliage_wrap foliage_translucency texture_softness normal_map_strength lamp_light lamp_glow lamp_foliage water_reflection water_ripples tide brush brush_scale foam sparkle bounce',
-    color: 'shadow_tint water_color water_shallow tide_color',
+    surface: 'model',
+    number: 'ramp_center ramp_softness shadow_strength rim_strength rim_power specular specular_size clearcoat clearcoat_roughness sheen subsurface foliage_wrap foliage_translucency texture_softness normal_map_strength lamp_light lamp_glow lamp_foliage water_reflection water_ripples tide brush brush_scale foam sparkle bounce',
+    color: 'shadow_tint subsurface_color water_color water_shallow tide_color',
   },
   post: {
-    number: 'ambient_occlusion ao_radius outline painterly painterly_far bloom bloom_threshold exposure saturation contrast vignette fog fog_height fog_falloff sharpen sun_shafts',
+    tonemap: 'tonemap',
+    number: 'ambient_occlusion ao_radius outline painterly painterly_far bloom bloom_threshold exposure ev100 saturation contrast vignette fog fog_height fog_falloff sharpen sun_shafts',
     color: 'ao_tint outline_color lift gain',
+    object: 'camera',
   },
   sky: { number: 'cloud_scale star_density moon_size moon_intensity dusk_warmth dawn_mist', color: 'moon_color', array: 'keys' },
   time: { number: 'hours day_of_year latitude moon_lag_hours moon_declination', vector: 'north' },
@@ -17,6 +20,9 @@ const fields = {
   views: {},
 };
 const weather = ['clear', 'cloudy', 'overcast', 'mist', 'rain', 'storm', 'petals'];
+const surfaces = ['stylized_ramp', 'stylized_character', 'standard_ggx', 'clearcoat', 'charlie_cloth', 'subsurface_skin'];
+const tonemaps = ['stylized', 'agx', 'aces_fitted'];
+const enums = { preset: weather, surface: surfaces, tonemap: tonemaps };
 const title = (key) => (key[0].toUpperCase() + key.slice(1)).replaceAll('_', ' ');
 
 function fieldValue(value, type) {
@@ -44,9 +50,13 @@ export function parseLookInput(text, type) {
     if (!Number.isFinite(n)) throw new Error('Enter a finite number.');
     return n;
   }
-  if (type === 'preset' || (type === 'color' && /^#[0-9a-f]{6}$/i.test(input))) return input;
+  if (type in enums || (type === 'color' && /^#[0-9a-f]{6}$/i.test(input))) return input;
   let value;
-  try { value = JSON.parse(input); } catch { throw new Error(type === 'color' ? 'Enter #rrggbb or three linear RGB values in brackets.' : 'Enter an array in brackets.'); }
+  try { value = JSON.parse(input); } catch { throw new Error(type === 'color' ? 'Enter #rrggbb or three linear RGB values in brackets.' : type === 'object' ? 'Enter a JSON object in braces.' : 'Enter an array in brackets.'); }
+  if (type === 'object') {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Enter a JSON object in braces.');
+    return value;
+  }
   if (!Array.isArray(value)) throw new Error('Enter an array in brackets.');
   if (type !== 'array') {
     const count = type === 'pair' ? 2 : 3;
@@ -75,11 +85,12 @@ export function drawLookInspector(box, { doc, environment, section, retry, chang
     const stored = keys.reduce((v, k) => v?.[k], doc.root);
     const id = 'look-field-' + keys.join('-');
     const row = el('div', { class: 'look-field', 'data-key': id });
-    const input = type === 'preset'
-      ? el('select', {id}, el('option', {value: ''}, t('lookDefault')), weather.map(v => el('option', {value: v}, v)))
+    const input = type in enums
+      ? el('select', {id}, el('option', {value: ''}, t('lookDefault')), enums[type].map(v => el('option', {value: v}, v)))
       : type === 'array' ? el('textarea', {id, rows: 5, spellcheck: false, placeholder: '[]'})
-        : el('input', {id, type: type === 'number' ? 'number' : 'text', step: type === 'number' ? 'any' : null,
-          placeholder: type === 'color' ? '#rrggbb / [r, g, b]' : type === 'vector' ? '[x, y, z]' : type === 'pair' ? '[start, full]' : t('lookDefault')});
+        : type === 'object' ? el('textarea', {id, rows: 3, spellcheck: false, placeholder: '{"aperture": 8, "shutter_speed": 0.008, "iso": 100, "compensation": 0}'})
+          : el('input', {id, type: type === 'number' ? 'number' : 'text', step: type === 'number' ? 'any' : null,
+            placeholder: type === 'color' ? '#rrggbb / [r, g, b]' : type === 'vector' ? '[x, y, z]' : type === 'pair' ? '[start, full]' : t('lookDefault')});
     input.value = fieldValue(stored, type);
     const error = el('small', { class: 'look-error', 'aria-live': 'polite' });
     input.addEventListener('input', () => { input.setCustomValidity(''); error.textContent = ''; });

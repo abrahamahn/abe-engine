@@ -1,6 +1,6 @@
-//! Props: meshes, materials and textures a game creates while it runs (a table, cards, chips,
-//! characters), placed by per-instance transforms and drawn with the cooked world in every
-//! pass: shadow cascades, the water reflection and the main view, with the same stylized
+//! Props: meshes, materials and textures a game creates while it runs (characters, interactive
+//! props, architecture), placed by per-instance transforms and drawn with the cooked world in every
+//! pass: shadow cascades, the water reflection and the main view, with the same unified
 //! shading, tiled lamps and Look rules (a prop material's name is matched like a world
 //! material's).
 //!
@@ -17,6 +17,7 @@
 //! Handles are generational: using one after its object was destroyed is an error, never a
 //! different object.
 use super::View;
+use super::look::SurfaceModel;
 use super::math::{self, M4, V3};
 use super::renderer::Renderer;
 use super::scene::MaterialData;
@@ -112,6 +113,18 @@ pub struct MaterialDesc {
     pub shader: Option<PropShader>,
     /// What the prop shader reads (`ShadeInput::p0`..`p4`); unused without one.
     pub params: [f32; PROP_SHADER_PARAMS],
+    /// Optional per-material surface response override (`None` inherits Look / DetailRule).
+    pub surface: Option<SurfaceModel>,
+    /// Optional clear-coat lobe weight (`0..1`).
+    pub clearcoat: Option<f32>,
+    /// Optional clear-coat roughness (`0.02..1`).
+    pub clearcoat_roughness: Option<f32>,
+    /// Optional fabric sheen weight (`0..1`).
+    pub sheen: Option<f32>,
+    /// Optional fabric sheen tint (`0..1`, `0` = white, `1` = base colour).
+    pub sheen_tint: Option<f32>,
+    /// Optional subsurface wrap / scatter weight (`0..1`).
+    pub subsurface: Option<f32>,
 }
 
 impl Default for MaterialDesc {
@@ -137,6 +150,12 @@ impl Default for MaterialDesc {
             order: 0.0,
             shader: None,
             params: [0.0; PROP_SHADER_PARAMS],
+            surface: None,
+            clearcoat: None,
+            clearcoat_roughness: None,
+            sheen: None,
+            sheen_tint: None,
+            subsurface: None,
         }
     }
 }
@@ -146,8 +165,8 @@ impl MaterialDesc {
     /// and unknown fields are errors:
     ///
     /// ```json
-    /// {"name": "felt", "color": [0.1, 0.3, 0.2, 1], "emissive": [0, 0, 0], "lamp": false,
-    ///  "roughness": 0.8, "metallic": 0, "shading": "standard",
+    /// {"name": "stone", "color": [0.1, 0.3, 0.2, 1], "emissive": [0, 0, 0], "lamp": false,
+    ///  "roughness": 0.8, "metallic": 0, "shading": "standard", "surface": "standard_ggx",
     ///  "alphaCutoff": 0.5, "baseTexture": 3, "normalTexture": 4, "emissiveTexture": 5,
     ///  "normalScale": 1, "castsShadow": true, "blend": "opaque", "overlay": false,
     ///  "depthTest": true, "depthWrite": false, "order": 0, "shader": 2, "params": [0.5, 1, 0, 0]}
@@ -158,7 +177,7 @@ impl MaterialDesc {
     /// [`PropShader`]); `params` holds up to twenty numbers (the rest are zero).
     pub fn from_json(text: &[u8]) -> Result<Self> {
         use crate::assets::json::{self, Value};
-        const KNOWN: [&str; 20] = [
+        const KNOWN: [&str; 26] = [
             "name",
             "color",
             "emissive",
@@ -179,6 +198,12 @@ impl MaterialDesc {
             "order",
             "shader",
             "params",
+            "surface",
+            "clearcoat",
+            "clearcoatRoughness",
+            "sheen",
+            "sheenTint",
+            "subsurface",
         ];
         let v = json::parse(text).map_err(|e| format!("material: {e}"))?;
         let Value::Object(map) = &v else {
@@ -310,6 +335,18 @@ impl MaterialDesc {
                 *out = x.float().map_err(|e| field("params", e))?;
             }
         }
+        if let Some(s) = v.get("surface") {
+            let name = s.string().map_err(|e| field("surface", e))?;
+            d.surface = Some(
+                SurfaceModel::parse(name)
+                    .ok_or_else(|| field("surface", format!("unknown {name:?}")))?,
+            );
+        }
+        d.clearcoat = num("clearcoat")?.map(|x| x.clamp(0.0, 1.0));
+        d.clearcoat_roughness = num("clearcoatRoughness")?.map(|x| x.clamp(0.02, 1.0));
+        d.sheen = num("sheen")?.map(|x| x.clamp(0.0, 1.0));
+        d.sheen_tint = num("sheenTint")?.map(|x| x.clamp(0.0, 1.0));
+        d.subsurface = num("subsurface")?.map(|x| x.clamp(0.0, 1.0));
         Ok(d)
     }
 }
@@ -1621,6 +1658,30 @@ impl Renderer {
         self.props.batches.iter().any(|b| b.layer == Layer::Overlay)
     }
 
+    /// Whether this frame has opaque shadow-casting prop batches.
+    pub(super) fn has_prop_shadows(&self) -> bool {
+        self.props.batches.iter().any(|b| {
+            b.layer == Layer::Opaque
+                && self
+                    .props
+                    .materials
+                    .get(b.material)
+                    .is_some_and(|m| m.desc.casts_shadow)
+        })
+    }
+
+    /// Whether this frame has scene prop batches using water shading.
+    pub(super) fn has_water_props(&self) -> bool {
+        self.props.batches.iter().any(|b| {
+            b.layer != Layer::Overlay
+                && self
+                    .props
+                    .materials
+                    .get(b.material)
+                    .is_some_and(|m| m.desc.shading == Shading::Water)
+        })
+    }
+
     fn create_prop_slot(&self, device: &mut Device<'_>, slot: usize) -> Result<PropSlot> {
         let buffer = device.create_buffer(&BufferDesc {
             size: u64::from(self.props.capacity) * PROP_BYTES,
@@ -1764,6 +1825,20 @@ impl Renderer {
         push[20..24].copy_from_slice(&mat.data.emissive);
         push[24..28].copy_from_slice(&mat.data.params);
         push[28..32].copy_from_slice(&mat.data.flags);
+        if let Some(s) = mat.desc.surface {
+            push[10] = (s as u32 + 1) as f32;
+        }
+        if let Some(w) = mat
+            .desc
+            .clearcoat
+            .or(mat.desc.sheen)
+            .or(mat.desc.subsurface)
+        {
+            push[11] = w;
+        }
+        if let Some(p) = mat.desc.clearcoat_roughness.or(mat.desc.sheen_tint) {
+            push[15] = p;
+        }
         if mat.desc.shader.is_some() {
             // A prop shader's parameters: detail0..2, emissive and flags (prop_shader.wgsl).
             push[..12].copy_from_slice(&mat.desc.params[..12]);
@@ -1928,12 +2003,15 @@ mod tests {
     #[test]
     fn material_from_json() {
         let d = MaterialDesc::from_json(
-            br#"{"name": "felt", "color": [0.1, 0.3, 0.2, 1], "roughness": 2,
+            br#"{"name": "stone", "color": [0.1, 0.3, 0.2, 1], "roughness": 2,
                  "shading": "unlit", "alphaCutoff": 0.5, "baseTexture": 7,
-                 "castsShadow": false, "lamp": true, "emissive": [1, 0.5, 0]}"#,
+                 "castsShadow": false, "lamp": true, "emissive": [1, 0.5, 0],
+                 "surface": "clearcoat", "clearcoat": 0.8, "clearcoatRoughness": 0.1}"#,
         )
         .unwrap();
-        assert_eq!(d.name, "felt");
+        assert_eq!(d.name, "stone");
+        assert_eq!(d.surface, Some(SurfaceModel::ClearCoat));
+        assert_eq!((d.clearcoat, d.clearcoat_roughness), (Some(0.8), Some(0.1)));
         assert_eq!(d.base_color, [0.1, 0.3, 0.2, 1.0]);
         assert_eq!((d.roughness, d.shading), (1.0, Shading::Unlit));
         assert_eq!(

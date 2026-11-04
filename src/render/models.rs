@@ -430,7 +430,7 @@ impl Renderer {
         self.place_model_parts(i)
     }
 
-    /// Shows or hides the meshes of one node (a card in a hand).
+    /// Shows or hides the meshes of one node (a sub-assembly or equipment attachment).
     pub fn set_model_node_visible(
         &mut self,
         i: ModelInstance,
@@ -566,7 +566,7 @@ impl Renderer {
         Ok(())
     }
 
-    /// Node `node`'s world transform as of the last update (a socket a card rides on).
+    /// Node `node`'s world transform as of the last update (a socket an attachment rides on).
     pub fn model_node_world(&self, i: ModelInstance, node: usize) -> Result<M4> {
         let e = self
             .models
