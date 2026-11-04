@@ -791,6 +791,10 @@ export function mountCodeXray(container, studioApi = {}) {
     },
     decisions: loadTriageDecisionsFromStorage(storage),
     glbCache: new Map(),
+    glbInflight: new Map(),
+    glbQueue: [],
+    glbActiveLoads: 0,
+    bookshelfLimit: 120,
     sourceCache: new Map(),
     sourceInflight: new Set(),
     saveNotice: '',
@@ -831,6 +835,20 @@ export function mountCodeXray(container, studioApi = {}) {
     };
   }
 
+  function acquireGlbSlot() {
+    if (state.glbActiveLoads < 2) {
+      state.glbActiveLoads++;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => state.glbQueue.push(resolve));
+  }
+
+  function releaseGlbSlot() {
+    const next = state.glbQueue.shift();
+    if (next) next();
+    else state.glbActiveLoads = Math.max(0, state.glbActiveLoads - 1);
+  }
+
   async function loadGlbGeometryForCanvas(item, canvas, width, height, isMini = false) {
     if (!item || !canvas || typeof fetchImpl !== 'function') return;
     const cacheKey = item.id;
@@ -838,24 +856,43 @@ export function mountCodeXray(container, studioApi = {}) {
       drawGlbPreviewCanvas(canvas, state.glbCache.get(cacheKey), currentGlbDrawOpts(width, height, isMini));
       return;
     }
-    // Paint empty studio background immediately using WebGL2 so canvas context stays WebGL2
     drawGlbPreviewCanvas(canvas, null, currentGlbDrawOpts(width, height, isMini));
-    try {
-      const primaryUrl = resolveAssetPreviewUrl(item, studioApi);
-      const fallbackUrl = `/api/project/file?repo=${encodeURIComponent(item?.repo || 'ganbate-main')}&path=${encodeURIComponent(item?.repoPath || '')}`;
-      let res = await fetchImpl(primaryUrl);
-      if ((!res || !res.ok) && primaryUrl !== fallbackUrl) {
-        res = await fetchImpl(fallbackUrl);
-      }
-      if (!res?.ok) return;
-      const buf = await res.arrayBuffer();
-      const parsed = (await parseGlbPreviewAsync(buf, { fetchImpl })) || parseGlbPreview(buf);
-      if (parsed && !state.disposed) {
-        state.glbCache.set(cacheKey, parsed);
-        drawGlbPreviewCanvas(canvas, parsed, currentGlbDrawOpts(width, height, isMini));
-      }
-    } catch {
-      // ignore offline preview fetch
+
+    let loadPromise = state.glbInflight.get(cacheKey);
+    if (!loadPromise) {
+      loadPromise = (async () => {
+        await acquireGlbSlot();
+        try {
+          const primaryUrl = resolveAssetPreviewUrl(item, studioApi);
+          const fallbackUrl = `/api/project/file?repo=${encodeURIComponent(item?.repo || 'ganbate-main')}&path=${encodeURIComponent(item?.repoPath || '')}`;
+          let res = await fetchImpl(primaryUrl);
+          if ((!res || !res.ok) && primaryUrl !== fallbackUrl) {
+            res = await fetchImpl(fallbackUrl);
+          }
+          if (!res?.ok) return null;
+          const buf = await res.arrayBuffer();
+          await new Promise((r) => setTimeout(r, 0));
+          const maxFullTris = isMini ? 85000 : 165000;
+          const parsed =
+            (await parseGlbPreviewAsync(buf, { fetchImpl, maxFullTris })) ||
+            parseGlbPreview(buf, { maxFullTris });
+          if (parsed && !state.disposed) {
+            state.glbCache.set(cacheKey, parsed);
+          }
+          return parsed;
+        } catch {
+          return null;
+        } finally {
+          releaseGlbSlot();
+          state.glbInflight.delete(cacheKey);
+        }
+      })();
+      state.glbInflight.set(cacheKey, loadPromise);
+    }
+
+    const parsed = await loadPromise;
+    if (parsed && !state.disposed && canvas.isConnected !== false) {
+      drawGlbPreviewCanvas(canvas, parsed, currentGlbDrawOpts(width, height, isMini));
     }
   }
 
@@ -1182,7 +1219,13 @@ export function mountCodeXray(container, studioApi = {}) {
       h(
         'div',
         { class: 'cxr-card-grid' },
-        clusterItems.map((it) => renderBookCard(it, { showTurntable: is3dCluster })),
+        clusterItems.map((it, idx) =>
+          renderBookCard(it, {
+            showTurntable:
+              is3dCluster &&
+              (state.glbCache.has(it.id) || (idx < 6 && (it.fileSize || 0) <= 20 * 1024 * 1024)),
+          }),
+        ),
       ),
     );
   }
@@ -2125,11 +2168,40 @@ export function mountCodeXray(container, studioApi = {}) {
           ? renderCodeTreeShelf(filteredItems)
           : state.viewMode === 'audit'
             ? renderAuditQueueShelf(filteredItems)
-            : h(
-                'div',
-                { class: 'cxr-card-grid' },
-                filteredItems.slice(0, 180).map((it) => renderBookCard(it, { showTurntable: Boolean(it.glbStats) })),
-              ),
+            : (() => {
+                let auto3dCount = 0;
+                const limit = state.bookshelfLimit || 120;
+                const visible = filteredItems.slice(0, limit);
+                return h(
+                  'div',
+                  { style: 'display:flex;flex-direction:column;gap:12px;' },
+                  h(
+                    'div',
+                    { class: 'cxr-card-grid' },
+                    visible.map((it) => {
+                      const canAuto =
+                        Boolean(it.glbStats) &&
+                        (state.glbCache.has(it.id) ||
+                          (auto3dCount < 6 && (it.fileSize || 0) <= 20 * 1024 * 1024 && (++auto3dCount, true)));
+                      return renderBookCard(it, { showTurntable: canAuto });
+                    }),
+                  ),
+                  filteredItems.length > limit
+                    ? h(
+                        'button',
+                        {
+                          type: 'button',
+                          class: 'cxr-btn',
+                          onClick: () => {
+                            state.bookshelfLimit = limit + 120;
+                            render();
+                          },
+                        },
+                        `Load More (+120 · showing ${visible.length} of ${filteredItems.length})`,
+                      )
+                    : null,
+                );
+              })(),
     );
 
     const inspectorPane = h('aside', { class: 'cxr-inspector-pane' }, renderInspector(selectedItem));

@@ -802,6 +802,33 @@ export function createAssetLibrary({
     });
   }
 
+  let modelThumbObserver = null;
+  const pendingThumbCallbacks = new WeakMap();
+  function observeModelThumb(target, onVisible) {
+    if (typeof IntersectionObserver !== 'function') {
+      onVisible();
+      return;
+    }
+    if (!modelThumbObserver) {
+      modelThumbObserver = new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            modelThumbObserver.unobserve(entry.target);
+            const cb = pendingThumbCallbacks.get(entry.target);
+            if (cb) {
+              pendingThumbCallbacks.delete(entry.target);
+              cb();
+            }
+          }
+        },
+        { rootMargin: '160px' },
+      );
+    }
+    pendingThumbCallbacks.set(target, onVisible);
+    modelThumbObserver.observe(target);
+  }
+
   function renderPreviewVisual(asset, { width = 180, height = 96, interactive = false } = {}) {
     const { looks } = getContext();
     if (asset.kind === 'texture') {
@@ -856,11 +883,27 @@ export function createAssetLibrary({
       } else {
         const placeholder = kindGraphic('model');
         box.append(placeholder);
-        previews.loadEntry(asset).then((info) => {
-          if (!info || !box.isConnected) return;
-          placeholder.replaceWith(canvas);
-          paint(info);
-        });
+        const triggerLoad = (force = interactive) => {
+          previews
+            .loadEntry(asset, { force, maxFullTris: interactive ? 150000 : undefined })
+            .then((info) => {
+              if (!info || !box.isConnected) return;
+              if (info.deferredLargeModel) {
+                let pill = box.querySelector('.asset-meta-pill');
+                const label = `${formatBytes(info.bytes || asset.bytes || 0)} · Click`;
+                if (pill) pill.textContent = label;
+                else box.append(el('span', { class: 'asset-meta-pill' }, label));
+                return;
+              }
+              if (placeholder.parentNode === box) placeholder.replaceWith(canvas);
+              paint(info);
+            });
+        };
+        if (interactive) {
+          triggerLoad(true);
+        } else {
+          observeModelThumb(box, () => triggerLoad(false));
+        }
       }
       if (interactive) {
         box.addEventListener('pointerdown', (ev) => {

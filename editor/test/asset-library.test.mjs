@@ -17,7 +17,7 @@ import {
   projectAssetUrl,
   raycastDropPoint,
 } from '../asset-library.js';
-import { extractWavPeaks, parseGlbPreview } from '../asset-previews.js';
+import { createPreviewManager, extractWavPeaks, parseGlbPreview } from '../asset-previews.js';
 
 const SAMPLE_ASSETS = [
   { id: 'scn_main', kind: 'scene', path: 'content/scenes/courtyard.scene.json', bytes: 1840 },
@@ -295,4 +295,81 @@ test('extractWavPeaks parses PCM RIFF WAVE duration and normalized waveform peak
   assert.equal(parsed.channels, 1);
   assert.equal(parsed.peaks.length, 16);
   assert.ok(Math.max(...parsed.peaks) > 0.45 && Math.max(...parsed.peaks) <= 0.55);
+});
+
+test('parseGlbPreview resolves EXT_texture_webp, alphaCutoff, skips zero-scale nodes, and defers >20MB auto-loads', async () => {
+  const gltf = {
+    asset: { version: '2.0' },
+    extensionsUsed: ['EXT_texture_webp'],
+    scene: 0,
+    scenes: [{ nodes: [0, 1] }],
+    nodes: [
+      { name: 'visible_body', mesh: 0, scale: [1, 1, 1] },
+      { name: 'hidden_attachment', mesh: 0, scale: [0, 0, 0], translation: [100, 100, 100] },
+    ],
+    images: [{ bufferView: 2, mimeType: 'image/webp' }],
+    textures: [{ extensions: { EXT_texture_webp: { source: 0 } } }],
+    materials: [
+      {
+        alphaMode: 'MASK',
+        alphaCutoff: 0.42,
+        pbrMetallicRoughness: {
+          baseColorFactor: [1, 1, 1, 1],
+          baseColorTexture: { index: 0 },
+        },
+      },
+    ],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0 }, indices: 1, material: 0 }] }],
+    bufferViews: [
+      { buffer: 0, byteOffset: 0, byteLength: 36 },
+      { buffer: 0, byteOffset: 36, byteLength: 6 },
+      { buffer: 0, byteOffset: 44, byteLength: 16 },
+    ],
+    accessors: [
+      { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3' },
+      { bufferView: 1, componentType: 5123, count: 3, type: 'SCALAR' },
+    ],
+    buffers: [{ byteLength: 60 }],
+  };
+  const jsonRaw = Buffer.from(JSON.stringify(gltf), 'utf8');
+  const jsonPad = (4 - (jsonRaw.length % 4)) % 4;
+  const jsonChunk = Buffer.concat([jsonRaw, Buffer.alloc(jsonPad, 0x20)]);
+  const binChunk = Buffer.alloc(60);
+  [0, 0, 0, 1, 0, 0, 0, 2, 0].forEach((v, i) => binChunk.writeFloatLE(v, i * 4));
+  binChunk.writeUInt16LE(0, 36);
+  binChunk.writeUInt16LE(1, 38);
+  binChunk.writeUInt16LE(2, 40);
+  binChunk.write('RIFF\x08\x00\x00\x00WEBP', 44, 'binary');
+
+  const totalLen = 12 + 8 + jsonChunk.length + 8 + binChunk.length;
+  const hdr = Buffer.alloc(12);
+  hdr.writeUInt32LE(0x46546c67, 0);
+  hdr.writeUInt32LE(2, 4);
+  hdr.writeUInt32LE(totalLen, 8);
+  const jh = Buffer.alloc(8);
+  jh.writeUInt32LE(jsonChunk.length, 0);
+  jh.writeUInt32LE(0x4e4f534a, 4);
+  const bh = Buffer.alloc(8);
+  bh.writeUInt32LE(binChunk.length, 0);
+  bh.writeUInt32LE(0x004e4942, 4);
+
+  const parsed = parseGlbPreview(Buffer.concat([hdr, jh, jsonChunk, bh, binChunk]));
+  assert.ok(parsed);
+  assert.equal(parsed.triangles, 1, 'zero-scale hidden node is skipped');
+  assert.deepEqual(parsed.bounds, [[0, 0, 0], [1, 2, 0]], 'hidden node at [100,100,100] does not pollute bounds');
+  assert.equal(parsed.submeshes[0].imageIndex, 0, 'EXT_texture_webp source resolves to image 0');
+  assert.ok(Math.abs(parsed.submeshes[0].alphaCutoff - 0.42) < 1e-6);
+
+  let fetchCalls = 0;
+  const mgr = createPreviewManager({
+    urlForAsset: (p) => `/project/${p}`,
+  });
+  const deferred = await mgr.loadEntry({
+    id: 'huge_env',
+    kind: 'model',
+    path: 'content/world/district.glb',
+    bytes: 50 * 1024 * 1024,
+  });
+  assert.equal(deferred.deferredLargeModel, true);
+  assert.equal(fetchCalls, 0);
 });

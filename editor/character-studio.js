@@ -17,6 +17,7 @@ import {
   sampleBlendSpace1D,
   sampleBlendSpace2D,
 } from '../web/character-customization.mjs';
+import { drawGlbPreviewCanvas, parseGlbPreview, parseGlbPreviewAsync } from './asset-previews.js';
 
 export const CHARACTER_SCHEMA = 'ganbate.character/1';
 
@@ -504,7 +505,250 @@ export function mountCharacterStudio(container, studioApi = {}) {
   let active = true;
   let destroyed = false;
 
+  // Persistent 3D Character Viewport Stage state
+  let stageYaw = 0.24;
+  let stagePitch = 0.14;
+  let stageZoom = 1.05;
+  let stagePanX = 0;
+  let stagePanY = 0;
+  let stageFocus = 'body';
+  let stageShading = 'textured';
+  let stageTurntable = false;
+  let stageRaf = 0;
+  let activeModelUrl = '';
+  let activeParsedGlb = null;
+  let stageStatusText = '';
+  const glbByUrl = new Map();
+
   const unsubscribers = [];
+
+  const el = (tag, className, text) => {
+    const node = dom.createElement(tag);
+    if (className) node.className = className;
+    if (text != null) node.textContent = text;
+    return node;
+  };
+
+  const resolveCharacterModelUrl = (rawPath) => {
+    const clean = String(rawPath || '').trim();
+    if (!clean) return '';
+    if (clean.startsWith('/') || clean.startsWith('http://') || clean.startsWith('https://')) {
+      return clean;
+    }
+    if (typeof studioApi.resolveAssetUrl === 'function') {
+      return studioApi.resolveAssetUrl(clean);
+    }
+    return `/project/${clean.split('/').map(encodeURIComponent).join('/')}`;
+  };
+
+  const currentOutfit = () =>
+    docData.outfits.find((o) => o.id === docData.activeOutfitId) ?? docData.outfits[0] ?? null;
+
+  // Create persistent canvas once so dragging sliders never recreates or flickers the 3D stage
+  const stageCanvas = el('canvas', 'gb-char-viewport-canvas');
+  stageCanvas.dataset.role = 'character-stage-canvas';
+  const hasRealCanvas = typeof stageCanvas.getContext === 'function';
+
+  const repaintStage = () => {
+    if (destroyed || !hasRealCanvas) return;
+    const cssW = Math.max(260, stageCanvas.clientWidth || 480);
+    const cssH = Math.max(220, stageCanvas.clientHeight || 360);
+    drawGlbPreviewCanvas(stageCanvas, activeParsedGlb, {
+      width: cssW,
+      height: cssH,
+      yaw: stageYaw + (Number(docData.skeleton?.placement?.yawRad) || 0),
+      pitch: stagePitch,
+      zoom: stageZoom,
+      panX: stagePanX,
+      panY: stagePanY,
+      shading: stageShading,
+      focus: stageFocus,
+      onTextureLoaded: repaintStage,
+    });
+
+    const ctx = stageCanvas.getContext('2d');
+    if (!ctx) return;
+    const dpr = typeof window !== 'undefined' ? Math.min(2, window.devicePixelRatio || 1) : 1;
+    ctx.save?.();
+    ctx.setTransform?.(dpr, 0, 0, dpr, 0, 0);
+
+    // Top-left model / outfit badge
+    const outfit = currentOutfit();
+    const topLabel = activeParsedGlb
+      ? `${outfit?.label || docData.name} · ${activeParsedGlb.triangles.toLocaleString()} tris`
+      : stageStatusText || 'Loading 3D character mesh…';
+    ctx.fillStyle = 'rgba(14, 17, 24, 0.76)';
+    ctx.fillRect?.(10, 10, Math.min(cssW - 20, Math.max(150, topLabel.length * 6.4 + 18)), 24);
+    ctx.fillStyle = '#e8ecf4';
+    ctx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText?.(topLabel, 18, 25);
+
+    // Live Look-At reticle indicator when enabled
+    if (docData.lookAt?.enabled && activeParsedGlb) {
+      const tx = Math.min(1, Math.max(-1, (docData.lookAt.target[0] ?? 0) / 1.5));
+      const ty = Math.min(
+        1,
+        Math.max(-1, ((docData.lookAt.target[1] ?? 1.55) - (docData.lookAt.origin[1] ?? 1.55)) / 1.0),
+      );
+      const gx = cssW * 0.5 + tx * (cssW * 0.28);
+      const gy = cssH * (stageFocus === 'bust' ? 0.42 : 0.26) - ty * (cssH * 0.2);
+      ctx.strokeStyle = 'rgba(232, 180, 74, 0.85)';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath?.();
+      ctx.arc?.(gx, gy, 6, 0, Math.PI * 2);
+      ctx.stroke?.();
+    }
+
+    // Bottom status bar showing active pose / morph summary
+    const activeMorphs = Object.entries(docData.morphWeights || {})
+      .filter(([, w]) => Math.abs(Number(w) || 0) > 0.02)
+      .slice(0, 3)
+      .map(([k, w]) => `${k}:${Number(w).toFixed(2)}`);
+    const boneOffCount = Object.keys(docData.boneOffsets || {}).length;
+    const footerParts = [`Clip: ${clipId || 'rest'} (${timeS.toFixed(2)}s)`];
+    if (boneOffCount > 0) footerParts.push(`${boneOffCount} bone offset${boneOffCount > 1 ? 's' : ''}`);
+    if (activeMorphs.length) footerParts.push(activeMorphs.join(' '));
+    const footerText = footerParts.join(' · ');
+    ctx.fillStyle = 'rgba(14, 17, 24, 0.72)';
+    ctx.fillRect?.(10, cssH - 30, Math.min(cssW - 20, Math.max(160, footerText.length * 6.0 + 18)), 20);
+    ctx.fillStyle = '#aeb6c6';
+    ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText?.(footerText, 18, cssH - 16);
+    ctx.restore?.();
+  };
+
+  const ensureOutfitModelLoaded = async () => {
+    if (destroyed || !hasRealCanvas || typeof globalThis.fetch !== 'function') return;
+    const outfit = currentOutfit();
+    const candidates = [];
+    if (outfit?.modelPath) candidates.push(resolveCharacterModelUrl(outfit.modelPath));
+    // Fallback to first project `.glb` asset if document uses a placeholder model path
+    if (typeof studioApi.listAssets === 'function') {
+      const firstCharAsset = studioApi
+        .listAssets({ kind: 'model' })
+        .find((a) => String(a.path || '').toLowerCase().includes('char') || String(a.path || '').endsWith('.glb'));
+      if (firstCharAsset) candidates.push(resolveCharacterModelUrl(firstCharAsset.path));
+    }
+    const targetUrl = candidates[0] || '';
+    if (!targetUrl) {
+      activeParsedGlb = null;
+      stageStatusText = 'No 3D .glb assigned to active outfit';
+      repaintStage();
+      return;
+    }
+    if (glbByUrl.has(targetUrl)) {
+      activeModelUrl = targetUrl;
+      activeParsedGlb = glbByUrl.get(targetUrl);
+      stageStatusText = '';
+      repaintStage();
+      return;
+    }
+    activeModelUrl = targetUrl;
+    activeParsedGlb = null;
+    stageStatusText = `Loading ${outfit?.label || 'character'}…`;
+    repaintStage();
+
+    for (const url of candidates) {
+      if (!url) continue;
+      if (glbByUrl.has(url)) {
+        if (destroyed) return;
+        activeModelUrl = url;
+        activeParsedGlb = glbByUrl.get(url);
+        stageStatusText = '';
+        repaintStage();
+        return;
+      }
+      try {
+        const res = await globalThis.fetch(url);
+        if (!res?.ok) continue;
+        const buf = await res.arrayBuffer();
+        const parsed = (await parseGlbPreviewAsync(buf, { maxFullTris: 140000 })) || parseGlbPreview(buf);
+        if (parsed) {
+          glbByUrl.set(url, parsed);
+          if (!destroyed && activeModelUrl === targetUrl) {
+            activeModelUrl = url;
+            activeParsedGlb = parsed;
+            stageStatusText = '';
+            repaintStage();
+          }
+          return;
+        }
+      } catch {
+        // try next candidate
+      }
+    }
+    if (!destroyed && activeModelUrl === targetUrl) {
+      stageStatusText = `Model not found: ${outfit?.modelPath || targetUrl}`;
+      repaintStage();
+    }
+  };
+
+  if (hasRealCanvas) {
+    let dragging = false;
+    let panMode = false;
+    let lx = 0;
+    let ly = 0;
+    stageCanvas.addEventListener('contextmenu', (ev) => ev.preventDefault?.());
+    stageCanvas.addEventListener('pointerdown', (ev) => {
+      dragging = true;
+      panMode = ev.button === 2 || ev.button === 1 || Boolean(ev.shiftKey);
+      lx = ev.clientX ?? 0;
+      ly = ev.clientY ?? 0;
+      stageCanvas.setPointerCapture?.(ev.pointerId);
+    });
+    stageCanvas.addEventListener('pointermove', (ev) => {
+      if (!dragging) return;
+      const dx = (ev.clientX ?? 0) - lx;
+      const dy = (ev.clientY ?? 0) - ly;
+      lx = ev.clientX ?? 0;
+      ly = ev.clientY ?? 0;
+      if (panMode) {
+        stagePanX += dx;
+        stagePanY += dy;
+      } else {
+        stageYaw -= dx * 0.01;
+        stagePitch = Math.max(-1.15, Math.min(1.15, stagePitch + dy * 0.01));
+      }
+      repaintStage();
+    });
+    const endDrag = (ev) => {
+      if (!dragging) return;
+      dragging = false;
+      try { stageCanvas.releasePointerCapture?.(ev.pointerId); } catch { /* ignore */ }
+    };
+    stageCanvas.addEventListener('pointerup', endDrag);
+    stageCanvas.addEventListener('pointercancel', endDrag);
+    stageCanvas.addEventListener('wheel', (ev) => {
+      ev.preventDefault?.();
+      const factor = (ev.deltaY ?? 0) < 0 ? 1.12 : 1 / 1.12;
+      stageZoom = Math.max(0.35, Math.min(6.0, stageZoom * factor));
+      repaintStage();
+    });
+  }
+
+  const stepStageAnimation = () => {
+    if (destroyed || !active || (!stageTurntable && !playing)) {
+      stageRaf = 0;
+      return;
+    }
+    if (stageTurntable) stageYaw += 0.012;
+    if (playing) {
+      const clipObj = docData.clips.find((c) => c.id === clipId) ?? docData.clips[0];
+      const dur = Math.max(0.2, clipObj?.durationS ?? 2.0);
+      timeS = clipObj?.looping !== false ? (timeS + 1 / 60) % dur : Math.min(dur, timeS + 1 / 60);
+      pushPoseToEngine();
+    }
+    repaintStage();
+    if (typeof requestAnimationFrame === 'function') {
+      stageRaf = requestAnimationFrame(stepStageAnimation);
+    }
+  };
+
+  const ensureAnimLoop = () => {
+    if ((stageTurntable || playing) && !stageRaf && typeof requestAnimationFrame === 'function') {
+      stageRaf = requestAnimationFrame(stepStageAnimation);
+    }
+  };
 
   const syncFromStudio = () => {
     const activeDoc = studioApi.getActiveDocument?.();
@@ -521,7 +765,7 @@ export function mountCharacterStudio(container, studioApi = {}) {
     }
   };
 
-  const commitOps = (ops, label, merge = false) => {
+  const commitOps = (ops, label, merge = false, { skipRebuild = false } = {}) => {
     if (!ops.length) return;
     for (const op of ops) applyOpLocally(docData, op);
     docData = normalizeCharacterDocument(docData);
@@ -529,7 +773,12 @@ export function mountCharacterStudio(container, studioApi = {}) {
       studioApi.edit(activeDocId, ops, label, merge);
     }
     pushPoseToEngine();
-    render();
+    if (skipRebuild) {
+      repaintStage();
+    } else {
+      render();
+      void ensureOutfitModelLoaded();
+    }
   };
 
   const pushPoseToEngine = () => {
@@ -557,13 +806,6 @@ export function mountCharacterStudio(container, studioApi = {}) {
   container.innerHTML = '';
   container.appendChild(root);
 
-  const el = (tag, className, text) => {
-    const node = dom.createElement(tag);
-    if (className) node.className = className;
-    if (text != null) node.textContent = text;
-    return node;
-  };
-
   const render = () => {
     if (destroyed) return;
     root.innerHTML = '';
@@ -572,6 +814,39 @@ export function mountCharacterStudio(container, studioApi = {}) {
     const toolbar = el('div', 'gb-char-toolbar');
     toolbar.appendChild(el('span', 'gb-char-title', 'Character Studio'));
     toolbar.appendChild(el('span', 'gb-char-meta', `${docData.name} (${docData.id})`));
+
+    // Project Character Document Switcher (when multiple `.character.json` files exist)
+    const charDocs = typeof studioApi.listDocuments === 'function'
+      ? studioApi.listDocuments({ suffix: '.character.json' })
+      : [];
+    if (Array.isArray(charDocs) && charDocs.length > 0) {
+      const docSelect = el('select', 'gb-char-select');
+      docSelect.dataset.role = 'character-doc-select';
+      for (const cd of charDocs) {
+        const shortName = String(cd.path || cd.id).split('/').pop().replace(/\.character\.json$/i, '');
+        const opt = el('option', '', shortName);
+        opt.value = cd.id;
+        if (cd.id === activeDocId || cd.path === activeDocId) opt.selected = true;
+        docSelect.appendChild(opt);
+      }
+      docSelect.addEventListener('change', async (ev) => {
+        const nextId = ev.target.value;
+        if (nextId && typeof studioApi.openDocument === 'function') {
+          const opened = await studioApi.openDocument(nextId);
+          if (opened) {
+            activeDocId = opened.id ?? nextId;
+            docData = normalizeCharacterDocument(opened.root ?? opened);
+            selectedJoint = docData.skeleton.joints[0]?.name ?? '';
+            clipId = docData.clips[0]?.id ?? '';
+            render();
+            pushPoseToEngine();
+            void ensureOutfitModelLoaded();
+          }
+        }
+      });
+      toolbar.appendChild(docSelect);
+    }
+
     toolbar.appendChild(el('div', 'gb-char-spacer'));
 
     const lightSelect = el('select', 'gb-char-select');
@@ -650,17 +925,21 @@ export function mountCharacterStudio(container, studioApi = {}) {
         slider.step = '1';
         slider.value = String(curEuler[axisIdx] ?? 0);
         slider.dataset.role = `bone-euler-${axisIdx}`;
+        const valSpan = el('span', 'gb-char-val', `${curEuler[axisIdx] ?? 0}°`);
         slider.addEventListener('input', (ev) => {
-          const next = [...curEuler];
+          const cur = docData.boneOffsets[selectedJoint]?.eulerDeg ?? [0, 0, 0];
+          const next = [...cur];
           next[axisIdx] = Number(ev.target.value);
+          valSpan.textContent = `${next[axisIdx]}°`;
           commitOps(
             buildBoneOffsetOps(selectedJoint, next, docData.boneOffsets[selectedJoint]?.translation ?? [0, 0, 0]),
             `Adjust ${selectedJoint} ${axisLabel}`,
             true,
+            { skipRebuild: true },
           );
         });
         row.appendChild(slider);
-        row.appendChild(el('span', 'gb-char-val', `${curEuler[axisIdx] ?? 0}°`));
+        row.appendChild(valSpan);
         boneCard.appendChild(row);
       });
     }
@@ -694,17 +973,93 @@ export function mountCharacterStudio(container, studioApi = {}) {
       offsetSlider.value = String(sock.translation[1] ?? 0);
       offsetSlider.dataset.role = `socket-y-${sIdx}`;
       offsetSlider.addEventListener('input', (ev) => {
-        const nextT = [...sock.translation];
+        const curSock = docData.sockets[sIdx] ?? sock;
+        const nextT = [...curSock.translation];
         nextT[1] = Number(ev.target.value);
-        commitOps(buildSocketTransformOps(sIdx, { translation: nextT }), `Move socket ${sock.id}`, true);
+        sockRow.textContent = `Socket ${curSock.id} → ${curSock.parentJoint} [${nextT.map((n) => n.toFixed(2)).join(', ')}]`;
+        commitOps(buildSocketTransformOps(sIdx, { translation: nextT }), `Move socket ${sock.id}`, true, { skipRebuild: true });
       });
       outfitCard.appendChild(offsetSlider);
     });
     leftCol.appendChild(outfitCard);
     grid.appendChild(leftCol);
 
-    // Center column: Animation Clips + State Crossfade + Look-At + Two-Bone IK
+    // Center column: Live 3D Character Stage + Animation Clips + Look-At + Two-Bone IK
     const centerCol = el('div', 'gb-char-col');
+
+    const stageCard = el('div', 'gb-char-stage-card');
+    const stageHdr = el('div', 'gb-char-card-header');
+    stageHdr.appendChild(el('span', '', '3D Character Turntable'));
+
+    const stageControls = el('div', 'gb-char-stage-controls');
+    const focusModes = [
+      ['body', 'Full Body'],
+      ['bust', 'Face / Bust'],
+    ];
+    for (const [fid, flabel] of focusModes) {
+      const fBtn = el('button', `gb-char-btn${stageFocus === fid ? ' is-active' : ''}`, flabel);
+      fBtn.dataset.role = `stage-focus-${fid}`;
+      fBtn.addEventListener('click', () => {
+        stageFocus = fid;
+        stagePanX = 0;
+        stagePanY = 0;
+        render();
+        repaintStage();
+      });
+      stageControls.appendChild(fBtn);
+    }
+
+    const shadingModes = [
+      ['textured', 'Textured'],
+      ['clay', 'Clay'],
+      ['wireframe', 'Wire'],
+      ['normals', 'Normals'],
+    ];
+    for (const [sid, slabel] of shadingModes) {
+      const sBtn = el('button', `gb-char-btn${stageShading === sid ? ' is-active' : ''}`, slabel);
+      sBtn.dataset.role = `stage-shade-${sid}`;
+      sBtn.addEventListener('click', () => {
+        stageShading = sid;
+        render();
+        repaintStage();
+      });
+      stageControls.appendChild(sBtn);
+    }
+
+    const turnBtn = el('button', `gb-char-btn${stageTurntable ? ' is-active' : ''}`, 'Turn');
+    turnBtn.dataset.role = 'stage-turntable';
+    turnBtn.addEventListener('click', () => {
+      stageTurntable = !stageTurntable;
+      render();
+      ensureAnimLoop();
+      repaintStage();
+    });
+    stageControls.appendChild(turnBtn);
+
+    const resetCamBtn = el('button', 'gb-char-btn', 'Reset Cam');
+    resetCamBtn.dataset.role = 'stage-reset-cam';
+    resetCamBtn.addEventListener('click', () => {
+      stageYaw = 0.24;
+      stagePitch = 0.14;
+      stageZoom = 1.05;
+      stagePanX = 0;
+      stagePanY = 0;
+      repaintStage();
+    });
+    stageControls.appendChild(resetCamBtn);
+    stageHdr.appendChild(stageControls);
+    stageCard.appendChild(stageHdr);
+
+    const stageWrap = el('div', 'gb-char-stage-wrap');
+    stageWrap.appendChild(stageCanvas);
+    stageCard.appendChild(stageWrap);
+
+    const stageHint = el('div', 'gb-char-stage-hint');
+    stageHint.appendChild(el('span', '', 'Left-drag: Orbit · Right/Shift-drag: Pan · Wheel: Zoom'));
+    const activeOutfitObj = currentOutfit();
+    stageHint.appendChild(el('span', '', activeOutfitObj?.modelPath || ''));
+    stageCard.appendChild(stageHint);
+    centerCol.appendChild(stageCard);
 
     const animCard = el('div', 'gb-char-card');
     animCard.appendChild(el('div', 'gb-char-card-header', 'Animation & Hermite Crossfade'));
@@ -721,6 +1076,7 @@ export function mountCharacterStudio(container, studioApi = {}) {
       timeS = 0;
       pushPoseToEngine();
       render();
+      repaintStage();
     });
     animCard.appendChild(clipSelect);
 
@@ -731,6 +1087,8 @@ export function mountCharacterStudio(container, studioApi = {}) {
     playBtn.addEventListener('click', () => {
       playing = !playing;
       render();
+      ensureAnimLoop();
+      repaintStage();
     });
     scrubRow.appendChild(playBtn);
     const scrubber = el('input');
@@ -740,13 +1098,15 @@ export function mountCharacterStudio(container, studioApi = {}) {
     scrubber.step = '0.01';
     scrubber.value = String(timeS);
     scrubber.dataset.role = 'clip-scrubber';
+    const scrubVal = el('span', 'gb-char-val', `${timeS.toFixed(2)}s`);
     scrubber.addEventListener('input', (ev) => {
       timeS = Number(ev.target.value);
+      scrubVal.textContent = `${timeS.toFixed(2)}s`;
       pushPoseToEngine();
-      render();
+      repaintStage();
     });
     scrubRow.appendChild(scrubber);
-    scrubRow.appendChild(el('span', 'gb-char-val', `${timeS.toFixed(2)}s`));
+    scrubRow.appendChild(scrubVal);
     animCard.appendChild(scrubRow);
 
     const fadeRow = el('div', 'gb-char-slider-row');
@@ -758,6 +1118,7 @@ export function mountCharacterStudio(container, studioApi = {}) {
       crossfadeElapsedS = crossfadeMs / 2000;
       pushPoseToEngine();
       render();
+      repaintStage();
     });
     fadeRow.appendChild(triggerFadeBtn);
     const fadeSlider = el('input');
@@ -767,13 +1128,15 @@ export function mountCharacterStudio(container, studioApi = {}) {
     fadeSlider.step = '10';
     fadeSlider.value = String(crossfadeMs);
     fadeSlider.dataset.role = 'crossfade-ms';
+    const hVal = hermiteFade(crossfadeElapsedS, crossfadeMs / 1000);
+    const fadeVal = el('span', 'gb-char-val', `${crossfadeMs}ms (${hVal.toFixed(2)})`);
     fadeSlider.addEventListener('input', (ev) => {
       crossfadeMs = Number(ev.target.value);
-      render();
+      const hv = hermiteFade(crossfadeElapsedS, crossfadeMs / 1000);
+      fadeVal.textContent = `${crossfadeMs}ms (${hv.toFixed(2)})`;
     });
     fadeRow.appendChild(fadeSlider);
-    const hVal = hermiteFade(crossfadeElapsedS, crossfadeMs / 1000);
-    fadeRow.appendChild(el('span', 'gb-char-val', `${crossfadeMs}ms (${hVal.toFixed(2)})`));
+    fadeRow.appendChild(fadeVal);
     animCard.appendChild(fadeRow);
     centerCol.appendChild(animCard);
 
@@ -826,11 +1189,14 @@ export function mountCharacterStudio(container, studioApi = {}) {
       wSlider.step = '0.05';
       wSlider.value = String(ik.weight);
       wSlider.dataset.role = `ik-weight-${idx}`;
+      const wVal = el('span', 'gb-char-val', ik.weight.toFixed(2));
       wSlider.addEventListener('input', (ev) => {
-        commitOps(buildIkChainOps(idx, { weight: Number(ev.target.value) }), `Adjust IK ${ik.id}`, true);
+        const nextW = Number(ev.target.value);
+        wVal.textContent = nextW.toFixed(2);
+        commitOps(buildIkChainOps(idx, { weight: nextW }), `Adjust IK ${ik.id}`, true, { skipRebuild: true });
       });
       wRow.appendChild(wSlider);
-      wRow.appendChild(el('span', 'gb-char-val', ik.weight.toFixed(2)));
+      wRow.appendChild(wVal);
       ikCard.appendChild(wRow);
     });
     centerCol.appendChild(ikCard);
@@ -860,15 +1226,19 @@ export function mountCharacterStudio(container, studioApi = {}) {
     intSlider.step = '0.05';
     intSlider.value = String(docData.expressionIntensity);
     intSlider.dataset.role = 'expression-intensity';
+    const intVal = el('span', 'gb-char-val', `${docData.expressionIntensity.toFixed(2)}x`);
     intSlider.addEventListener('input', (ev) => {
+      const v = Number(ev.target.value);
+      intVal.textContent = `${v.toFixed(2)}x`;
       commitOps(
-        [{ set: ['expressionIntensity'], value: Number(ev.target.value) }],
+        [{ set: ['expressionIntensity'], value: v }],
         'Adjust expression intensity',
         true,
+        { skipRebuild: true },
       );
     });
     intensityRow.appendChild(intSlider);
-    intensityRow.appendChild(el('span', 'gb-char-val', `${docData.expressionIntensity.toFixed(2)}x`));
+    intensityRow.appendChild(intVal);
     presetCard.appendChild(intensityRow);
     rightCol.appendChild(presetCard);
 
@@ -888,11 +1258,14 @@ export function mountCharacterStudio(container, studioApi = {}) {
         mSlider.step = '0.01';
         mSlider.value = String(curVal);
         mSlider.dataset.morph = target.id;
+        const mVal = el('span', 'gb-char-val', curVal.toFixed(2));
         mSlider.addEventListener('input', (ev) => {
-          commitOps(buildMorphWeightOps(target.id, Number(ev.target.value)), `Morph ${target.id}`, true);
+          const nextV = Number(ev.target.value);
+          mVal.textContent = nextV.toFixed(2);
+          commitOps(buildMorphWeightOps(target.id, nextV), `Morph ${target.id}`, true, { skipRebuild: true });
         });
         row.appendChild(mSlider);
-        row.appendChild(el('span', 'gb-char-val', curVal.toFixed(2)));
+        row.appendChild(mVal);
         gCard.appendChild(row);
       }
       rightCol.appendChild(gCard);
@@ -900,17 +1273,30 @@ export function mountCharacterStudio(container, studioApi = {}) {
 
     grid.appendChild(rightCol);
     root.appendChild(grid);
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => repaintStage());
+    } else {
+      repaintStage();
+    }
   };
 
   syncFromStudio();
   render();
   pushPoseToEngine();
+  void ensureOutfitModelLoaded();
 
   if (typeof studioApi.subscribe === 'function') {
     const unsub = studioApi.subscribe(() => {
       if (!active || destroyed) return;
+      const focusedTag = dom.activeElement?.tagName;
+      if (focusedTag === 'INPUT' || focusedTag === 'SELECT') return;
+      const prevId = activeDocId;
+      const prevOutfit = docData.activeOutfitId;
       syncFromStudio();
-      render();
+      if (activeDocId !== prevId || docData.activeOutfitId !== prevOutfit) {
+        render();
+        void ensureOutfitModelLoaded();
+      }
     });
     if (typeof unsub === 'function') unsubscribers.push(unsub);
   }
@@ -919,6 +1305,11 @@ export function mountCharacterStudio(container, studioApi = {}) {
     if (destroyed) return;
     destroyed = true;
     playing = false;
+    stageTurntable = false;
+    if (stageRaf && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(stageRaf);
+      stageRaf = 0;
+    }
     while (unsubscribers.length) {
       const fn = unsubscribers.pop();
       try {
@@ -937,6 +1328,7 @@ export function mountCharacterStudio(container, studioApi = {}) {
       syncFromStudio();
       render();
       pushPoseToEngine();
+      void ensureOutfitModelLoaded();
     },
     setDocument(pathOrId, rawDoc) {
       activeDocId = pathOrId;
@@ -945,16 +1337,23 @@ export function mountCharacterStudio(container, studioApi = {}) {
       clipId = docData.clips[0]?.id ?? '';
       render();
       pushPoseToEngine();
+      void ensureOutfitModelLoaded();
     },
     onActivate() {
       active = true;
       syncFromStudio();
       render();
       pushPoseToEngine();
+      void ensureOutfitModelLoaded();
     },
     onDeactivate() {
       active = false;
       playing = false;
+      stageTurntable = false;
+      if (stageRaf && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(stageRaf);
+        stageRaf = 0;
+      }
     },
   };
 }

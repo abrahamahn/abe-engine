@@ -33,7 +33,7 @@
 
 .gb-char-grid {
   display: grid;
-  grid-template-columns: minmax(220px, 270px) minmax(280px, 1fr) minmax(240px, 300px);
+  grid-template-columns: minmax(220px, 270px) minmax(360px, 1.35fr) minmax(240px, 300px);
   gap: 1px;
   flex: 1 1 auto;
   min-height: 0;
@@ -180,4 +180,53 @@
   font-size: 11px;
   color: var(--dim, #8a909c);
   font-variant-numeric: tabular-nums;
+}
+
+.gb-char-stage-card {
+  background: var(--panel, #1e2025);
+  border: 1px solid var(--line, #2c2f36);
+  border-radius: 4px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.gb-char-stage-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.gb-char-stage-wrap {
+  position: relative;
+  width: 100%;
+  height: 360px;
+  min-height: 280px;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid var(--line, #2c2f36);
+  background: #12151c;
+}
+
+.gb-char-viewport-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+  touch-action: none;
+}
+
+.gb-char-viewport-canvas:active {
+  cursor: grabbing;
+}
+
+.gb-char-stage-hint {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--dim, #8a909c);
 }

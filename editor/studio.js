@@ -730,14 +730,27 @@ function refreshLook(sections) {
   if (sections.some(section => section === 'time' || section === 'weather')) {
     loadWorld(state.cooked).catch(e => log(2, `viewport: ${e.message}`));
   } else {
-    try { state.engine.setLook(look); } catch (e) { log(2, `Look: ${e.message}`); }
+    try { state.engine.setLook(look); markViewportDirty(); } catch (e) { log(2, `Look: ${e.message}`); }
   }
+}
+
+function markViewportDirty(frames = 4, holdMs = 240) {
+  state.dirtyFrames = Math.max(state.dirtyFrames || 0, frames);
+  const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  state.dirtyUntil = Math.max(state.dirtyUntil || 0, now + holdMs);
+}
+
+function effectiveViewportDpr() {
+  const raw = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
+  const heavy = (state.lamps?.length || 0) > 64 || (state.inst?.length || 0) > 250;
+  return Math.min(raw, heavy ? 1.25 : 2);
 }
 
 function setTime(hours) {
   state.time = hours;
   $('#time').value = String(hours);
   $('#time-label').textContent = `${hours.toFixed(1)} h`;
+  markViewportDirty();
   pieViewport?.notifyEnvironmentChanged();
 }
 
@@ -776,8 +789,15 @@ async function loadWorld(cooked) {
     engine.destroy();
     return;
   }
-  engine.fitCanvas(Math.min(window.devicePixelRatio || 1, 2));
+  state.cooked = cooked;
+  state.records = new Map(cooked.entities.map((r, i) => [r.id, i]));
+  state.current = cooked.entities.map((r) => r.transform.slice());
+  state.inst = [];
+  for (let i = 0; i < engine.worldInstances(); i++) state.inst.push(engine.worldInstance(i).matrix);
+  state.lamps = (cooked.lamps || []).map((p) => p.slice());
+  engine.fitCanvas(effectiveViewportDpr());
   state.engine = engine;
+  markViewportDirty(10, 500);
   // Paint the latest authored Look if it changed while the graphics device was opening.
   const latest = previewLook();
   if (JSON.stringify(latest) !== JSON.stringify(look)) {
@@ -787,12 +807,6 @@ async function loadWorld(cooked) {
     }
     engine.setLook(latest);
   }
-  state.cooked = cooked;
-  state.records = new Map(cooked.entities.map((r, i) => [r.id, i]));
-  state.current = cooked.entities.map((r) => r.transform.slice());
-  state.inst = [];
-  for (let i = 0; i < engine.worldInstances(); i++) state.inst.push(engine.worldInstance(i).matrix);
-  state.lamps = (cooked.lamps || []).map((p) => p.slice());
   // The document may have moved on while the cook ran: bring transforms up to date.
   for (const id of Object.keys(entities())) {
     if (state.records.has(id)) placeEntity(id, worldFromDoc(id));
@@ -856,6 +870,7 @@ function placeEntity(id, world) {
       state.engine.setWorldLight(l, state.lamps[l]);
     }
   }
+  markViewportDirty();
 }
 
 function eye() {
@@ -901,6 +916,7 @@ function frameBounds(b) {
   const size = Math.max(0.5, Math.hypot(b[1][0] - b[0][0], b[1][1] - b[0][1], b[1][2] - b[0][2]));
   state.view.target = c;
   state.view.distance = Math.min(2000, size * 1.4 + 1);
+  markViewportDirty();
 }
 
 function frameAll() {
@@ -1110,6 +1126,19 @@ function renderLoop(t) {
     requestAnimationFrame(renderLoop);
     return;
   }
+  const now = performance.now();
+  const needsDraw =
+    state.simulating ||
+    Boolean(state.drag) ||
+    (state.dirtyFrames || 0) > 0 ||
+    now < (state.dirtyUntil || 0);
+  if (!needsDraw) {
+    state.simClock = t;
+    state.last = now;
+    requestAnimationFrame(renderLoop);
+    return;
+  }
+  if ((state.dirtyFrames || 0) > 0) state.dirtyFrames--;
   if (state.engine && state.simulating) {
     try {
       stepSimulation(t);
@@ -1121,7 +1150,7 @@ function renderLoop(t) {
   }
   if (state.engine) {
     try {
-      state.engine.fitCanvas(Math.min(window.devicePixelRatio || 1, 2));
+      state.engine.fitCanvas(effectiveViewportDpr());
       const v = state.view;
       state.engine.setView({ eye: eye(), target: v.target, up: orbitBasis(v).up, fov: v.fov,
         near: v.near, shift: v.shift, focus: v.focus?.enabled ? v.focus : undefined });
@@ -1133,9 +1162,9 @@ function renderLoop(t) {
     }
   }
   drawOverlay();
-  const now = performance.now();
-  state.fps = state.last ? 0.9 * state.fps + 0.1 * (1000 / Math.max(1, now - state.last)) : 0;
-  state.last = now;
+  const doneNow = performance.now();
+  state.fps = state.last ? 0.9 * state.fps + 0.1 * (1000 / Math.max(1, doneNow - state.last)) : 0;
+  state.last = doneNow;
   requestAnimationFrame(renderLoop);
 }
 
@@ -1245,9 +1274,14 @@ function viewportEvents() {
         v.yaw -= dx * 0.005;
         v.pitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, v.pitch + dy * 0.005));
       }
+      markViewportDirty();
       return;
     }
-    state.hover = axisUnder(x, y);
+    const nextHover = axisUnder(x, y);
+    if (nextHover !== state.hover) {
+      state.hover = nextHover;
+      markViewportDirty(2, 80);
+    }
   });
   vp.addEventListener('pointerup', (e) => {
     const r = vp.getBoundingClientRect();
@@ -1257,12 +1291,18 @@ function viewportEvents() {
     else if (state.click && Math.hypot(x - state.click.x, y - state.click.y) < 4) select(entityAt(x, y));
     state.click = null;
     orbit = null;
+    markViewportDirty(2, 80);
   });
   vp.addEventListener('wheel', (e) => {
     e.preventDefault();
     state.cameraFollow = null;
     state.view.distance = Math.max(0.2, Math.min(5000, state.view.distance * Math.exp(e.deltaY * 0.001)));
+    markViewportDirty();
   }, { passive: false });
+  if (typeof ResizeObserver === 'function') {
+    new ResizeObserver(() => markViewportDirty()).observe(vp);
+  }
+  window.addEventListener('resize', () => markViewportDirty());
   vp.addEventListener('dragover', (e) => {
     if (!hasAssetDrag(e)) return;
     if (state.draggingAsset && !canPlaceAsset(state.draggingAsset, state.doc).ok) {
@@ -1309,6 +1349,7 @@ function select(id) {
   if (state.inspectedLook) inspectLook(null);
   if (state.inspectedData) inspectData(null);
   state.selection = id;
+  markViewportDirty();
   drawOutliner();
   drawInspector();
   if (state.doc) state.host.send({ type: 'select', doc: state.doc.id, entities: id ? [id] : [] });
@@ -2066,6 +2107,7 @@ const studioApi = {
         const fovInput = $('#viewport-fov');
         if (fovInput) fovInput.value = String(pose.fov);
       }
+      markViewportDirty();
     },
     setLightingPreset: (preset = {}) => {
       if (typeof preset === 'string') {
@@ -2246,6 +2288,7 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
     state.activeWorkbench = workbenchId;
     document.body.classList.remove('workbench-active');
     if (deck) deck.hidden = true;
+    markViewportDirty(6, 300);
     if (workbenchId === 'layout-rig') {
       const targetAsset = options.doc
         ? state.assets.find((a) => a.id === options.doc || a.path === options.doc)
@@ -2909,6 +2952,7 @@ function lookThrough(id) {
   state.cameraFollow = id;
   state.view = { ...view, ...cameraLens(camera) };
   $('#viewport-fov').value = String(view.fov);
+  markViewportDirty();
 }
 
 function alignCamera(id) {
@@ -3200,6 +3244,7 @@ function commands() {
 
 function setMode(m) {
   state.mode = m;
+  markViewportDirty(2, 80);
   drawToolbar();
 }
 

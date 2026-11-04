@@ -4,7 +4,12 @@
 // directly; `mountModelStudio(container, studioApi)` implements `StudioWorkbenchInstance`.
 
 import { formatBytes, assetBasename, assetStem } from './asset-library.js';
-import { parseGlbPreview } from './asset-previews.js';
+import {
+  drawGlbPreviewCanvas,
+  hasWebGlPreviewSupport,
+  parseGlbPreview,
+  parseGlbPreviewAsync,
+} from './asset-previews.js';
 
 export const WORKBENCH_ID = 'model-studio';
 export const DEFAULT_LOD_RATIOS = Object.freeze([1.0, 0.5, 0.25, 0.125]);
@@ -1092,7 +1097,59 @@ export function drawLookDevViewport(canvas, state) {
   // 2. Render Active LOD Mesh with Non-Destructive Fixup Applied
   const mesh = state.renderMesh;
   const fixup = state.fixup;
-  if (mesh && mesh.indices?.length >= 3 && fixup) {
+  const canUseWebGl =
+    hasWebGlPreviewSupport() &&
+    mesh &&
+    mesh.indices?.length >= 3 &&
+    fixup &&
+    (state.shading === 'shaded' || state.shading === 'wireframe' || state.shading === 'normals');
+
+  if (canUseWebGl) {
+    const invScale = 1 / Math.max(1e-6, fixup.effectiveScale || 1);
+    const tr = fixup.translation || [0, 0, 0];
+    const rawEye = [
+      (eye[0] - tr[0]) * invScale,
+      (eye[1] - tr[1]) * invScale,
+      (eye[2] - tr[2]) * invScale,
+    ];
+    const rawTarget = [
+      (cam.target[0] - tr[0]) * invScale,
+      (cam.target[1] - tr[1]) * invScale,
+      (cam.target[2] - tr[2]) * invScale,
+    ];
+    const activeLod = state.meta?.import?.active_lod || 0;
+    let glInfo = state.parsed;
+    if (activeLod > 0 || !glInfo?.fullMesh?.indices?.length) {
+      if (!state._lodGlInfo || state._lodGlMesh !== mesh) {
+        state._lodGlMesh = mesh;
+        state._lodGlInfo = {
+          bounds: state.parsed?.bounds || [[-0.5, 0, -0.5], [0.5, 1, 0.5]],
+          embeddedImages: state.parsed?.embeddedImages || [],
+          submeshes: [
+            {
+              indexOffset: 0,
+              indexCount: mesh.indices.length,
+              imageIndex: state.parsed?.submeshes?.find((s) => typeof s.imageIndex === 'number')?.imageIndex ?? null,
+              alphaCutoff: 0,
+              baseColor: [0.85, 0.88, 0.94],
+            },
+          ],
+          fullMesh: mesh,
+        };
+      }
+      glInfo = state._lodGlInfo;
+    }
+    drawGlbPreviewCanvas(canvas, glInfo, {
+      width: cssW,
+      height: cssH,
+      shading: state.shading === 'shaded' ? 'textured' : state.shading,
+      skipBackground: true,
+      clearTarget: false,
+      camera: { eye: rawEye, target: rawTarget, fovRad },
+      onTextureLoaded: state.onTextureLoaded || null,
+    });
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  } else if (mesh && mesh.indices?.length >= 3 && fixup) {
     const pos = mesh.positions;
     const norm = mesh.normals;
     const tan = mesh.tangents;
@@ -1450,15 +1507,15 @@ export function mountModelStudio(container, studioApi = {}) {
     state.camera.distance = clamp(maxDim * 2.1, 0.8, 250);
   }
 
-  function loadBytesIntoStage(bytes, { label, sourceKind, assetId = null, meta = null }) {
-    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-    const parsed = parseGlbPreview(u8);
+  function applyParsedModel(u8, parsed, { label, sourceKind, assetId = null, meta = null }) {
     if (!parsed) {
       setStatus(`Invalid or unsupported .glb: ${label}`, 'err');
       return false;
     }
     state.rawBytes = u8;
     state.parsed = parsed;
+    state._lodGlInfo = null;
+    state._lodGlMesh = null;
     state.selectedAssetId = assetId;
     state.selectedPath = label;
     state.sourceKind = sourceKind;
@@ -1471,6 +1528,18 @@ export function mountModelStudio(container, studioApi = {}) {
     return true;
   }
 
+  function loadBytesIntoStage(bytes, opts) {
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const parsed = parseGlbPreview(u8);
+    return applyParsedModel(u8, parsed, opts);
+  }
+
+  async function loadBytesIntoStageAsync(bytes, opts) {
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const parsed = (await parseGlbPreviewAsync(u8, { maxFullTris: 180000 })) || parseGlbPreview(u8);
+    return applyParsedModel(u8, parsed, opts);
+  }
+
   async function inspectProjectAsset(idOrPath) {
     if (!idOrPath) return false;
     const models = listProjectModels();
@@ -1480,6 +1549,7 @@ export function mountModelStudio(container, studioApi = {}) {
     try {
       const url = resolveAssetUrl(asset);
       if (typeof fetch !== 'function') return false;
+      setStatus(`Loading ${assetBasename(asset.path)}…`, 'info');
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = await res.arrayBuffer();
@@ -1496,7 +1566,7 @@ export function mountModelStudio(container, studioApi = {}) {
           // Pure static/cloud session without sidecar RPC uses default meta
         }
       }
-      return loadBytesIntoStage(buf, {
+      return await loadBytesIntoStageAsync(buf, {
         label: asset.path,
         sourceKind: 'project',
         assetId: asset.id,
@@ -1540,7 +1610,7 @@ export function mountModelStudio(container, studioApi = {}) {
         const defaultMeta = state.intake.normalizeOnIngest
           ? { import: { pivot: 'bottom_center', scale: 1.0 } }
           : {};
-        loadBytesIntoStage(bytes, {
+        await loadBytesIntoStageAsync(bytes, {
           label: `${item.rootLabel}/${item.intakePath}`,
           sourceKind: 'intake',
           meta: defaultMeta,
@@ -1737,6 +1807,7 @@ export function mountModelStudio(container, studioApi = {}) {
     if (state.destroyed || !state.active) return;
     drawLookDevViewport(canvas, state);
   }
+  state.onTextureLoaded = requestPaint;
 
   function stepTurntable() {
     if (state.destroyed || !state.turntableOn || !state.active) return;
@@ -2305,7 +2376,7 @@ export function mountModelStudio(container, studioApi = {}) {
     if (file && file.name.toLowerCase().endsWith('.glb')) {
       const buf = await file.arrayBuffer();
       state.primitive.name = assetStem(file.name) || 'dropped_model';
-      loadBytesIntoStage(buf, { label: file.name, sourceKind: 'drop' });
+      await loadBytesIntoStageAsync(buf, { label: file.name, sourceKind: 'drop' });
     }
   });
 
