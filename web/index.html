@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
-<title>ABE Web Player</title>
+<title>Ganbate Web Player</title>
 <style>
   :root {
     color-scheme: dark;
@@ -48,10 +48,10 @@
 </style>
 </head>
 <body>
-<canvas id="view" tabindex="0" aria-label="ABE render view"></canvas>
+<canvas id="view" tabindex="0" aria-label="Ganbate render view"></canvas>
 <div id="hud" class="panel">
   <button class="small" id="help-toggle" aria-expanded="false">?</button>
-  <div><b>ABE</b> <span id="status">starting…</span></div>
+  <div><b>Ganbate</b> <span id="status">starting…</span></div>
   <div id="adapter"></div>
   <div id="help">W A S D fly · Q / E down / up · arrows or drag to look · Shift faster · 1–9 views ·
     T / G time · C day cycle · Y weather · P pause motion.<br>
@@ -64,9 +64,9 @@
 </div>
 <div id="errors" class="panel"><h2>Errors</h2><pre id="error-list"></pre></div>
 <div id="touch" class="panel" aria-label="Controls"></div>
-<noscript>The ABE web player needs JavaScript and WebGPU or WebGL 2.</noscript>
+<noscript>The Ganbate web player needs JavaScript and WebGPU or WebGL 2.</noscript>
 <script type="module">
-import { startPlayer, startSelfTest } from './abe.js';
+import { startPlayer, startSelfTest } from './ganbate.js';
 
 const params = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
@@ -122,10 +122,10 @@ window.addEventListener('keydown', (e) => {
 
 const scene = params.get('scene');
 if (params.get('selftest') === '1') {
-  // GPU-layer self-test (compute, copies, mips, canvas blit); see crates/abe-web/src/selftest.rs.
+  // GPU-layer self-test (compute, copies, mips, canvas blit); see crates/ganbate-web/src/selftest.rs.
   try {
     const result = await startSelfTest({
-      canvas, wasm: params.get('wasm') || './abe_web.wasm', sizeCanvas, api: params.get('api') || 'auto',
+      canvas, wasm: params.get('wasm') || './ganbate_web.wasm', sizeCanvas, api: params.get('api') || 'auto',
       onPhase(text) { phase.textContent = text; },
       onLog(level, text) { (level >= 2 ? console.error : console.log)(text); if (level >= 2) showError(text); },
       onError: showError,
@@ -133,20 +133,20 @@ if (params.get('selftest') === '1') {
     $('loading').style.display = 'none';
     $('status').textContent = `self-test done, ${result.errors().length} errors`;
     $('adapter').textContent = `${result.adapter} · ${result.format}`;
-    window.abe = { selftest: result };
+    window.ganbate = { selftest: result };
   } catch (e) {
     $('loading').style.display = 'none';
     showError(e.message || String(e));
-    window.abe = { failed: e.message || String(e) };
+    window.ganbate = { failed: e.message || String(e) };
   }
 } else if (!scene) {
-  showError('Give the world to show: index.html?scene=world.abew&look=look.json');
+  showError('Give the world to show: index.html?scene=world.gbew&look=look.json');
   phase.textContent = 'No scene';
 } else {
   try {
     const player = await startPlayer({
       canvas,
-      wasm: params.get('wasm') || './abe_web.wasm',
+      wasm: params.get('wasm') || './ganbate_web.wasm',
       api: params.get('api') || 'auto',
       scene,
       look: params.get('look') || '',
@@ -165,13 +165,13 @@ if (params.get('selftest') === '1') {
       onError: showError,
     });
     $('adapter').textContent = `${player.adapter} · ${player.format}`;
-    window.abe = player;
+    window.ganbate = player;
     buildTouchControls(player);
     canvas.focus();
   } catch (e) {
     $('loading').style.display = 'none';
     showError(e.message || String(e));
-    window.abe = { failed: e.message || String(e) };
+    window.ganbate = { failed: e.message || String(e) };
   }
 }
 

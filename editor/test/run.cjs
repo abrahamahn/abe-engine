@@ -1,11 +1,11 @@
-// End-to-end test of ABE Studio: the host, the browser interface and the engine viewport.
+// End-to-end test of Ganbate Studio: the host, the browser interface and the engine viewport.
 //
 //   node editor/test/run.cjs --out OUT_DIR [--api webgl2] [--keep]
 //
 // Needs release builds of the sample writer, the host and the cooker, and the web runtime:
-//   cargo build --release --example studio_sample -p abe-engine
-//   cargo build --release -p abe-studio --bin abe-studio
-//   cargo build --release --bin abe-build --bin abe-render
+//   cargo build --release --example studio_sample -p ganbate-engine
+//   cargo build --release -p ganbate-studio --bin ganbate-studio
+//   cargo build --release --bin ganbate-build --bin ganbate-render
 //   scripts/build-web.sh web/dist
 //
 // Between the rename and the new component it also checks what the keyboard does after a field
@@ -13,13 +13,13 @@
 // back, two entities added at once, and two cooks that overlap; after reopening the scene it
 // stops the host (a move made meanwhile snaps back) and starts it again (the page reconnects).
 //
-// It writes the synthetic sample project, starts `abe-studio` on it, opens the interface in
+// It writes the synthetic sample project, starts `ganbate-studio` on it, opens the interface in
 // headless Chromium and, through real pointer and key events: selects an entity by clicking
 // it, drags it along X with the gizmo, undoes and redoes, moves a parent and checks its child
 // follows, renames through the inspector, adds a component (which re-cooks the scene), saves,
 // reloads the page and finds the edits, simulates the scene's physics and stops, then cooks the
-// saved scene with `abe-build cook-scene`, renders it with `abe-render` and checks that the
-// browser's simulation ends in the same state as `abe-build simulate`, bit for bit. OUT gets
+// saved scene with `ganbate-build cook-scene`, renders it with `ganbate-render` and checks that the
+// browser's simulation ends in the same state as `ganbate-build simulate`, bit for bit. OUT gets
 // screenshots, the saved scene and results.json.
 'use strict';
 const fs = require('fs');
@@ -53,7 +53,7 @@ function check(name, ok, detail) {
 
 /** Starts the host; its output goes on `lines`. Resolves with the process once it listens. */
 function startHost(project, port, lines) {
-  const host = spawn(path.join(BIN, 'abe-studio'), [project, '--port', String(port),
+  const host = spawn(path.join(BIN, 'ganbate-studio'), [project, '--port', String(port),
     '--editor', path.join(ROOT, 'editor'), '--engine', path.join(ROOT, 'web', 'dist')],
   { stdio: ['ignore', 'pipe', 'pipe'] });
   const from = lines.length;
@@ -76,8 +76,8 @@ function startHost(project, port, lines) {
 // The engine module as the page imports it, wrapped so that a test can hold a load back and
 // see which engines were destroyed: `window.__engines` lists each createEngine call in order.
 const ENGINE_WRAPPER = `
-import * as real from '/engine/abe.js?real';
-export * from '/engine/abe.js?real';
+import * as real from '/engine/ganbate.js?real';
+export * from '/engine/ganbate.js?real';
 export async function createEngine(options) {
   const rec = { canvas: options.canvas, engine: null, destroyed: false };
   (window.__engines ||= []).push(rec);
@@ -190,7 +190,7 @@ async function pressAndWait(page, keys, what) {
 async function main() {
   const o = args();
   fs.mkdirSync(o.out, { recursive: true });
-  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'abe-studio-test-'));
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'ganbate-studio-test-'));
   execFileSync(path.join(BIN, 'examples', 'studio_sample'), [project], { stdio: 'inherit' });
   fs.mkdirSync(path.join(project, 'editor'), { recursive: true });
   fs.writeFileSync(path.join(project, 'editor', 'project-tools.json'), JSON.stringify({
@@ -205,7 +205,7 @@ async function main() {
   const logs = [];
   page.on('console', (m) => logs.push(`[${m.type()}] ${m.text()}`));
   page.on('pageerror', (e) => logs.push(`[pageerror] ${e.message}`));
-  await page.route((u) => u.pathname === '/engine/abe.js' && !u.search,
+  await page.route((u) => u.pathname === '/engine/ganbate.js' && !u.search,
     (route) => route.fulfill({ contentType: 'text/javascript', body: ENGINE_WRAPPER }));
   // While the host is deliberately down, the page's attempts to reconnect fail (log indices).
   const offline = [0, 0];
@@ -535,7 +535,7 @@ async function main() {
     check('the saved file has the move', JSON.stringify(saved.entities[a].components.transform.translation) === JSON.stringify(moved),
       saved.entities[a].components.transform.translation);
     check('the saved file is canonical JSON (sorted keys, two-space indent, final newline)',
-      text.endsWith('}\n') && text.startsWith('{\n  "abe": "scene",\n  "entities": {'));
+      text.endsWith('}\n') && text.startsWith('{\n  "entities": {') && text.includes('\n  "ganbate": "scene",\n'));
     await page.reload();
     await waitFor(page, () => window.__studio?.engine && window.__studio.cooked && window.__studio.doc, null, 'the reload');
     await page.waitForTimeout(800);
@@ -609,14 +609,14 @@ async function main() {
     check('stopping puts the crate back', Math.abs(y2 - y0) < 1e-4, { y0, y2 });
 
     // 9. The same scene, cooked by the command-line cooker, for the standalone player.
-    const abew = path.join(o.out, 'blocks.abew');
-    const cookOut = execFileSync(path.join(BIN, 'abe-build'), ['cook-scene', project, 'content/scenes/blocks.scene.json', abew]).toString();
-    const inspect = execFileSync(path.join(BIN, 'abe-build'), ['inspect', abew]).toString();
-    check('abe-build cooks the saved scene with its entities', /ABEW v4/.test(inspect) && inspect.includes('"Block Alpha"'), cookOut.trim());
+    const gbew = path.join(o.out, 'blocks.gbew');
+    const cookOut = execFileSync(path.join(BIN, 'ganbate-build'), ['cook-scene', project, 'content/scenes/blocks.scene.json', gbew]).toString();
+    const inspect = execFileSync(path.join(BIN, 'ganbate-build'), ['inspect', gbew]).toString();
+    check('ganbate-build cooks the saved scene with its entities', /GBEW v4/.test(inspect) && inspect.includes('"Block Alpha"'), cookOut.trim());
     const look = path.join(project, 'content', 'looks', 'day.look.json');
-    execFileSync(path.join(BIN, 'abe-render'), ['--scene', abew, '--look', look, '--view', 'overview',
+    execFileSync(path.join(BIN, 'ganbate-render'), ['--scene', gbew, '--look', look, '--view', 'overview',
       '--width', '640', '--height', '360', '--samples', '1', '--out', path.join(o.out, 'player-still.png')], { stdio: 'inherit' });
-    check('abe-render draws the cooked scene', fs.existsSync(path.join(o.out, 'player-still.png')));
+    check('ganbate-render draws the cooked scene', fs.existsSync(path.join(o.out, 'player-still.png')));
 
     // 10. Determinism: the browser's simulation of the saved scene, stepped 120 times at 60 Hz,
     // ends in exactly the state a native run of the command-line cook reaches.
@@ -632,11 +632,12 @@ async function main() {
       e.physicsStop();
       return h;
     }, steps);
-    const simulated = execFileSync(path.join(BIN, 'abe-build'), ['simulate', abew, String(steps)]).toString();
+    const simulated = execFileSync(path.join(BIN, 'ganbate-build'), ['simulate', gbew, String(steps)]).toString();
     const nativeHash = (simulated.match(/^hash ([0-9a-f]{16})$/m) || [])[1];
     check('the browser simulation matches a native run bit for bit', !!wasmHash && wasmHash === nativeHash,
       { wasmHash, nativeHash, native: simulated.trim().split('\n').slice(1, 4) });
     await require('./camera-authoring.cjs')(page, check);
+    await require('./assets.cjs')(page, project, check);
     await require('./framing.cjs')(page, check);
   } catch (e) {
     failed = e.message;

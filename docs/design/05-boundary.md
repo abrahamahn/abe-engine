@@ -24,7 +24,7 @@ engine, the numbers become documents, and a small amount of policy stays as game
 
 | In a game today | Goes to | As |
 | --- | --- | --- |
-| Matrix, quaternion and node-hierarchy helpers | engine | `abe-core` math, scene hierarchy |
+| Matrix, quaternion and node-hierarchy helpers | engine | `ganbate-core` math, scene hierarchy |
 | Fixing up models at load (UVs, normals, merged objects, missing lights) | engine | import settings and import tools; the fix happens once, at import |
 | Building meshes in code (cards, discs, rings, ribbons) | engine | procedural mesh builders and prefab assets |
 | CPU particle emitters | engine | the VFX system; the game keeps presets as documents |
@@ -43,7 +43,7 @@ engine, the numbers become documents, and a small amount of policy stays as game
 
 ## 3. Extension points
 
-A game extends ABE in six ways and never by editing engine code:
+A game extends Ganbate in six ways and never by editing engine code:
 
 | Extension | Lives in | Example |
 | --- | --- | --- |
@@ -56,24 +56,24 @@ A game extends ABE in six ways and never by editing engine code:
 
 Runtime access to authored data goes through the cooked scene: the entity table names every entity, its
 instances and lamps, and carries every component the renderer does not draw. A web game reads it with
-`engine.worldEntities()`; a native game reads the same table through `abe_assets::cooked::decode_scene`.
+`engine.worldEntities()`; a native game reads the same table through `ganbate_assets::cooked::decode_scene`.
 
 ## 4. Contracts across the boundary
 
-- **Versioned APIs.** The Rust crates and the schema format are versioned; the web library (`web/abe.js`,
-  `web/abe.d.ts`) and the edit protocol will be in M2 (a `version` constant the library exports, a `protocol` number
+- **Versioned APIs.** The Rust crates and the schema format are versioned; the web library (`web/ganbate.js`,
+  `web/ganbate.d.ts`) and the edit protocol will be in M2 (a `version` constant the library exports, a `protocol` number
   in `hello` and `welcome`). Additive changes keep old games working; a breaking change bumps the version and ships
   a migration note.
 - **A game pins the engine.** A web game vendors a built runtime with its engine revision; a native game pins the
   crates. Upgrading is a reviewed change in the game's repository, rolled out per platform.
 - **Fixtures stay with the game.** A game's tests run its own fixtures through its own adapters against the
   pinned engine. The engine's tests use synthetic, genre-neutral content only.
-- **Reversible migrations.** Moving a game from another renderer onto ABE happens per surface and per platform
+- **Reversible migrations.** Moving a game from another renderer onto Ganbate happens per surface and per platform
   behind a switch, and each step can be switched back until the old path is deleted.
 
 ## 5. Sorting a game's existing code
 
-1. **Inventory** what the old renderer draws, file by file, and what the ABE path already matches.
+1. **Inventory** what the old renderer draws, file by file, and what the Ganbate path already matches.
 2. **Classify** each module with the three questions; mark mixed modules section by section.
 3. **Extract mechanisms** into the engine one at a time, each with synthetic tests in this repository, and delete
    the game's copy once its stage uses the engine's.

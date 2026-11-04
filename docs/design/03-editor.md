@@ -1,6 +1,6 @@
-# Editor: ABE Studio
+# Editor: Ganbate Studio
 
-**Decision.** The editor is **ABE Studio**: a local Rust host (`abe-studio`) that owns the project folder, and a
+**Decision.** The editor is **Ganbate Studio**: a local Rust host (`ganbate-studio`) that owns the project folder, and a
 browser interface whose viewport is the engine itself (the same wasm runtime and renderer a web game ships). The
 host is the only writer of project files and the keeper of undo history; the interface, a running game and a
 phone are all clients of the same edit protocol. A native viewport client joins later for work the browser cannot
@@ -34,7 +34,7 @@ documents and plugins (§6). **D** stays the place to model meshes; the editor a
              project folder (JSON documents, sources, sidecars)
                          |  read / write (only the host writes)
                  +-------+--------+
-                 |   abe-studio   |  asset database, import cache, cook, documents + undo,
+                 |   ganbate-studio   |  asset database, import cache, cook, documents + undo,
                  |   (Rust host)  |  validation, live-link hub, serves the interface
                  +---+-------+----+
         WebSocket    |       |    WebSocket (opt-in on the LAN, with a pairing token)
@@ -42,11 +42,11 @@ documents and plugins (§6). **D** stays the place to model meshes; the editor a
           |                                         |
    browser interface                       live targets
    panels in the DOM                       a running game (web or native) with the live-link
-   viewport = abe-web (wasm)               client; a phone on the same network; a native
+   viewport = ganbate-web (wasm)               client; a phone on the same network; a native
                                            viewport client (later)
 ```
 
-- **Host.** `abe-studio <project>` serves the interface at `http://localhost:<port>/`, reads and indexes the
+- **Host.** `ganbate-studio <project>` serves the interface at `http://localhost:<port>/`, reads and indexes the
   project, opens documents on request and keeps each open document's history. It is written with the standard
   library only: HTTP/1.1 and WebSocket (RFC 6455). It scans the project when it starts; files added or changed
   while it runs are seen after a restart (re-scanning by polling is planned), except that a document reopened with
@@ -60,12 +60,12 @@ documents and plugins (§6). **D** stays the place to model meshes; the editor a
 - **Edits are ops.** A client sends
   `{"type": "edit", "doc": id, "rev": n, "label": "Move", "merge": "drag:7f...", "req": 7, "ops": [{"set": ["entities",
   "2b8f0c71d4e6a935", "components", "transform", "translation"], "value": [4.5, 0, -2]}, {"remove": [...]}]}`: set
-  and remove ops (`abe_scene::doc`) on paths of 1 to 64 keys; in scenes and prefabs only `entities` and `name` may
+  and remove ops (`ganbate_scene::doc`) on paths of 1 to 64 keys; in scenes and prefabs only `entities` and `name` may
   change. The host checks the revision, the schema and the scene rules (no parent cycles, valid ids), applies the
   ops all-or-nothing, refuses an edit that adds a validation problem (problems the document already had do not block
   edits), records the inverse for undo and broadcasts the ops with the new revision to every client watching that
   document. A client whose revision is stale gets the current document instead. The protocol's messages are listed
-  at the top of `crates/abe-studio/src/session.rs`: `hello`/`welcome`, `open`/`doc`, `close`, `edit` (answered with
+  at the top of `crates/ganbate-studio/src/session.rs`: `hello`/`welcome`, `open`/`doc`, `close`, `edit` (answered with
   `ops` or `error`), `delete` (an edit whose ops the host works out, through what prefab instances show), `undo`,
   `redo`, `save`/`saved` (with `force` to overwrite a file changed on disk), `ids`, `create`/`created`, `import`,
   `cook`/`cooked`, and `preview` and `select`, which are relayed to the other clients.
@@ -75,7 +75,7 @@ documents and plugins (§6). **D** stays the place to model meshes; the editor a
 - **Undo and redo** are per document, host-side, with labels ("Move Lantern 3"), a limit, merging of consecutive
   same-key edits and a saved marker for the dirty dot. Ctrl+Z in any window undoes the focused document.
 - **Save** writes canonical text atomically (a temporary file, then a rename). In M1 unsaved edits live only in the
-  host's memory, so a host crash loses them; autosave to `.abe/autosave/` is planned (M2). The project files change
+  host's memory, so a host crash loses them; autosave to `.ganbate/autosave/` is planned (M2). The project files change
   only on Save.
 
 ## 3. Panels
@@ -125,11 +125,11 @@ Every tool edits documents through ops, so every tool gets undo, save, live link
   HTTPS follows edits through a relay: the host connects out to a WebSocket endpoint the game's server offers, which
   forwards ops to pages that present the pairing code. The engine needs no TLS of its own for either.
 - **Validation everywhere.** The host validates every edit (schema, id format, parent cycles) and refuses one that
-  adds a problem; `abe-build cook-scene` refuses a scene with any problem. Validation on save, checks that the
-  referenced parents, prefabs and assets exist, and `abe-build check` for commits and CI are planned (M2).
+  adds a problem; `ganbate-build cook-scene` refuses a scene with any problem. Validation on save, checks that the
+  referenced parents, prefabs and assets exist, and `ganbate-build check` for commits and CI are planned (M2).
 - **Selection and references.** Entities are addressed by id everywhere (outliner, inspector, viewport, console
   links, the game's plugin), so a selection survives renames and moves.
-- **Agents and people share one edit path.** An AI agent edits through the `abe` command (`scene inspect`,
+- **Agents and people share one edit path.** An AI agent edits through the `ganbate` command (`scene inspect`,
   `validate`, `apply` with `--dry-run`, `undo`, `diff`, and `render`; short JSON answers with stable error codes),
   which uses the editor's ops, validation and canonical writer, so an agent's change and a person's change are the
   same kind of thing in git and in review. Several edits form one transaction that writes nothing if any of them
@@ -195,15 +195,15 @@ A scene hour or weather preset takes precedence over that part of the Look.
 
 The first release is the smallest editor that ends script-driven placement:
 
-1. `abe-studio` serves the interface and opens a project; the asset database indexes it and creates sidecars.
+1. `ganbate-studio` serves the interface and opens a project; the asset database indexes it and creates sidecars.
 2. A static GLB imports as a scene with one entity per node (names and hierarchy kept) instead of being merged;
    skinned, morphed and animated models are refused (they stay run-time models).
 3. The viewport draws the scene (cooked on the fly, entities kept) with the Look named by the scene's
    `environment` component; click selects an entity.
 4. Outliner, schema inspector and console work; the move/rotate/scale gizmo edits transforms with undo and redo.
-5. Save writes canonical JSON; reopening gives the same scene; `abe-build cook-scene PROJECT SCENE out.abew` cooks
-   the saved scene into one ABEW v4 file (world plus entity table), which `abe-render`, the player (`--scene`) and
-   the web runtime read. A per-platform package cook (`abe-build cook-project`) is not built yet (see the data page).
+5. Save writes canonical JSON; reopening gives the same scene; `ganbate-build cook-scene PROJECT SCENE out.gbew` cooks
+   the saved scene into one GBEW v4 file (world plus entity table), which `ganbate-render`, the player (`--scene`) and
+   the web runtime read. A per-platform package cook (`ganbate-build cook-project`) is not built yet (see the data page).
 
 M1 has the Viewport (orbit, frame, click to select, the gizmo), the Outliner (tree and filter), the Inspector
 (schema fields, add and remove components), Assets (list, open, import as scene, new scene) and the Console; the
@@ -212,4 +212,4 @@ rest of each panel comes with later milestones.
 Acceptance (met by `editor/test/run.cjs` in headless Chromium on WebGPU and WebGL 2): on the synthetic sample, click
 an object to select it, drag it with the gizmo, undo and redo, move a parent and see its child follow, rename
 through the inspector, add a component (re-cooking the scene), save, reload and find the move, then cook the saved
-scene with `abe-build` and render it with `abe-render`.
+scene with `ganbate-build` and render it with `ganbate-render`.

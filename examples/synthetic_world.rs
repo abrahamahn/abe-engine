@@ -1,13 +1,13 @@
 //! Writes the synthetic world of `tests/render.rs` (ground with a checker texture, boxes,
-//! water, a foliage cube, a lamp and an alpha-masked card) as `synthetic.abew`, with a Look
+//! water, a foliage cube, a lamp and an alpha-masked card) as `synthetic.gbew`, with a Look
 //! file holding its camera, to a directory. The web player test renders both natively and in
 //! a browser.
 //!
 //! ```sh
 //! cargo run --release --example synthetic_world -- OUT_DIR
 //! ```
-use abe_engine::Vec3;
-use abe_engine::world::{
+use ganbate_engine::Vec3;
+use ganbate_engine::world::{
     AlphaMode, Emission, Instance, Material, Mesh, PointLight, Shading, Texture, Transform, World,
 };
 
@@ -167,21 +167,21 @@ fn main() -> Result<(), String> {
         .ok_or("usage: synthetic_world OUT_DIR")?;
     let dir = std::path::Path::new(&dir);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let bytes = abe_engine::assets::cooked::encode(&world())?;
-    std::fs::write(dir.join("synthetic.abew"), bytes).map_err(|e| e.to_string())?;
+    let bytes = ganbate_engine::assets::cooked::encode(&world())?;
+    std::fs::write(dir.join("synthetic.gbew"), bytes).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("synthetic-look.json"), LOOK).map_err(|e| e.to_string())?;
     // The same world as delivered to browsers: coded meshes and textures kept as PNG files.
     let mut compact = world();
     for t in &mut compact.textures {
-        let png = abe_engine::assets::png::encode(t.width, t.height, &t.levels[0])?;
+        let png = ganbate_engine::assets::png::encode(t.width, t.height, &t.levels[0])?;
         t.levels.clear();
-        t.encoded = Some(abe_engine::world::EncodedImage {
+        t.encoded = Some(ganbate_engine::world::EncodedImage {
             mime: "image/png".into(),
             data: png,
         });
     }
-    let bytes = abe_engine::assets::cooked::encode_compact(&compact)?;
-    std::fs::write(dir.join("synthetic-compact.abew"), bytes).map_err(|e| e.to_string())?;
-    println!("{}", dir.join("synthetic.abew").display());
+    let bytes = ganbate_engine::assets::cooked::encode_compact(&compact)?;
+    std::fs::write(dir.join("synthetic-compact.gbew"), bytes).map_err(|e| e.to_string())?;
+    println!("{}", dir.join("synthetic.gbew").display());
     Ok(())
 }

@@ -1,6 +1,6 @@
-//! ABE's stylized renderer: soft cel shading, a time-of-day sky and weather, water reflections
+//! Ganbate's stylized renderer: soft cel shading, a time-of-day sky and weather, water reflections
 //! and painterly post-processing, built on the backend-neutral [`crate::gpu`] layer and shaders
-//! compiled by ABE's own compiler. The look is data ([`Look`], usually from a game's Look
+//! compiled by Ganbate's own compiler. The look is data ([`Look`], usually from a game's Look
 //! file); nothing game-specific lives here.
 /// A generational handle type (ids are never 0).
 macro_rules! handle {

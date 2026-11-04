@@ -1,5 +1,5 @@
 //! Physics on the engine's own renderer: a pyramid of blocks on the ground and a ball thrown into
-//! it, simulated by `abe-physics` at 60 steps per second and drawn by the stylized renderer at five
+//! it, simulated by `ganbate-physics` at 60 steps per second and drawn by the stylized renderer at five
 //! moments, side by side in one image. The same run gives the same picture and the same numbers
 //! every time, on every platform.
 //!
@@ -7,11 +7,13 @@
 //!
 //! It needs a Vulkan driver (`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` uses lavapipe).
 
-use abe_engine::Vec3 as V;
-use abe_engine::gpu::Device;
-use abe_engine::render::{Environment, Look, Output, Quality, Renderer, TimeOfDay, View, Weather};
-use abe_engine::world::{AlphaMode, Instance, Material, Mesh, Shading, Transform, World};
-use abe_physics::{BodyDesc, BodyId, BodyKind, ColliderDesc, PhysicsWorld, Shape, Vec3};
+use ganbate_engine::Vec3 as V;
+use ganbate_engine::gpu::Device;
+use ganbate_engine::render::{
+    Environment, Look, Output, Quality, Renderer, TimeOfDay, View, Weather,
+};
+use ganbate_engine::world::{AlphaMode, Instance, Material, Mesh, Shading, Transform, World};
+use ganbate_physics::{BodyDesc, BodyId, BodyKind, ColliderDesc, PhysicsWorld, Shape, Vec3};
 
 const W: u32 = 384;
 const H: u32 = 216;
@@ -224,7 +226,7 @@ fn main() -> Result<(), String> {
             physics.contact_count()
         );
     }
-    let png = abe_engine::assets::png::encode(W * moments.len() as u32, H, &sheet)?;
+    let png = ganbate_engine::assets::png::encode(W * moments.len() as u32, H, &sheet)?;
     std::fs::write(&out, png).map_err(|e| e.to_string())?;
     println!(
         "{out}: {} moments; state hash {:016x}",

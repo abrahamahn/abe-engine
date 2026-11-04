@@ -1,15 +1,15 @@
 //! Driver tests for the GPU layer. Run on a Vulkan device, ideally with validation:
-//! `ABE_VULKAN_VALIDATION=1 cargo test --locked --offline --test gpu -- --ignored`.
+//! `GANBATE_VULKAN_VALIDATION=1 cargo test --locked --offline --test gpu -- --ignored`.
 //! The presentation test needs a display (for example `Xvfb :99 &` and `DISPLAY=:99`).
 //!
 //! The shaders are GLSL sources in `tests/fixtures`, compiled with
 //! `glslangValidator --target-env vulkan1.0 -V x -o x.spv`; their reflection is written by hand
-//! below until the ABE shader compiler produces both.
+//! below until the Ganbate shader compiler produces both.
 #![cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
-use abe_engine::gpu::shader::{
+use ganbate_engine::gpu::shader::{
     Binding, BindingKind, Compiled, Interface, IoType, SampleType, Stage, TexelFormat, TextureView,
 };
-use abe_engine::gpu::*;
+use ganbate_engine::gpu::*;
 
 fn spirv(bytes: &[u8]) -> Vec<u32> {
     bytes
@@ -1404,14 +1404,14 @@ fn creates_uses_and_recycles_many_bind_groups() {
 #[test]
 #[ignore = "requires a display and a Vulkan presentation driver"]
 fn presents_frames_across_a_resize() {
-    use abe_engine::window::Window;
+    use ganbate_engine::window::Window;
     use std::time::{Duration, Instant};
     #[cfg(target_os = "linux")]
     if std::env::var_os("DISPLAY").is_none() {
         eprintln!("skipping: DISPLAY is not set");
         return;
     }
-    let window = match Window::new("ABE gpu presentation test", 320, 200) {
+    let window = match Window::new("Ganbate gpu presentation test", 320, 200) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("skipping: {e}");

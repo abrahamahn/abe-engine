@@ -3,82 +3,82 @@
 version = 4
 
 [[package]]
-name = "abe-agent"
+name = "ganbate-agent"
 version = "0.2.0"
 dependencies = [
- "abe-assets",
- "abe-core",
- "abe-engine",
- "abe-pipeline",
- "abe-scene",
- "abe-studio",
+ "ganbate-assets",
+ "ganbate-core",
+ "ganbate-engine",
+ "ganbate-pipeline",
+ "ganbate-scene",
+ "ganbate-studio",
 ]
 
 [[package]]
-name = "abe-assets"
+name = "ganbate-assets"
 version = "0.2.0"
 dependencies = [
- "abe-core",
+ "ganbate-core",
 ]
 
 [[package]]
-name = "abe-core"
+name = "ganbate-core"
 version = "0.2.0"
 
 [[package]]
-name = "abe-engine"
+name = "ganbate-engine"
 version = "0.2.0"
 dependencies = [
- "abe-assets",
- "abe-core",
- "abe-physics",
- "abe-pipeline",
- "abe-scene",
- "abe-shader",
+ "ganbate-assets",
+ "ganbate-core",
+ "ganbate-physics",
+ "ganbate-pipeline",
+ "ganbate-scene",
+ "ganbate-shader",
 ]
 
 [[package]]
-name = "abe-physics"
+name = "ganbate-physics"
 version = "0.2.0"
 dependencies = [
- "abe-core",
+ "ganbate-core",
 ]
 
 [[package]]
-name = "abe-pipeline"
+name = "ganbate-pipeline"
 version = "0.2.0"
 dependencies = [
- "abe-assets",
- "abe-core",
- "abe-scene",
+ "ganbate-assets",
+ "ganbate-core",
+ "ganbate-scene",
 ]
 
 [[package]]
-name = "abe-scene"
+name = "ganbate-scene"
 version = "0.2.0"
 dependencies = [
- "abe-core",
+ "ganbate-core",
 ]
 
 [[package]]
-name = "abe-shader"
+name = "ganbate-shader"
 version = "0.2.0"
 
 [[package]]
-name = "abe-studio"
+name = "ganbate-studio"
 version = "0.2.0"
 dependencies = [
- "abe-assets",
- "abe-core",
- "abe-engine",
- "abe-pipeline",
- "abe-scene",
+ "ganbate-assets",
+ "ganbate-core",
+ "ganbate-engine",
+ "ganbate-pipeline",
+ "ganbate-scene",
 ]
 
 [[package]]
-name = "abe-web"
+name = "ganbate-web"
 version = "0.2.0"
 dependencies = [
- "abe-engine",
- "abe-physics",
+ "ganbate-engine",
+ "ganbate-physics",
 ]

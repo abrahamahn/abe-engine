@@ -1,19 +1,19 @@
-# Studio workflow: how ABE works the way large studios do, at a small studio's size
+# Studio workflow: how Ganbate works the way large studios do, at a small studio's size
 
-**Decision.** ABE copies what makes large studios productive — tools as part of the engine, data instead of code
+**Decision.** Ganbate copies what makes large studios productive — tools as part of the engine, data instead of code
 for anything tunable, a pipeline from content tools to a cooked runtime with live feedback, and a hard line between
 engine and game — and leaves out what only pays at a large studio's size. The editor is where every role that is
 not engine programming works.
 
 ## 1. Roles, and who fills them here
 
-A large team splits the work across many specialists. ABE keeps the split as *kinds of work*, because each kind
+A large team splits the work across many specialists. Ganbate keeps the split as *kinds of work*, because each kind
 needs its own tool, even when one person or an agent does several.
 
-| Kind of work | In a large studio | In ABE |
+| Kind of work | In a large studio | In Ganbate |
 | --- | --- | --- |
 | Engine programming | engine, graphics, platform, audio, physics, network programmers | agents writing Rust in this repository, against synthetic tests |
-| Tools programming | a tools team building editors and pipelines | the same, in `abe-studio`, `editor/` and `abe-pipeline` |
+| Tools programming | a tools team building editors and pipelines | the same, in `ganbate-studio`, `editor/` and `ganbate-pipeline` |
 | Gameplay programming | gameplay engineers in the game's code | agents in the game's repository, through the engine's extension points |
 | Art direction, environment and level art | art director, environment artists, level designers | the founder in the editor: placement, landscape, vegetation, lighting, Look |
 | Character art and animation | character artists, riggers, animators | modelling in a content tool; assembly, animation graphs, expressions and customization in the editor |
@@ -60,7 +60,7 @@ Large engines converge on the same idea: code defines *kinds* of things and thei
 things, *where*, and *how much*. Unreal has reflected properties and data assets, Unity has serialized components
 and ScriptableObjects, Frostbite and RAGE describe their content in large typed data sets read by generic systems.
 
-ABE's version:
+Ganbate's version:
 
 - **Schemas** describe every component kind (engine and game) once; the inspector, validation, the cook and the
   runtime readers follow from them.
@@ -73,7 +73,7 @@ ABE's version:
 
 ## 4. One engine, several games
 
-| Engine | How games are separated | Lesson for ABE |
+| Engine | How games are separated | Lesson for Ganbate |
 | --- | --- | --- |
 | Unity | The engine is a product; each game is a project of assets, scripts and packages; the editor is extended by editor scripts | Projects, packages and editor extensions are the right shape; a game should never need the engine's source changed |
 | Unreal | Engine source plus game modules and plugins; licensees often modify the engine, creating long-lived forks | Give games real extension points (schemas, code, plugins) so nobody forks the engine |
@@ -81,7 +81,7 @@ ABE's version:
 | Frostbite | One engine across many studios and genres; well-documented costs when a game's genre differs from what the engine was built for | Prove reuse early with a different kind of game, before the API sets around the first one |
 | Godot, Bevy | Text scene formats, reflection-driven inspectors, asset processors with sidecar metadata | Text-first data and sidecars work for small teams and for git |
 
-ABE therefore:
+Ganbate therefore:
 
 1. Keeps the engine repository free of any game's names, assets and rules; samples are synthetic.
 2. Gives games extension points instead of forks: component schemas, game code against versioned APIs, editor
@@ -91,7 +91,7 @@ ABE therefore:
    synthetic, genre-neutral sample and test, and no game's concepts enter the engine API, before or after M9.
 4. Treats tools as engine features: an engine change that adds a field also adds its schema, so the editor shows it.
 
-## 5. Where ABE deliberately differs
+## 5. Where Ganbate deliberately differs
 
 - **Zero third-party code.** Codecs, the shader compiler, the editor host and its protocol are first-party. Only
   platform SDKs that cannot be avoided (consoles) live outside, in private platform modules.

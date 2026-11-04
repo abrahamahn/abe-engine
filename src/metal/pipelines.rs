@@ -7,7 +7,7 @@ use crate::apple::objc::nsstring;
 use crate::gpu::{
     Blend, BufferUsage, Cull, RenderPipelineDesc, Resource, TextureUsage, Topology, VertexFormat,
 };
-use abe_shader::{Compiled, IoType, SampleType, Stage, TexelFormat, TextureView};
+use ganbate_shader::{Compiled, IoType, SampleType, Stage, TexelFormat, TextureView};
 
 const MAX_BIND_GROUPS: usize = 8;
 
@@ -96,8 +96,8 @@ fn merge_bindings(stages: &[&Compiled]) -> Result<Vec<Vec<Entry>>> {
 /// Compiles a shader's MSL and returns its entry function (+1) and its binding map.
 fn function(device: Id, shader: &Compiled, invariant: &mut bool) -> Result<(Obj, StageMap)> {
     let msl = shader.msl.as_ref().ok_or(
-        "the shader has no Metal Shading Language; compile it with abe_shader::compile on an \
-         Apple target or with abe_shader::compile_msl",
+        "the shader has no Metal Shading Language; compile it with ganbate_shader::compile on an \
+         Apple target or with ganbate_shader::compile_msl",
     )?;
     *invariant |= msl.invariant;
     let source = nsstring(&msl.source);
@@ -326,9 +326,12 @@ impl<'w> Gpu<'w> {
                         let e = at(attributes, a.location as usize);
                         send!(e, "setFormat:", format as NSUInteger => NSUInteger; ());
                         send!(e, "setOffset:", a.offset as NSUInteger => NSUInteger; ());
-                        send!(e, "setBufferIndex:", abe_shader::VERTEX_BUFFER as NSUInteger => NSUInteger; ());
+                        send!(e, "setBufferIndex:", ganbate_shader::VERTEX_BUFFER as NSUInteger => NSUInteger; ());
                     }
-                    let l = at(send!(vd, "layouts"; Id), abe_shader::VERTEX_BUFFER as usize);
+                    let l = at(
+                        send!(vd, "layouts"; Id),
+                        ganbate_shader::VERTEX_BUFFER as usize,
+                    );
                     send!(l, "setStride:", layout.stride as NSUInteger => NSUInteger; ());
                     send!(l, "setStepFunction:", ffi::STEP_PER_VERTEX as NSUInteger => NSUInteger; ());
                     send!(l, "setStepRate:", 1usize => NSUInteger; ());
@@ -729,7 +732,7 @@ impl<'w> Gpu<'w> {
     ) -> Result<(PipelineId, SamplerId)> {
         if self.blitter.is_none() {
             let compile = |stage, entry| {
-                abe_shader::compile_msl(BLIT_WGSL, stage, entry)
+                ganbate_shader::compile_msl(BLIT_WGSL, stage, entry)
                     .map_err(|e| format!("blit shader {entry}: {e}"))
             };
             let vertex = compile(Stage::Vertex, "vs_blit")?;

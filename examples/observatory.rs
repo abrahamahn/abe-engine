@@ -3,7 +3,7 @@
 mod common;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use abe_engine::{Camera, Vec3, vulkan::VulkanRenderer};
+    use ganbate_engine::{Camera, Vec3, vulkan::VulkanRenderer};
     use std::io::{BufWriter, Write};
     let output = std::env::args_os()
         .nth(1)

@@ -1,4 +1,4 @@
-//! Replays a backend-neutral [`Encoder`] into the command stream `web/abe.js` executes on
+//! Replays a backend-neutral [`Encoder`] into the command stream `web/ganbate.js` executes on
 //! WebGL 2: `u32` words, one opcode followed by its operands. Recording checks what GL would
 //! otherwise report as errors (formats, usages, attachment/binding feedback loops, missing
 //! bindings), resolves each draw's uniform blocks, texture units, storage textures and hidden

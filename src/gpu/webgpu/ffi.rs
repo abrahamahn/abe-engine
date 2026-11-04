@@ -1,5 +1,5 @@
-//! The browser's WebGPU, reached through imports that the JavaScript host (`web/abe.js`)
-//! provides in the wasm import module `abe`. This is the only `unsafe` code of the backend.
+//! The browser's WebGPU, reached through imports that the JavaScript host (`web/ganbate.js`)
+//! provides in the wasm import module `ganbate`. This is the only `unsafe` code of the backend.
 //!
 //! Objects: every GPU object lives in a JavaScript table and Rust holds its `u32` index. Index
 //! 0 is never a valid object: a create call returns 0 on failure and [`last_error`] explains
@@ -27,7 +27,7 @@ pub const EMPTY_GROUP: u32 = 0xFFFF_FFFE;
 pub const PUSH_RENDER: u32 = 0xFFFF_FFFD;
 pub const PUSH_COMPUTE: u32 = 0xFFFF_FFFC;
 
-#[link(wasm_import_module = "abe")]
+#[link(wasm_import_module = "ganbate")]
 unsafe extern "C" {
     fn gpu_info(out: *mut u32, cap: u32) -> u32;
     fn gpu_adapter_name(out: *mut u8, cap: u32) -> u32;

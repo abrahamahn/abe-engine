@@ -318,9 +318,9 @@ pub struct DepthState {
 /// is used in (a pass with a depth attachment needs a pipeline with `depth: Some(..)`).
 #[derive(Clone, Debug)]
 pub struct RenderPipelineDesc<'a> {
-    pub vertex: &'a abe_shader::Compiled,
+    pub vertex: &'a ganbate_shader::Compiled,
     /// `None` for depth-only pipelines (requires `colors` to be empty).
-    pub fragment: Option<&'a abe_shader::Compiled>,
+    pub fragment: Option<&'a ganbate_shader::Compiled>,
     /// `None` when the vertex shader takes no `@location` inputs (e.g. full-screen passes).
     pub vertex_layout: Option<VertexLayout>,
     pub topology: Topology,

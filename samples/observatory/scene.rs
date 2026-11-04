@@ -1,4 +1,4 @@
-use abe_engine::{Scene, Vec3};
+use ganbate_engine::{Scene, Vec3};
 
 /// A gallery of solids makes a neutral example for any engine client.
 pub fn gallery(angle: f32) -> Scene {

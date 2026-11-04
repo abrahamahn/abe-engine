@@ -1,5 +1,5 @@
 //! WebGPU implementation of the backend-neutral GPU layer in [`crate::gpu`], for `wasm32`
-//! builds running in a browser. The JavaScript host (`web/abe.js`) creates the adapter, device
+//! builds running in a browser. The JavaScript host (`web/ganbate.js`) creates the adapter, device
 //! and canvas context before the engine starts and provides the imports in [`ffi`].
 //!
 //! Ownership: [`Gpu`] keeps the engine's generational pools of buffers, textures, samplers,
@@ -10,8 +10,8 @@
 //! command stream ([`record`]) that the host turns into one `GPUCommandEncoder` and submits.
 //! The browser derives every barrier. Push constants (which WebGPU lacks) are written into a
 //! per-submission ring of [`PUSH_SLOT`]-byte uniform blocks and bound with a dynamic offset at
-//! [`abe_shader::wgsl::PUSH_CONSTANT_GROUP`]; shaders are compiled to WGSL with that lowering
-//! by [`abe_shader::compile_wgsl`] (see [`crate::gpu::compile_shader`]).
+//! [`ganbate_shader::wgsl::PUSH_CONSTANT_GROUP`]; shaders are compiled to WGSL with that lowering
+//! by [`ganbate_shader::compile_wgsl`] (see [`crate::gpu::compile_shader`]).
 //!
 //! Synchronization: `submit` and `present` return without waiting. `write_buffer`,
 //! `write_texture` and submissions execute in call order on the queue, so a write made after a
@@ -30,7 +30,7 @@ use crate::gpu::{
     Limits, Memory, PipelineId, RenderPipelineDesc, Resource, SamplerDesc, SamplerId, TextureDesc,
     TextureId, TextureUsage, Topology, VertexFormat,
 };
-use abe_shader::{BindingKind, Compiled, IoType, SampleType, Stage, TexelFormat, TextureView};
+use ganbate_shader::{BindingKind, Compiled, IoType, SampleType, Stage, TexelFormat, TextureView};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -40,7 +40,7 @@ type Result<T> = std::result::Result<T, String>;
 pub(crate) const PUSH_SLOT: u32 = 256;
 /// Bind groups every WebGPU device supports; the last one holds push constants.
 const MAX_GROUPS: usize = 4;
-const PUSH_GROUP: usize = abe_shader::wgsl::PUSH_CONSTANT_GROUP as usize;
+const PUSH_GROUP: usize = ganbate_shader::wgsl::PUSH_CONSTANT_GROUP as usize;
 
 const VISIBLE_VERTEX: u32 = 1;
 const VISIBLE_FRAGMENT: u32 = 2;
@@ -253,7 +253,7 @@ impl Gpu<'static> {
         let w = ffi::info();
         if w.len() < 16 {
             return Err(format!(
-                "the WebGPU host is not ready ({}); load the module through web/abe.js",
+                "the WebGPU host is not ready ({}); load the module through web/ganbate.js",
                 ffi::last_error()
             ));
         }
@@ -625,7 +625,7 @@ impl<'w> Gpu<'w> {
         let w = c.wgsl.as_ref().ok_or_else(|| {
             format!(
                 "the {:?} shader has no WGSL; compile it with gpu::compile_shader \
-                 (abe_shader::compile_wgsl) for WebGPU",
+                 (ganbate_shader::compile_wgsl) for WebGPU",
                 c.stage
             )
         })?;
@@ -745,7 +745,11 @@ impl<'w> Gpu<'w> {
             for (s, _) in stages {
                 let lowered = s.wgsl.as_ref().and_then(|w| w.push_constants);
                 if s.push_constant_size > 0
-                    && lowered != Some((PUSH_GROUP as u32, abe_shader::wgsl::PUSH_CONSTANT_BINDING))
+                    && lowered
+                        != Some((
+                            PUSH_GROUP as u32,
+                            ganbate_shader::wgsl::PUSH_CONSTANT_BINDING,
+                        ))
                 {
                     return Err(format!(
                         "the {:?} shader's push constants are not at @group({PUSH_GROUP})",

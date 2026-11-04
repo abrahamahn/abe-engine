@@ -1,19 +1,19 @@
 [package]
-name = "abe-engine"
+name = "ganbate-engine"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 publish = false
-description = "ABE studio's native 3D renderer"
+description = "Ganbate Studio's native 3D renderer"
 
 [workspace]
-members = ["crates/abe-agent", "crates/abe-core", "crates/abe-assets", "crates/abe-physics", "crates/abe-pipeline", "crates/abe-scene", "crates/abe-shader", "crates/abe-studio", "crates/abe-web"]
+members = ["crates/ganbate-agent", "crates/ganbate-core", "crates/ganbate-assets", "crates/ganbate-physics", "crates/ganbate-pipeline", "crates/ganbate-scene", "crates/ganbate-shader", "crates/ganbate-studio", "crates/ganbate-web"]
 resolver = "3"
 
 [dependencies]
-abe-core = { path = "crates/abe-core" }
-abe-assets = { path = "crates/abe-assets" }
-abe-pipeline = { path = "crates/abe-pipeline" }
-abe-scene = { path = "crates/abe-scene" }
-abe-shader = { path = "crates/abe-shader" }
-abe-physics = { path = "crates/abe-physics" }
+ganbate-core = { path = "crates/ganbate-core" }
+ganbate-assets = { path = "crates/ganbate-assets" }
+ganbate-pipeline = { path = "crates/ganbate-pipeline" }
+ganbate-scene = { path = "crates/ganbate-scene" }
+ganbate-shader = { path = "crates/ganbate-shader" }
+ganbate-physics = { path = "crates/ganbate-physics" }

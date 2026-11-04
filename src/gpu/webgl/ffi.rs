@@ -1,5 +1,5 @@
-//! The browser's WebGL 2, reached through imports that the JavaScript host (`web/abe.js`)
-//! provides in the wasm import module `abe`. This is the only `unsafe` code of the backend.
+//! The browser's WebGL 2, reached through imports that the JavaScript host (`web/ganbate.js`)
+//! provides in the wasm import module `ganbate`. This is the only `unsafe` code of the backend.
 //!
 //! Objects: every GL object (and every pipeline: a program plus fixed-function state and a
 //! vertex layout) lives in a JavaScript table and Rust holds its `u32` index. Index 0 is never
@@ -26,7 +26,7 @@ pub const BUFFER_STORAGE: u32 = 4;
 /// Host memory only, for readback.
 pub const BUFFER_READBACK: u32 = 8;
 
-#[link(wasm_import_module = "abe")]
+#[link(wasm_import_module = "ganbate")]
 unsafe extern "C" {
     fn gl_info(out: *mut u32, cap: u32) -> u32;
     fn gl_renderer_name(out: *mut u8, cap: u32) -> u32;

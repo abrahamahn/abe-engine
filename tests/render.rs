@@ -1,12 +1,12 @@
 //! Driver tests for the stylized renderer on a synthetic scene (run with `--ignored`; set
-//! `ABE_VULKAN_VALIDATION=1` to also check the Vulkan validation layers).
-use abe_engine::Vec3;
-use abe_engine::gpu::Device;
-use abe_engine::render::{
+//! `GANBATE_VULKAN_VALIDATION=1` to also check the Vulkan validation layers).
+use ganbate_engine::Vec3;
+use ganbate_engine::gpu::Device;
+use ganbate_engine::render::{
     DetailPreset, DetailRule, Environment, LightDesc, Look, MaterialDesc, MeshData, Output,
     Quality, Renderer, SpotCone, Terrain, TimeOfDay, View, Weather, math,
 };
-use abe_engine::world::{
+use ganbate_engine::world::{
     AlphaMode, Emission, Instance, Material, Mesh, PointLight, Shading, Texture, Transform, World,
 };
 
@@ -1411,7 +1411,7 @@ fn empty_world_with_props() {
 #[test]
 #[ignore = "requires a Vulkan driver"]
 fn prop_layers_blend_overlay_tint_and_pick() {
-    use abe_engine::render::BlendMode;
+    use ganbate_engine::render::BlendMode;
     let mut device = Device::headless().expect("device");
     let world = World {
         instances: vec![Instance {
@@ -1740,7 +1740,7 @@ fn prop_layers_blend_overlay_tint_and_pick() {
 #[test]
 #[ignore = "requires a Vulkan driver"]
 fn prop_shaders_colour_overlays_from_their_params() {
-    use abe_engine::render::BlendMode;
+    use ganbate_engine::render::BlendMode;
     let mut device = Device::headless().expect("device");
     let world = World {
         instances: vec![Instance {
@@ -1792,7 +1792,7 @@ fn prop_shaders_colour_overlays_from_their_params() {
              }",
         )
         .expect("shader");
-    let mut params = [0.0f32; abe_engine::render::PROP_SHADER_PARAMS];
+    let mut params = [0.0f32; ganbate_engine::render::PROP_SHADER_PARAMS];
     params[..3].copy_from_slice(&[1.0, 0.0, 0.0]);
     params[4..7].copy_from_slice(&[0.0, 0.0, 1.0]);
     let desc = MaterialDesc {
@@ -1911,8 +1911,8 @@ fn prop_shaders_colour_overlays_from_their_params() {
 #[test]
 #[ignore = "requires a Vulkan driver"]
 fn models_pose_skin_and_place() {
-    use abe_engine::anim::Pose;
-    use abe_engine::assets::model::{
+    use ganbate_engine::anim::Pose;
+    use ganbate_engine::assets::model::{
         Channel, Clip, Interpolation, Material as ModelMaterial, Mesh as ModelMesh, Model, Node,
         Path, Primitive, Skin,
     };
@@ -2143,8 +2143,8 @@ fn models_pose_skin_and_place() {
 #[test]
 #[ignore = "requires a Vulkan driver"]
 fn models_morph_scattered_vertices() {
-    use abe_engine::anim::morphed_vertices;
-    use abe_engine::assets::model::{
+    use ganbate_engine::anim::morphed_vertices;
+    use ganbate_engine::assets::model::{
         Material as ModelMaterial, Mesh as ModelMesh, Model, MorphTarget, Node, Primitive,
     };
     let mut device = Device::headless().expect("device");
@@ -2294,7 +2294,7 @@ fn math_translate(x: f32) -> [f32; 16] {
 #[test]
 #[ignore = "requires a Vulkan driver"]
 fn focus_softens_what_lies_past_it() {
-    use abe_engine::render::{BlendMode, Focus};
+    use ganbate_engine::render::{BlendMode, Focus};
     let mut device = Device::headless().expect("device");
     let mut wall = material("wall", [1.0; 4], Shading::Standard);
     wall.base_color_texture = Some(0);

@@ -28,9 +28,9 @@ use crate::gpu::{
     BindGroupId, BufferDesc, BufferId, Format, Limits, PipelineId, SamplerId, TextureDesc,
     TextureId, ValidationLog,
 };
-use abe_shader::BindingKind;
 use core::cell::Cell;
 use core::ptr::{null, null_mut};
+use ganbate_shader::BindingKind;
 use std::collections::HashMap;
 use track::{State, Use};
 

@@ -1,0 +1,23 @@
+[package]
+name = "ganbate-agent"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Ganbate's agent-facing command line (ganbate): inspect, validate, edit, diff, undo and render scenes, answering in JSON"
+
+[[bin]]
+name = "ganbate"
+path = "src/main.rs"
+
+[dependencies]
+# The engine only for the `ganbate` binary's offscreen renderer (src/main.rs); the library does not use it.
+ganbate-engine = { path = "../.." }
+ganbate-core = { path = "../ganbate-core" }
+ganbate-assets = { path = "../ganbate-assets" }
+ganbate-pipeline = { path = "../ganbate-pipeline" }
+ganbate-scene = { path = "../ganbate-scene" }
+
+[dev-dependencies]
+# Only to prove that a CLI edit writes the same bytes as the same edit made in Ganbate Studio.
+ganbate-studio = { path = "../ganbate-studio" }

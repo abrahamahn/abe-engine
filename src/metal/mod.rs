@@ -5,13 +5,13 @@
 //! object releases the engine's reference at once: command buffers retain the resources they
 //! use until they complete, so objects in flight stay alive.
 //!
-//! Shaders: pipelines are built from the MSL that `abe-shader` emits next to the SPIR-V
-//! ([`abe_shader::Compiled::msl`]), compiled at pipeline creation with
+//! Shaders: pipelines are built from the MSL that `ganbate-shader` emits next to the SPIR-V
+//! ([`ganbate_shader::Compiled::msl`]), compiled at pipeline creation with
 //! `newLibraryWithSource:`. Each stage's binding map turns `@group/@binding` into
 //! `[[buffer]]`, `[[texture]]` and `[[sampler]]` indices; a bind group is resolved against the
 //! current pipeline's maps when a draw or dispatch is recorded. Push constants are sent with
-//! `set*Bytes` at `abe_shader::PUSH_CONSTANT_BUFFER`, the vertex buffer is bound at
-//! `abe_shader::VERTEX_BUFFER` and described by an `MTLVertexDescriptor`.
+//! `set*Bytes` at `ganbate_shader::PUSH_CONSTANT_BUFFER`, the vertex buffer is bound at
+//! `ganbate_shader::VERTEX_BUFFER` and described by an `MTLVertexDescriptor`.
 //!
 //! Synchronization: Metal tracks hazards between passes for the default (tracked) resources
 //! of one queue, so recorded scopes need no barriers. Every submission is one command buffer;
@@ -36,7 +36,7 @@ use crate::gpu::{
     BufferDesc, BufferId, Format, Limits, PipelineId, SamplerId, TextureDesc, TextureId,
     ValidationLog,
 };
-use abe_shader::{BindingKind, MslSlot};
+use ganbate_shader::{BindingKind, MslSlot};
 use std::collections::HashMap;
 
 pub(crate) type Result<T> = std::result::Result<T, String>;
@@ -241,7 +241,7 @@ fn ns_error(prefix: &str, error: Id) -> String {
 }
 
 impl Gpu<'static> {
-    /// The default GPU (on a Mac, `ABE_METAL_DEVICE` picks one by name substring).
+    /// The default GPU (on a Mac, `GANBATE_METAL_DEVICE` picks one by name substring).
     pub fn headless() -> Result<Self> {
         autoreleasepool(|| Self::with_device(Self::pick_device()?))
     }
@@ -250,7 +250,7 @@ impl Gpu<'static> {
 impl<'w> Gpu<'w> {
     fn pick_device() -> Result<Obj> {
         #[cfg(target_os = "macos")]
-        if let Ok(want) = std::env::var("ABE_METAL_DEVICE") {
+        if let Ok(want) = std::env::var("GANBATE_METAL_DEVICE") {
             // SAFETY: MTLCopyAllDevices returns an owned NSArray of MTLDevices.
             unsafe {
                 let all = Obj::owned(ffi::MTLCopyAllDevices()).ok_or("no Metal devices")?;
@@ -265,7 +265,7 @@ impl<'w> Gpu<'w> {
                     names.push(name);
                 }
                 return Err(format!(
-                    "ABE_METAL_DEVICE={want:?} matches none of {names:?}"
+                    "GANBATE_METAL_DEVICE={want:?} matches none of {names:?}"
                 ));
             }
         }

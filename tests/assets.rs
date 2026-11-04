@@ -1,5 +1,5 @@
-//! The `abe-build` entry points on a synthetic textured, lit scene.
-use abe_engine::{
+//! The `ganbate-build` entry points on a synthetic textured, lit scene.
+use ganbate_engine::{
     Vec3,
     assets::{cooked, png, read_asset},
     world::{Emission, Shading},
@@ -45,7 +45,7 @@ fn scene(mime: &str) -> Vec<u8> {
         "accessors":[{{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}},{{"bufferView":1,"componentType":5126,"count":3,"type":"VEC2"}}],
         "images":[{{"bufferView":2,"mimeType":"{mime}"}}],"textures":[{{"source":0}}],
         "materials":[{{"name":"lantern","pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}}}},"emissiveFactor":[1,0.6,0.2],
-            "extensions":{{"KHR_materials_emissive_strength":{{"emissiveStrength":4}}}},"extras":{{"abe":{{"emission":"lamp"}}}}}}],
+            "extensions":{{"KHR_materials_emissive_strength":{{"emissiveStrength":4}}}},"extras":{{"ganbate":{{"emission":"lamp"}}}}}}],
         "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0,"TEXCOORD_0":1}},"material":0}}]}}],
         "nodes":[{{"translation":[3,0,0],"children":[1,2]}},{{"mesh":0}},{{"translation":[0,2,0],"extensions":{{"KHR_lights_punctual":{{"light":0}}}}}}],
         "scenes":[{{"nodes":[0]}}]}}"#,
@@ -55,19 +55,19 @@ fn scene(mime: &str) -> Vec<u8> {
 }
 
 fn build(args: &[&Path]) -> (bool, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_abe-build"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ganbate-build"))
         .args(args)
         .output()
-        .expect("run abe-build");
+        .expect("run ganbate-build");
     let text = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
     (out.status.success(), text.into_owned())
 }
 
 #[test]
-fn abe_build_cooks_and_inspects_a_textured_lit_scene() {
-    let dir = std::env::temp_dir().join(format!("abe-assets-test-{}", std::process::id()));
+fn ganbate_build_cooks_and_inspects_a_textured_lit_scene() {
+    let dir = std::env::temp_dir().join(format!("ganbate-assets-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let (source, cooked_path) = (dir.join("scene.glb"), dir.join("scene.abew"));
+    let (source, cooked_path) = (dir.join("scene.glb"), dir.join("scene.gbew"));
     std::fs::write(&source, scene("image/png")).unwrap();
     let (ok, text) = build(&[Path::new("cook"), &source, &cooked_path]);
     assert!(ok, "{text}");
@@ -77,7 +77,7 @@ fn abe_build_cooks_and_inspects_a_textured_lit_scene() {
     );
     let (ok, text) = build(&[Path::new("inspect"), &cooked_path]);
     assert!(ok, "{text}");
-    assert!(text.starts_with("ABEW v3 |"), "{text}");
+    assert!(text.starts_with("GBEW v3 |"), "{text}");
     assert!(
         text.contains("material 0: lantern [standard, lamp, base 2x2]"),
         "{text}"
@@ -96,7 +96,7 @@ fn abe_build_cooks_and_inspects_a_textured_lit_scene() {
     );
 
     // Compact, with the image kept as a file for the host to decode: the same world.
-    let compact_path = dir.join("scene-compact.abew");
+    let compact_path = dir.join("scene-compact.gbew");
     let (ok, text) = build(&[
         Path::new("cook"),
         Path::new("--compact"),

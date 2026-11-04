@@ -50,7 +50,7 @@ impl VulkanRenderer {
     }
     fn instance(extensions: &[*const core::ffi::c_char]) -> Result<Self> {
         let mut app = VkApplicationInfo::new();
-        app.pApplicationName = c"ABE Engine".as_ptr();
+        app.pApplicationName = c"Ganbate Engine".as_ptr();
         app.apiVersion = 1 << 22; // Vulkan 1.0
         let mut ci = VkInstanceCreateInfo::new();
         ci.pApplicationInfo = &app;
@@ -98,7 +98,7 @@ impl VulkanRenderer {
             physical.truncate(count as usize);
             let mut last_error =
                 String::from("no graphics-capable Vulkan device with a supported depth attachment");
-            let pick = std::env::var("ABE_VULKAN_DEVICE")
+            let pick = std::env::var("GANBATE_VULKAN_DEVICE")
                 .unwrap_or_default()
                 .to_lowercase();
             if !pick.is_empty() {

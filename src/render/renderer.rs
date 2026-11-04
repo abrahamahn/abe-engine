@@ -12,7 +12,7 @@ use crate::gpu::{
     RenderPipelineDesc, Resource, Result, SamplerDesc, SamplerId, TextureDesc, TextureId,
     TextureUsage, Topology, VertexAttribute, VertexFormat, VertexLayout, f32_bytes,
 };
-use abe_shader::{Compiled, Stage};
+use ganbate_shader::{Compiled, Stage};
 
 use super::look::{DetailPreset, Focus, Look, View};
 use super::math::{
@@ -152,7 +152,7 @@ pub(super) struct Pipelines {
     pub(super) prop_layout: VertexLayout,
     /// What a prop shader's fragment stage reads: an overlay's frame bindings and a scene prop's
     /// material group (its draws bind a material made for `scene_prop`).
-    pub(super) prop_shader_bindings: Vec<abe_shader::Binding>,
+    pub(super) prop_shader_bindings: Vec<ganbate_shader::Binding>,
     /// The props' vertex stage (`vs_prop`): every prop shader's, which never calls `shade`.
     pub(super) prop_vs: Compiled,
     shadow: PipelineId,
@@ -292,7 +292,7 @@ pub(super) fn prop_shader_stage(pipelines: &Pipelines, user: &str) -> Result<Com
 const MATERIAL_GROUP: u32 = 1;
 
 /// Bindings by group and binding, for comparing stages.
-fn sorted_bindings(bindings: &[abe_shader::Binding]) -> Vec<abe_shader::Binding> {
+fn sorted_bindings(bindings: &[ganbate_shader::Binding]) -> Vec<ganbate_shader::Binding> {
     let mut out = bindings.to_vec();
     out.sort_by_key(|b| (b.group, b.binding));
     out

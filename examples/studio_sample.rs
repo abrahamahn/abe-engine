@@ -1,19 +1,19 @@
-//! Writes a small synthetic project for ABE Studio: a model of a few named blocks, a tower with
+//! Writes a small synthetic project for Ganbate Studio: a model of a few named blocks, a tower with
 //! a child, a lamp with its light and a ground plate (`content/models/blocks.glb`, built here),
 //! a Look file, and a scene imported from the model with an environment and a camera added.
 //!
 //! cargo run --example studio_sample -- DIR
-//! cargo run -p abe-studio -- DIR      # then open http://localhost:7480/
+//! cargo run -p ganbate-studio -- DIR      # then open http://localhost:7480/
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use abe_engine::assets::glb;
-use abe_engine::id::Ids;
-use abe_engine::json;
-use abe_pipeline::cook::scene_from_model;
-use abe_pipeline::project::{Kind, Project, new_sidecar, write_json};
-use abe_scene::doc::Document;
-use abe_scene::scene;
+use ganbate_engine::assets::glb;
+use ganbate_engine::id::Ids;
+use ganbate_engine::json;
+use ganbate_pipeline::cook::scene_from_model;
+use ganbate_pipeline::project::{Kind, Project, new_sidecar, write_json};
+use ganbate_scene::doc::Document;
+use ganbate_scene::scene;
 
 const LOOK: &str = r#"{
   "about": "Synthetic studio sample.",
@@ -119,7 +119,7 @@ fn glb_bytes() -> Vec<u8> {
         cube(4),
     ];
     let doc = format!(
-        r#"{{"asset":{{"version":"2.0","generator":"abe studio_sample"}},
+        r#"{{"asset":{{"version":"2.0","generator":"ganbate studio_sample"}},
 "extensionsUsed":["KHR_lights_punctual"],
 "extensions":{{"KHR_lights_punctual":{{"lights":[{{"type":"point","color":[1,0.8,0.55],"intensity":18,"range":9}}]}}}},
 "buffers":[{{"byteLength":{len}}}],
@@ -250,13 +250,16 @@ fn main() -> Result<(), String> {
             comp("collider", r#"{"shape":"box"}"#),
         ]),
     ))?;
-    let issues = scene::check(doc.root(), &abe_scene::schema::engine_registry());
+    let issues = scene::check(doc.root(), &ganbate_scene::schema::engine_registry());
     if let Some(i) = issues.first() {
         return Err(format!("{}: {}", i.path, i.message));
     }
     project.write_document("content/scenes/blocks.scene.json", Kind::Scene, doc.root())?;
     project.manifest.startup = Some(scene_id);
-    write_json(&root.join("abe.project.json"), &project.manifest.to_value())?;
+    write_json(
+        &root.join("ganbate.project.json"),
+        &project.manifest.to_value(),
+    )?;
     println!(
         "{}: studio sample with scene content/scenes/blocks.scene.json",
         root.display()

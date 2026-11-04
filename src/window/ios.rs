@@ -11,7 +11,7 @@
 //! buttons made with [`Window::add_button`] as [`Input::Button`], and size and visibility
 //! changes as [`Input::Event`]. Sizes are pixels (points times the screen scale).
 //!
-//! The scene manifest in the app's `Info.plist` must name `ABESceneDelegate` (see
+//! The scene manifest in the app's `Info.plist` must name `GanbateSceneDelegate` (see
 //! `scripts/apple/build-ios.sh`); the app delegate also returns that configuration.
 use super::Event;
 use crate::apple::objc::{
@@ -85,8 +85,8 @@ pub struct Window {
     state: Box<State>,
 }
 
-const STATE_IVAR: &core::ffi::CStr = c"abe_state";
-const WINDOW_IVAR: &core::ffi::CStr = c"abe_window";
+const STATE_IVAR: &core::ffi::CStr = c"ganbate_state";
+const WINDOW_IVAR: &core::ffi::CStr = c"ganbate_window";
 
 type Setup = fn(&'static Window) -> Box<dyn FnMut()>;
 
@@ -137,7 +137,7 @@ extern "C" fn configuration_for_scene(_: Id, _: Sel, _: Id, session: Id, _: Id) 
             role => Id;
             Id
         );
-        send!(config, "setDelegateClass:", class!("ABESceneDelegate") => Id; ());
+        send!(config, "setDelegateClass:", class!("GanbateSceneDelegate") => Id; ());
         send!(config, "autorelease"; Id)
     }
 }
@@ -145,7 +145,7 @@ extern "C" fn configuration_for_scene(_: Id, _: Sel, _: Id, session: Id, _: Id) 
 extern "C" fn scene_will_connect(this: Id, _: Sel, scene: Id, _: Id, _: Id) {
     autoreleasepool(|| {
         if let Err(e) = connect(this, scene) {
-            eprintln!("abe: cannot start: {e}");
+            eprintln!("ganbate: cannot start: {e}");
         }
     });
 }
@@ -322,7 +322,7 @@ fn classes() -> (Id, Id, Id, Id, Id) {
             }
         };
         // SAFETY (all method registrations): each implementation matches its encoding.
-        let app = build(c"ABEAppDelegate", class!("UIResponder"), &|b| unsafe {
+        let app = build(c"GanbateAppDelegate", class!("UIResponder"), &|b| unsafe {
             b.protocol(c"UIApplicationDelegate");
             b.method(
                 objc::sel!("application:didFinishLaunchingWithOptions:"),
@@ -335,7 +335,7 @@ fn classes() -> (Id, Id, Id, Id, Id) {
                 c"@@:@@@",
             );
         });
-        let view = build(c"ABEMetalView", class!("UIView"), &|b| unsafe {
+        let view = build(c"GanbateMetalView", class!("UIView"), &|b| unsafe {
             b.pointer_ivar(STATE_IVAR);
             b.class_method(
                 objc::sel!("layerClass"),
@@ -364,7 +364,7 @@ fn classes() -> (Id, Id, Id, Id, Id) {
             );
         });
         let controller = build(
-            c"ABEViewController",
+            c"GanbateViewController",
             class!("UIViewController"),
             &|b| unsafe {
                 b.method(objc::sel!("loadView"), load_view as *const c_void, c"v@:");
@@ -385,42 +385,46 @@ fn classes() -> (Id, Id, Id, Id, Id) {
                 );
             },
         );
-        let scene = build(c"ABESceneDelegate", class!("UIResponder"), &|b| unsafe {
-            b.protocol(c"UIWindowSceneDelegate");
-            b.pointer_ivar(WINDOW_IVAR);
-            b.method(
-                objc::sel!("scene:willConnectToSession:options:"),
-                scene_will_connect as *const c_void,
-                c"v@:@@@",
-            );
-            b.method(
-                objc::sel!("window"),
-                delegate_window as *const c_void,
-                c"@@:",
-            );
-            b.method(
-                objc::sel!("setWindow:"),
-                delegate_set_window as *const c_void,
-                c"v@:@",
-            );
-            b.method(
-                objc::sel!("sceneWillEnterForeground:"),
-                scene_foreground as *const c_void,
-                c"v@:@",
-            );
-            b.method(
-                objc::sel!("sceneDidBecomeActive:"),
-                scene_foreground as *const c_void,
-                c"v@:@",
-            );
-            b.method(
-                objc::sel!("sceneDidEnterBackground:"),
-                scene_background as *const c_void,
-                c"v@:@",
-            );
-            b.method(objc::sel!("frame:"), frame as *const c_void, c"v@:@");
-        });
-        let target = build(c"ABEButtonTarget", class!("NSObject"), &|b| unsafe {
+        let scene = build(
+            c"GanbateSceneDelegate",
+            class!("UIResponder"),
+            &|b| unsafe {
+                b.protocol(c"UIWindowSceneDelegate");
+                b.pointer_ivar(WINDOW_IVAR);
+                b.method(
+                    objc::sel!("scene:willConnectToSession:options:"),
+                    scene_will_connect as *const c_void,
+                    c"v@:@@@",
+                );
+                b.method(
+                    objc::sel!("window"),
+                    delegate_window as *const c_void,
+                    c"@@:",
+                );
+                b.method(
+                    objc::sel!("setWindow:"),
+                    delegate_set_window as *const c_void,
+                    c"v@:@",
+                );
+                b.method(
+                    objc::sel!("sceneWillEnterForeground:"),
+                    scene_foreground as *const c_void,
+                    c"v@:@",
+                );
+                b.method(
+                    objc::sel!("sceneDidBecomeActive:"),
+                    scene_foreground as *const c_void,
+                    c"v@:@",
+                );
+                b.method(
+                    objc::sel!("sceneDidEnterBackground:"),
+                    scene_background as *const c_void,
+                    c"v@:@",
+                );
+                b.method(objc::sel!("frame:"), frame as *const c_void, c"v@:@");
+            },
+        );
+        let target = build(c"GanbateButtonTarget", class!("NSObject"), &|b| unsafe {
             b.pointer_ivar(STATE_IVAR);
             b.method(objc::sel!("tap:"), button_tapped as *const c_void, c"v@:@");
         });
@@ -438,7 +442,7 @@ pub fn run(setup: fn(&'static Window) -> Box<dyn FnMut()>) -> ! {
     // copies. UIApplicationMain runs the main run loop forever.
     unsafe {
         let _ = app;
-        let delegate = objc::nsstring("ABEAppDelegate");
+        let delegate = objc::nsstring("GanbateAppDelegate");
         UIApplicationMain(
             *_NSGetArgc(),
             *_NSGetArgv(),

@@ -1,4 +1,4 @@
-//! ABE's GPU layer ("RHI v0"): a backend-neutral interface shaped like WebGPU and Metal —
+//! Ganbate's GPU layer ("RHI v0"): a backend-neutral interface shaped like WebGPU and Metal —
 //! pipelines, bind groups, passes and automatic barriers — implemented today on the engine's
 //! direct Vulkan 1.0 backend. Metal, WebGPU and D3D12 backends can implement the same API.
 //!
@@ -6,7 +6,7 @@
 //! A [`Device`] owns every object and hands out small `Copy` handles ([`BufferId`],
 //! [`TextureId`], [`SamplerId`], [`PipelineId`], [`BindGroupId`]). Handles are generational:
 //! using a destroyed object is reported as an error. Everything is freed when the device drops
-//! (after the GPU is idle). Pipelines are built from [`abe_shader::Compiled`] modules and their
+//! (after the GPU is idle). Pipelines are built from [`ganbate_shader::Compiled`] modules and their
 //! reflection: bind-group layouts, push-constant sizes and vertex inputs come from the shaders.
 //! A bind group is created for one `@group` of one pipeline and can be used with any pipeline
 //! whose layout for that group is identical (same bindings, kinds and shader stages). Because
@@ -73,9 +73,9 @@
 )]
 mod encoder;
 mod types;
-pub use abe_shader as shader;
 pub(crate) use encoder::Command;
 pub use encoder::Encoder;
+pub use ganbate_shader as shader;
 pub use types::*;
 
 #[cfg(target_vendor = "apple")]
@@ -94,11 +94,11 @@ mod webgpu;
 pub fn compile_shader(source: &str, stage: shader::Stage, entry: &str) -> Result<shader::Compiled> {
     #[cfg(target_arch = "wasm32")]
     let compiled = match web_api() {
-        Some(WebApi::WebGl2) => abe_shader::compile_glsl(source, stage, entry),
-        _ => abe_shader::compile_wgsl(source, stage, entry),
+        Some(WebApi::WebGl2) => ganbate_shader::compile_glsl(source, stage, entry),
+        _ => ganbate_shader::compile_wgsl(source, stage, entry),
     };
     #[cfg(not(target_arch = "wasm32"))]
-    let compiled = abe_shader::compile(source, stage, entry);
+    let compiled = ganbate_shader::compile(source, stage, entry);
     compiled.map_err(|e| format!("shader {entry}: {e}"))
 }
 
@@ -110,10 +110,10 @@ pub enum WebApi {
     WebGl2,
 }
 
-/// The API the host (`web/abe.js`) set up before the engine started, if any.
+/// The API the host (`web/ganbate.js`) set up before the engine started, if any.
 #[cfg(target_arch = "wasm32")]
 pub fn web_api() -> Option<WebApi> {
-    #[link(wasm_import_module = "abe")]
+    #[link(wasm_import_module = "ganbate")]
     unsafe extern "C" {
         fn gpu_api() -> u32;
     }
@@ -125,7 +125,7 @@ pub fn web_api() -> Option<WebApi> {
     }
 }
 
-/// Validation messages collected while `ABE_VULKAN_VALIDATION=1`. The log outlives the device,
+/// Validation messages collected while `GANBATE_VULKAN_VALIDATION=1`. The log outlives the device,
 /// so it can also report errors raised while the device is torn down.
 #[derive(Clone, Debug, Default)]
 pub struct ValidationLog(pub(crate) std::sync::Arc<std::sync::Mutex<Vec<String>>>);
@@ -139,12 +139,12 @@ impl ValidationLog {
 /// A GPU device with its queue, object pools and, for [`Device::for_window`], a surface.
 ///
 /// The lifetime is that of the window a presentation device draws into; headless devices are
-/// `Device<'static>`. Set `ABE_VULKAN_DEVICE` to a name substring to pick an adapter and
-/// `ABE_VULKAN_VALIDATION=1` to enable the Khronos validation layer with synchronization
+/// `Device<'static>`. Set `GANBATE_VULKAN_DEVICE` to a name substring to pick an adapter and
+/// `GANBATE_VULKAN_VALIDATION=1` to enable the Khronos validation layer with synchronization
 /// validation (creation then fails if the layer is missing).
 ///
 /// On macOS and iOS the device is Metal (see the `metal` module): on a Mac,
-/// `ABE_METAL_DEVICE` picks a GPU by name substring, and Metal's own validation is enabled
+/// `GANBATE_METAL_DEVICE` picks a GPU by name substring, and Metal's own validation is enabled
 /// with `MTL_DEBUG_LAYER=1` (reported on the console, not through [`ValidationLog`]).
 #[cfg(any(
     target_os = "linux",
@@ -197,7 +197,7 @@ impl<'w> Device<'w> {
     pub fn limits(&self) -> Limits {
         self.gpu.limits()
     }
-    /// True when `ABE_VULKAN_VALIDATION=1` enabled the validation layer.
+    /// True when `GANBATE_VULKAN_VALIDATION=1` enabled the validation layer.
     pub fn validation_enabled(&self) -> bool {
         self.gpu.validation_log().is_some()
     }
@@ -259,7 +259,10 @@ impl<'w> Device<'w> {
     pub fn create_render_pipeline(&mut self, d: &RenderPipelineDesc) -> Result<PipelineId> {
         self.gpu.create_render_pipeline(d)
     }
-    pub fn create_compute_pipeline(&mut self, shader: &abe_shader::Compiled) -> Result<PipelineId> {
+    pub fn create_compute_pipeline(
+        &mut self,
+        shader: &ganbate_shader::Compiled,
+    ) -> Result<PipelineId> {
         self.gpu.create_compute_pipeline(shader)
     }
     /// Binds `entries` (`(binding, resource)`) to `@group(group)` of `pipeline`. Every binding
@@ -321,7 +324,7 @@ impl<'w> Device<'w> {
 }
 
 /// A GPU device in a browser: WebGPU when the browser has it, otherwise WebGL 2 (`wasm32`
-/// builds hosted by `web/abe.js`, which picks the API; see [`web_api`]).
+/// builds hosted by `web/ganbate.js`, which picks the API; see [`web_api`]).
 ///
 /// The host creates the adapter and device (or the WebGL 2 context) and the canvas before the
 /// engine starts. The contract above holds with these differences: `submit` and `present`
@@ -442,7 +445,10 @@ impl Device<'_> {
     pub fn create_render_pipeline(&mut self, d: &RenderPipelineDesc) -> Result<PipelineId> {
         web!(mut self, g => g.create_render_pipeline(d))
     }
-    pub fn create_compute_pipeline(&mut self, shader: &abe_shader::Compiled) -> Result<PipelineId> {
+    pub fn create_compute_pipeline(
+        &mut self,
+        shader: &ganbate_shader::Compiled,
+    ) -> Result<PipelineId> {
         web!(mut self, g => g.create_compute_pipeline(shader))
     }
     pub fn create_bind_group(

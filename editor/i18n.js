@@ -20,7 +20,28 @@ const STRINGS = {
     frame: 'Frame', frameTip: 'Frame the selection (F)', time: 'Time', refresh: 'Refresh', refreshTip: 'Cook the scene again',
     simulate: 'Simulate', simulateTip: 'Run the physics of rigid bodies and colliders; again to stop (P)', stopSimulation: 'Stop',
     noPhysics: 'This scene has no rigid bodies or colliders to simulate',
-    assets: 'Assets', newScene: '+ Scene', newSceneTip: 'New scene', outliner: 'Outliner', inspector: 'Inspector',
+    assets: 'Assets', newScene: '+ Scene', newSceneTip: 'New scene', newPrefab: '+ Prefab', newPrefabTip: 'New prefab', newPrefabFile: 'New prefab file',
+    searchAssets: 'Search assets…', allFolders: 'All Assets', allKinds: 'All',
+    kind_scene: 'Scene', kind_prefab: 'Prefab', kind_model: 'Model', kind_look: 'Look', kind_material: 'Material', kind_texture: 'Texture', kind_sound: 'Sound',
+    gridView: 'Grid', gridViewTip: 'Show assets as thumbnail cards', listView: 'List', listViewTip: 'Show assets as a detailed list',
+    placeInScene: 'Place', placeInSceneTip: 'Place into the open scene (or drag into the viewport)',
+    openSceneToPlace: 'Open a scene or prefab first to place assets', cannotPlaceSelf: 'A prefab cannot be placed inside itself',
+    dropToPlace: 'Drop to place {x}', dropToAssign: 'Drop to assign {x}',
+    noMatchingAssets: 'No assets match the current filter.', noProjectAssets: 'No assets in this project yet.', clearFilters: 'Clear filters',
+    copyId: 'Copy asset ID', copiedId: 'Copied', copyPath: 'Copy path', previewSound: 'Play', stopSound: 'Stop', toggleConsole: 'Toggle Console',
+    importAssets: '+ Import', importAssetsTip: 'Import asset files from disk (.glb, .png, .jpg, .webp, .wav, .ogg, .json)',
+    dropFilesToImport: 'Drop files to import into {x}', importedCount: 'Imported {x}',
+    favorites: 'Favorites', recentAssets: 'Recent', unusedAssets: 'Unused', foldersHeading: 'Folders',
+    favoriteAsset: 'Favorite', unfavoriteAsset: 'Unfavorite',
+    sortKind: 'Sort: Kind', sortName: 'Sort: Name', sortFolder: 'Sort: Folder', sortSize: 'Sort: Size',
+    cardScaleTip: 'Thumbnail size',
+    assetDetails: 'Details', toggleAssetDetails: 'Toggle Asset Details & References pane',
+    selectAssetHint: 'Select an asset to inspect its preview, metadata, and references.',
+    renameAsset: 'Rename…', renameAssetPrompt: 'New name for {x}', moveAsset: 'Move…', moveAssetPrompt: 'Target path for {x}',
+    whereUsed: 'Where Used', unusedBadge: 'Unused', usedInCount: '{x} references', noReferences: 'Not referenced by any scene, prefab, or material.',
+    startupSceneRef: 'Project startup scene', loadingReferences: 'Scanning references…',
+    modelStats: '{v} verts · {t} tris', boundsMeters: '{x} m',
+    vPlace: 'Place', outliner: 'Outliner', inspector: 'Inspector',
     console: 'Console', filter: 'Filter', open: 'Open', importAsScene: 'Import as scene', newSceneFile: 'New scene file',
     noDocument: 'No document', addEntityTip: 'Add an entity (under the selection)', duplicateTip: 'Duplicate (Ctrl+D)',
     deleteTip: 'Delete (Del)', selectHint: 'Select an entity in the viewport or the outliner.',
@@ -53,7 +74,28 @@ const STRINGS = {
     frame: '맞춤', frameTip: '선택 항목에 맞춤 (F)', time: '시각', refresh: '다시 굽기', refreshTip: '씬을 다시 굽기',
     simulate: '시뮬레이션', simulateTip: '강체와 충돌체의 물리를 실행합니다. 다시 누르면 멈춥니다 (P)', stopSimulation: '정지',
     noPhysics: '이 씬에는 시뮬레이션할 강체나 충돌체가 없습니다',
-    assets: '에셋', newScene: '+ 씬', newSceneTip: '새 씬', outliner: '아웃라이너', inspector: '인스펙터',
+    assets: '에셋', newScene: '+ 씬', newSceneTip: '새 씬', newPrefab: '+ 프리팹', newPrefabTip: '새 프리팹', newPrefabFile: '새 프리팹 파일',
+    searchAssets: '에셋 검색…', allFolders: '전체 에셋', allKinds: '전체',
+    kind_scene: '씬', kind_prefab: '프리팹', kind_model: '모델', kind_look: '룩', kind_material: '재질', kind_texture: '텍스처', kind_sound: '사운드',
+    gridView: '격자', gridViewTip: '썸네일 카드로 보기', listView: '목록', listViewTip: '상세 목록으로 보기',
+    placeInScene: '배치', placeInSceneTip: '열린 씬에 배치 (또는 뷰포트로 드래그)',
+    openSceneToPlace: '에셋을 배치하려면 먼저 씬이나 프리팹을 여세요', cannotPlaceSelf: '프리팹은 자기 자신 안에 배치할 수 없습니다',
+    dropToPlace: '여기에 놓아 {x} 배치', dropToAssign: '여기에 놓아 {x} 지정',
+    noMatchingAssets: '조건에 맞는 에셋이 없습니다.', noProjectAssets: '이 프로젝트에는 아직 에셋이 없습니다.', clearFilters: '필터 지우기',
+    copyId: '에셋 ID 복사', copiedId: '복사됨', copyPath: '경로 복사', previewSound: '재생', stopSound: '정지', toggleConsole: '콘솔 접기/펼치기',
+    importAssets: '+ 가져오기', importAssetsTip: '디스크에서 에셋 파일 가져오기 (.glb, .png, .jpg, .webp, .wav, .ogg, .json)',
+    dropFilesToImport: '{x} 폴더로 파일 가져오기', importedCount: '{x} 가져옴',
+    favorites: '즐겨찾기', recentAssets: '최근 항목', unusedAssets: '미사용', foldersHeading: '폴더',
+    favoriteAsset: '즐겨찾기 추가', unfavoriteAsset: '즐겨찾기 해제',
+    sortKind: '정렬: 종류', sortName: '정렬: 이름', sortFolder: '정렬: 폴더', sortSize: '정렬: 크기',
+    cardScaleTip: '썸네일 크기',
+    assetDetails: '상세', toggleAssetDetails: '에셋 상세 및 참조 패널 열기/닫기',
+    selectAssetHint: '미리보기, 메타데이터, 참조 목록을 보려면 에셋을 선택하세요.',
+    renameAsset: '이름 변경…', renameAssetPrompt: '{x}의 새 이름', moveAsset: '이동…', moveAssetPrompt: '{x}의 이동 경로',
+    whereUsed: '사용처', unusedBadge: '미사용', usedInCount: '참조 {x}곳', noReferences: '씬, 프리팹, 재질에서 참조되지 않습니다.',
+    startupSceneRef: '프로젝트 시작 씬', loadingReferences: '참조 확인 중…',
+    modelStats: '정점 {v} · 삼각형 {t}', boundsMeters: '{x} m',
+    vPlace: '배치', outliner: '아웃라이너', inspector: '인스펙터',
     console: '콘솔', filter: '검색', open: '열기', importAsScene: '씬으로 가져오기', newSceneFile: '새 씬 파일',
     noDocument: '문서 없음', addEntityTip: '엔티티 추가 (선택 항목 아래)', duplicateTip: '복제 (Ctrl+D)',
     deleteTip: '삭제 (Del)', selectHint: '뷰포트나 아웃라이너에서 엔티티를 선택하세요.',
@@ -73,7 +115,7 @@ const STRINGS = {
 
 function initial() {
   try {
-    const saved = localStorage.getItem('abe.studio.lang');
+    const saved = localStorage.getItem('ganbate.studio.lang');
     if (saved && STRINGS[saved]) return saved;
   } catch { /* storage may be unavailable */ }
   return (navigator.language || 'en').toLowerCase().startsWith('ko') ? 'ko' : 'en';
@@ -85,7 +127,7 @@ export const lang = () => current;
 
 export function setLang(l) {
   current = STRINGS[l] ? l : 'en';
-  try { localStorage.setItem('abe.studio.lang', current); } catch { /* per-viewer convenience only */ }
+  try { localStorage.setItem('ganbate.studio.lang', current); } catch { /* per-viewer convenience only */ }
 }
 
 export function t(key, x) {

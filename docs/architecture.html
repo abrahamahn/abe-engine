@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>ABE Engine · Architecture Explorer</title>
+    <title>Ganbate Engine · Architecture Explorer</title>
     <style>
 :root{color-scheme:dark;
     --bg:#101821;
@@ -121,7 +121,7 @@ p,footer,.eyebrow,.gate b{color:black}
 
 </style>
     <header>
-      <span class="eyebrow">ABE ENGINE / STUDIO ARCHITECTURE</span>
+      <span class="eyebrow">GANBATE ENGINE / STUDIO ARCHITECTURE</span>
       <h1>Architecture explorer</h1>
       <p>Choose a layer and expand a subsystem to see its responsibilities, current status and next proof.</p>
       <div class="frame">
@@ -241,7 +241,7 @@ p,footer,.eyebrow,.gate b{color:black}
           <details>
             <summary>Materials, shaders and lighting <small class="partial">Working slice</small>
             </summary>
-            <p>Shaders are written in a WGSL subset and compiled by ABE's own compiler (<code>abe-shader</code>) to SPIR-V; MSL, HLSL and WGSL emitters come with their backends. The stylized renderer draws cooked materials and textures with soft cel lighting, two shadow cascades, tiled lamp lights and the lights a game hangs (spots casting the props' shadows), water reflections and a time-of-day sky with weather; each game sets its style in a Look file. Skinned models are skinned on the GPU in every pass. Next come pipeline cache keys and a physically based shading model beside the stylized one. Ray tracing, virtual shadows and advanced GI are optional higher tiers.</p>
+            <p>Shaders are written in a WGSL subset and compiled by Ganbate's own compiler (<code>ganbate-shader</code>) to SPIR-V; MSL, HLSL and WGSL emitters come with their backends. The stylized renderer draws cooked materials and textures with soft cel lighting, two shadow cascades, tiled lamp lights and the lights a game hangs (spots casting the props' shadows), water reflections and a time-of-day sky with weather; each game sets its style in a Look file. Skinned models are skinned on the GPU in every pass. Next come pipeline cache keys and a physically based shading model beside the stylized one. Ray tracing, virtual shadows and advanced GI are optional higher tiers.</p>
             <p class="gate">
               <b>Acceptance test</b> Reimporting one material updates the editor and player with the same pipeline and stable cache keys.</p>
           </details>
@@ -319,7 +319,7 @@ p,footer,.eyebrow,.gate b{color:black}
           <details open>
             <summary>Importer, cooker and packages <small class="partial">First slice</small>
             </summary>
-            <p>The cooker reads a bounded static GLB subset (meshes, PBR material factors, PNG base-colour/normal/emissive textures, point lights) with first-party zlib/PNG codecs and writes a deterministic ABEW v2 world with mip chains. Next come dependency manifests, content hashes, GPU-compressed texture formats, audio formats and incremental target packages.</p>
+            <p>The cooker reads a bounded static GLB subset (meshes, PBR material factors, PNG base-colour/normal/emissive textures, point lights) with first-party zlib/PNG codecs and writes a deterministic GBEW v2 world with mip chains. Next come dependency manifests, content hashes, GPU-compressed texture formats, audio formats and incremental target packages.</p>
             <p class="gate">
               <b>Acceptance test</b> A clean rebuild produces identical bytes; corrupt inputs and unsupported features fail explicitly.</p>
           </details>

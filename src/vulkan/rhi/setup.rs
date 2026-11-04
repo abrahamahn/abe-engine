@@ -61,7 +61,7 @@ unsafe extern "system" fn on_message(
 }
 
 fn validation_requested() -> bool {
-    std::env::var("ABE_VULKAN_VALIDATION").is_ok_and(|v| !v.is_empty() && v != "0")
+    std::env::var("GANBATE_VULKAN_VALIDATION").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 fn names<T>(
@@ -111,7 +111,7 @@ impl<'w> Gpu<'w> {
                 .any(|l| l.as_bytes() == VALIDATION_LAYER.to_bytes())
             {
                 return Err(
-                    "ABE_VULKAN_VALIDATION is set but VK_LAYER_KHRONOS_validation is \
+                    "GANBATE_VULKAN_VALIDATION is set but VK_LAYER_KHRONOS_validation is \
                             not installed"
                         .into(),
                 );
@@ -152,8 +152,8 @@ impl<'w> Gpu<'w> {
             messenger.pNext = (&sync as *const VkValidationFeaturesEXT).cast();
         }
         let mut app = VkApplicationInfo::new();
-        app.pApplicationName = c"ABE Engine".as_ptr();
-        app.pEngineName = c"ABE".as_ptr();
+        app.pApplicationName = c"Ganbate Engine".as_ptr();
+        app.pEngineName = c"Ganbate".as_ptr();
         app.apiVersion = 1 << 22; // Vulkan 1.0
         let mut ci = VkInstanceCreateInfo::new();
         ci.pApplicationInfo = &app;
@@ -246,10 +246,10 @@ impl<'w> Gpu<'w> {
         }
     }
 
-    /// Picks the first adapter (filtered by `ABE_VULKAN_DEVICE`) with a graphics+compute queue
+    /// Picks the first adapter (filtered by `GANBATE_VULKAN_DEVICE`) with a graphics+compute queue
     /// that can present to `surface` (if non-zero) and render and sample `Depth32Float`.
     pub(super) fn open_device(&mut self, surface: u64) -> Result<()> {
-        let pick = std::env::var("ABE_VULKAN_DEVICE")
+        let pick = std::env::var("GANBATE_VULKAN_DEVICE")
             .unwrap_or_default()
             .to_lowercase();
         let mut last_error = if pick.is_empty() {

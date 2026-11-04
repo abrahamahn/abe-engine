@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the Metal player and renderer for macOS, and optionally check them on this Mac.
 #
-#   scripts/apple/build-mac.sh            build abe-player and abe-render (release)
+#   scripts/apple/build-mac.sh            build ganbate-player and ganbate-render (release)
 #   scripts/apple/build-mac.sh --shaders  also compile every renderer shader's MSL with
 #                                         Apple's offline compiler (needs Xcode's Metal
 #                                         toolchain; skipped with a note otherwise)
@@ -45,15 +45,15 @@ if command -v rustup >/dev/null 2>&1; then
     rustup target add "$target" >/dev/null
 fi
 
-cargo build --release --locked --target "$target" --bin abe-player --bin abe-render
+cargo build --release --locked --target "$target" --bin ganbate-player --bin ganbate-render
 out="${CARGO_TARGET_DIR:-target}/$target/release"
-echo "Built $out/abe-player and $out/abe-render"
+echo "Built $out/ganbate-player and $out/ganbate-render"
 
 if [ "$shaders" = 1 ]; then
     dir="${CARGO_TARGET_DIR:-target}/msl"
     mkdir -p "$dir"
-    cargo build --release --locked -p abe-shader --example abe-shaderc
-    shaderc="${CARGO_TARGET_DIR:-target}/release/examples/abe-shaderc"
+    cargo build --release --locked -p ganbate-shader --example ganbate-shaderc
+    shaderc="${CARGO_TARGET_DIR:-target}/release/examples/ganbate-shaderc"
     metal=""
     if xcrun -sdk macosx --find metal >/dev/null 2>&1; then
         metal="xcrun -sdk macosx metal"

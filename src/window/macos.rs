@@ -49,7 +49,7 @@ pub struct Window {
     state: Box<State>,
 }
 
-const STATE_IVAR: &core::ffi::CStr = c"abe_state";
+const STATE_IVAR: &core::ffi::CStr = c"ganbate_state";
 
 /// `NSWindowStyleMaskTitled | Closable | Miniaturizable | Resizable`.
 const STYLE: NSUInteger = 1 | 2 | 4 | 8;
@@ -144,7 +144,7 @@ extern "C" fn ignore_event(_: Id, _: Sel, _: Id) {}
 fn classes() -> (Id, Id) {
     static CLASSES: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
     let (d, v) = *CLASSES.get_or_init(|| {
-        let delegate = match ClassBuilder::new(c"ABEWindowDelegate", class!("NSObject")) {
+        let delegate = match ClassBuilder::new(c"GanbateWindowDelegate", class!("NSObject")) {
             Some(mut b) => {
                 b.pointer_ivar(STATE_IVAR);
                 // SAFETY: each implementation matches its type encoding (v = void, c = BOOL,
@@ -193,9 +193,9 @@ fn classes() -> (Id, Id) {
                 }
                 b.register()
             }
-            None => objc::class_named(c"ABEWindowDelegate"),
+            None => objc::class_named(c"GanbateWindowDelegate"),
         };
-        let view = match ClassBuilder::new(c"ABEMetalView", class!("NSView")) {
+        let view = match ClassBuilder::new(c"GanbateMetalView", class!("NSView")) {
             Some(mut b) => {
                 // SAFETY: as above.
                 unsafe {
@@ -234,7 +234,7 @@ fn classes() -> (Id, Id) {
                 }
                 b.register()
             }
-            None => objc::class_named(c"ABEMetalView"),
+            None => objc::class_named(c"GanbateMetalView"),
         };
         (delegate as usize, view as usize)
     });

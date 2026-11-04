@@ -1,9 +1,9 @@
 # Physics
 
-ABE implements rigid-body physics in `crates/abe-physics`, with no dependency beyond `abe-core`. A soft-step
+Ganbate implements rigid-body physics in `crates/ganbate-physics`, with no dependency beyond `ganbate-core`. A soft-step
 solver advances the world in fixed time slices. Native and WebAssembly builds are designed to produce identical
 poses and velocities for the same inputs. Authors attach `rigid_body` and `collider` components to scene entities
-in ABE Studio. The scene cook writes them into the world's entity table.
+in Ganbate Studio. The scene cook writes them into the world's entity table.
 
 Games use it for anything that falls, rolls, slides, swings or blocks: dropped props, doors and drawers, characters
 walking a town, vehicles later. A game that only needs rays (picking, line of sight, placement on surfaces) uses the
@@ -96,7 +96,7 @@ own sweeps see triangles from both sides.
 
 ## 5. Authoring and runtime
 
-`rigid_body` and `collider` are engine components defined in `crates/abe-scene/src/engine.schema.json`, with
+`rigid_body` and `collider` are engine components defined in `crates/ganbate-scene/src/engine.schema.json`, with
 Korean labels. A collider belongs to the nearest rigid body on its entity or an ancestor. With no such body it
 becomes static scenery. A child collider forms part of a compound body, and its instances and lamps move with
 that body.
@@ -109,7 +109,7 @@ adds at most 25% to its volume and each shape fits inside the other doubled abou
 the largest stretch, and a capsule takes the largest stretch across its axis. The `hull` and `mesh` shapes use
 the entity's own mesh geometry.
 
-`abe_physics::scene::build` reads the components from the cooked entity table and creates a physics world.
+`ganbate_physics::scene::build` reads the components from the cooked entity table and creates a physics world.
 After a step, `ScenePhysics::instance_matrix` gives each instance's updated transform for `setWorldInstance`
 on the web or the renderer's native world edits.
 
@@ -133,10 +133,10 @@ The web library simulates a cooked world's authored physics: `physicsStart()` co
 loaded (`physicsError()` names the entity when they could not be built), `physicsStep(dt, steps)` advances them and
 moves the instances and lamps of the bodies that moved, once per call. Each call runs up to 64 steps of at most
 1/15 second each. Excess steps are dropped. `physicsStop()` restores the cooked poses, and `physicsHash()` returns
-the state hash for comparison with the same steps on a native build. ABE Studio's **Simulate** button (P) re-cooks the scene, so the simulation starts from what the viewport
+the state hash for comparison with the same steps on a native build. Ganbate Studio's **Simulate** button (P) re-cooks the scene, so the simulation starts from what the viewport
 shows, steps at a fixed 60 Hz whatever the display's rate, and stops on a second press.
 
-`abe-build simulate WORLD.abew STEPS` runs the same simulation natively from a cooked world and prints the state
+`ganbate-build simulate WORLD.gbew STEPS` runs the same simulation natively from a cooked world and prints the state
 hash and where each moving body ended. The editor's end-to-end test steps the saved sample scene 120 times in the
 browser and checks that its hash equals this command's, on WebGPU and on WebGL 2.
 

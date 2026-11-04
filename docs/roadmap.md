@@ -1,26 +1,26 @@
 # Engine roadmap
 
-**Two goals advance together.** A first game project leaves its old web renderer for ABE completely, and all of
-its content work moves into ABE Studio. Each editor milestone turns one slice of the game's hand-written content
-into documents *and* closes that slice's remaining gaps on ABE, so the parity work is done once, in data, not twice.
+**Two goals advance together.** A first game project leaves its old web renderer for Ganbate completely, and all of
+its content work moves into Ganbate Studio. Each editor milestone turns one slice of the game's hand-written content
+into documents *and* closes that slice's remaining gaps on Ganbate, so the parity work is done once, in data, not twice.
 The game decides when its old renderer stops taking new visual work (the first game proposes milestone 2); the old
-renderer is switched off per surface and platform when ABE passes the device gates, and deleted after a release
+renderer is switched off per surface and platform when Ganbate passes the device gates, and deleted after a release
 without a switch-back. Every milestone ships something usable
 and ends with tests that prove it. The [design](design/README.md) explains the parts.
 
 | Milestone | Ships | Status |
 | --- | --- | --- |
 | M0 Foundation | Stylized renderer on Vulkan, Metal, WebGPU and WebGL 2; Look files; props, overlays, prop shaders, game lights; animated glTF models; web library mode | done |
-| M1 Scene and editor foundation | Scene and prefab documents, schemas, undo; asset database; import that keeps objects; cook with entity tables; world objects that move, hide and pick; ABE Studio host and interface | done |
+| M1 Scene and editor foundation | Scene and prefab documents, schemas, undo; asset database; import that keeps objects; cook with entity tables; world objects that move, hide and pick; Ganbate Studio host and interface | done |
 | M2 Look, light, material and camera | Editing the style and lighting live on a running game and a phone | next |
 | M3 Game stages and sequences | Game components, plugins, anchors, prefab overrides, sequencer, play in editor | |
-| M4 Parity and switch | The first game fully on ABE per surface and platform; old renderer deleted | |
+| M4 Parity and switch | The first game fully on Ganbate per surface and platform; old renderer deleted | |
 | M5 Landscape and vegetation | Terrain sculpt and paint, foliage, water bodies | |
 | M6 Characters | Animation graphs, look-at and IK, spring bones, expressions, character creator | |
 | M7 Effects and audio | Particle system and editor; audio engine with buses, banks and mixes | |
 | M8 Native apps | iOS and Android app shells, text, native interface with accessibility, haptics | |
 | M9 Prove reuse and open worlds | A second, non-card game with movement and collision; streaming cells, HLOD, jobs | |
-| Physics (ahead of M9) | Rigid bodies, colliders, joints, queries, a character controller; Simulate in ABE Studio; native and browser state-hash checks | done |
+| Physics (ahead of M9) | Rigid bodies, colliders, joints, queries, a character controller; Simulate in Ganbate Studio; native and browser state-hash checks | done |
 | M10 Consoles | Private platform modules and certification work | |
 
 The six milestones this roadmap replaces map onto it: *Player* is M0 (native presentation on Linux; Windows
@@ -29,16 +29,16 @@ is M1 to M3, *Platform qualification* is M4 and M8, *Prove reuse* is M9.
 
 ## M1 Scene and editor foundation (done)
 
-- `abe-core`: canonical JSON writer, SHA-256, ids. `abe-scene`: documents with ops and undo, schemas, scenes,
-  prefabs with overrides, order keys. `abe-pipeline`: projects, sidecars, asset index, object-keeping import, scene
-  cook to ABEW v4 with an entity table. Renderer: draws grouped by material; world instances move, hide and pick;
-  lamps move. Web runtime: `worldEntities`, `setWorldInstance`, `pickWorld`, `setWorldLight`. `abe-studio` host and
-  the `editor/` interface. `abe-build cook-scene` and `import`.
+- `ganbate-core`: canonical JSON writer, SHA-256, ids. `ganbate-scene`: documents with ops and undo, schemas, scenes,
+  prefabs with overrides, order keys. `ganbate-pipeline`: projects, sidecars, asset index, object-keeping import, scene
+  cook to GBEW v4 with an entity table. Renderer: draws grouped by material; world instances move, hide and pick;
+  lamps move. Web runtime: `worldEntities`, `setWorldInstance`, `pickWorld`, `setWorldLight`. `ganbate-studio` host and
+  the `editor/` interface. `ganbate-build cook-scene` and `import`.
 - **Acceptance (met):** on the synthetic sample (`examples/studio_sample.rs`), in headless Chromium on WebGPU and
   WebGL 2, `editor/test/run.cjs` clicks an object in the viewport to select it, drags it with the gizmo, undoes and
   redoes with the keyboard, moves a parent and sees its child follow, renames through the inspector, adds a
   component (re-cooking the scene), saves canonical JSON, reloads and finds the move, then cooks the saved scene
-  with `abe-build` and renders it with `abe-render`. The driver test
+  with `ganbate-build` and renders it with `ganbate-render`. The driver test
   `world_instances_move_hide_and_pick_like_a_recooked_world` shows a moved world draws the same pixels as one
   cooked that way.
 
@@ -56,9 +56,9 @@ A resting hexagonal prism kept the same four contact IDs for 300 settled steps a
 triangle mesh. The native `physics_demo` rendered the ball striking its pyramid of 15 blocks at five points
 over three simulated seconds (final state hash `664d75dcfa0fa7de`).
 
-ABE Studio passed all 50 end-to-end checks on each of WebGPU and WebGL 2 in headless Chromium 156.
+Ganbate Studio passed all 50 end-to-end checks on each of WebGPU and WebGL 2 in headless Chromium 156.
 The saved scene produced the same state hash, `c9df1e2e6456329b`, on both graphics backends and in the native
-`abe-build simulate` command after 120 steps. The first browser call requested 2³² steps and exercised
+`ganbate-build simulate` command after 120 steps. The first browser call requested 2³² steps and exercised
 the 64-step cap. Both editor runs included overlapping scene loads and a host disconnect and reconnect.
 The web renderer also passed 35 API checks on each backend. For the synthetic scene, the images matched
 the native Vulkan reference at 47.7 dB PSNR on WebGPU (SwiftShader) and 51.6 dB on WebGL 2 (ANGLE on llvmpipe).
@@ -83,7 +83,7 @@ The Studio can create, edit, undo and save Look assets while previewing them in 
   game served over HTTPS follows edits through a relay on the game's own server (see the editor design).
 - Engine pieces the game slice needs: visibility groups (layers) of the cooked world; per-view grading; procedural
   mesh builders; import settings for the usual fix-ups, with Draco and meshopt decoded at import; a shader standard
-  library and `abe-build check-shader`; cook provenance (engine revision and source hashes in every package);
+  library and `ganbate-build check-shader`; cook provenance (engine revision and source hashes in every package);
   compressed cooked geometry for worlds and models (the first game's download budget needs it); Look rules for
   characters (cel ramps, rim and sheen in the model's rest space); clearcoat and glass approximated as Look rules
   (lacquer, chip edges).
@@ -92,14 +92,14 @@ The Studio can create, edit, undo and save Look assets while previewing them in 
   and sinks shown in the editor's console; a headless engine for games' unit tests; hardened decoding of cooked files
   on wasm32 (every count bounded by the bytes that remain).
 - Device-loss and context-restore recovery in the web runtime. Autosave of unsaved documents; validation on save
-  and of references (parents, prefabs, assets); `abe-build check` for commits and CI; versions on the web library
+  and of references (parents, prefabs, assets); `ganbate-build check` for commits and CI; versions on the web library
   and the edit protocol; re-scanning the project while the host runs. Render on demand with per-state cadences, an adaptive resolution governor with device-class floors, and a
   loading policy with priorities and fallbacks in the web library.
-- Packaging and publishing: `abe-build cook-project` turns a project into one package per platform (the manifest's
-  `platforms` settings take effect), and `abe-build publish` writes content-addressed files and an append-only list.
-  Look files gain the `abe`/`version` header and a sidecar id.
-- Agents: the `abe` command sends its transactions through a running host (live, undoable, never over unsaved
-  work), and `abe benchmark` reports a scene's engine stats from a camera for a device profile.
+- Packaging and publishing: `ganbate-build cook-project` turns a project into one package per platform (the manifest's
+  `platforms` settings take effect), and `ganbate-build publish` writes content-addressed files and an append-only list.
+  Look files gain the `ganbate`/`version` header and a sidecar id.
+- Agents: the `ganbate` command sends its transactions through a running host (live, undoable, never over unsaved
+  work), and `ganbate benchmark` reports a scene's engine stats from a camera for a device profile.
 - **Game slice:** the game's world, light rigs, camera stops and flights, and material colours come from documents;
   per-stop cutaways are entity layers. The game decides whether its old renderer stops taking new visual work here
   (the first game proposes so).
@@ -125,7 +125,7 @@ The Studio can create, edit, undo and save Look assets while previewing them in 
   an overlap check in the editor that lists objects intersecting each other.
 - Agent proposals: a transaction an agent proposes appears as a ghost preview with its changed fields, and a
   person accepts all or part of it. A measured comparison, on a fixed set of scene tasks, of agents editing through
-  the `abe` command against agents editing code: tokens, retries, time and regressions per accepted change.
+  the `ganbate` command against agents editing code: tokens, retries, time and regressions per accepted change.
 - Material and prefab variants swapped at run time (cosmetics: table themes, card backs, frames) as data; a
   reduced-motion variant for every sequence, chosen by the player's setting.
 - **Game slice:** table layouts per seat count and orientation, choreography timings, camera emphasis, table
@@ -136,8 +136,8 @@ The Studio can create, edit, undo and save Look assets while previewing them in 
 
 ## M4 Parity and switch
 
-- Close every remaining gap the game's surfaces need on ABE (each listed in the game's migration plan).
-- Device qualification per platform: sustained frame-rate gates with `abe-framecheck` on real displays, two-hour
+- Close every remaining gap the game's surfaces need on Ganbate (each listed in the game's migration plan).
+- Device qualification per platform: sustained frame-rate gates with `ganbate-framecheck` on real displays, two-hour
   memory soaks, load-time and download budgets, input latency. Budgets become data: per-platform profiles in the
   project manifest (frame time, draws, memory, download size) that the cook and the gates check.
 - Switch the default renderer per surface and platform behind the game's flag, observe a release, then delete the

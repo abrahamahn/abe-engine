@@ -1,4 +1,4 @@
-use abe_engine::{Camera, Scene, Vec3};
+use ganbate_engine::{Camera, Scene, Vec3};
 
 fn camera() -> Camera {
     Camera {

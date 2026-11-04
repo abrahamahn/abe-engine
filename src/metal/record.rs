@@ -8,8 +8,8 @@ use super::*;
 use crate::gpu::{
     BindGroupId, BufferUsage, Command, Encoder, Filter, Load, PassDesc, TextureUsage,
 };
-use abe_shader::MslIndex;
 use core::ops::Range;
+use ganbate_shader::MslIndex;
 
 /// What the replay has bound on the current encoder, to skip redundant calls.
 #[derive(Default)]
@@ -460,7 +460,7 @@ impl<'w> Gpu<'w> {
                             "setVertexBuffer:offset:atIndex:",
                             b.obj.id() => Id,
                             offset as NSUInteger => NSUInteger,
-                            abe_shader::VERTEX_BUFFER as NSUInteger => NSUInteger;
+                            ganbate_shader::VERTEX_BUFFER as NSUInteger => NSUInteger;
                             ()
                         );
                         st.vertex = true;
@@ -683,7 +683,7 @@ impl<'w> Gpu<'w> {
             if stage.push
                 && let Some(data) = push
             {
-                send_bytes(data.to_vec(), abe_shader::PUSH_CONSTANT_BUFFER);
+                send_bytes(data.to_vec(), ganbate_shader::PUSH_CONSTANT_BUFFER);
             }
             if !stage.sized.is_empty() {
                 let mut sizes = Vec::with_capacity(stage.sized.len() * 4);
@@ -694,7 +694,7 @@ impl<'w> Gpu<'w> {
                     };
                     sizes.extend_from_slice(&size.to_le_bytes());
                 }
-                send_bytes(sizes, abe_shader::SIZES_BUFFER);
+                send_bytes(sizes, ganbate_shader::SIZES_BUFFER);
             }
         }
         Ok(())

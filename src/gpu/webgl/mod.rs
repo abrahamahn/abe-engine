@@ -1,8 +1,8 @@
 //! WebGL 2 implementation of the backend-neutral GPU layer in [`crate::gpu`], for `wasm32`
-//! builds in browsers without WebGPU. The JavaScript host (`web/abe.js`) creates the context
+//! builds in browsers without WebGPU. The JavaScript host (`web/ganbate.js`) creates the context
 //! before the engine starts and provides the imports in [`ffi`].
 //!
-//! Shaders come from [`abe_shader::compile_glsl`] (see [`crate::gpu::compile_shader`]), whose
+//! Shaders come from [`ganbate_shader::compile_glsl`] (see [`crate::gpu::compile_shader`]), whose
 //! module documentation describes the lowering this backend follows: a render pipeline is one
 //! linked program plus fixed-function state; each of its uniform blocks gets a binding point
 //! (push constants at [`PUSH_POINT`]) and each combined sampler and storage buffer a texture
@@ -39,8 +39,8 @@ use crate::gpu::{
     Limits, Memory, PipelineId, RenderPipelineDesc, Resource, SamplerDesc, SamplerId, TextureDesc,
     TextureId, TextureUsage, Topology, VertexFormat,
 };
-use abe_shader::glsl::HiddenValue;
-use abe_shader::{BindingKind, Compiled, IoType, SampleType, Stage, TextureView};
+use ganbate_shader::glsl::HiddenValue;
+use ganbate_shader::{BindingKind, Compiled, IoType, SampleType, Stage, TextureView};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -256,7 +256,7 @@ impl Gpu<'static> {
         let w = ffi::info();
         if w.len() < 16 {
             return Err(format!(
-                "the WebGL 2 host is not ready ({}); load the module through web/abe.js",
+                "the WebGL 2 host is not ready ({}); load the module through web/ganbate.js",
                 ffi::last_error()
             ));
         }
@@ -629,11 +629,11 @@ impl<'w> Gpu<'w> {
     /// storage buffers get texture units, hidden uniforms an index; the host receives that
     /// assignment as lines `b NAME POINT`, `u NAME UNIT`, `h NAME INDEX TYPE`.
     fn program(&mut self, vs: &Compiled, fs: Option<&Compiled>) -> Result<usize> {
-        fn glsl(c: &Compiled) -> Result<&abe_shader::glsl::Glsl> {
+        fn glsl(c: &Compiled) -> Result<&ganbate_shader::glsl::Glsl> {
             c.glsl.as_ref().ok_or_else(|| {
                 format!(
                     "the {:?} shader has no GLSL; compile it with gpu::compile_shader \
-                     (abe_shader::compile_glsl) for WebGL 2",
+                     (ganbate_shader::compile_glsl) for WebGL 2",
                     c.stage
                 )
             })
@@ -647,7 +647,7 @@ impl<'w> Gpu<'w> {
         if let Some(&p) = self.program_cache.get(&key) {
             return Ok(p);
         }
-        let stages: Vec<&abe_shader::glsl::Glsl> = std::iter::once(v).chain(f).collect();
+        let stages: Vec<&ganbate_shader::glsl::Glsl> = std::iter::once(v).chain(f).collect();
         let mut meta = String::new();
         let mut blocks: Vec<(String, ProgramBlock)> = Vec::new();
         let mut units: Vec<(String, ProgramUnit)> = Vec::new();

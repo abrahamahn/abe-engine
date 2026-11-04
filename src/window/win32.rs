@@ -116,7 +116,7 @@ impl Window {
             SetProcessDPIAware();
         }
         let (w, h) = outer_size(width, height)?;
-        let class: Vec<_> = "ABE.Player.Window".encode_utf16().chain([0]).collect();
+        let class: Vec<_> = "Ganbate.Player.Window".encode_utf16().chain([0]).collect();
         if title.contains('\0') {
             return Err("window title contains NUL".into());
         }

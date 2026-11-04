@@ -402,7 +402,7 @@ pub(super) struct Batch {
 /// A game's prop shader: its compiled stages and the overlay pipelines made from them so far.
 pub(super) struct PropShaderEntry {
     /// Its fragment stage (the vertex stage is every prop's).
-    fragment: abe_shader::Compiled,
+    fragment: ganbate_shader::Compiled,
     pipelines: [[Option<crate::gpu::PipelineId>; 3]; 3],
 }
 

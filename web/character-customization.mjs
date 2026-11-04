@@ -1,4 +1,4 @@
-/** Bind named glTF morphs to one ABE model instance. Sharing a model does not share its pose.
+/** Bind named glTF morphs to one Ganbate model instance. Sharing a model does not share its pose.
  * Pass only the channels this editor owns. Omitted weights leave the current pose alone.
  * Call apply with force after another producer (for example an animation clip) writes the pose.
  */

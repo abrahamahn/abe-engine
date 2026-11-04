@@ -12,7 +12,7 @@ cooked results.
 
 ```text
 my-game/
-  abe.project.json            the manifest (below)
+  ganbate.project.json            the manifest (below)
   content/                    everything authored or imported, committed
     models/lantern.glb        a source asset ...
     models/lantern.glb.meta.json   ... and its sidecar: id and import settings
@@ -21,17 +21,17 @@ my-game/
     looks/night.look.json + .meta.json
   schemas/game.schema.json    the game's component kinds
   editor/                     the game's editor plugins (JavaScript modules)
-  .abe/                       local derived data, ignored by git: in M1 the editor's cooked previews; later the
+  .ganbate/                       local derived data, ignored by git: in M1 the editor's cooked previews; later the
                               import cache, thumbnails and editor state
   build/                      cooked packages per platform (ignored by git)
   publish/                    content-addressed files the game ships (committed or uploaded: the game decides)
 ```
 
-`abe.project.json`:
+`ganbate.project.json`:
 
 ```json
 {
-  "abe": "project",
+  "ganbate": "project",
   "content": [
     "content"
   ],
@@ -58,7 +58,7 @@ my-game/
 ```
 
 The manifest names folders and the scene the editor opens first (`startup`). `platforms` is accepted and kept,
-but no tool reads it yet: per-platform cook settings take effect with `abe-build cook-project` (planned, M2). Engine
+but no tool reads it yet: per-platform cook settings take effect with `ganbate-build cook-project` (planned, M2). Engine
 version requirements and plugin lists join it when they exist; unknown keys are refused so typos surface.
 
 ## 2. Identity
@@ -77,7 +77,7 @@ changed by hand (an offer to give it a new id is planned). A sidecar is small an
 
 ```json
 {
-  "abe": "meta",
+  "ganbate": "meta",
   "id": "8c2d...",
   "import": {},
   "kind": "model",
@@ -100,7 +100,7 @@ One value has one spelling, so a save that changes one field changes one line:
   (`0.1`, not `0.10000000149011612`). No exponent between 1e-6 and 1e21.
 - UTF-8, only JSON's required escapes, a final newline. Reading and writing canonical text gives the same bytes.
 
-`abe_core::json::to_canonical` writes it. The reader is bounded (size, depth, value count) and refuses duplicate
+`ganbate_core::json::to_canonical` writes it. The reader is bounded (size, depth, value count) and refuses duplicate
 keys. A file a person edits by hand is reformatted on the next save; the editor never fails on non-canonical
 input.
 
@@ -109,7 +109,7 @@ bounded reader, and the canonical rules recover most of the merge-friendliness o
 
 ## 4. Documents
 
-Every document starts with `"abe": "<kind>"` and `"version": n`. A reader refuses versions newer than it knows
+Every document starts with `"ganbate": "<kind>"` and `"version": n`. A reader refuses versions newer than it knows
 and migrates older ones on load; the next save writes the current version. (The Look predates these rules: see its
 row below.)
 
@@ -117,7 +117,7 @@ row below.)
 
 ```json
 {
-  "abe": "scene",
+  "ganbate": "scene",
   "entities": {
     "0f1e2d3c4b5a6978": {
       "name": "Pier lights",
@@ -161,9 +161,9 @@ row below.)
 - An entity has a `name`, optionally a `parent`, an `order` key among its siblings, `components` and `prefab`.
 - **Components are sparse.** A missing field reads as its schema default, so files hold only what someone set,
   and changing a default reaches every entity that never set it.
-- **Order keys** are base-62 fractions (`abe_scene::order`): inserting between two siblings writes one new key and
+- **Order keys** are base-62 fractions (`ganbate_scene::order`): inserting between two siblings writes one new key and
   rewrites nothing else. Siblings without one sort after every keyed sibling, by name and then id.
-- **Prefabs** are the same document with `"abe": "prefab"` and exactly one root. An instance takes the prefab
+- **Prefabs** are the same document with `"ganbate": "prefab"` and exactly one root. An instance takes the prefab
   root's components beneath its own, shows the prefab's other entities under derived ids, and changes them
   through `overrides` (field-level merges, renames, removals). Instances nest up to 16 deep; a prefab that
   contains itself is refused. Entities can be added under an instance's derived entities.
@@ -180,7 +180,7 @@ namespace (`arena.spawn`).
 
 ```json
 {
-  "abe": "schema",
+  "ganbate": "schema",
   "components": {
     "arena.spawn": {
       "doc": "Where a player enters.",
@@ -221,7 +221,7 @@ kind version and ships a migration with the game's editor plugin.
 
 | Document | Holds | Status |
 | --- | --- | --- |
-| Look (`*.look.json`) | a game's whole style: shading, post-processing, sky palette, place and time, weather, named views, per-material detail rules (fields documented in `src/render/look.rs`) | exists, older than the document rules: in M2 it gains the `abe`/`version` header and a sidecar id; readers keep accepting header-less files |
+| Look (`*.look.json`) | a game's whole style: shading, post-processing, sky palette, place and time, weather, named views, per-material detail rules (fields documented in `src/render/look.rs`) | exists, older than the document rules: in M2 it gains the `ganbate`/`version` header and a sidecar id; readers keep accepting header-less files |
 | Variant (`*.variant.json`) | a named set of material and prefab overrides (a table theme, a card back, an outfit) applied at run time | M3 |
 | Platform profile (in the project manifest) | per-platform budgets: frame time, draws, memory, download size, which the cook and the device gates check | M4 |
 | Material (`*.material.json`) | shading model, factors, textures by id, alpha, detail preset, prop shader and its parameters | M2 |
@@ -237,21 +237,21 @@ Each follows the same rules: canonical JSON, an `id`, references by id, a versio
 ## 5. Derived data and the cook
 
 **Import cache (planned with the incremental cook).** Imports (GLB parsing and splitting, image decoding) will be
-cached in `.abe/cache/` under the SHA-256 of the source bytes, the import settings and the importer's version, so a
+cached in `.ganbate/cache/` under the SHA-256 of the source bytes, the import settings and the importer's version, so a
 clean cache rebuilds identically. In M1 every cook re-imports each model.
 
-**Cook.** In M1, `abe-build cook-scene PROJECT SCENE out.abew [--compact] [--keep-images]` cooks one scene into one
-ABEW v4 file, and the editor cooks previews into `.abe/cooked/<scene id>.<first 16 hex of sha256>.abew`. Planned
-(M2): `abe-build cook-project` (and a Build command in the editor) turns a project into one package per platform:
+**Cook.** In M1, `ganbate-build cook-scene PROJECT SCENE out.gbew [--compact] [--keep-images]` cooks one scene into one
+GBEW v4 file, and the editor cooks previews into `.ganbate/cooked/<scene id>.<first 16 hex of sha256>.gbew`. Planned
+(M2): `ganbate-build cook-project` (and a Build command in the editor) turns a project into one package per platform:
 
 ```text
 build/web/
   package.json                      { "assets": { "<asset id>": { "file": "...", "sha256": "...", "bytes": n, "deps": [...] } } }
-  8e1f4b2c...-harbour.abew          a cooked scene: world plus its entity table
+  8e1f4b2c...-harbour.gbew          a cooked scene: world plus its entity table
   7d0e....glb                       a run-time model (skinned, animated) as the loader reads it
 ```
 
-A cooked scene is an ABEW world (v4) that keeps authored identity:
+A cooked scene is an GBEW world (v4) that keeps authored identity:
 
 - meshes, instances, materials, textures and lamps as in v3;
 - an **entity table**: for each entity its id, name, parent, world transform and the contiguous run of instances and
@@ -273,7 +273,7 @@ Console packages are cooked by platform modules kept outside the public reposito
 A game that serves files to players must never change a published file, because caches, CDNs and old clients
 hold it. The engine makes that the default rather than a discipline:
 
-1. (Planned, M2.) `abe-build publish` copies each cooked file to
+1. (Planned, M2.) `ganbate-build publish` copies each cooked file to
    `publish/<platform>/<name>.<first 16 hex of sha256>.<ext>`.
    A file with that name already present must have the same bytes, or publishing stops.
 2. It appends the new entries to `publish/<platform>/published.json` (asset id, file, sha256, bytes, the cook's
@@ -285,10 +285,10 @@ the engine's rule and the game's agree because both forbid rewriting a name.
 
 ## 7. Git
 
-- Commit `abe.project.json`, `content/`, `schemas/`, `editor/` and, if the game ships from the repository,
-  `publish/`. Ignore `.abe/` and `build/`. Large binaries may use the game's LFS policy; the engine does not
+- Commit `ganbate.project.json`, `content/`, `schemas/`, `editor/` and, if the game ships from the repository,
+  `publish/`. Ignore `.ganbate/` and `build/`. Large binaries may use the game's LFS policy; the engine does not
   require it.
-- Canonical text plus id-keyed entities makes most merges automatic. `abe-build check` (planned, M2) will validate
+- Canonical text plus id-keyed entities makes most merges automatic. `ganbate-build check` (planned, M2) will validate
   every document (ids, references, schemas, prefab cycles) and be the pre-commit and CI gate.
-- A semantic merge driver (`abe-build merge`: three-way merge of entity maps by id, field by field) is planned
+- A semantic merge driver (`ganbate-build merge`: three-way merge of entity maps by id, field by field) is planned
   for M9; until then, a conflict is ordinary JSON lines.

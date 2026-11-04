@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABE library-mode check</title>
+<title>Ganbate library-mode check</title>
 <style>
   html, body { margin: 0; background: #111; }
   canvas { display: block; width: 320px; height: 180px; }
@@ -15,7 +15,7 @@
 // Library mode (createEngine) end to end, for web/test/run.cjs --engine: a world plus props
 // (a lit cube, an unlit textured card), the camera, projection, picking, hiding, batch moves
 // and texture updates. The verdict and two frames land in window.engineCheck.
-import { createEngine } from '/abe.js';
+import { createEngine } from '/ganbate.js';
 
 const params = new URLSearchParams(location.search);
 const canvas = document.querySelector('canvas');
@@ -174,7 +174,7 @@ async function frame(engine) {
 async function run() {
   const engine = await createEngine({
     canvas,
-    wasm: '/abe_web.wasm',
+    wasm: '/ganbate_web.wasm',
     api: params.get('api') || 'auto',
     world: params.get('world') || undefined,
     onLog: (level, text) => log.push(`[${level}] ${text}`),

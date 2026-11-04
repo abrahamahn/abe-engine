@@ -1,4 +1,4 @@
-//! Replays a backend-neutral [`Encoder`] into the command stream `web/abe.js` executes: `u32`
+//! Replays a backend-neutral [`Encoder`] into the command stream `web/ganbate.js` executes: `u32`
 //! words, one opcode followed by its operands. Recording checks what the browser would
 //! otherwise report asynchronously (formats, usages, layouts, attachment and binding
 //! conflicts), resolves bind group state at each draw (as the Vulkan backend does) and places

@@ -4,7 +4,7 @@
 
 use super::math::{V3, hex};
 use super::sky::{Palette, SkyKey, TimeOfDay, Weather};
-use abe_assets::json::Value;
+use ganbate_assets::json::Value;
 
 /// Shading and post-processing parameters. Colours are linear RGB.
 #[derive(Clone, Debug, PartialEq)]
@@ -387,7 +387,7 @@ impl LookFile {
     /// Parse a Look file. Every field is optional; unknown keys are ignored so files can carry
     /// notes. Colours are `"#rrggbb"` (sRGB) or `[r, g, b]` (linear).
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        Self::from_value(&abe_assets::json::parse(bytes)?)
+        Self::from_value(&ganbate_assets::json::parse(bytes)?)
     }
 
     /// Parses an already decoded Look, for editors that validate a transaction before saving it.

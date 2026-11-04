@@ -1,4 +1,4 @@
-// The edit protocol's client side (see crates/abe-studio/src/session.rs): one WebSocket to the
+// The edit protocol's client side (see crates/ganbate-studio/src/session.rs): one WebSocket to the
 // host, messages as JSON objects with a `type`. Edits to a document, and the undo, redo and save
 // that follow them, are sent one at a time, each after the host has answered the one before, so
 // the host sees them in the order they were made and every edit carries the current revision.
@@ -107,7 +107,7 @@ export class Host {
   }
 }
 
-/** Applies ops to a document root the way the host does (`abe_scene::doc`). */
+/** Applies ops to a document root the way the host does (`ganbate_scene::doc`). */
 export function applyOps(root, ops) {
   for (const op of ops) {
     const path = op.set || op.remove;

@@ -1,5 +1,5 @@
 #![cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
-use abe_engine::{Vertex, vulkan::VulkanRenderer};
+use ganbate_engine::{Vertex, vulkan::VulkanRenderer};
 
 fn triangle(depth: f32, rgb: [f32; 3]) -> [Vertex; 3] {
     [[-0.8, -0.8], [0.8, -0.8], [0.0, 0.8]].map(|[x, y]| Vertex {
@@ -34,7 +34,7 @@ fn rasterizes_depth_and_reads_back_repeated_frames() {
 #[test]
 #[ignore = "requires a Vulkan graphics device"]
 fn resident_vertices_match_cpu_projection_and_complete_benchmark_queries() {
-    use abe_engine::{Camera, Scene, Vec3, vulkan::bench};
+    use ganbate_engine::{Camera, Scene, Vec3, vulkan::bench};
     let mut scene = Scene::default();
     scene.triangle(
         Vec3(-0.7, 0., 0.),
@@ -71,7 +71,7 @@ fn resident_vertices_match_cpu_projection_and_complete_benchmark_queries() {
 #[test]
 #[ignore = "requires a Vulkan graphics device"]
 fn mixed_scene_shares_depth_and_preserves_both_draws() {
-    use abe_engine::{Camera, Scene, Vec3};
+    use ganbate_engine::{Camera, Scene, Vec3};
     let mut base = Scene::default();
     base.triangle(
         Vec3(-1., -1., 0.),

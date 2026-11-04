@@ -1,4 +1,4 @@
-/** Minimal ABE model interface. The native engine owns the model, its render data and its pose. */
+/** Minimal Ganbate model interface. The native engine owns the model, its render data and its pose. */
 export function bindCharacterShapes<K extends string>(
   engine: {
     modelMorph(instance: number, node: number, target: number, weight: number): void;

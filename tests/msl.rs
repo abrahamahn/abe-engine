@@ -1,12 +1,12 @@
 //! The stylized renderer's shaders as Metal Shading Language: every entry point of
 //! `src/render/shaders` (with `common.wgsl` prepended, as the renderer does) must emit MSL,
-//! and, when `clang++` is available, compile against abe-shader's stand-in `metal_stdlib`.
+//! and, when `clang++` is available, compile against ganbate-shader's stand-in `metal_stdlib`.
 //! A compile check on Linux, not a Metal run.
 
-#[path = "../crates/abe-shader/tests/msl/check.rs"]
+#[path = "../crates/ganbate-shader/tests/msl/check.rs"]
 mod check;
 
-use abe_engine::gpu::shader::{MslIndex, compile_msl, entry_points};
+use ganbate_engine::gpu::shader::{MslIndex, compile_msl, entry_points};
 
 const COMMON: &str = include_str!("../src/render/shaders/common.wgsl");
 const SHADERS: [(&str, &str); 3] = [

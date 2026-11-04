@@ -5,7 +5,7 @@
 
 use std::process::Command;
 
-use abe_engine::gpu::shader::{Stage, compile_glsl};
+use ganbate_engine::gpu::shader::{Stage, compile_glsl};
 
 const COMMON: &str = include_str!("../src/render/shaders/common.wgsl");
 const SCENE: &str = include_str!("../src/render/shaders/scene.wgsl");
@@ -50,7 +50,7 @@ fn glslang() -> bool {
 }
 
 fn link(vs: &str, fs: &str, tag: &str) -> Result<(), String> {
-    let dir = std::env::temp_dir().join(format!("abe-glsl-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("ganbate-glsl-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let v = dir.join(format!("{tag}.vert"));
     let f = dir.join(format!("{tag}.frag"));
@@ -77,7 +77,7 @@ fn renderer_shaders_compile_and_link_as_glsl_es() {
     if !check {
         eprintln!("note: glslangValidator not found on PATH; the GLSL is not validated");
     }
-    let dump = std::env::var_os("ABE_GLSL_DUMP").map(std::path::PathBuf::from);
+    let dump = std::env::var_os("GANBATE_GLSL_DUMP").map(std::path::PathBuf::from);
     let mut failures = Vec::new();
     for &(body, vs_entry, fs_entry) in PAIRS {
         let source = format!("{COMMON}\n{body}");

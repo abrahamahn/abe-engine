@@ -1,4 +1,4 @@
-//! ABE's portable scene data and camera. Game-specific content belongs to clients.
+//! Ganbate's portable scene data and camera. Game-specific content belongs to clients.
 
 pub mod anim;
 #[cfg(target_vendor = "apple")]
@@ -17,5 +17,5 @@ pub mod vulkan;
 ))]
 pub mod window;
 
-pub use abe_assets as assets;
-pub use abe_core::*;
+pub use ganbate_assets as assets;
+pub use ganbate_core::*;

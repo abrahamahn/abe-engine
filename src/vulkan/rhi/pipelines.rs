@@ -5,7 +5,7 @@ use super::track::{access, stage};
 use super::*;
 use crate::gpu::{Blend, BufferUsage, Cull, RenderPipelineDesc, Resource, Topology, VertexFormat};
 use crate::gpu::{TextureUsage, VertexLayout};
-use abe_shader::{Compiled, IoType, SampleType, Stage, TexelFormat, TextureView};
+use ganbate_shader::{Compiled, IoType, SampleType, Stage, TexelFormat, TextureView};
 
 const VERTEX_BIT: u32 = 0x1;
 const FRAGMENT_BIT: u32 = 0x10;

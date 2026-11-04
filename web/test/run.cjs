@@ -1,12 +1,12 @@
-// Headless browser test of the ABE web player.
+// Headless browser test of the Ganbate web player.
 //
-//   node web/test/run.cjs --dist web/dist --out OUT_DIR [--abe-render PATH] [--selftest] [--api webgl2] \
-//     --case name=NAME,scene=WORLD.abew,look=LOOK.json,view=VIEW,time=HOURS,weather=PRESET,size=WxH
+//   node web/test/run.cjs --dist web/dist --out OUT_DIR [--ganbate-render PATH] [--selftest] [--api webgl2] \
+//     --case name=NAME,scene=WORLD.gbew,look=LOOK.json,view=VIEW,time=HOURS,weather=PRESET,size=WxH
 //     [--case ...]
 //
 // --api webgl2 runs everything on the WebGL 2 backend instead of WebGPU.
 //
-// --engine WORLD.abew runs web/test/engine.html: library mode (createEngine) with the world plus
+// --engine WORLD.gbew runs web/test/engine.html: library mode (createEngine) with the world plus
 // props, checking drawing, texture orientation, projection, picking, hiding, batch moves,
 // texture updates, overlays, blending, tints, pick layers and error reporting
 // (OUT/engine-first.png, -second.png, -third.png).
@@ -17,9 +17,9 @@
 //
 // For each case it serves web/dist plus the case's world and Look file (from where they are,
 // under /assets/), opens the player with the view, time and weather fixed and the animation
-// clock paused at `seconds` (default 12, abe-render's default), waits for `frames` presented
+// clock paused at `seconds` (default 12, ganbate-render's default), waits for `frames` presented
 // frames (default 3), and saves the canvas pixels (read back from the canvas texture) as
-// OUT/NAME-web.png and a page screenshot as OUT/NAME-page.png. With --abe-render it first
+// OUT/NAME-web.png and a page screenshot as OUT/NAME-page.png. With --ganbate-render it first
 // renders the same view natively (one sample, realtime quality) to OUT/NAME-native.png and
 // compares the two: OUT/NAME-diff.png shows |web - native| x 4. Console messages and WebGPU
 // errors are written to OUT/NAME-console.txt; any WebGPU error fails the case, and so does a
@@ -44,13 +44,13 @@ const CHROMIUM_ARGS = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--
   '--use-vulkan=swiftshader'];
 
 function parseArgs(argv) {
-  const opts = { cases: [], dist: path.join(__dirname, '..', 'dist'), out: 'web-test-out', abeRender: null, selftest: false, api: '', engine: null };
+  const opts = { cases: [], dist: path.join(__dirname, '..', 'dist'), out: 'web-test-out', ganbateRender: null, selftest: false, api: '', engine: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const val = () => argv[++i];
     if (a === '--dist') opts.dist = val();
     else if (a === '--out') opts.out = val();
-    else if (a === '--abe-render') opts.abeRender = val();
+    else if (a === '--ganbate-render') opts.ganbateRender = val();
     else if (a === '--selftest') opts.selftest = true;
     else if (a === '--api') opts.api = val();
     else if (a === '--engine') opts.engine = val();
@@ -69,7 +69,7 @@ function parseArgs(argv) {
 }
 
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm',
-  '.json': 'application/json', '.png': 'image/png', '.abew': 'application/octet-stream' };
+  '.json': 'application/json', '.png': 'image/png', '.gbew': 'application/octet-stream' };
 
 function serve(dist, assets, gzipped) {
   const server = http.createServer((req, res) => {
@@ -118,7 +118,7 @@ function native(opts, c, out) {
   if (c.time) args.push('--time', c.time);
   if (c.weather) args.push('--weather', c.weather);
   const started = Date.now();
-  execFileSync(opts.abeRender, args, { stdio: ['ignore', 'inherit', 'inherit'] });
+  execFileSync(opts.ganbateRender, args, { stdio: ['ignore', 'inherit', 'inherit'] });
   return (Date.now() - started) / 1000;
 }
 
@@ -129,7 +129,7 @@ async function runCase(browser, port, opts, c, assets) {
   const page = await browser.newPage({ viewport, deviceScaleFactor: 1 });
   page.on('console', (m) => log.push(`[${m.type()}] ${m.text()}`));
   page.on('pageerror', (e) => log.push(`[pageerror] ${e.message}`));
-  const q = new URLSearchParams({ scene: `/assets/${c.name}.abew`, dpr: '1', seconds: c.seconds,
+  const q = new URLSearchParams({ scene: `/assets/${c.name}.gbew`, dpr: '1', seconds: c.seconds,
     paused: '1' });
   if (c.size !== 'auto') q.set('size', c.size);
   if (opts.api) q.set('api', opts.api);
@@ -154,21 +154,21 @@ async function interact(page, c) {
   const status = () => page.evaluate(() => document.getElementById('status').textContent);
   // Waits until `count` more frames have been presented (input acts once per frame).
   const frames = async (count) => {
-    const n = await page.evaluate(() => window.abe.frames());
-    await page.waitForFunction(([m, k]) => window.abe.frames() >= m + k, [n, count],
+    const n = await page.evaluate(() => window.ganbate.frames());
+    await page.waitForFunction(([m, k]) => window.ganbate.frames() >= m + k, [n, count],
       { timeout: 300000, polling: 50 });
   };
   const settle = () => frames(2);
   // Captures the next frame and keeps it for `changed`.
   const image = () => page.evaluate(async () => {
-    window.lastInteract = await window.abe.capture();
+    window.lastInteract = await window.ganbate.capture();
     return { width: window.lastInteract.width, height: window.lastInteract.height };
   });
   // Whether the next frame differs from the last capture: a resize, or a mean absolute
   // difference above 1 level of 255 per channel.
   const changed = () => page.evaluate(async () => {
     const a = window.lastInteract;
-    const b = await window.abe.capture();
+    const b = await window.ganbate.capture();
     window.lastInteract = b;
     if (a.width !== b.width || a.height !== b.height) return true;
     let sum = 0;
@@ -235,21 +235,21 @@ async function interact(page, c) {
     const s5 = await status();
     steps.resize = { status: s5, ok: s5.endsWith('800x450') };
   }
-  const errors = await page.evaluate(() => window.abe.errors());
+  const errors = await page.evaluate(() => window.ganbate.errors());
   return { ok: Object.values(steps).every((s) => s.ok) && errors.length === 0, steps, errors };
 }
 
 async function drive(page, url, started, opts, c, assets, log) {
   await page.goto(url);
   const timeout = Number(c.timeout || 600) * 1000;
-  await page.waitForFunction((n) => window.abe && (window.abe.failed || window.abe.frames() >= n
-    || window.abe.errors().length > 0), Number(c.frames), { timeout, polling: 250 });
+  await page.waitForFunction((n) => window.ganbate && (window.ganbate.failed || window.ganbate.frames() >= n
+    || window.ganbate.errors().length > 0), Number(c.frames), { timeout, polling: 250 });
   const state = await page.evaluate(() => ({
-    failed: window.abe.failed || null,
-    frames: window.abe.failed ? 0 : window.abe.frames(),
-    errors: window.abe.failed ? [] : window.abe.errors(),
-    adapter: window.abe.adapter || '',
-    wasmMemoryMB: window.abe.exports ? window.abe.exports.memory.buffer.byteLength / 1048576 : 0,
+    failed: window.ganbate.failed || null,
+    frames: window.ganbate.failed ? 0 : window.ganbate.frames(),
+    errors: window.ganbate.failed ? [] : window.ganbate.errors(),
+    adapter: window.ganbate.adapter || '',
+    wasmMemoryMB: window.ganbate.exports ? window.ganbate.exports.memory.buffer.byteLength / 1048576 : 0,
     status: document.getElementById('status').textContent,
     userAgent: navigator.userAgent,
   }));
@@ -257,7 +257,7 @@ async function drive(page, url, started, opts, c, assets, log) {
   if (!state.failed) {
     // Pixels of one more frame, read back from the canvas texture.
     const png = await page.evaluate(async () => {
-      const img = await window.abe.capture();
+      const img = await window.ganbate.capture();
       const cv = document.createElement('canvas');
       cv.width = img.width; cv.height = img.height;
       cv.getContext('2d').putImageData(new ImageData(img.rgba, img.width, img.height), 0, 0);
@@ -269,7 +269,7 @@ async function drive(page, url, started, opts, c, assets, log) {
     result.web = webPng;
     if (c.interact === '1') result.interact = await interact(page, c);
     // Software rendering can take seconds per frame; stop the loop so the page can settle.
-    await page.evaluate(() => window.abe.stop());
+    await page.evaluate(() => window.ganbate.stop());
     if (c.native) {
       assets.set(`${c.name}-native.png`, c.native);
       const cmp = await page.evaluate(async (src) => {
@@ -320,7 +320,7 @@ async function drive(page, url, started, opts, c, assets, log) {
     } catch (e) {
       result.screenshot = `skipped: ${e.message.split('\n')[0]}`;
     }
-    result.errors = await page.evaluate(() => window.abe.errors());
+    result.errors = await page.evaluate(() => window.ganbate.errors());
   }
   result.ok = !result.failed && result.frames >= Number(c.frames) && result.errors.length === 0
     && (!result.interact || result.interact.ok)
@@ -337,11 +337,11 @@ async function runSelfTest(browser, port, opts) {
   const result = { name: 'selftest' };
   try {
     await page.goto(`http://localhost:${port}/index.html?selftest=1&size=256x256&dpr=1${opts.api ? `&api=${opts.api}` : ''}`);
-    await page.waitForFunction(() => window.abe && (window.abe.failed || window.abe.selftest),
+    await page.waitForFunction(() => window.ganbate && (window.ganbate.failed || window.ganbate.selftest),
       null, { timeout: 120000, polling: 100 });
     const r = await page.evaluate(() => {
-      if (window.abe.failed) return { failed: window.abe.failed };
-      const { pixels, errors, adapter } = window.abe.selftest;
+      if (window.ganbate.failed) return { failed: window.ganbate.failed };
+      const { pixels, errors, adapter } = window.ganbate.selftest;
       const px = (x, y) => Array.from(pixels.rgba.slice((y * pixels.width + x) * 4, (y * pixels.width + x) * 4 + 3));
       const cv = document.createElement('canvas');
       cv.width = pixels.width; cv.height = pixels.height;
@@ -385,7 +385,7 @@ async function runEngineCheck(browser, port, opts) {
   page.on('pageerror', (e) => log.push(`[pageerror] ${e.message}`));
   const result = { name: 'engine' };
   try {
-    const query = new URLSearchParams({ world: '/assets/engine.abew' });
+    const query = new URLSearchParams({ world: '/assets/engine.gbew' });
     if (opts.api) query.set('api', opts.api);
     await page.goto(`http://localhost:${port}/test/engine.html?${query}`);
     await page.waitForFunction(() => window.engineCheck, null, { timeout: 300000, polling: 200 });
@@ -414,9 +414,9 @@ async function main() {
   fs.mkdirSync(opts.out, { recursive: true });
   const assets = new Map();
   for (const c of opts.cases) {
-    assets.set(`${c.name}.abew`, path.resolve(c.scene));
+    assets.set(`${c.name}.gbew`, path.resolve(c.scene));
     if (c.look) assets.set(`${c.name}.json`, path.resolve(c.look));
-    if (opts.abeRender && c.native !== '0' && c.size !== 'auto') {
+    if (opts.ganbateRender && c.native !== '0' && c.size !== 'auto') {
       const out = path.join(opts.out, `${c.name}-native.png`);
       const s = native(opts, c, out);
       console.log(`${c.name}: native reference ${out} (${s.toFixed(1)} s)`);
@@ -427,8 +427,8 @@ async function main() {
       delete c.native;
     }
   }
-  if (opts.engine) assets.set('engine.abew', path.resolve(opts.engine));
-  const gzipped = new Set(opts.cases.filter((c) => c.gzip === '1').map((c) => `${c.name}.abew`));
+  if (opts.engine) assets.set('engine.gbew', path.resolve(opts.engine));
+  const gzipped = new Set(opts.cases.filter((c) => c.gzip === '1').map((c) => `${c.name}.gbew`));
   const server = await serve(path.resolve(opts.dist), assets, gzipped);
   const port = server.address().port;
   const browser = await chromium.launch({ args: CHROMIUM_ARGS });

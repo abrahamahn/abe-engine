@@ -1,8 +1,8 @@
 #!/bin/sh
-# Build the ABE iPhone app, bundle a scene into it, sign it and install it.
+# Build the Ganbate iPhone app, bundle a scene into it, sign it and install it.
 #
-#   scripts/apple/build-ios.sh --sim    --world world.abew [--look look.json]
-#   scripts/apple/build-ios.sh --device --world world.abew [--look look.json]
+#   scripts/apple/build-ios.sh --sim    --world world.gbew [--look look.json]
+#   scripts/apple/build-ios.sh --device --world world.gbew [--look look.json]
 #
 # --sim     builds for aarch64-apple-ios-sim, installs into the booted simulator (booting the
 #           first available iPhone if none is) and launches the app with its console.
@@ -11,15 +11,15 @@
 # --no-run  installs without launching.
 #
 # Environment:
-#   ABE_IOS_TEAM       your Apple developer team ID (10 characters; device builds). Find it
+#   GANBATE_IOS_TEAM       your Apple developer team ID (10 characters; device builds). Find it
 #                      in Xcode > Settings > Accounts, or in a provisioning profile.
-#   ABE_IOS_BUNDLE_ID  bundle identifier (default dev.abe.player.<team>); a development
+#   GANBATE_IOS_BUNDLE_ID  bundle identifier (default dev.ganbate.player.<team>); a development
 #                      provisioning profile must cover it (see the README).
-#   ABE_IOS_PROFILE    a .mobileprovision to embed (default: the newest installed profile for
+#   GANBATE_IOS_PROFILE    a .mobileprovision to embed (default: the newest installed profile for
 #                      the team that covers the bundle identifier).
-#   ABE_IOS_IDENTITY   codesign identity (default: the first "Apple Development" identity).
-#   ABE_IOS_DEVICE     devicectl device identifier or name (default: the first paired device).
-#   ABE_IOS_SIMULATOR  simulator name or UDID (default: the booted one, else the first iPhone).
+#   GANBATE_IOS_IDENTITY   codesign identity (default: the first "Apple Development" identity).
+#   GANBATE_IOS_DEVICE     devicectl device identifier or name (default: the first paired device).
+#   GANBATE_IOS_SIMULATOR  simulator name or UDID (default: the booted one, else the first iPhone).
 #
 # Needs Xcode (the iOS SDK and simulators, selected with xcode-select) and Rust (rustup).
 set -eu
@@ -58,18 +58,18 @@ die() {
     exit 1
 }
 [ -n "$mode" ] || die "pass --sim or --device (see --help)"
-[ -n "$world" ] || die "pass --world path/to/world.abew (cook one with abe-build)"
+[ -n "$world" ] || die "pass --world path/to/world.gbew (cook one with ganbate-build)"
 [ -f "$world" ] || die "$world does not exist"
 [ -z "$look" ] || [ -f "$look" ] || die "$look does not exist"
 [ "$(uname -s)" = Darwin ] || die "runs on macOS"
 xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1 ||
     die "the iOS SDK is missing: install Xcode and run sudo xcode-select -s /Applications/Xcode.app"
 
-team="${ABE_IOS_TEAM:-}"
+team="${GANBATE_IOS_TEAM:-}"
 if [ "$mode" = device ] && [ -z "$team" ]; then
-    die "set ABE_IOS_TEAM to your development team ID"
+    die "set GANBATE_IOS_TEAM to your development team ID"
 fi
-bundle="${ABE_IOS_BUNDLE_ID:-dev.abe.player${team:+.$(echo "$team" | tr 'A-Z' 'a-z')}}"
+bundle="${GANBATE_IOS_BUNDLE_ID:-dev.ganbate.player${team:+.$(echo "$team" | tr 'A-Z' 'a-z')}}"
 if [ "$mode" = sim ]; then
     target=aarch64-apple-ios-sim
     platform=iPhoneSimulator
@@ -81,13 +81,13 @@ command -v rustup >/dev/null 2>&1 && rustup target add "$target" >/dev/null
 
 # The app uses scenes (iOS 13) and is tested against iOS 15 and later.
 export IPHONEOS_DEPLOYMENT_TARGET=15.0
-cargo build --release --locked --target "$target" --bin abe-ios
+cargo build --release --locked --target "$target" --bin ganbate-ios
 out="${CARGO_TARGET_DIR:-target}/$target/release"
-app="$out/ABE.app"
+app="$out/Ganbate.app"
 rm -rf "$app"
 mkdir -p "$app"
-cp "$out/abe-ios" "$app/abe-ios"
-cp "$world" "$app/world.abew"
+cp "$out/ganbate-ios" "$app/ganbate-ios"
+cp "$world" "$app/world.gbew"
 [ -z "$look" ] || cp "$look" "$app/look.json"
 
 cat >"$app/Info.plist" <<EOF
@@ -96,11 +96,11 @@ cat >"$app/Info.plist" <<EOF
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key><string>en</string>
-    <key>CFBundleDisplayName</key><string>ABE</string>
-    <key>CFBundleExecutable</key><string>abe-ios</string>
+    <key>CFBundleDisplayName</key><string>Ganbate</string>
+    <key>CFBundleExecutable</key><string>ganbate-ios</string>
     <key>CFBundleIdentifier</key><string>$bundle</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>CFBundleName</key><string>ABE</string>
+    <key>CFBundleName</key><string>Ganbate</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.2.0</string>
     <key>CFBundleVersion</key><string>1</string>
@@ -128,7 +128,7 @@ cat >"$app/Info.plist" <<EOF
             <array>
                 <dict>
                     <key>UISceneConfigurationName</key><string>Default</string>
-                    <key>UISceneDelegateClassName</key><string>ABESceneDelegate</string>
+                    <key>UISceneDelegateClassName</key><string>GanbateSceneDelegate</string>
                 </dict>
             </array>
         </dict>
@@ -140,7 +140,7 @@ plutil -lint "$app/Info.plist" >/dev/null
 
 if [ "$mode" = sim ]; then
     codesign --force --sign - --timestamp=none "$app"
-    sim="${ABE_IOS_SIMULATOR:-}"
+    sim="${GANBATE_IOS_SIMULATOR:-}"
     if [ -z "$sim" ]; then
         if xcrun simctl list devices booted | grep -q Booted; then
             sim=booted
@@ -161,7 +161,7 @@ fi
 # Device: embed a development provisioning profile and sign with its entitlements.
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-profile="${ABE_IOS_PROFILE:-}"
+profile="${GANBATE_IOS_PROFILE:-}"
 if [ -z "$profile" ]; then
     best=""
     for dir in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
@@ -182,13 +182,13 @@ if [ -z "$profile" ]; then
     profile="$best"
 fi
 [ -n "$profile" ] || die "no provisioning profile of team $team covers $bundle; see the README \
-(open Xcode once with this bundle identifier, or set ABE_IOS_PROFILE)"
+(open Xcode once with this bundle identifier, or set GANBATE_IOS_PROFILE)"
 cp "$profile" "$app/embedded.mobileprovision"
 security cms -D -i "$profile" >"$tmp/profile.plist"
 /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$tmp/profile.plist" >"$tmp/entitlements.plist"
 /usr/libexec/PlistBuddy -c "Set :application-identifier $team.$bundle" "$tmp/entitlements.plist"
 
-identity="${ABE_IOS_IDENTITY:-}"
+identity="${GANBATE_IOS_IDENTITY:-}"
 if [ -z "$identity" ]; then
     identity=$(security find-identity -v -p codesigning | grep -m1 'Apple Development' |
         sed -E 's/^ *[0-9]+\) ([0-9A-F]{40}).*/\1/')
@@ -196,7 +196,7 @@ fi
 [ -n "$identity" ] || die "no Apple Development signing identity in the keychain (sign in to Xcode)"
 codesign --force --sign "$identity" --entitlements "$tmp/entitlements.plist" --timestamp=none "$app"
 
-device="${ABE_IOS_DEVICE:-}"
+device="${GANBATE_IOS_DEVICE:-}"
 if [ -z "$device" ]; then
     xcrun devicectl list devices --json-output "$tmp/devices.json" >/dev/null
     device=$(plutil -extract result.devices.0.identifier raw "$tmp/devices.json" 2>/dev/null || true)

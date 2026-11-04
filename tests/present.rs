@@ -1,5 +1,5 @@
 #![cfg(any(target_os = "linux", target_os = "windows"))]
-use abe_engine::{
+use ganbate_engine::{
     Camera, Scene, Vec3,
     vulkan::present::{DesktopRenderer, PresentStatus, Presenter},
     window::Window,
@@ -42,7 +42,7 @@ fn frames(window: &Window, p: &mut Presenter<'_>, s: &Scene, n: u64) {
 #[test]
 #[ignore = "requires a native display and Vulkan graphics/present driver"]
 fn presents_and_recovers_after_resize_hide_and_restore() {
-    let window = Window::new("ABE presentation test", 320, 200).unwrap();
+    let window = Window::new("Ganbate presentation test", 320, 200).unwrap();
     pump_until(&window, || window.visible());
     let mut gpu = DesktopRenderer::new(&window).unwrap();
     let mut s = Scene::default();

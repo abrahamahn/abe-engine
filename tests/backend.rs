@@ -1,25 +1,25 @@
-//! Driver tests of the GPU layer with WGSL shaders compiled by `abe-shader`, so the same tests
+//! Driver tests of the GPU layer with WGSL shaders compiled by `ganbate-shader`, so the same tests
 //! run on every backend: SPIR-V on Vulkan (Linux, Windows) and MSL on Metal (macOS, iOS). A
 //! test that passes on Vulkan and fails on Metal points at the Metal backend or the MSL
 //! emitter. Run with `cargo test --test backend -- --ignored` (on a Mac with
-//! `MTL_DEBUG_LAYER=1`, on Vulkan with `ABE_VULKAN_VALIDATION=1`).
+//! `MTL_DEBUG_LAYER=1`, on Vulkan with `GANBATE_VULKAN_VALIDATION=1`).
 #![cfg(any(
     target_os = "linux",
     target_os = "windows",
     target_os = "android",
     target_vendor = "apple"
 ))]
-#[path = "../crates/abe-shader/tests/msl/check.rs"]
+#[path = "../crates/ganbate-shader/tests/msl/check.rs"]
 mod check;
 
-use abe_engine::gpu::shader::{Compiled, Stage, compile, compile_msl, entry_points};
-use abe_engine::gpu::*;
+use ganbate_engine::gpu::shader::{Compiled, Stage, compile, compile_msl, entry_points};
+use ganbate_engine::gpu::*;
 
 fn shader(src: &str, stage: Stage, entry: &str) -> Compiled {
     compile(src, stage, entry).unwrap_or_else(|e| panic!("{entry}: {e}"))
 }
 
-/// The shaders below as MSL, checked with `clang++` against abe-shader's stand-in
+/// The shaders below as MSL, checked with `clang++` against ganbate-shader's stand-in
 /// `metal_stdlib` when it is installed (no GPU needed).
 #[test]
 fn shaders_emit_msl_that_compiles() {

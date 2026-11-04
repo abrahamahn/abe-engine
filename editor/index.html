@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABE Editor</title>
+<title>Ganbate Editor</title>
 <link rel="stylesheet" href="/editor/studio.css">
 </head>
 <body>
 <header id="toolbar">
-  <strong id="project-name">ABE Studio</strong>
+  <strong id="project-name">Ganbate Studio</strong>
   <span id="doc-name" data-i18n="noDocument">No document</span><button id="download-draft" hidden data-i18n="downloadDraft">Download draft</button>
   <span class="sep"></span>
   <button id="save" data-i18n="save" data-i18n-title="saveTip">Save</button>
@@ -48,11 +48,6 @@
 </header>
 <main>
   <section id="left">
-    <div class="panel" id="assets">
-      <h2><span data-i18n="assets">Assets</span><span><button id="rescan-assets" class="mini" data-i18n="rescanAssets" data-i18n-title="rescanAssetsTip">Rescan</button><button id="new-scene" class="mini" data-i18n="newScene" data-i18n-title="newSceneTip">+ Scene</button><button id="new-look" class="mini" data-i18n="newLook" data-i18n-title="newLookFile">+ Look</button></span></h2>
-      <div id="asset-scan-report" aria-live="polite"></div>
-      <div id="assets-list"></div>
-    </div>
     <div class="panel" id="outliner">
       <h2><span data-i18n="outliner">Outliner</span>
         <span>
@@ -69,15 +64,63 @@
   <div id="preview-frame"><section id="viewport" tabindex="0">
     <canvas id="overlay"></canvas>
     <div id="frame-guide" hidden aria-hidden="true"></div>
+    <div id="viewport-drop-hint" hidden aria-hidden="true"></div>
   </section></div>
   <section id="right" class="panel">
     <h2 data-i18n="inspector">Inspector</h2>
     <div id="inspector-body" tabindex="-1"></div>
   </section>
 </main>
-<footer class="panel" id="console">
-  <h2 data-i18n="console">Console</h2>
-  <div id="console-lines"></div>
+<div id="dock-resizer" role="separator" aria-orientation="horizontal"></div>
+<footer id="bottom-dock">
+  <section class="panel" id="assets">
+    <header class="assets-header">
+      <div class="assets-title-group">
+        <h2 data-i18n="assets">Assets</h2>
+        <span id="assets-count" class="count-badge">0</span>
+      </div>
+      <input id="assets-search" type="search" data-i18n-placeholder="searchAssets" placeholder="Search assets…">
+      <div id="assets-kinds" role="group"></div>
+      <span class="grow"></span>
+      <div class="assets-toolbar-actions">
+        <select id="assets-sort" aria-label="Sort assets">
+          <option value="kind" data-i18n="sortKind">Sort: Kind</option>
+          <option value="name" data-i18n="sortName">Sort: Name</option>
+          <option value="folder" data-i18n="sortFolder">Sort: Folder</option>
+          <option value="size" data-i18n="sortSize">Sort: Size</option>
+        </select>
+        <label id="assets-scale-wrap" class="asset-scale-wrap" data-i18n-title="cardScaleTip" title="Thumbnail size">
+          <input id="assets-scale" type="range" min="112" max="220" step="4" value="152" aria-label="Thumbnail size">
+        </label>
+        <span class="view-toggle" role="group">
+          <button id="assets-view-grid" type="button" class="mini on" data-i18n="gridView" data-i18n-title="gridViewTip">Grid</button>
+          <button id="assets-view-list" type="button" class="mini" data-i18n="listView" data-i18n-title="listViewTip">List</button>
+        </span>
+        <button id="toggle-asset-details" type="button" class="mini on" data-i18n="assetDetails" data-i18n-title="toggleAssetDetails">Details</button>
+        <button id="import-assets" type="button" class="mini" data-i18n="importAssets" data-i18n-title="importAssetsTip">+ Import</button>
+        <input id="import-assets-input" type="file" multiple hidden accept=".glb,.png,.jpg,.jpeg,.webp,.wav,.ogg,.json">
+        <button id="rescan-assets" type="button" class="mini" data-i18n="rescanAssets" data-i18n-title="rescanAssetsTip">Rescan</button>
+        <button id="new-scene" type="button" class="mini" data-i18n="newScene" data-i18n-title="newSceneTip">+ Scene</button>
+        <button id="new-prefab" type="button" class="mini" data-i18n="newPrefab" data-i18n-title="newPrefabTip">+ Prefab</button>
+        <button id="new-look" type="button" class="mini" data-i18n="newLook" data-i18n-title="newLookFile">+ Look</button>
+        <button id="toggle-console" type="button" class="mini on" data-i18n="console" data-i18n-title="toggleConsole">Console</button>
+      </div>
+    </header>
+    <div id="asset-scan-report" aria-live="polite"></div>
+    <div id="assets-body">
+      <nav id="assets-folders"></nav>
+      <div id="assets-main">
+        <div id="assets-bar"></div>
+        <div id="assets-list" class="view-grid" tabindex="0"></div>
+      </div>
+      <aside id="assets-inspector"></aside>
+    </div>
+    <div id="asset-drop-overlay" hidden aria-hidden="true"></div>
+  </section>
+  <section class="panel" id="console">
+    <h2 data-i18n="console">Console</h2>
+    <div id="console-lines"></div>
+  </section>
 </footer>
 <script type="module" src="/editor/studio.js"></script>
 <dialog id="project-tool-panel" aria-labelledby="project-tool-title">
@@ -87,5 +130,6 @@
   </header>
   <iframe id="project-tool-frame" referrerpolicy="no-referrer" sandbox="allow-forms allow-scripts allow-same-origin allow-downloads allow-popups"></iframe>
 </dialog>
+<div id="asset-context-menu" class="context-menu" role="menu" hidden></div>
 </body>
 </html>

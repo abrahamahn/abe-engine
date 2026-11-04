@@ -1,4 +1,4 @@
-// ABE Studio's interface. It talks to the studio host (`abe-studio`) over the edit protocol and
+// Ganbate Studio's interface. It talks to the studio host (`ganbate-studio`) over the edit protocol and
 // draws the scene with the engine's web runtime, the same renderer a web game ships. The host
 // owns the files and the undo history; this page shows a document, turns gestures into ops and
 // applies the ops the host confirms.
@@ -7,6 +7,16 @@ import { drawLookInspector } from './look-inspector.js';
 import * as M from './math.js';
 import { setupViewportFrame } from './viewport-frame.js';
 import { cameraLens, cameraWorld, captureCamera, orbitBasis, orbitFromCamera } from './cameras.js';
+import {
+  ASSET_DRAG_MIME,
+  assetBasename,
+  assetFolder,
+  assetStem,
+  canPlaceAsset,
+  createAssetLibrary,
+  placementEntity,
+  raycastDropPoint,
+} from './asset-library.js';
 import { t, label, lang, setLang, translate } from './i18n.js';
 
 import { projectToolsPanel } from './project-tools.js';
@@ -16,8 +26,9 @@ const $ = (sel) => document.querySelector(sel);
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
-    if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
-    else if (k === 'class') e.className = v;
+    if (k.startsWith('on')) {
+      if (v) e.addEventListener(k.slice(2), v);
+    } else if (k === 'class') e.className = v;
     else if (v !== undefined && v !== null && v !== false) e.setAttribute(k, v === true ? '' : v);
   }
   for (const c of children.flat()) if (c !== null && c !== undefined) e.append(c);
@@ -53,11 +64,14 @@ const state = {
   cookTimer: 0,
   cooking: false,
   drag: null,
+  draggingAsset: null,
   hover: null,
   fps: 0,
   loadGen: 0, // counts viewport loads: a load that a newer one overtook drops its engine
   wanted: null, // the document last asked for, opened again after a reconnect
   inspectorStale: false, // the inspector skipped a redraw while a field was being typed into
+  usageTimer: 0,
+  pendingSelectEntity: null,
 };
 window.__studio = state;
 // For tests and plugins that need the viewport's geometry.
@@ -208,6 +222,7 @@ function onMessage(msg) {
       drawScanReport();
       $('#project-name').textContent = msg.project.name || 'Project';
       drawAssets();
+      scheduleUsageRefresh(20);
       void loadProjectTools(msg.project, msg.toolCatalogs);
       // After a reconnect, the document that was open (or being opened) opens again.
       const requested = new URLSearchParams(location.search).get('asset');
@@ -217,7 +232,7 @@ function onMessage(msg) {
       else if (msg.project.startup) openDoc(msg.project.startup);
       if (state.inspectedLook) watchLook(state.inspectedLook);
       else if (asset?.kind === 'look') inspectLook(asset.id);
-      if (asset) document.querySelector(`#assets-list [data-id="${CSS.escape(asset.id)}"]`)?.scrollIntoView({ block: 'nearest' });
+      if (asset) assetLibrary.revealAsset(asset.id);
       break;
     }
     case 'rescanned':
@@ -226,11 +241,28 @@ function onMessage(msg) {
       if (msg.ok) state.drafts = msg.drafts;
       drawScanReport();
       drawAssets();
+      scheduleUsageRefresh(40);
       break;
     case 'assets':
       state.assets = msg.assets;
       watchLook(state.inspectedLook);
       drawAssets();
+      scheduleUsageRefresh(40);
+      break;
+    case 'asset-usage':
+      if (msg.counts) assetLibrary.setUsageCounts(msg.counts);
+      if (msg.id && Array.isArray(msg.uses)) assetLibrary.setAssetUses(msg.id, msg.uses);
+      break;
+    case 'asset-moved':
+      log(0, `${msg.from} → ${msg.to}`);
+      assetLibrary.notifyAssetMoved(msg.id);
+      scheduleUsageRefresh(40);
+      break;
+    case 'asset-imported':
+      log(0, t('importedCount', msg.path));
+      assetLibrary.recordRecent(msg.id);
+      assetLibrary.revealAsset(msg.id);
+      scheduleUsageRefresh(40);
       break;
     case 'doc': {
       const doc = { id: msg.doc, rev: msg.rev, path: msg.path, kind: msg.kind, root: msg.root, dirty: msg.dirty, undo: msg.undo, redo: msg.redo, issues: msg.issues };
@@ -248,6 +280,11 @@ function onMessage(msg) {
       }
       if (state.doc?.id !== doc.id) state.cameraFollow = null;
       state.doc = doc;
+      if (state.pendingSelectEntity?.doc === doc.id) {
+        const target = state.pendingSelectEntity.entity;
+        state.pendingSelectEntity = null;
+        if (target && entity(target)) state.selection = target;
+      }
       if (state.cameraFollow) lookThrough(state.cameraFollow);
       watchLook(lookAsset()?.look);
       if (state.selection && !entity(state.selection)) state.selection = null;
@@ -275,6 +312,12 @@ function onMessage(msg) {
         watchLook(lookAsset()?.look);
         refreshLook(['time', 'weather']);
       }
+      if (msg.ops.some(op => {
+        const p = op.set || op.remove;
+        return p.length <= 2 || p[2] === 'components' || p[2] === 'prefab';
+      })) {
+        scheduleUsageRefresh(120);
+      }
       drawAll();
       break;
     }
@@ -286,6 +329,7 @@ function onMessage(msg) {
         log(0, `saved ${msg.path}`);
         drawToolbar();
         drawAssets();
+        scheduleUsageRefresh(60);
       }
       break;
     case 'ids':
@@ -455,12 +499,12 @@ async function loadWorld(cooked) {
   if (old) old.replaceWith(canvas);
   else host.prepend(canvas);
   state.canvas = canvas;
-  const { createEngine } = await import('/engine/abe.js');
+  const { createEngine } = await import('/engine/ganbate.js');
   const api = new URLSearchParams(location.search).get('api') || 'auto';
   const engine = await createEngine({
     canvas,
     api,
-    wasm: '/engine/abe_web.wasm',
+    wasm: '/engine/ganbate_web.wasm',
     world: `/cooked/${name}`,
     look,
     onLog: (level, text) => log(level, `engine: ${text}`),
@@ -956,6 +1000,32 @@ function viewportEvents() {
     state.cameraFollow = null;
     state.view.distance = Math.max(0.2, Math.min(5000, state.view.distance * Math.exp(e.deltaY * 0.001)));
   }, { passive: false });
+  vp.addEventListener('dragover', (e) => {
+    if (!hasAssetDrag(e)) return;
+    if (state.draggingAsset && !canPlaceAsset(state.draggingAsset, state.doc).ok) {
+      clearViewportDrop();
+      return;
+    }
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    vp.classList.add('drop-active');
+    const dropHint = $('#viewport-drop-hint');
+    if (dropHint && state.draggingAsset) {
+      dropHint.textContent = t('dropToPlace', assetBasename(state.draggingAsset.path));
+      dropHint.hidden = false;
+    }
+  });
+  vp.addEventListener('dragleave', (e) => {
+    if (!vp.contains(e.relatedTarget)) clearViewportDrop();
+  });
+  vp.addEventListener('drop', (e) => {
+    clearViewportDrop();
+    const asset = resolveDraggedAsset(e);
+    if (!asset || !canPlaceAsset(asset, state.doc).ok) return;
+    e.preventDefault();
+    const worldPos = raycastDropPoint(state.view, e.clientX, e.clientY, vp.getBoundingClientRect());
+    void placeAsset(asset, { worldPos });
+  });
 }
 
 /** Marks the inspector field that holds typing not yet committed (see drawInspector). */
@@ -984,6 +1054,7 @@ function drawAll() {
   drawToolbar();
   drawOutliner();
   drawInspector();
+  drawAssets();
 }
 
 function drawToolbar() {
@@ -1022,48 +1093,212 @@ function drawScanReport() {
   box.append(details);
 }
 
+function clearViewportDrop() {
+  $('#viewport')?.classList.remove('drop-active');
+  const hint = $('#viewport-drop-hint');
+  if (hint) hint.hidden = true;
+}
+
+function clearDragFeedback() {
+  clearViewportDrop();
+  for (const node of document.querySelectorAll('.drop-target')) {
+    node.classList.remove('drop-target');
+  }
+}
+
+function hasAssetDrag(ev) {
+  if (state.draggingAsset) return true;
+  const types = ev.dataTransfer?.types;
+  return !!types && [...types].includes(ASSET_DRAG_MIME);
+}
+
+function resolveDraggedAsset(ev) {
+  const id = ev.dataTransfer?.getData(ASSET_DRAG_MIME);
+  if (id) {
+    const found = state.assets.find((a) => a.id === id);
+    if (found) return found;
+  }
+  return state.draggingAsset;
+}
+
+function defaultCreateDir(kind, fallbackSubdir) {
+  const activeFolder = assetLibrary.state.folder;
+  const contentRoots = state.project?.content || [];
+  if (activeFolder && contentRoots.some((c) => activeFolder === c || activeFolder.startsWith(c + '/'))) {
+    return activeFolder;
+  }
+  const previous = state.assets.find((a) => a.kind === kind);
+  if (previous) {
+    const dir = assetFolder(previous.path);
+    if (dir) return dir;
+  }
+  const root = contentRoots[0] || 'content';
+  return fallbackSubdir ? `${root}/${fallbackSubdir}` : root;
+}
+
+function importModelAsScene(asset) {
+  const stem = assetStem(asset.path);
+  const dir = defaultCreateDir('scene', 'scenes');
+  const path = prompt(t('newSceneFile'), `${dir}/${stem}.scene.json`);
+  if (path) state.host.send({ type: 'import', model: asset.id, path, name: stem });
+}
+
+async function placeAsset(asset, { worldPos = null, parent = undefined, localOrigin = false } = {}) {
+  const doc = state.doc;
+  const check = canPlaceAsset(asset, doc);
+  if (!check.ok) {
+    if (check.reason) log(1, t(check.reason));
+    return null;
+  }
+  let targetParent = parent;
+  if (targetParent === undefined) {
+    targetParent = doc.kind === 'prefab' ? (children(null)[0] || null) : null;
+  }
+  if (targetParent && !entity(targetParent)) targetParent = null;
+
+  let localTranslation = null;
+  if (!localOrigin) {
+    const world = worldPos || state.view.target;
+    if (targetParent) {
+      const parentWorld = cameraWorld(entities(), targetParent) || M.IDENTITY;
+      const invParent = M.invert(parentWorld);
+      localTranslation = invParent ? M.point(invParent, world) : world;
+    } else {
+      localTranslation = world;
+    }
+  }
+
+  const [id] = (await takeIds(1)) || [];
+  if (!id || state.doc?.id !== doc.id) return null;
+  if (targetParent && !entity(targetParent)) targetParent = null;
+  const value = placementEntity(asset, { parent: targetParent, localTranslation });
+  const answer = await edit(`${t('vPlace')} ${value.name}`, [{ set: ['entities', id], value }]);
+  if (answer?.type === 'ops' && state.doc?.id === doc.id) {
+    select(id);
+    return id;
+  }
+  return null;
+}
+
+function bytesToBase64(bytes) {
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+function inferKindAndSubdir(fileName) {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith('.scene.json')) return ['scene', 'scenes'];
+  if (lower.endsWith('.prefab.json')) return ['prefab', 'prefabs'];
+  if (lower.endsWith('.look.json')) return ['look', 'looks'];
+  if (lower.endsWith('.material.json')) return ['material', 'materials'];
+  if (lower.endsWith('.glb')) return ['model', 'models'];
+  if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.webp')) {
+    return ['texture', 'textures'];
+  }
+  if (lower.endsWith('.wav') || lower.endsWith('.ogg')) return ['sound', 'audio'];
+  return [null, ''];
+}
+
+function uniqueImportPath(dir, rawName) {
+  const cleanName = rawName.replace(/[\\:\0]/g, '_').replace(/^\.+/, '');
+  const candidate = `${dir}/${cleanName}`;
+  const taken = new Set(state.assets.map((a) => a.path));
+  if (!taken.has(candidate)) return candidate;
+  const stem = assetStem(cleanName);
+  const ext = cleanName.slice(stem.length);
+  for (let n = 2; n < 1000; n++) {
+    const next = `${dir}/${stem}_${n}${ext}`;
+    if (!taken.has(next)) return next;
+  }
+  return candidate;
+}
+
+async function importDroppedFiles(files, activeFolder) {
+  if (!state.host?.open || !state.project) return;
+  const contentRoots = state.project.content || [];
+  const validFolder = activeFolder && contentRoots.some((c) => activeFolder === c || activeFolder.startsWith(c + '/'))
+    ? activeFolder
+    : '';
+  for (const file of files) {
+    const [kind, subdir] = inferKindAndSubdir(file.name || '');
+    if (!kind) {
+      log(2, `${file.name}: unsupported asset format`);
+      continue;
+    }
+    const dir = validFolder || defaultCreateDir(kind, subdir);
+    const targetPath = uniqueImportPath(dir, file.name);
+    try {
+      const buf = await file.arrayBuffer();
+      const dataBase64 = bytesToBase64(new Uint8Array(buf));
+      state.host.send({ type: 'asset-import', path: targetPath, dataBase64, req: 'asset-import' });
+    } catch (e) {
+      log(2, `${file.name}: ${e.message}`);
+    }
+  }
+}
+
+function scheduleUsageRefresh(delay = 80) {
+  clearTimeout(state.usageTimer);
+  state.usageTimer = setTimeout(() => {
+    if (!state.host?.open) return;
+    state.host.send({ type: 'asset-usage', req: 'asset-usage-counts' });
+    const sel = assetLibrary.state.selectedId;
+    if (sel) state.host.send({ type: 'asset-usage', id: sel, req: 'asset-usage-detail' });
+  }, delay);
+}
+
+function jumpToAssetReference(ref) {
+  if (!ref?.doc) return;
+  if (state.doc?.id === ref.doc) {
+    if (ref.entity && entity(ref.entity)) {
+      select(ref.entity);
+      const b = boundsOf(ref.entity);
+      if (b) frameBounds(b);
+    }
+    return;
+  }
+  state.pendingSelectEntity = { doc: ref.doc, entity: ref.entity || null };
+  openDoc(ref.doc);
+}
+
+const assetLibrary = createAssetLibrary({
+  el,
+  t,
+  getContext: () => ({
+    assets: state.assets,
+    drafts: state.drafts,
+    project: state.project,
+    doc: state.doc,
+    inspectedLook: state.inspectedLook,
+    looks: state.looks,
+    draggingAsset: state.draggingAsset,
+  }),
+  onOpenDoc: openDoc,
+  onInspectLook: inspectLook,
+  onImportModel: importModelAsScene,
+  onPlaceAsset: (asset) => { void placeAsset(asset); },
+  onMoveAsset: (asset, to) => {
+    if (state.host?.open) state.host.send({ type: 'asset-move', id: asset.id, to, req: 'asset-move' });
+  },
+  onImportFiles: (files, activeFolder) => { void importDroppedFiles(files, activeFolder); },
+  onRequestUsage: (id) => {
+    if (state.host?.open && id) state.host.send({ type: 'asset-usage', id, req: 'asset-usage-detail' });
+  },
+  onJumpToReference: jumpToAssetReference,
+  onStartDrag: (asset) => { state.draggingAsset = asset; },
+  onEndDrag: () => {
+    state.draggingAsset = null;
+    clearDragFeedback();
+  },
+});
+state.assetLibrary = assetLibrary;
+
 function drawAssets() {
-  const list = $('#assets-list');
-  const requested = new URLSearchParams(location.search).get('asset');
-  list.replaceChildren();
-  if (state.drafts.length) {
-    list.append(el('div', {class: 'group'}, t('missingDrafts')));
-    for (const doc of state.drafts) {
-      list.append(el('div', {class: 'asset missing-draft', title: doc.path}, doc.path.split('/').pop(),
-        el('button', {type: 'button', class: 'mini', onclick: () => doc.kind === 'look' ? inspectLook(doc.id) : openDoc(doc.id)}, t('open'))));
-    }
-  }
-  const kinds = ['scene', 'prefab', 'model', 'look', 'texture', 'material', 'sound'];
-  for (const kind of kinds) {
-    const items = state.assets.filter((a) => a.kind === kind).sort((a, b) => a.path.localeCompare(b.path));
-    if (!items.length) continue;
-    list.append(el('div', { class: 'group' }, kind));
-    for (const a of items) {
-      const name = a.path.split('/').pop();
-      const selected = a.id === state.inspectedLook || a.path === requested;
-      const row = el('div', { class: selected ? 'asset requested-asset' : 'asset', title: a.path, 'data-id': a.id }, name);
-      if (kind === 'scene' || kind === 'prefab') {
-        row.addEventListener('dblclick', () => openDoc(a.id));
-        row.append(el('button', { class: 'mini', onclick: () => openDoc(a.id) }, t('open')));
-      }
-      if (kind === 'look') {
-        if (state.looks.get(a.id)?.dirty) row.append(el('span', { class: 'badge' }, '•'));
-        row.addEventListener('dblclick', () => inspectLook(a.id));
-        row.append(el('button', { type: 'button', class: 'mini', onclick: () => inspectLook(a.id) }, t('editLook')));
-      }
-      if (kind === 'model') {
-        row.append(el('button', {
-          class: 'mini',
-          onclick: () => {
-            const stem = name.replace(/\.glb$/i, '');
-            const path = prompt(t('newSceneFile'), `content/scenes/${stem}.scene.json`);
-            if (path) state.host.send({ type: 'import', model: a.id, path, name: stem });
-          },
-        }, t('importAsScene')));
-      }
-      list.append(row);
-    }
-  }
+  assetLibrary.draw();
 }
 
 function drawOutliner() {
@@ -1081,6 +1316,25 @@ function drawOutliner() {
       'data-id': id,
       onclick: () => select(id),
       ondblclick: () => rename(id),
+      ondragover: (ev) => {
+        if (!hasAssetDrag(ev)) return;
+        if (state.draggingAsset && !canPlaceAsset(state.draggingAsset, state.doc).ok) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+        r.classList.add('drop-target');
+      },
+      ondragleave: (ev) => {
+        if (!r.contains(ev.relatedTarget)) r.classList.remove('drop-target');
+      },
+      ondrop: (ev) => {
+        r.classList.remove('drop-target');
+        const asset = resolveDraggedAsset(ev);
+        if (!asset || !canPlaceAsset(asset, state.doc).ok) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        void placeAsset(asset, { parent: id, localOrigin: true });
+      },
     }, el('span', { class: 'twisty' }, kids.length ? '▾' : '·'), e.name || id,
     e.prefab ? el('span', { class: 'badge' }, 'prefab') : null);
     tree.append(r);
@@ -1198,9 +1452,19 @@ function fieldWidget(id, kind, name, schema, stored) {
     }) : null);
   } else if (ty === 'asset') {
     const options = state.assets.filter((a) => !schema.kind || a.kind === schema.kind);
+    const nameCounts = new Map();
+    for (const a of options) {
+      const base = assetBasename(a.path);
+      nameCounts.set(base, (nameCounts.get(base) || 0) + 1);
+    }
     input = el('select', { onchange: (e) => commit(e.target.value || null) },
       el('option', { value: '' }, t('none')),
-      options.map((a) => el('option', { value: a.id, selected: a.id === value }, a.path.split('/').pop())));
+      options.map((a) => {
+        const base = assetBasename(a.path);
+        const dir = assetFolder(a.path);
+        const text = (nameCounts.get(base) || 0) > 1 && dir ? `${base} (${dir})` : base;
+        return el('option', { value: a.id, selected: a.id === value, title: a.path }, text);
+      }));
   } else {
     input = el('input', { type: 'text', value: JSON.stringify(value ?? null), onchange: (e) => {
       try { commit(JSON.parse(e.target.value)); } catch (err) { log(2, `${key}: ${err.message}`); }
@@ -1209,8 +1473,35 @@ function fieldWidget(id, kind, name, schema, stored) {
   const reset = stored !== undefined
     ? el('button', { class: 'mini', title: t('resetDefault'), onclick: () => edit(`${t('vReset')} ${key}`, [{ remove: ['entities', id, 'components', kind, ...path] }]) }, '↺')
     : null;
-  return el('div', { class: `field${path.length > 1 ? ' subfield' : ''}${stored === undefined ? ' default' : ''}`, title: schema.doc || '', 'data-key': `${kind}.${key}` },
-    el('label', {}, `${label(schema, leaf)}${unit}`), input, reset);
+  const row = el('div', {
+    class: `field${path.length > 1 ? ' subfield' : ''}${stored === undefined ? ' default' : ''}`,
+    title: schema.doc || '',
+    'data-key': `${kind}.${key}`,
+    'data-asset-kind': ty === 'asset' ? (schema.kind || '*') : null,
+  }, el('label', {}, `${label(schema, leaf)}${unit}`), input, reset);
+  if (ty === 'asset') {
+    const accepts = (asset) => asset && (!schema.kind || asset.kind === schema.kind);
+    row.addEventListener('dragover', (ev) => {
+      if (!hasAssetDrag(ev)) return;
+      if (state.draggingAsset && !accepts(state.draggingAsset)) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+      row.classList.add('drop-target');
+    });
+    row.addEventListener('dragleave', (ev) => {
+      if (!row.contains(ev.relatedTarget)) row.classList.remove('drop-target');
+    });
+    row.addEventListener('drop', (ev) => {
+      row.classList.remove('drop-target');
+      const asset = resolveDraggedAsset(ev);
+      if (!accepts(asset)) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      commit(asset.id);
+    });
+  }
+  return row;
 }
 
 function appendField(box, id, kind, path, f, stored) {
@@ -1377,6 +1668,7 @@ const inScene = (node) => !!node && ($('#viewport').contains(node) || $('#outlin
 
 function commands() {
   setupViewportFrame();
+  assetLibrary.setupEvents();
   $('#save').onclick = () => save();
   $('#undo').onclick = () => undoRedo('undo');
   $('#redo').onclick = () => undoRedo('redo');
@@ -1414,15 +1706,88 @@ function commands() {
   };
   $('#new-look').onclick = () => {
     if (!state.project) return;
-    const previous = state.assets.find(asset => asset.kind === 'look');
-    const dir = previous ? previous.path.slice(0, previous.path.lastIndexOf('/')) : state.project.content[0];
+    const dir = defaultCreateDir('look', '');
     const path = prompt(t('newLookFile'), dir + '/new.look.json');
     if (path) state.host.send({type: 'create', kind: 'look', path});
   };
   $('#new-scene').onclick = () => {
-    const path = prompt(t('newSceneFile'), 'content/scenes/new.scene.json');
-    if (path) state.host.send({ type: 'create', kind: 'scene', path, name: path.split('/').pop().replace('.scene.json', '') });
+    const dir = defaultCreateDir('scene', 'scenes');
+    const path = prompt(t('newSceneFile'), `${dir}/new.scene.json`);
+    if (path) state.host.send({ type: 'create', kind: 'scene', path, name: assetStem(path) });
   };
+  const newPrefabBtn = $('#new-prefab');
+  if (newPrefabBtn) {
+    newPrefabBtn.onclick = () => {
+      const dir = defaultCreateDir('prefab', 'prefabs');
+      const path = prompt(t('newPrefabFile'), `${dir}/new.prefab.json`);
+      if (path) state.host.send({ type: 'create', kind: 'prefab', path, name: assetStem(path) });
+    };
+  }
+  const outlinerTree = $('#outliner-tree');
+  outlinerTree.addEventListener('dragover', (ev) => {
+    if (!hasAssetDrag(ev)) return;
+    if (state.draggingAsset && !canPlaceAsset(state.draggingAsset, state.doc).ok) return;
+    ev.preventDefault();
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+  });
+  outlinerTree.addEventListener('drop', (ev) => {
+    const asset = resolveDraggedAsset(ev);
+    if (!asset || !canPlaceAsset(asset, state.doc).ok) return;
+    ev.preventDefault();
+    void placeAsset(asset);
+  });
+  const dock = $('#bottom-dock');
+  const toggleConsoleBtn = $('#toggle-console');
+  if (dock && toggleConsoleBtn) {
+    const setConsoleHidden = (hidden) => {
+      dock.classList.toggle('console-hidden', hidden);
+      toggleConsoleBtn.classList.toggle('on', !hidden);
+      toggleConsoleBtn.setAttribute('aria-pressed', String(!hidden));
+    };
+    try {
+      setConsoleHidden(localStorage.getItem('ganbate.studio.consoleHidden') === '1');
+    } catch {
+      setConsoleHidden(false);
+    }
+    toggleConsoleBtn.onclick = () => {
+      const nextHidden = !dock.classList.contains('console-hidden');
+      setConsoleHidden(nextHidden);
+      try { localStorage.setItem('ganbate.studio.consoleHidden', nextHidden ? '1' : '0'); } catch { /* ignore */ }
+    };
+  }
+  const resizer = $('#dock-resizer');
+  if (resizer) {
+    try {
+      const savedHeight = localStorage.getItem('ganbate.studio.dockHeight');
+      if (savedHeight && /^\d+px$/.test(savedHeight)) {
+        document.documentElement.style.setProperty('--dock-height', savedHeight);
+      }
+    } catch { /* ignore */ }
+    resizer.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      resizer.setPointerCapture(e.pointerId);
+      resizer.classList.add('dragging');
+      const onMove = (ev) => {
+        const maxH = Math.max(160, Math.round(window.innerHeight * 0.62));
+        const h = Math.max(120, Math.min(maxH, Math.round(window.innerHeight - ev.clientY)));
+        document.documentElement.style.setProperty('--dock-height', `${h}px`);
+      };
+      const onUp = () => {
+        resizer.classList.remove('dragging');
+        resizer.removeEventListener('pointermove', onMove);
+        resizer.removeEventListener('pointerup', onUp);
+        resizer.removeEventListener('pointercancel', onUp);
+        const cur = document.documentElement.style.getPropertyValue('--dock-height');
+        if (cur) {
+          try { localStorage.setItem('ganbate.studio.dockHeight', cur); } catch { /* ignore */ }
+        }
+      };
+      resizer.addEventListener('pointermove', onMove);
+      resizer.addEventListener('pointerup', onUp);
+      resizer.addEventListener('pointercancel', onUp);
+    });
+  }
   $('#outliner-filter').oninput = drawOutliner;
   $('#time').oninput = (e) => setTime(Number(e.target.value));
   window.addEventListener('keydown', (e) => {
