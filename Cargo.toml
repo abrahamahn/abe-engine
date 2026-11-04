@@ -7,7 +7,7 @@ publish = false
 description = "Ganbate Studio's native 3D renderer"
 
 [workspace]
-members = ["crates/ganbate-agent", "crates/ganbate-core", "crates/ganbate-assets", "crates/ganbate-physics", "crates/ganbate-pipeline", "crates/ganbate-scene", "crates/ganbate-shader", "crates/ganbate-studio", "crates/ganbate-web"]
+members = ["crates/ganbate-agent", "crates/ganbate-core", "crates/ganbate-assets", "crates/ganbate-audio", "crates/ganbate-physics", "crates/ganbate-pipeline", "crates/ganbate-scene", "crates/ganbate-shader", "crates/ganbate-studio", "crates/ganbate-web"]
 resolver = "3"
 
 [dependencies]
