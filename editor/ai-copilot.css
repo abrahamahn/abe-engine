@@ -108,6 +108,17 @@ body[data-ux-tier="creator"] .frame-options {
   color: var(--dim);
 }
 
+.gb-copilot-wg-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+  font-size: 11px;
+}
+
 .gb-copilot-tabs {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -328,4 +339,71 @@ body[data-ux-tier="creator"] .frame-options {
   font-weight: 600;
   background: rgba(232, 180, 74, 0.16);
   color: #f4d284;
+}
+
+.gb-copilot-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.gb-copilot-bench {
+  padding: 7px 9px;
+  border-radius: 6px;
+  background: #0c0f15;
+  border: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text);
+}
+
+.gb-copilot-bench-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.gb-copilot-bench-head strong {
+  font-size: 11px;
+  color: #f4d284;
+}
+
+.gb-copilot-bench-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: #cbd5e1;
+}
+
+.gb-copilot-bench-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: #cbd5e1;
+}
+
+.gb-copilot-bench-table th,
+.gb-copilot-bench-table td {
+  padding: 2px 4px;
+  border-top: 1px solid var(--line);
+  text-align: right;
+}
+
+.gb-copilot-bench-table th:first-child,
+.gb-copilot-bench-table td:first-child {
+  text-align: left;
+}
+
+.gb-copilot-bench-table th {
+  border-top: 0;
+  color: var(--dim);
+  font-weight: 600;
 }

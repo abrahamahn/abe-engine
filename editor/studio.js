@@ -556,6 +556,9 @@ function onMessage(msg) {
         state.aiCopilot?.updateWorldGraph?.(msg);
       }
       break;
+    case 'world-graph-benchmark-result':
+      state.aiCopilot?.updateBenchmarkResult?.(msg);
+      break;
     case 'error':
       if (msg.req === 'asset-rescan') {
         state.scanning = false;
@@ -2634,6 +2637,12 @@ function setupAiIdeBar() {
     patchWorldGraph: async (patch) => {
       if (!state.host?.open || state.host.kind === 'cloud') return null;
       const reply = await state.host.request({ type: 'world-graph-patch', patch });
+      if (reply?.type === 'error') return { ok: false, error: reply.message };
+      return reply;
+    },
+    benchmarkWorldGraph: async (iterations = 500) => {
+      if (!state.host?.open || state.host.kind === 'cloud') return null;
+      const reply = await state.host.request({ type: 'world-graph-benchmark', iterations });
       if (reply?.type === 'error') return { ok: false, error: reply.message };
       return reply;
     },

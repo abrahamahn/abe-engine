@@ -2622,7 +2622,8 @@ cam frame <subject|@selection|all> [azimuth=<deg>] [elevation=<deg>]";
     }
 
     /// Runs the reproducible read-only academic benchmark suite (`world_graph_benchmark`) against
-    /// `self.project.root`, optionally attaching rendered `latex` or `markdown` text when `format` is requested.
+    /// `self.project.root`, attaching a formatted `booktabs` `latex` table by default (unless
+    /// `include_latex: false`) and optional `rendered` text when `format` is requested.
     pub fn world_graph_benchmark(&self, args: &Value) -> Result<Value, String> {
         let iterations = match args.get("iterations") {
             Some(v) => {
@@ -2640,11 +2641,20 @@ cam frame <subject|@selection|all> [azimuth=<deg>] [elevation=<deg>]";
             Some(raw) if !raw.trim().is_empty() => Some(crate::ai::bench::BenchFormat::parse(raw)?),
             _ => None,
         };
+        let include_latex = match args.get("include_latex") {
+            Some(Value::Bool(b)) => *b,
+            _ => true,
+        };
         let report = crate::ai::bench::run_benchmark(&self.project.root, iterations)?;
         let mut val = report.to_json_value();
-        if let (Some(fmt), Value::Object(map)) = (requested_format, &mut val) {
-            map.insert("format".into(), s(fmt.as_str()));
-            map.insert("rendered".into(), Value::String(report.render(fmt, false)?));
+        if let Value::Object(map) = &mut val {
+            if include_latex {
+                map.insert("latex".into(), Value::String(report.to_latex()));
+            }
+            if let Some(fmt) = requested_format {
+                map.insert("format".into(), s(fmt.as_str()));
+                map.insert("rendered".into(), Value::String(report.render(fmt, false)?));
+            }
         }
         Ok(val)
     }

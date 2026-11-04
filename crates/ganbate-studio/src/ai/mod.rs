@@ -4,7 +4,7 @@
 //! - [`verify`] (`M-AI.4`): `<100ms` spatial lint, screen-box projection, GPU-budget oracle, and 2×2 AOV contact sheet.
 //! - [`mcp`] (`M-AI.1`): Warm JSON-RPC 2.0 MCP server bridging live `@selection` and Studio Undo/Redo transactions.
 //! - [`world_graph`]: `<400`-token Tri-Modal Semantic World Graph (`ganbate://context`) with `120Hz` and server-authority guardrails.
-//! - [`bench`]: Reproducible academic benchmark & empirical verification suite (`ganbate bench` / `world_graph_benchmark`).
+//! - [`mod@bench`]: Reproducible academic benchmark & empirical verification suite (`ganbate bench` / `world_graph_benchmark`).
 
 pub mod bench;
 pub mod catalog;
