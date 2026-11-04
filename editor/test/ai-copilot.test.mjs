@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  BENCH_SUBSYSTEM_LABELS,
   STARTER_TEMPLATES,
   UX_TIERS,
   buildDefaultWorldGraph,
+  buildFallbackBenchmarkReport,
   buildFallbackProjectContext,
   compileNaturalPromptToGbs,
   extractGbsFromLlmReply,
@@ -235,4 +237,123 @@ test('mountAiCopilot renders ganbate://context (120Hz) badge, syncs world-graph-
   assert.match(assistantMsgs.at(-1).children[0].textContent, /\[Authority Guardrail\]/);
 
   copilot.destroy();
+});
+
+test('mountAiCopilot dispatches world-graph-benchmark, renders empirical telemetry, copies LaTeX, and supports offline fallback', async () => {
+  const { body } = createMiniDom();
+  const wsRequests = [];
+  const copiedLatexLog = [];
+
+  const mockLatex = [
+    '\\begin{table}[t]',
+    '\\centering',
+    '\\toprule',
+    'Neuro-Symbolic Context Compression (86 files) & \\multicolumn{4}{r}{$6812.56\\times$ (1825766 $\\to$ 268 tok, 99.985\\% reduction)} \\\\',
+    '\\bottomrule',
+    '\\end{table}',
+  ].join('\n');
+
+  const mockBenchResult = {
+    type: 'world-graph-benchmark-result',
+    ok: true,
+    schema: 'ganbate.academic-benchmark.v1',
+    uri: 'ganbate://context',
+    environment: { os: 'linux', arch: 'x86_64', iterations: 500, sha256_nist_verified: true },
+    compression: {
+      source_files: 86,
+      raw_bytes: 7303064,
+      estimated_raw_tokens: 1825766,
+      graph_bytes: 1072,
+      estimated_graph_tokens: 268,
+      compression_ratio: 6812.56,
+      token_reduction_pct: 99.9853,
+    },
+    isomorphism: {
+      isomorphism_verified: true,
+      invertibility_verified: true,
+      byte_drift: 0,
+    },
+    guardrails: {
+      authority_total_cases: 16,
+      authority_rejected_cases: 16,
+      budget_total_cases: 8,
+      budget_clamped_cases: 8,
+    },
+    latencies_us: [
+      { id: 'world_graph_roundtrip', label: 'SemanticWorldGraph Round-Trip', p50_us: 10.62, p95_us: 13.71 },
+      { id: 'tri_modal_prompt_compile_and_patch', label: 'Tri-Modal Prompt Compile & Patch', p50_us: 8.63, p95_us: 10.89 },
+      { id: 'stereo_xr_frustum_pair', label: 'Omni Stereo XR Frustum Pair (63mm IPD)', p50_us: 0.14, p95_us: 0.17 },
+      { id: 'upper_body_ik_sanitize', label: 'Upper-Body 6-DoF IK Pose Sanitization', p50_us: 0.05, p95_us: 0.06 },
+      { id: 'governor_closed_loop_step', label: '120Hz Frame-Budget Governor Closed-Loop Tick', p50_us: 0.05, p95_us: 0.06 },
+    ],
+    latex: mockLatex,
+  };
+
+  const copilot = mountAiCopilot(body, {
+    getProjectName: () => 'Empirical Studio',
+    fetchWorldGraph: async () => ({ graph: buildDefaultWorldGraph() }),
+    benchmarkWorldGraph: async (iterations) => {
+      wsRequests.push({ type: 'world-graph-benchmark', iterations });
+      return mockBenchResult;
+    },
+    onCopyLatex: (tex) => copiedLatexLog.push(tex),
+  });
+
+  copilot.open('context');
+  await new Promise((r) => setTimeout(r, 15));
+
+  const wgCard = body.queryAll((n) => n.dataset?.role === 'world-graph-card')[0];
+  assert.ok(wgCard, 'world-graph-card mounted');
+
+  const runBtn = wgCard.queryAll((n) => n.dataset?.action === 'run-world-graph-bench')[0];
+  assert.ok(runBtn, 'run-world-graph-bench button mounted');
+  assert.equal(runBtn.textContent, '🎓 Run Empirical Benchmark');
+
+  runBtn.click();
+  await new Promise((r) => setTimeout(r, 15));
+
+  assert.deepEqual(wsRequests, [{ type: 'world-graph-benchmark', iterations: 500 }]);
+
+  // Re-query inside re-rendered context tab
+  const liveCard = body.queryAll((n) => n.dataset?.role === 'world-graph-card')[0];
+  const benchOut = liveCard.queryAll((n) => n.dataset?.role === 'world-graph-bench-output')[0];
+  assert.ok(benchOut, 'world-graph-bench-output rendered');
+
+  const allText = benchOut.queryAll(() => true).map((n) => n.textContent).join(' | ');
+  assert.match(allText, /6,812\.56x · 268 tok/);
+  assert.match(allText, /Code == UI == EN == KO: PASS · 0B drift/);
+  assert.match(allText, /16\/16 · 8\/8/);
+  for (const label of Object.values(BENCH_SUBSYSTEM_LABELS)) {
+    assert.ok(allText.includes(label), `expected subsystem row ${label} in latency table`);
+  }
+  assert.match(allText, /10\.62/);
+  assert.match(allText, /13\.71/);
+
+  const copyLatexBtn = liveCard.queryAll((n) => n.dataset?.action === 'copy-world-graph-latex')[0];
+  assert.ok(copyLatexBtn, 'copy-world-graph-latex button mounted');
+  copyLatexBtn.click();
+
+  assert.equal(copilot.getLastCopiedLatex(), mockLatex);
+  assert.deepEqual(copiedLatexLog, [mockLatex]);
+  assert.equal(copyLatexBtn.textContent, 'Copied LaTeX!');
+  copilot.destroy();
+
+  // Verify deterministic offline fallback when disconnected (`benchmarkWorldGraph` returns null)
+  const { body: offlineBody } = createMiniDom();
+  const offlineCopilot = mountAiCopilot(offlineBody, {
+    listAssets: () => [{ id: 'a1', kind: 'scene', path: 'scenes/stage.scene.json' }],
+    benchmarkWorldGraph: async () => null,
+  });
+  offlineCopilot.open('context');
+  await new Promise((r) => setTimeout(r, 15));
+  const fallbackRes = await offlineCopilot.runWorldGraphBenchmark(120);
+  assert.equal(fallbackRes.ok, true);
+  assert.equal(fallbackRes.offline_fallback, true);
+  assert.match(fallbackRes.latex, /\\begin\{table\}\[t\]/);
+  assert.equal(buildFallbackBenchmarkReport({ iterations: 32 }).latencies_us.length, 5);
+  const offlineOut = offlineBody.queryAll((n) => n.dataset?.role === 'world-graph-bench-output')[0];
+  const offlineText = offlineOut.queryAll(() => true).map((n) => n.textContent).join(' | ');
+  assert.match(offlineText, /Offline Fallback · N=120/);
+  assert.match(offlineText, /Code == UI == EN == KO: PASS · 0B drift/);
+  offlineCopilot.destroy();
 });

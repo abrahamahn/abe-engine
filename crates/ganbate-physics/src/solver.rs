@@ -9,8 +9,8 @@
 //! once per step; their separation is updated each substep from how far the bodies have moved
 //! (`dp`, `dq`), which is what makes substepping cheap and stable.
 //!
-//! Hot linear/angular velocities live in [`SolverVel`] (24 bytes per body) separate from cold
-//! pose/inertia state in [`SolverBody`], cutting Gauss-Seidel writeback cache traffic by 5.6x
+//! Hot linear/angular velocities live in `SolverVel` (24 bytes per body) separate from cold
+//! pose/inertia state in `SolverBody`, cutting Gauss-Seidel writeback cache traffic by 5.6x
 //! while keeping identical arithmetic order.
 
 use crate::math::{Mat3, Quat, Vec3};

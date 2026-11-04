@@ -285,6 +285,12 @@ pub fn tools_list() -> Value {
                         "Optional rendered snippet format to attach: json, latex, or markdown",
                     ),
                 ),
+                (
+                    "include_latex",
+                    prop_bool(
+                        "Include formatted booktabs LaTeX table in `latex` field (default true)",
+                    ),
+                ),
             ]),
             &[],
         ),
@@ -778,5 +784,14 @@ mod tests {
         );
         assert_eq!(ws_bench[0].1.get("ok"), Some(&Value::Bool(true)));
         assert_eq!(ws_bench[0].1.get("req"), Some(&s("wb-1")));
+        assert!(
+            ws_bench[0]
+                .1
+                .get("latex")
+                .and_then(|t| t.string().ok())
+                .is_some_and(
+                    |tex| tex.contains("\\begin{table}[t]") && tex.contains("\\bottomrule")
+                )
+        );
     }
 }

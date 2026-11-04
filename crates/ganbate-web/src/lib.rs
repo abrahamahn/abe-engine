@@ -11,6 +11,7 @@
 //!
 //! Query parameters read here: `view=NAME`, `time=HOURS`, `weather=PRESET`, `seconds=S`
 //! (start of the animation clock), `paused=1`, `quality=high`.
+#![cfg_attr(not(target_arch = "wasm32"), allow(rustdoc::broken_intra_doc_links))]
 #![cfg(target_arch = "wasm32")]
 
 mod physics;

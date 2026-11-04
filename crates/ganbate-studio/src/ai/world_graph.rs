@@ -101,12 +101,15 @@ pub struct CameraState {
     pub fov_y_deg: f32,
 }
 
+const DEFAULT_CAMERA_POSITION: [f32; 3] = [0.0, 1.65, 3.2];
+const DEFAULT_CAMERA_TARGET: [f32; 3] = [0.0, 1.0, 0.0];
+
 impl Default for CameraState {
     fn default() -> Self {
         Self {
             preset: "default".into(),
-            position: [0.0, 1.65, 3.2],
-            target: [0.0, 1.0, 0.0],
+            position: DEFAULT_CAMERA_POSITION,
+            target: DEFAULT_CAMERA_TARGET,
             fov_y_deg: 50.0,
         }
     }
@@ -206,12 +209,13 @@ impl Default for SemanticWorldGraph {
     }
 }
 
+#[inline]
 fn clamp_with_notice(
     val: &mut f32,
     min: f32,
     max: f32,
     fallback: f32,
-    field: &str,
+    field: impl std::fmt::Display,
     notices: &mut Vec<String>,
 ) {
     if !val.is_finite() {
@@ -334,21 +338,27 @@ impl SemanticWorldGraph {
 
         // Camera guardrails.
         sanitize_string_len(&mut self.camera.preset, "default", 32);
-        for (idx, axis) in ["x", "y", "z"].iter().enumerate() {
+        const CAM_POS_FIELDS: [&str; 3] = [
+            "camera.position.x",
+            "camera.position.y",
+            "camera.position.z",
+        ];
+        const CAM_TGT_FIELDS: [&str; 3] = ["camera.target.x", "camera.target.y", "camera.target.z"];
+        for idx in 0..3 {
             clamp_with_notice(
                 &mut self.camera.position[idx],
                 -500.0,
                 500.0,
-                CameraState::default().position[idx],
-                &format!("camera.position.{axis}"),
+                DEFAULT_CAMERA_POSITION[idx],
+                CAM_POS_FIELDS[idx],
                 &mut notices,
             );
             clamp_with_notice(
                 &mut self.camera.target[idx],
                 -500.0,
                 500.0,
-                CameraState::default().target[idx],
-                &format!("camera.target.{axis}"),
+                DEFAULT_CAMERA_TARGET[idx],
+                CAM_TGT_FIELDS[idx],
                 &mut notices,
             );
         }
@@ -380,14 +390,13 @@ impl SemanticWorldGraph {
             sanitize_string_len(&mut ent.id, "stage_entity", 40);
             sanitize_string_len(&mut ent.role, "prop", 32);
             sanitize_string_len(&mut ent.style_preset, "default", 32);
-            let ent_id = ent.id.clone();
             for (idx, axis) in ["x", "y", "z"].iter().enumerate() {
                 clamp_with_notice(
                     &mut ent.offset_metres[idx],
                     -100.0,
                     100.0,
                     0.0,
-                    &format!("entities[{ent_id}].offset_metres.{axis}"),
+                    format_args!("entities[{}].offset_metres.{axis}", ent.id),
                     &mut notices,
                 );
             }
@@ -396,7 +405,7 @@ impl SemanticWorldGraph {
                 -360.0,
                 360.0,
                 0.0,
-                &format!("entities[{ent_id}].yaw_deg"),
+                format_args!("entities[{}].yaw_deg", ent.id),
                 &mut notices,
             );
             for (idx, ch) in ["r", "g", "b", "a"].iter().enumerate() {
@@ -405,7 +414,7 @@ impl SemanticWorldGraph {
                     0.0,
                     1.0,
                     1.0,
-                    &format!("entities[{ent_id}].tint_rgba.{ch}"),
+                    format_args!("entities[{}].tint_rgba.{ch}", ent.id),
                     &mut notices,
                 );
             }
@@ -414,7 +423,7 @@ impl SemanticWorldGraph {
                 0.25,
                 3.0,
                 1.0,
-                &format!("entities[{ent_id}].speed_scale"),
+                format_args!("entities[{}].speed_scale", ent.id),
                 &mut notices,
             );
         }
@@ -542,10 +551,9 @@ impl SemanticWorldGraph {
             return Err("SemanticWorldGraph expected a JSON object".into());
         }
         let mut graph = Self::default();
-        let mut parse_notices = parse_merge_into(&mut graph, v)?;
+        parse_merge_into(&mut graph, v)?;
         let clamp_notices = graph.validate_and_clamp();
-        parse_notices.extend(clamp_notices);
-        Ok((graph, parse_notices))
+        Ok((graph, clamp_notices))
     }
 }
 
@@ -619,8 +627,7 @@ fn apply_entity_patch(ent: &mut StageEntity, v: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_merge_into(graph: &mut SemanticWorldGraph, patch: &Value) -> Result<Vec<String>, String> {
-    let notices = Vec::new();
+fn parse_merge_into(graph: &mut SemanticWorldGraph, patch: &Value) -> Result<(), String> {
     let Value::Object(map) = patch else {
         return Err("world graph patch must be a JSON object".into());
     };
@@ -743,7 +750,7 @@ fn parse_merge_into(graph: &mut SemanticWorldGraph, patch: &Value) -> Result<Vec
         }
     }
 
-    Ok(notices)
+    Ok(())
 }
 
 const FORBIDDEN_AUTHORITY_KEYS: &[&str] = &[
@@ -1063,8 +1070,8 @@ pub fn apply_world_graph_patch(
     }
 
     let mut next = current.clone();
-    let mut notices = parse_merge_into(&mut next, patch)?;
-    notices.extend(next.validate_and_clamp());
+    parse_merge_into(&mut next, patch)?;
+    let notices = next.validate_and_clamp();
 
     let empty_patch = matches!(patch, Value::Object(m) if m.is_empty());
     let applied = !empty_patch && (next != *current || !notices.is_empty());
