@@ -931,12 +931,11 @@ fn scan_cargo_manifest_deps(manifest_text: &str) -> (usize, usize) {
         if trimmed.is_empty() {
             return;
         }
-        if trimmed.contains("path") && trimmed.contains('=') {
-            *internal += 1;
-        } else if trimmed.contains("workspace")
+        let is_path_dep = trimmed.contains("path") && trimmed.contains('=');
+        let is_workspace_dep = trimmed.contains("workspace")
             && trimmed.contains("true")
-            && !trimmed.contains("version")
-        {
+            && !trimmed.contains("version");
+        if is_path_dep || is_workspace_dep {
             *internal += 1;
         } else {
             *external += 1;
