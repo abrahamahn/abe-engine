@@ -63,7 +63,7 @@ use std::f32::consts::{PI, TAU};
 
 use crate::math::{Iso, Mat3, Quat, Vec3};
 use crate::shape::MAX_EXTENT;
-use crate::solver::{BodyFrame, Softness, SolverBody, StepContext};
+use crate::solver::{BodyFrame, Softness, SolverBody, SolverVel, StepContext};
 use crate::world::BodyId;
 
 /// Drives a hinge (angular speed, rad/s, with a torque limit, N·m) or a slider (speed, m/s, with
@@ -577,52 +577,56 @@ pub(crate) fn prepare(
 }
 
 /// Applies the accumulated impulses (each substep, before solving).
-pub(crate) fn warm_start(c: &JointConstraint, bodies: &mut [SolverBody]) {
+pub(crate) fn warm_start(c: &JointConstraint, bodies: &[SolverBody], vels: &mut [SolverVel]) {
     if let Rows::Inactive = c.rows {
         return;
     }
-    let (mut ba, mut bb) = (bodies[c.a], bodies[c.b]);
-    let g = c.geometry(&ba, &bb);
+    let (ba, bb) = (&bodies[c.a], &bodies[c.b]);
+    let (mut va, mut vb) = (vels[c.a], vels[c.b]);
+    let g = c.geometry(ba, bb);
     let i = &c.impulses;
     // Each accumulated impulse is a number; their sums are kept numbers too.
     let axial = saturate(i.axial + i.motor + i.lower - i.upper);
     match c.rows {
         Rows::Inactive => {}
-        Rows::Ball => push(&mut ba, &mut bb, i.linear, g.ra, g.rb),
+        Rows::Ball => push(ba, bb, &mut va, &mut vb, i.linear, g.ra, g.rb),
         Rows::Fixed => {
-            push(&mut ba, &mut bb, i.linear, g.ra, g.rb);
-            turn(&mut ba, &mut bb, i.angular);
+            push(ba, bb, &mut va, &mut vb, i.linear, g.ra, g.rb);
+            turn(ba, bb, &mut va, &mut vb, i.angular);
         }
         Rows::Hinge(_) => {
             let (x, y, z) = axes(g.qa);
-            push(&mut ba, &mut bb, i.linear, g.ra, g.rb);
+            push(ba, bb, &mut va, &mut vb, i.linear, g.ra, g.rb);
             turn(
-                &mut ba,
-                &mut bb,
+                ba,
+                bb,
+                &mut va,
+                &mut vb,
                 saturate_vec(y * c.cross[0] + z * c.cross[1] + x * axial),
             );
         }
         Rows::Slider(_) => {
             let (x, y, z) = axes(g.qa);
             let p = saturate_vec(y * c.cross[0] + z * c.cross[1] + x * axial);
-            push(&mut ba, &mut bb, p, g.ra + g.d, g.rb);
-            turn(&mut ba, &mut bb, i.angular);
+            push(ba, bb, &mut va, &mut vb, p, g.ra + g.d, g.rb);
+            turn(ba, bb, &mut va, &mut vb, i.angular);
         }
         Rows::Distance(_) => {
             let (n, _) = g.d.normalize_and_length();
-            push(&mut ba, &mut bb, n * axial, g.ra, g.rb);
+            push(ba, bb, &mut va, &mut vb, n * axial, g.ra, g.rb);
         }
     }
     // Impulses that would leave a velocity not finite are not applied; the solve then drops the
     // joint for the step.
-    write_back(bodies, c.a, ba, c.b, bb);
+    write_back(vels, c.a, va, c.b, vb);
 }
 
 /// One pass over the joint: with the soft position bias when `use_bias`, without it to relax.
 pub(crate) fn solve(
     c: &mut JointConstraint,
     desc: &JointDesc,
-    bodies: &mut [SolverBody],
+    bodies: &[SolverBody],
+    vels: &mut [SolverVel],
     ctx: &StepContext,
     use_bias: bool,
 ) {
@@ -631,21 +635,22 @@ pub(crate) fn solve(
     if let Rows::Inactive = c.rows {
         return;
     }
-    let (mut ba, mut bb) = (bodies[c.a], bodies[c.b]);
-    let g = c.geometry(&ba, &bb);
-    let (ba_, bb_) = (&mut ba, &mut bb);
+    let (ba, bb) = (&bodies[c.a], &bodies[c.b]);
+    let (mut va, mut vb) = (vels[c.a], vels[c.b]);
+    let g = c.geometry(ba, bb);
+    let (va_, vb_) = (&mut va, &mut vb);
     match c.rows {
         Rows::Inactive => {}
-        Rows::Ball => solve_point(&mut c.impulses.linear, &g, ba_, bb_, ctx, use_bias),
-        Rows::Hinge(axial) => solve_hinge(c, &axial, &g, ba_, bb_, ctx, use_bias),
-        Rows::Slider(axial) => solve_slider(c, &axial, &g, ba_, bb_, ctx, use_bias),
+        Rows::Ball => solve_point(&mut c.impulses.linear, &g, ba, bb, va_, vb_, ctx, use_bias),
+        Rows::Hinge(axial) => solve_hinge(c, &axial, &g, ba, bb, va_, vb_, ctx, use_bias),
+        Rows::Slider(axial) => solve_slider(c, &axial, &g, ba, bb, va_, vb_, ctx, use_bias),
         Rows::Fixed => {
-            solve_rotation(&mut c.impulses.angular, &g, ba_, bb_, ctx, use_bias);
-            solve_point(&mut c.impulses.linear, &g, ba_, bb_, ctx, use_bias);
+            solve_rotation(&mut c.impulses.angular, &g, ba, bb, va_, vb_, ctx, use_bias);
+            solve_point(&mut c.impulses.linear, &g, ba, bb, va_, vb_, ctx, use_bias);
         }
-        Rows::Distance(dist) => solve_distance(c, &dist, &g, ba_, bb_, ctx, use_bias),
+        Rows::Distance(dist) => solve_distance(c, &dist, &g, ba, bb, va_, vb_, ctx, use_bias),
     }
-    if !write_back(bodies, c.a, ba, c.b, bb) {
+    if !write_back(vels, c.a, va, c.b, vb) {
         // Numbers past what `f32` can carry: this joint does nothing more this step.
         c.rows = Rows::Inactive;
         c.impulses = JointImpulses::default();
@@ -653,12 +658,15 @@ pub(crate) fn solve(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn solve_hinge(
     c: &mut JointConstraint,
     axial: &Axial,
     g: &Geometry,
-    ba: &mut SolverBody,
-    bb: &mut SolverBody,
+    ba: &SolverBody,
+    bb: &SolverBody,
+    va: &mut SolverVel,
+    vb: &mut SolverVel,
     ctx: &StepContext,
     use_bias: bool,
 ) {
@@ -689,42 +697,42 @@ fn solve_hinge(
             }
             _ => angle,
         };
-        let speed = |ba: &SolverBody, bb: &SolverBody| x.dot(bb.w - ba.w);
+        let speed = |va: &SolverVel, vb: &SolverVel| x.dot(vb.w - va.w);
         let i = &mut c.impulses;
         if let Some(s) = axial.spring {
-            let impulse = -mass * s.mass_scale * (speed(ba, bb) + s.bias_rate * angle)
+            let impulse = -mass * s.mass_scale * (speed(va, vb) + s.bias_rate * angle)
                 - s.impulse_scale * i.axial;
             let applied = accumulate(&mut i.axial, impulse);
-            turn(ba, bb, x * applied);
+            turn(ba, bb, va, vb, x * applied);
         }
         if let Some(m) = axial.motor {
-            let impulse = -mass * (speed(ba, bb) - m.speed);
+            let impulse = -mass * (speed(va, vb) - m.speed);
             let max = saturate(m.max_force * ctx.h);
             let old = i.motor;
             i.motor = clamp(saturate(old + impulse), -max, max);
-            turn(ba, bb, x * (i.motor - old));
+            turn(ba, bb, va, vb, x * (i.motor - old));
         }
         if let Some(lower) = axial.lower {
             let delta = one_sided(
                 &mut i.lower,
                 mass,
-                speed(ba, bb),
+                speed(va, vb),
                 limit_angle - lower,
                 ctx,
                 use_bias,
             );
-            turn(ba, bb, x * delta);
+            turn(ba, bb, va, vb, x * delta);
         }
         if let Some(upper) = axial.upper {
             let delta = one_sided(
                 &mut i.upper,
                 mass,
-                -speed(ba, bb),
+                -speed(va, vb),
                 upper - limit_angle,
                 ctx,
                 use_bias,
             );
-            turn(ba, bb, x * -delta);
+            turn(ba, bb, va, vb, x * -delta);
         }
     }
 
@@ -732,7 +740,7 @@ fn solve_hinge(
     // the swing between the axes.
     let s = hard(ctx, use_bias);
     let (iy, iz) = (inv_i.mul_vec(y), inv_i.mul_vec(z));
-    let w = bb.w - ba.w;
+    let w = vb.w - va.w;
     let mut rhs = (y.dot(w), z.dot(w));
     if use_bias {
         let e = swing(x, g.qb.rotate(Vec3::X), y);
@@ -757,18 +765,21 @@ fn solve_hinge(
         accumulate(&mut c.cross[0], impulse[0]),
         accumulate(&mut c.cross[1], impulse[1]),
     ];
-    turn(ba, bb, y * applied[0] + z * applied[1]);
+    turn(ba, bb, va, vb, y * applied[0] + z * applied[1]);
 
-    solve_point(&mut c.impulses.linear, g, ba, bb, ctx, use_bias);
+    solve_point(&mut c.impulses.linear, g, ba, bb, va, vb, ctx, use_bias);
     c.impulses.angular = y * c.cross[0] + z * c.cross[1];
 }
 
+#[allow(clippy::too_many_arguments)]
 fn solve_slider(
     c: &mut JointConstraint,
     axial: &Axial,
     g: &Geometry,
-    ba: &mut SolverBody,
-    bb: &mut SolverBody,
+    ba: &SolverBody,
+    bb: &SolverBody,
+    va: &mut SolverVel,
+    vb: &mut SolverVel,
     ctx: &StepContext,
     use_bias: bool,
 ) {
@@ -777,50 +788,50 @@ fn solve_slider(
     // same point (no torque on the pair).
     let (ra, rb) = (g.ra + g.d, g.rb);
     let m = ba.inv_mass + bb.inv_mass;
-    let relative = |ba: &SolverBody, bb: &SolverBody| bb.point_velocity(rb) - ba.point_velocity(ra);
+    let relative = |va: &SolverVel, vb: &SolverVel| vb.point_velocity(rb) - va.point_velocity(ra);
     if axial.any() {
         let mass = linear_row_mass(ba, bb, ra, rb, x);
         let position = x.dot(g.d);
-        let speed = |ba: &SolverBody, bb: &SolverBody| x.dot(relative(ba, bb));
+        let speed = |va: &SolverVel, vb: &SolverVel| x.dot(relative(va, vb));
         let i = &mut c.impulses;
         if let Some(s) = axial.spring {
-            let impulse = -mass * s.mass_scale * (speed(ba, bb) + s.bias_rate * position)
+            let impulse = -mass * s.mass_scale * (speed(va, vb) + s.bias_rate * position)
                 - s.impulse_scale * i.axial;
             let applied = accumulate(&mut i.axial, impulse);
-            push(ba, bb, x * applied, ra, rb);
+            push(ba, bb, va, vb, x * applied, ra, rb);
         }
         if let Some(motor) = axial.motor {
-            let impulse = -mass * (speed(ba, bb) - motor.speed);
+            let impulse = -mass * (speed(va, vb) - motor.speed);
             let max = saturate(motor.max_force * ctx.h);
             let old = i.motor;
             i.motor = clamp(saturate(old + impulse), -max, max);
-            push(ba, bb, x * (i.motor - old), ra, rb);
+            push(ba, bb, va, vb, x * (i.motor - old), ra, rb);
         }
         if let Some(lower) = axial.lower {
             let delta = one_sided(
                 &mut i.lower,
                 mass,
-                speed(ba, bb),
+                speed(va, vb),
                 position - lower,
                 ctx,
                 use_bias,
             );
-            push(ba, bb, x * delta, ra, rb);
+            push(ba, bb, va, vb, x * delta, ra, rb);
         }
         if let Some(upper) = axial.upper {
             let delta = one_sided(
                 &mut i.upper,
                 mass,
-                -speed(ba, bb),
+                -speed(va, vb),
                 upper - position,
                 ctx,
                 use_bias,
             );
-            push(ba, bb, x * -delta, ra, rb);
+            push(ba, bb, va, vb, x * -delta, ra, rb);
         }
     }
 
-    solve_rotation(&mut c.impulses.angular, g, ba, bb, ctx, use_bias);
+    solve_rotation(&mut c.impulses.angular, g, ba, bb, va, vb, ctx, use_bias);
 
     // Frame B's origin on frame A's X axis: two linear rows along frame A's Y and Z axes.
     let s = hard(ctx, use_bias);
@@ -828,7 +839,7 @@ fn solve_slider(
     let (iay, iaz) = (ba.inv_inertia.mul_vec(say), ba.inv_inertia.mul_vec(saz));
     let (iby, ibz) = (bb.inv_inertia.mul_vec(sby), bb.inv_inertia.mul_vec(sbz));
     let (my, mz) = (m.mul_elem(y), m.mul_elem(z));
-    let v = relative(ba, bb);
+    let v = relative(va, vb);
     let mut rhs = (y.dot(v), z.dot(v));
     if use_bias {
         rhs.0 += s.bias_rate * y.dot(g.d);
@@ -849,16 +860,19 @@ fn solve_slider(
         accumulate(&mut c.cross[0], impulse[0]),
         accumulate(&mut c.cross[1], impulse[1]),
     ];
-    push(ba, bb, y * applied[0] + z * applied[1], ra, rb);
+    push(ba, bb, va, vb, y * applied[0] + z * applied[1], ra, rb);
     c.impulses.linear = y * c.cross[0] + z * c.cross[1];
 }
 
+#[allow(clippy::too_many_arguments)]
 fn solve_distance(
     c: &mut JointConstraint,
     dist: &Distance,
     g: &Geometry,
-    ba: &mut SolverBody,
-    bb: &mut SolverBody,
+    ba: &SolverBody,
+    bb: &SolverBody,
+    va: &mut SolverVel,
+    vb: &mut SolverVel,
     ctx: &StepContext,
     use_bias: bool,
 ) {
@@ -867,7 +881,7 @@ fn solve_distance(
     let (ra, rb) = (g.ra, g.rb);
     let mass = linear_row_mass(ba, bb, ra, rb, n);
     let speed =
-        |ba: &SolverBody, bb: &SolverBody| n.dot(bb.point_velocity(rb) - ba.point_velocity(ra));
+        |va: &SolverVel, vb: &SolverVel| n.dot(vb.point_velocity(rb) - va.point_velocity(ra));
     let i = &mut c.impulses;
     if dist.rigid {
         let s = hard(ctx, use_bias);
@@ -876,48 +890,51 @@ fn solve_distance(
         } else {
             0.0
         };
-        let impulse = -mass * s.mass_scale * (speed(ba, bb) + bias) - s.impulse_scale * i.axial;
+        let impulse = -mass * s.mass_scale * (speed(va, vb) + bias) - s.impulse_scale * i.axial;
         let applied = accumulate(&mut i.axial, impulse);
-        push(ba, bb, n * applied, ra, rb);
+        push(ba, bb, va, vb, n * applied, ra, rb);
         return;
     }
     if let Some(s) = dist.spring {
-        let impulse = -mass * s.mass_scale * (speed(ba, bb) + s.bias_rate * (length - dist.length))
+        let impulse = -mass * s.mass_scale * (speed(va, vb) + s.bias_rate * (length - dist.length))
             - s.impulse_scale * i.axial;
         let applied = accumulate(&mut i.axial, impulse);
-        push(ba, bb, n * applied, ra, rb);
+        push(ba, bb, va, vb, n * applied, ra, rb);
     }
     if dist.min > 0.0 {
         let delta = one_sided(
             &mut i.lower,
             mass,
-            speed(ba, bb),
+            speed(va, vb),
             length - dist.min,
             ctx,
             use_bias,
         );
-        push(ba, bb, n * delta, ra, rb);
+        push(ba, bb, va, vb, n * delta, ra, rb);
     }
     if dist.max.is_finite() {
         let delta = one_sided(
             &mut i.upper,
             mass,
-            -speed(ba, bb),
+            -speed(va, vb),
             dist.max - length,
             ctx,
             use_bias,
         );
-        push(ba, bb, n * -delta, ra, rb);
+        push(ba, bb, va, vb, n * -delta, ra, rb);
     }
 }
 
 /// The point rows: anchor B on anchor A, three linear rows solved together through the 3×3
 /// effective mass `K = (M_a⁻¹ + M_b⁻¹) − [r_a]× I_a⁻¹ [r_a]× − [r_b]× I_b⁻¹ [r_b]×`.
+#[allow(clippy::too_many_arguments)]
 fn solve_point(
     acc: &mut Vec3,
     g: &Geometry,
-    ba: &mut SolverBody,
-    bb: &mut SolverBody,
+    ba: &SolverBody,
+    bb: &SolverBody,
+    va: &mut SolverVel,
+    vb: &mut SolverVel,
     ctx: &StepContext,
     use_bias: bool,
 ) {
@@ -926,7 +943,7 @@ fn solve_point(
     let k = Mat3::from_diagonal(ba.inv_mass + bb.inv_mass)
         - sa * ba.inv_inertia * sa
         - sb * bb.inv_inertia * sb;
-    let cdot = bb.point_velocity(g.rb) - ba.point_velocity(g.ra);
+    let cdot = vb.point_velocity(g.rb) - va.point_velocity(g.ra);
     let bias = if use_bias {
         g.d * s.bias_rate
     } else {
@@ -935,22 +952,25 @@ fn solve_point(
     let x = solve3(&k, cdot + bias, linear_scale(ba, bb, g.ra, g.rb));
     let impulse = -(x * s.mass_scale) - *acc * s.impulse_scale;
     let applied = accumulate_vec(acc, impulse);
-    push(ba, bb, applied, g.ra, g.rb);
+    push(ba, bb, va, vb, applied, g.ra, g.rb);
 }
 
 /// Three angular rows locking frame B's rotation to frame A's (slider, fixed), through the
 /// effective mass `I_a⁻¹ + I_b⁻¹`; the error is the rotation vector between the frames.
+#[allow(clippy::too_many_arguments)]
 fn solve_rotation(
     acc: &mut Vec3,
     g: &Geometry,
-    ba: &mut SolverBody,
-    bb: &mut SolverBody,
+    ba: &SolverBody,
+    bb: &SolverBody,
+    va: &mut SolverVel,
+    vb: &mut SolverVel,
     ctx: &StepContext,
     use_bias: bool,
 ) {
     let s = hard(ctx, use_bias);
     let k = ba.inv_inertia + bb.inv_inertia;
-    let cdot = bb.w - ba.w;
+    let cdot = vb.w - va.w;
     let bias = if use_bias {
         rotation_error(g.qa, g.qb) * s.bias_rate
     } else {
@@ -961,7 +981,7 @@ fn solve_rotation(
     let x = solve3(&k, cdot + bias, trace(&k));
     let impulse = -(x * s.mass_scale) - *acc * s.impulse_scale;
     let applied = accumulate_vec(acc, impulse);
-    turn(ba, bb, applied);
+    turn(ba, bb, va, vb, applied);
 }
 
 /// One side of a limit. `c` is how far the joint is inside it (negative once past it) and `cdot`
@@ -1004,38 +1024,46 @@ fn hard(ctx: &StepContext, use_bias: bool) -> Softness {
 
 /// Linear impulse `p` on B at `rb` and `-p` on A at `ra`.
 #[inline]
-fn push(ba: &mut SolverBody, bb: &mut SolverBody, p: Vec3, ra: Vec3, rb: Vec3) {
-    ba.apply(-p, ra);
-    bb.apply(p, rb);
+fn push(
+    ba: &SolverBody,
+    bb: &SolverBody,
+    va: &mut SolverVel,
+    vb: &mut SolverVel,
+    p: Vec3,
+    ra: Vec3,
+    rb: Vec3,
+) {
+    ba.apply(va, -p, ra);
+    bb.apply(vb, p, rb);
 }
 
 /// Angular impulse `l` on B and `-l` on A.
 #[inline]
-fn turn(ba: &mut SolverBody, bb: &mut SolverBody, l: Vec3) {
-    ba.w -= ba.inv_inertia.mul_vec(l);
-    bb.w += bb.inv_inertia.mul_vec(l);
+fn turn(ba: &SolverBody, bb: &SolverBody, va: &mut SolverVel, vb: &mut SolverVel, l: Vec3) {
+    va.w -= ba.inv_inertia.mul_vec(l);
+    vb.w += bb.inv_inertia.mul_vec(l);
 }
 
-/// Writes two solver bodies back, never touching the static slot. Writes nothing and returns
+/// Writes two solver velocities back, never touching the static slot. Writes nothing and returns
 /// false when a velocity is not a number, or so large that its square is not (beyond 1.8e19:
 /// only numbers past what `f32` carries, such as a saturated impulse on a light body, give one).
 #[inline]
 fn write_back(
-    bodies: &mut [SolverBody],
+    vels: &mut [SolverVel],
     a: usize,
-    ba: SolverBody,
+    va: SolverVel,
     b: usize,
-    bb: SolverBody,
+    vb: SolverVel,
 ) -> bool {
     let usable = |v: Vec3| v.length_squared().is_finite();
-    if !(usable(ba.v) && usable(ba.w) && usable(bb.v) && usable(bb.w)) {
+    if !(usable(va.v) && usable(va.w) && usable(vb.v) && usable(vb.w)) {
         return false;
     }
     if a != 0 {
-        bodies[a] = ba;
+        vels[a] = va;
     }
     if b != 0 {
-        bodies[b] = bb;
+        vels[b] = vb;
     }
     true
 }
@@ -1278,14 +1306,17 @@ mod tests {
         // by that much. That row must be left alone too, or it stops the table.
         let rb = Vec3::new(0.0, -0.1, 7.45e-9);
         let table = SolverBody {
-            w: Vec3::new(0.0, 2.0, 0.0),
             inv_inertia: Mat3::from_diagonal(Vec3::new(0.0, 1.2, 0.0)),
             ..SolverBody::STATIC
+        };
+        let table_vel = SolverVel {
+            v: Vec3::ZERO,
+            w: Vec3::new(0.0, 2.0, 0.0),
         };
         let sb = Mat3::skew(rb);
         let k = Mat3::ZERO - sb * table.inv_inertia * sb;
         assert!(k.cols[0].x > 0.0 && k.cols[0].x < 1e-15, "{k:?}");
-        let cdot = table.point_velocity(rb);
+        let cdot = table_vel.point_velocity(rb);
         let scale = linear_scale(&SolverBody::STATIC, &table, Vec3::ZERO, rb);
         assert_eq!(solve3(&k, cdot, scale), Vec3::ZERO, "{k:?} {cdot:?}");
     }
@@ -1408,13 +1439,19 @@ mod tests {
     /// its spin about X after one soft pass and after a relax pass, and the lower and upper
     /// impulses.
     fn just_past_the_upper_limit(lower: f32, upper: f32) -> (f32, f32, f32, f32) {
-        let mut bodies = vec![
+        let bodies = vec![
             SolverBody::STATIC,
             SolverBody {
-                w: Vec3::new(2.0, 0.0, 0.0),
                 inv_mass: Vec3::ONE,
                 inv_inertia: Mat3::IDENTITY,
                 ..SolverBody::STATIC
+            },
+        ];
+        let mut vels = vec![
+            SolverVel::ZERO,
+            SolverVel {
+                v: Vec3::ZERO,
+                w: Vec3::new(2.0, 0.0, 0.0),
             },
         ];
         let id = BodyId {
@@ -1441,10 +1478,10 @@ mod tests {
         let ctx = context();
         let fa = frame(Vec3::ZERO, 0);
         let mut c = prepare(&desc, &fa, &fb, &bodies, &ctx, JointImpulses::default());
-        solve(&mut c, &desc, &mut bodies, &ctx, true);
-        let soft = bodies[1].w.x;
-        solve(&mut c, &desc, &mut bodies, &ctx, false);
-        (soft, bodies[1].w.x, c.impulses.lower, c.impulses.upper)
+        solve(&mut c, &desc, &bodies, &mut vels, &ctx, true);
+        let soft = vels[1].w.x;
+        solve(&mut c, &desc, &bodies, &mut vels, &ctx, false);
+        (soft, vels[1].w.x, c.impulses.lower, c.impulses.upper)
     }
 
     #[test]
@@ -1496,14 +1533,19 @@ mod tests {
     fn a_rigid_pass_stops_the_anchor_without_touching_locked_axes_or_the_static_slot() {
         // A body hanging 1 m below a fixed pivot, moving away from it. It cannot move along Z
         // nor turn about X or Y.
-        let mut bodies = vec![
+        let bodies = vec![
             SolverBody::STATIC,
             SolverBody {
-                v: Vec3::new(1.0, -2.0, 0.0),
-                w: Vec3::new(0.0, 0.0, 0.5),
                 inv_mass: Vec3::new(1.0, 1.0, 0.0),
                 inv_inertia: Mat3::from_diagonal(Vec3::new(0.0, 0.0, 2.0)),
                 ..SolverBody::STATIC
+            },
+        ];
+        let mut vels = vec![
+            SolverVel::ZERO,
+            SolverVel {
+                v: Vec3::new(1.0, -2.0, 0.0),
+                w: Vec3::new(0.0, 0.0, 0.5),
             },
         ];
         let id = BodyId {
@@ -1523,47 +1565,50 @@ mod tests {
         let ctx = context();
         let (fa, fb) = (frame(Vec3::ZERO, 0), frame(Vec3::new(0.0, -1.0, 0.0), 1));
         let mut c = prepare(&desc, &fa, &fb, &bodies, &ctx, JointImpulses::default());
-        warm_start(&c, &mut bodies);
-        solve(&mut c, &desc, &mut bodies, &ctx, false);
-        let v = bodies[1].point_velocity(anchor);
+        warm_start(&c, &bodies, &mut vels);
+        solve(&mut c, &desc, &bodies, &mut vels, &ctx, false);
+        let v = vels[1].point_velocity(anchor);
         assert!(
             v.x.abs() < 1e-5 && v.y.abs() < 1e-5,
             "the anchor stops: {v:?}"
         );
-        assert_eq!(bodies[1].v.z, 0.0);
-        assert_eq!((bodies[1].w.x, bodies[1].w.y), (0.0, 0.0));
+        assert_eq!(vels[1].v.z, 0.0);
+        assert_eq!((vels[1].w.x, vels[1].w.y), (0.0, 0.0));
         assert_eq!(
             c.impulses.linear.z, 0.0,
             "nothing pushes along the locked axis"
         );
-        assert_eq!(bodies[0].v, Vec3::ZERO);
-        assert_eq!(bodies[0].w, Vec3::ZERO);
+        assert_eq!(vels[0].v, Vec3::ZERO);
+        assert_eq!(vels[0].w, Vec3::ZERO);
         // The impulse is kept for the next substep, and warm starting with it alone stops the
         // same motion again.
         let kept = c.impulses;
-        let mut again = vec![
-            SolverBody::STATIC,
-            SolverBody {
+        let mut again_vels = vec![
+            SolverVel::ZERO,
+            SolverVel {
                 v: Vec3::new(1.0, -2.0, 0.0),
                 w: Vec3::new(0.0, 0.0, 0.5),
-                ..bodies[1]
             },
         ];
-        let c = prepare(&desc, &fa, &fb, &again, &ctx, kept);
-        warm_start(&c, &mut again);
-        assert!(close(again[1].v, bodies[1].v, 1e-5) && close(again[1].w, bodies[1].w, 1e-5));
+        let c = prepare(&desc, &fa, &fb, &bodies, &ctx, kept);
+        warm_start(&c, &bodies, &mut again_vels);
+        assert!(close(again_vels[1].v, vels[1].v, 1e-5) && close(again_vels[1].w, vels[1].w, 1e-5));
     }
 
     #[test]
     fn a_pass_that_would_leave_a_velocity_not_finite_writes_nothing_and_drops_the_joint() {
         // Body B's centre is so far from A's that the soft correction overflows.
         let body = SolverBody {
-            v: Vec3::new(1.0, 0.0, 0.0),
             inv_mass: Vec3::ONE,
             inv_inertia: Mat3::IDENTITY,
             ..SolverBody::STATIC
         };
-        let mut bodies = vec![SolverBody::STATIC, body];
+        let start_vel = SolverVel {
+            v: Vec3::new(1.0, 0.0, 0.0),
+            w: Vec3::ZERO,
+        };
+        let bodies = vec![SolverBody::STATIC, body];
+        let mut vels = vec![SolverVel::ZERO, start_vel];
         let id = BodyId {
             index: 0,
             generation: 0,
@@ -1580,21 +1625,25 @@ mod tests {
         let ctx = context();
         let (fa, fb) = (frame(Vec3::ZERO, 0), frame(Vec3::new(3e38, 0.0, 0.0), 1));
         let mut c = prepare(&desc, &fa, &fb, &bodies, &ctx, JointImpulses::default());
-        solve(&mut c, &desc, &mut bodies, &ctx, true);
-        assert_eq!(bodies[1].v, body.v, "nothing written");
+        solve(&mut c, &desc, &bodies, &mut vels, &ctx, true);
+        assert_eq!(vels[1].v, start_vel.v, "nothing written");
         assert_eq!(c.impulses, JointImpulses::default());
-        warm_start(&c, &mut bodies);
-        solve(&mut c, &desc, &mut bodies, &ctx, false);
-        assert_eq!(bodies[1].v, body.v, "and nothing more this step");
+        warm_start(&c, &bodies, &mut vels);
+        solve(&mut c, &desc, &bodies, &mut vels, &ctx, false);
+        assert_eq!(vels[1].v, start_vel.v, "and nothing more this step");
     }
 
     #[test]
     fn a_joint_between_bodies_that_cannot_move_does_nothing() {
-        let kinematic = SolverBody {
-            v: Vec3::new(1.0, 0.0, 0.0),
-            ..SolverBody::STATIC
-        };
-        let mut bodies = vec![SolverBody::STATIC, kinematic];
+        let kinematic = SolverBody::STATIC;
+        let bodies = vec![SolverBody::STATIC, kinematic];
+        let mut vels = vec![
+            SolverVel::ZERO,
+            SolverVel {
+                v: Vec3::new(1.0, 0.0, 0.0),
+                w: Vec3::ZERO,
+            },
+        ];
         let id = BodyId {
             index: 0,
             generation: 0,
@@ -1615,9 +1664,9 @@ mod tests {
         };
         let (fa, fb) = (frame(Vec3::ZERO, 0), frame(Vec3::Y, 1));
         let mut c = prepare(&desc, &fa, &fb, &bodies, &ctx, warm);
-        warm_start(&c, &mut bodies);
-        solve(&mut c, &desc, &mut bodies, &ctx, true);
-        assert_eq!(bodies[1].v, Vec3::new(1.0, 0.0, 0.0));
+        warm_start(&c, &bodies, &mut vels);
+        solve(&mut c, &desc, &bodies, &mut vels, &ctx, true);
+        assert_eq!(vels[1].v, Vec3::new(1.0, 0.0, 0.0));
         assert_eq!(c.impulses, JointImpulses::default());
     }
     #[test]
@@ -1675,12 +1724,16 @@ mod tests {
         // 1e31 m/s. That is a number, but no speed a body can have: the pass writes nothing and
         // the joint drops out for the step, as for one that is not a number.
         let body = SolverBody {
-            v: Vec3::new(1.0, 0.0, 0.0),
             inv_mass: Vec3::ONE,
             inv_inertia: Mat3::IDENTITY,
             ..SolverBody::STATIC
         };
-        let mut bodies = vec![SolverBody::STATIC, body];
+        let start_vel = SolverVel {
+            v: Vec3::new(1.0, 0.0, 0.0),
+            w: Vec3::ZERO,
+        };
+        let bodies = vec![SolverBody::STATIC, body];
+        let mut vels = vec![SolverVel::ZERO, start_vel];
         let id = BodyId {
             index: 0,
             generation: 0,
@@ -1697,11 +1750,11 @@ mod tests {
         let ctx = context();
         let (fa, fb) = (frame(Vec3::ZERO, 0), frame(Vec3::new(1e30, 0.0, 0.0), 1));
         let mut c = prepare(&desc, &fa, &fb, &bodies, &ctx, JointImpulses::default());
-        solve(&mut c, &desc, &mut bodies, &ctx, true);
-        assert_eq!(bodies[1].v, body.v, "nothing written");
+        solve(&mut c, &desc, &bodies, &mut vels, &ctx, true);
+        assert_eq!(vels[1].v, start_vel.v, "nothing written");
         assert_eq!(c.impulses, JointImpulses::default());
-        warm_start(&c, &mut bodies);
-        solve(&mut c, &desc, &mut bodies, &ctx, false);
-        assert_eq!(bodies[1].v, body.v, "and nothing more this step");
+        warm_start(&c, &bodies, &mut vels);
+        solve(&mut c, &desc, &bodies, &mut vels, &ctx, false);
+        assert_eq!(vels[1].v, start_vel.v, "and nothing more this step");
     }
 }

@@ -191,6 +191,8 @@ export interface GanbateEngine {
   /** Draws and presents a frame; false when it skipped (GPU busy). */
   render(): boolean;
   frames(): number;
+  /** Static WebGPU render-bundle cache telemetry (`{ cached, candidates, replays }`). */
+  bundleStats(): { cached: number; candidates: number; replays: number };
   /** The last frame's pixels (RGBA rows, top first). */
   capture(): Promise<{ width: number; height: number; rgba: Uint8ClampedArray }>;
   /** Waits for submitted GPU work (WebGPU; immediate on WebGL 2). */
@@ -283,6 +285,10 @@ export interface GanbateEngine {
   setModelInstance(instance: number, matrix: Matrix4, visible?: boolean): void;
   destroyModelInstance(instance: number): void;
   modelRest(instance: number): void;
+  /** Snapshots `instance`'s current pose inside Rust WASM memory for zero-copy Hermite cross-fade. */
+  snapshotModelPose(instance: number): void;
+  /** Evaluates clips, cross-fade, Look-At, Two-Bone IK, bone offsets, morphs, and GPU commit in one WASM call. */
+  poseModelClip(instance: number, packet: Float32Array | readonly number[]): void;
   /** Mixes clip `clip` at `time` seconds into the pose; weight 1 replaces what it animates. */
   modelClip(instance: number, clip: number, time: number, weight?: number): void;
   modelNode(instance: number, node: number): GanbateNodeTransform;

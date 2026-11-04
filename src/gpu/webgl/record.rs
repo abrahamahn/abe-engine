@@ -23,8 +23,7 @@
 //! * `BLIT` src texture, mip, layer, dst texture, mip, layer, filter (0 nearest, 1 linear)
 use super::ffi::SURFACE;
 use super::*;
-use crate::gpu::{Command, Encoder, Load, PassDesc};
-use core::ops::Range;
+use crate::gpu::{Command, Encoder, Load, PassView, Span, TransferCmd};
 
 const BEGIN_PASS: u32 = 1;
 const END_PASS: u32 = 2;
@@ -46,46 +45,168 @@ const BLIT: u32 = 16;
 /// Marks a texture unit holding a storage buffer's data texture in [`Host::units`].
 const STORAGE_UNIT: u32 = 1 << 31;
 
-/// Push-constant blocks of one submission.
-#[derive(Default)]
+#[inline]
+fn hash_bytes(data: &[u8]) -> usize {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in data {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h as usize
+}
+
+/// Push-constant blocks of one submission, deduplicated without per-block `Vec<u8>` allocations.
 pub(super) struct Ring {
     pub bytes: Vec<u8>,
-    offsets: HashMap<Vec<u8>, u32>,
+    table: Vec<(u64, u32, u32)>,
+    used: usize,
+    stamp: u64,
     slot: u32,
 }
-impl Ring {
-    fn new(align: u32) -> Self {
+impl Default for Ring {
+    fn default() -> Self {
         Self {
-            slot: PUSH_SLOT.next_multiple_of(align.max(1)),
-            ..Self::default()
+            bytes: Vec::new(),
+            table: Vec::new(),
+            used: 0,
+            stamp: 1,
+            slot: PUSH_SLOT,
         }
     }
+}
+impl Ring {
+    fn reset(&mut self, align: u32) {
+        self.bytes.clear();
+        self.used = 0;
+        self.slot = PUSH_SLOT.next_multiple_of(align.max(1));
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            self.table.fill((0, 0, 0));
+            self.stamp = 1;
+        }
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let new_cap = (self.table.len() * 2).max(64);
+        let old = core::mem::replace(&mut self.table, vec![(0, 0, 0); new_cap]);
+        let mask = new_cap - 1;
+        let stamp = self.stamp;
+        for (st, off, len) in old {
+            if st != stamp {
+                continue;
+            }
+            let slice = &self.bytes[off as usize..(off + len) as usize];
+            let mut pos = hash_bytes(slice) & mask;
+            while self.table[pos].0 == stamp {
+                pos = (pos + 1) & mask;
+            }
+            self.table[pos] = (stamp, off, len);
+        }
+    }
+
     /// The offset of a block holding `data`, zero-padded to the slot size.
     fn place(&mut self, data: &[u8]) -> u32 {
-        if let Some(&o) = self.offsets.get(data) {
-            return o;
+        if (self.used + 1) * 2 > self.table.len() {
+            self.grow();
         }
-        let offset = self.bytes.len() as u32;
-        self.bytes.extend_from_slice(data);
-        self.bytes.resize((offset + self.slot) as usize, 0);
-        self.offsets.insert(data.to_vec(), offset);
-        offset
+        let mask = self.table.len() - 1;
+        let mut pos = hash_bytes(data) & mask;
+        loop {
+            let (st, off, len) = self.table[pos];
+            if st != self.stamp {
+                let offset = self.bytes.len() as u32;
+                self.bytes.extend_from_slice(data);
+                self.bytes.resize((offset + self.slot) as usize, 0);
+                self.table[pos] = (self.stamp, offset, data.len() as u32);
+                self.used += 1;
+                return offset;
+            }
+            if len as usize == data.len()
+                && &self.bytes[off as usize..(off + len) as usize] == data
+            {
+                return off;
+            }
+            pos = (pos + 1) & mask;
+        }
     }
 }
 
-/// The GL bindings this submission's stream has made so far.
+/// The GL bindings this submission's stream has made so far, indexed directly by slot.
 #[derive(Default)]
 struct Host {
     pipeline: Option<u32>,
     /// Uniform block binding point → (buffer, offset, size); the ring is buffer 0.
-    points: HashMap<u32, (u32, u32, u32)>,
+    points: Vec<Option<(u32, u32, u32)>>,
     /// Texture unit → (texture or `STORAGE_UNIT | buffer`, sampler).
-    units: HashMap<u32, (u32, u32)>,
-    /// Texture → (base mip, mip count) last applied.
-    levels: HashMap<u32, (u32, u32)>,
+    units: Vec<Option<(u32, u32)>>,
+    /// Texture handle → (base mip, mip count) last applied.
+    levels: Vec<Option<(u32, u32)>>,
     vao: Option<u32>,
     /// (program, hidden index) → value.
-    hidden: HashMap<(u32, u32), u32>,
+    hidden: Vec<(u32, u32, u32)>,
+}
+impl Host {
+    fn reset(&mut self) {
+        self.pipeline = None;
+        self.points.fill(None);
+        self.units.fill(None);
+        self.levels.fill(None);
+        self.vao = None;
+        self.hidden.clear();
+    }
+    #[inline]
+    fn set_point(&mut self, point: u32, val: (u32, u32, u32)) -> bool {
+        let p = point as usize;
+        if p >= self.points.len() {
+            self.points.resize(p + 1, None);
+        }
+        if self.points[p] == Some(val) {
+            return false;
+        }
+        self.points[p] = Some(val);
+        true
+    }
+    #[inline]
+    fn set_unit(&mut self, unit: u32, val: (u32, u32)) -> bool {
+        let u = unit as usize;
+        if u >= self.units.len() {
+            self.units.resize(u + 1, None);
+        }
+        if self.units[u] == Some(val) {
+            return false;
+        }
+        self.units[u] = Some(val);
+        true
+    }
+    #[inline]
+    fn set_levels(&mut self, tex: u32, val: (u32, u32)) -> bool {
+        let t = tex as usize;
+        if t >= self.levels.len() {
+            self.levels.resize(t + 1, None);
+        }
+        if self.levels[t] == Some(val) {
+            return false;
+        }
+        self.levels[t] = Some(val);
+        true
+    }
+    #[inline]
+    fn set_hidden(&mut self, prog: u32, idx: u32, val: u32) -> bool {
+        if let Some(entry) = self
+            .hidden
+            .iter_mut()
+            .find(|(p, i, _)| *p == prog && *i == idx)
+        {
+            if entry.2 == val {
+                return false;
+            }
+            entry.2 = val;
+            return true;
+        }
+        self.hidden.push((prog, idx, val));
+        true
+    }
 }
 
 /// Bind state of one render pass.
@@ -93,10 +214,10 @@ struct Host {
 struct DrawState {
     pipeline: Option<PipelineId>,
     groups: [Option<BindGroupId>; MAX_GROUPS],
+    checked: [Option<BindGroupId>; MAX_GROUPS],
     vertex: Option<(BufferId, u64)>,
     index: Option<(BufferId, u64)>,
-    push: Option<Range<usize>>,
-    checked: Vec<BindGroupId>,
+    push: Option<Span>,
 }
 
 /// One draw's parameters.
@@ -145,63 +266,68 @@ impl Gpu<'_> {
         &self,
         e: &Encoder,
         acquired: Option<TextureId>,
-    ) -> Result<(Vec<u32>, Vec<u8>)> {
+        out: &mut Vec<u32>,
+        ring: &mut Ring,
+    ) -> Result<()> {
         e.finish()?;
-        let mut out = Vec::with_capacity(e.commands.len() * 6);
-        let mut ring = Ring::new(self.info.uniform_align);
+        out.clear();
+        out.reserve(e.commands.len() * 6);
+        ring.reset(self.info.uniform_align);
         let mut host = Host::default();
         let commands = &e.commands;
         let mut i = 0;
         while i < commands.len() {
-            match &commands[i] {
-                Command::BeginPass(desc) => {
-                    let end = commands[i..]
-                        .iter()
-                        .position(|c| matches!(c, Command::EndPass))
-                        .map(|n| i + n)
-                        .ok_or("begin_pass without end_pass")?;
-                    let body = &commands[i + 1..end];
-                    self.record_pass(e, desc, body, &mut out, &mut ring, &mut host, acquired)?;
+            match commands[i] {
+                Command::BeginPass {
+                    colors,
+                    depth,
+                    end_cmd,
+                } => {
+                    let end = if end_cmd != u32::MAX {
+                        end_cmd as usize
+                    } else {
+                        return Err("begin_pass without end_pass".into());
+                    };
+                    let desc = e.pass(colors, depth);
+                    self.record_pass(e, desc, &commands[i + 1..end], out, ring, &mut host, acquired)?;
                     i = end;
                 }
-                Command::Dispatch { .. } => {
-                    return Err("dispatch: WebGL 2 has no compute shaders".into());
-                }
-                &Command::CopyTextureToBuffer {
-                    src,
-                    mip,
-                    layer,
-                    dst,
-                    offset,
-                } => {
-                    self.record_texture_copy((src, mip, layer), dst, offset, &mut out, acquired)?
-                }
-                &Command::CopyBufferToBuffer {
-                    src,
-                    src_offset,
-                    dst,
-                    dst_offset,
-                    size,
-                } => {
-                    self.record_buffer_copy((src, src_offset), (dst, dst_offset), size, &mut out)?
-                }
-                &Command::Blit { src, dst, filter } => {
-                    self.record_blit(src, dst, filter, &mut out, acquired)?;
-                    // The host's blit program changes the program, units and vertex array.
-                    host = Host::default();
-                }
+                Command::Transfer(idx) => match &e.transfers[idx as usize] {
+                    TransferCmd::Dispatch { .. } => {
+                        return Err("dispatch: WebGL 2 has no compute shaders".into());
+                    }
+                    &TransferCmd::CopyTextureToBuffer {
+                        src,
+                        mip,
+                        layer,
+                        dst,
+                        offset,
+                    } => self.record_texture_copy((src, mip, layer), dst, offset, out, acquired)?,
+                    &TransferCmd::CopyBufferToBuffer {
+                        src,
+                        src_offset,
+                        dst,
+                        dst_offset,
+                        size,
+                    } => self.record_buffer_copy((src, src_offset), (dst, dst_offset), size, out)?,
+                    &TransferCmd::Blit { src, dst, filter } => {
+                        self.record_blit(src, dst, filter, out, acquired)?;
+                        // The host's blit program changes the program, units and vertex array.
+                        host.reset();
+                    }
+                },
                 other => return Err(format!("{other:?} recorded outside a pass")),
             }
             i += 1;
         }
-        Ok((out, ring.bytes))
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn record_pass(
         &self,
         e: &Encoder,
-        desc: &PassDesc,
+        desc: PassView<'_>,
         body: &[Command],
         out: &mut Vec<u32>,
         ring: &mut Ring,
@@ -211,26 +337,28 @@ impl Gpu<'_> {
         if desc.colors.is_empty() && desc.depth.is_none() {
             return Err("begin_pass: a pass needs at least one attachment".into());
         }
-        if desc.colors.len() > self.info.max_draw_buffers as usize {
+        if desc.colors.len() > (self.info.max_draw_buffers as usize).min(8) {
             return Err(format!(
                 "begin_pass: {} colour attachments exceed the device limit",
                 desc.colors.len()
             ));
         }
         let mut size = None;
-        let mut attached: Vec<(TextureId, u32, u32)> = Vec::new();
-        let mut colors = Vec::new();
+        let mut attached = [(TextureId::from_raw(0), 0u32, 0u32); 9];
+        let mut attached_len = 0usize;
+        let mut colors = [Format::Rgba8Unorm; 8];
+        let mut colors_len = 0usize;
         let mut depth_format = None;
-        let mut words = vec![
-            BEGIN_PASS,
-            desc.colors.len() as u32,
-            u32::from(desc.depth.is_some()),
-        ];
+        let mut words = [0u32; 96];
+        words[0] = BEGIN_PASS;
+        words[1] = desc.colors.len() as u32;
+        words[2] = u32::from(desc.depth.is_some());
+        let mut word_len = 3usize;
         let attachments = desc
             .colors
             .iter()
             .map(|a| (a, false))
-            .chain(desc.depth.iter().map(|a| (a, true)));
+            .chain(desc.depth.into_iter().map(|a| (a, true)));
         for (a, depth) in attachments {
             let t = self.usable(a.texture, acquired)?;
             let need = if depth {
@@ -258,32 +386,40 @@ impl Gpu<'_> {
                 return Err("begin_pass: attachments differ in size".into());
             }
             let sub = (a.texture, a.mip, a.layer);
-            if attached.contains(&sub) {
+            if attached[..attached_len].contains(&sub) {
                 return Err("begin_pass: the same subresource is attached twice".into());
             }
-            attached.push(sub);
+            attached[attached_len] = sub;
+            attached_len += 1;
             let (load, clear) = match a.load {
                 Load::Load => (0, [0.0; 4]),
                 Load::Clear(v) => (1, v),
                 Load::DontCare => (2, [0.0; 4]),
             };
-            words.extend([t.js, a.mip, a.layer, load, u32::from(a.store)]);
+            words[word_len..word_len + 5]
+                .copy_from_slice(&[t.js, a.mip, a.layer, load, u32::from(a.store)]);
+            word_len += 5;
             if depth {
-                words.push(clear[0].clamp(0.0, 1.0).to_bits());
+                words[word_len] = clear[0].clamp(0.0, 1.0).to_bits();
+                word_len += 1;
                 depth_format = Some(t.desc.format);
             } else {
-                words.extend(clear.map(f32::to_bits));
-                colors.push(t.desc.format);
+                words[word_len..word_len + 4].copy_from_slice(&clear.map(f32::to_bits));
+                word_len += 4;
+                colors[colors_len] = t.desc.format;
+                colors_len += 1;
             }
         }
-        out.extend(words);
+        out.extend_from_slice(&words[..word_len]);
+        let pass_colors = &colors[..colors_len];
+        let attached_slice = &attached[..attached_len];
         let (w, h) = size.expect("at least one attachment");
         let mut st = DrawState::default();
         for c in body {
-            match c {
-                &Command::SetPipeline(id) => {
+            match *c {
+                Command::SetPipeline(id) => {
                     let p = self.pipeline(id)?;
-                    if p.colors != colors || p.depth != depth_format {
+                    if p.colors.as_slice() != pass_colors || p.depth != depth_format {
                         return Err(format!(
                             "set_pipeline: {id:?} renders {:?} + depth {:?}, which does not match \
                              this pass",
@@ -292,14 +428,14 @@ impl Gpu<'_> {
                     }
                     st.pipeline = Some(id);
                 }
-                &Command::SetBindGroup(g, id) => {
+                Command::SetBindGroup(g, id) => {
                     let slot = st
                         .groups
                         .get_mut(g as usize)
                         .ok_or_else(|| format!("set_bind_group: group {g} is out of range"))?;
                     *slot = Some(id);
                 }
-                &Command::SetVertexBuffer(id, offset) => {
+                Command::SetVertexBuffer(id, offset) => {
                     let b = self.buffer(id)?;
                     if !b.desc.usage.contains(BufferUsage::VERTEX) {
                         return Err(format!("set_vertex_buffer: {id:?} lacks VERTEX usage"));
@@ -311,7 +447,7 @@ impl Gpu<'_> {
                     }
                     st.vertex = Some((id, offset));
                 }
-                &Command::SetIndexBuffer(id, offset) => {
+                Command::SetIndexBuffer(id, offset) => {
                     let b = self.buffer(id)?;
                     if !b.desc.usage.contains(BufferUsage::INDEX) {
                         return Err(format!("set_index_buffer: {id:?} lacks INDEX usage"));
@@ -323,16 +459,16 @@ impl Gpu<'_> {
                     }
                     st.index = Some((id, offset));
                 }
-                &Command::SetViewport(v) => {
+                Command::SetViewport(v) => {
                     out.push(VIEWPORT);
                     out.extend(v.map(f32::to_bits));
                 }
-                &Command::SetScissor([x, y, sw, sh]) => {
+                Command::SetScissor([x, y, sw, sh]) => {
                     let (x, y) = (x.min(w), y.min(h));
                     out.extend([SCISSOR, x, y, sw.min(w - x), sh.min(h - y)]);
                 }
-                Command::PushConstants(range) => st.push = Some(range.clone()),
-                &Command::Draw {
+                Command::PushConstants(span) => st.push = Some(span),
+                Command::Draw {
                     vertices,
                     instances,
                     first_vertex,
@@ -343,10 +479,10 @@ impl Gpu<'_> {
                         base_vertex: 0,
                         first_instance,
                     };
-                    self.bind_for_draw(e, &mut st, &call, &attached, out, ring, host)?;
+                    self.bind_for_draw(e, &mut st, &call, attached_slice, out, ring, host)?;
                     out.extend([DRAW, vertices, instances, first_vertex]);
                 }
-                &Command::DrawIndexed {
+                Command::DrawIndexed {
                     indices,
                     instances,
                     first_index,
@@ -358,7 +494,7 @@ impl Gpu<'_> {
                         base_vertex,
                         first_instance,
                     };
-                    self.bind_for_draw(e, &mut st, &call, &attached, out, ring, host)?;
+                    self.bind_for_draw(e, &mut st, &call, attached_slice, out, ring, host)?;
                     let (ib, offset) = st.index.expect("checked by bind_for_draw");
                     let first = offset / 4 + u64::from(first_index);
                     let count = self.buffer(ib)?.desc.size / 4;
@@ -414,21 +550,21 @@ impl Gpu<'_> {
         if call.indexed && st.index.is_none() {
             return Err("draw_indexed without set_index_buffer".into());
         }
-        for (slot, layout) in p.groups.iter().enumerate() {
-            if layout.is_empty() {
+        for (slot, &expected_id) in p.group_ids.iter().enumerate() {
+            if expected_id == 0 {
                 continue;
             }
             let gid = st.groups[slot]
                 .ok_or_else(|| format!("{id:?} uses @group({slot}) but no bind group is set"))?;
             let g = self.group(gid)?;
-            if g.layout.as_ref() != Some(layout) {
+            if g.layout_id != expected_id {
                 return Err(format!(
                     "{gid:?} was created for a different layout than @group({slot}) of {id:?}"
                 ));
             }
-            if !st.checked.contains(&gid) {
+            if st.checked[slot] != Some(gid) {
                 self.check_bound(g)?;
-                st.checked.push(gid);
+                st.checked[slot] = Some(gid);
             }
         }
         if host.pipeline != Some(p.js) {
@@ -439,20 +575,21 @@ impl Gpu<'_> {
         for b in &program.blocks {
             let (buffer, offset, size) = match b.binding {
                 None => {
-                    let range = st.push.clone().ok_or_else(|| {
+                    let span = st.push.ok_or_else(|| {
                         format!(
                             "{id:?} uses {} bytes of push constants but none are set",
                             p.push_size
                         )
                     })?;
-                    if range.len() < p.push_size as usize {
+                    if span.len() < p.push_size as usize {
                         return Err(format!(
                             "{id:?} uses {} bytes of push constants but only {} are set",
                             p.push_size,
-                            range.len()
+                            span.len()
                         ));
                     }
-                    let data = &e.bytes[range.start..range.start + p.push_size as usize];
+                    let start = span.start as usize;
+                    let data = &e.bytes[start..start + p.push_size as usize];
                     (0, ring.place(data), b.size.next_multiple_of(16))
                 }
                 Some(at) => match self.entry(st, at)? {
@@ -462,16 +599,16 @@ impl Gpu<'_> {
                     other => return Err(format!("{at:?} holds {other:?}, not a uniform buffer")),
                 },
             };
-            if host.points.get(&b.point) != Some(&(buffer, offset, size)) {
+            if host.set_point(b.point, (buffer, offset, size)) {
                 if b.binding.is_none() {
                     out.extend([PUSH_RANGE, offset, size]);
                 } else {
                     out.extend([BIND_UBO, b.point, buffer, offset, size]);
                 }
-                host.points.insert(b.point, (buffer, offset, size));
             }
         }
-        let mut viewed: Vec<(u32, (u32, u32))> = Vec::new();
+        let mut viewed = [(0u32, (0u32, 0u32)); 64];
+        let mut viewed_len = 0usize;
         for u in &program.units {
             let Bound::Texture {
                 id: tid,
@@ -492,14 +629,17 @@ impl Gpu<'_> {
             if u.view == TextureView::D2Array && !t.array {
                 return Err(format!("{tid:?} is not an array texture"));
             }
-            if let Some(&(_, m)) = viewed.iter().find(|(js, _)| *js == t.js)
+            if let Some(&(_, m)) = viewed[..viewed_len].iter().find(|(js, _)| *js == t.js)
                 && m != mips
             {
                 return Err(format!(
                     "{tid:?} is viewed with two mip ranges in one draw, which WebGL 2 cannot do"
                 ));
             }
-            viewed.push((t.js, mips));
+            if viewed_len < viewed.len() {
+                viewed[viewed_len] = (t.js, mips);
+                viewed_len += 1;
+            }
             let sampler = match u.sampler {
                 Some(at) => match self.entry(st, at)? {
                     Bound::Sampler(s) => self.sampler(s)?.js,
@@ -508,12 +648,10 @@ impl Gpu<'_> {
                 None => 0,
             };
             let levels = (mips.0, mips.1 - mips.0);
-            if host.units.get(&u.unit) != Some(&(t.js, sampler))
-                || host.levels.get(&t.js) != Some(&levels)
-            {
+            let unit_changed = host.set_unit(u.unit, (t.js, sampler));
+            let levels_changed = host.set_levels(t.js, levels);
+            if unit_changed || levels_changed {
                 out.extend([BIND_UNIT, u.unit, t.js, sampler, levels.0, levels.1]);
-                host.units.insert(u.unit, (t.js, sampler));
-                host.levels.insert(t.js, levels);
             }
         }
         for s in &program.storage {
@@ -521,9 +659,8 @@ impl Gpu<'_> {
                 return Err(format!("{:?} does not hold a storage buffer", s.binding));
             };
             let js = self.buffer(bid)?.js;
-            if host.units.get(&s.unit) != Some(&(STORAGE_UNIT | js, 0)) {
+            if host.set_unit(s.unit, (STORAGE_UNIT | js, 0)) {
                 out.extend([BIND_STORAGE, s.unit, js]);
-                host.units.insert(s.unit, (STORAGE_UNIT | js, 0));
             }
         }
         for (index, h) in program.hidden.iter().enumerate() {
@@ -543,10 +680,8 @@ impl Gpu<'_> {
                     _ => return Err(format!("({g}, {b}) does not hold a texture")),
                 },
             };
-            let key = (program.js, index as u32);
-            if host.hidden.get(&key) != Some(&value) {
+            if host.set_hidden(program.js, index as u32, value) {
                 out.extend([SET_HIDDEN, index as u32, value]);
-                host.hidden.insert(key, value);
             }
         }
         // The vertex array: the pipeline's layout over the vertex buffer, shifted by the base

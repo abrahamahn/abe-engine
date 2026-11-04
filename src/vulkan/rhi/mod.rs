@@ -38,8 +38,14 @@ type Result<T> = std::result::Result<T, String>;
 
 /// Frames in flight for presentation.
 const FRAMES: usize = 2;
+/// Double-buffered asynchronous transfer command buffers for staged uploads & mip generation.
+const XFER_SLOTS: usize = 2;
 /// Index of the synchronous submission in `Gpu::subs`; frame slot `f` uses `1 + f`.
 const IMMEDIATE: usize = 0;
+const XFER_BASE: usize = 1 + FRAMES;
+const SUB_COUNT: usize = 1 + FRAMES + XFER_SLOTS;
+/// Maximum colour attachments per pass.
+const MAX_PASS_COLORS: usize = 8;
 /// Longest wait for one GPU submission before reporting a hang.
 /// How long a submission may take before it is reported as lost (process-wide).
 static FENCE_TIMEOUT_NS: std::sync::atomic::AtomicU64 =
@@ -107,9 +113,34 @@ impl<T> Pool<T> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Alloc {
+    pub memory: u64,
+    pub offset: u64,
+    pub size: u64,
+    /// `u32::MAX` for dedicated `VkDeviceMemory` blocks; otherwise index in `Gpu::slabs`.
+    pub slab: u32,
+}
+impl Alloc {
+    pub const NONE: Self = Self {
+        memory: 0,
+        offset: 0,
+        size: 0,
+        slab: u32::MAX,
+    };
+}
+
+struct Slab {
+    memory: u64,
+    memory_type: u32,
+    optimal_image: bool,
+    mapped: *mut u8,
+    free: Vec<(u64, u64)>,
+}
+
 struct Buffer {
     handle: u64,
-    memory: u64,
+    alloc: Alloc,
     desc: BufferDesc,
     /// Persistent mapping of host-visible memory; null for `Memory::Device`.
     mapped: *mut u8,
@@ -129,11 +160,13 @@ struct ViewKey {
 
 struct Texture {
     image: u64,
-    /// Zero for swapchain images, which the swapchain owns.
-    memory: u64,
+    /// `Alloc::NONE` for swapchain images, which the swapchain owns.
+    alloc: Alloc,
     desc: TextureDesc,
     format: i32,
     aspect: u32,
+    /// Software block-decompression fallback when hardware lacks BC/ASTC support.
+    sw_decompress: Option<ganbate_core::world::TextureCompression>,
     /// Per subresource, indexed `layer * mips + mip`.
     states: Vec<State>,
     views: Vec<(ViewKey, u64)>,
@@ -147,7 +180,7 @@ struct Sampler {
 }
 
 /// One binding of a descriptor set layout, as reflected from the shaders.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Entry {
     binding: u32,
     kind: BindingKind,
@@ -156,6 +189,7 @@ struct Entry {
 }
 #[derive(Clone, Debug, PartialEq)]
 struct GroupLayout {
+    id: u32,
     set_layout: u64,
     entries: Vec<Entry>,
 }
@@ -197,7 +231,7 @@ const DESCRIPTOR_TYPES: [i32; 5] = [0, 2, 3, 6, 7];
 struct BindGroup {
     set: u64,
     pool: usize,
-    layout: GroupLayout,
+    layout_id: u32,
     bound: Vec<Bound>,
     counts: [u32; 5],
 }
@@ -209,8 +243,8 @@ struct DescriptorPool {
 }
 
 enum Garbage {
-    Buffer(u64, u64),
-    Image(u64, u64, Vec<u64>),
+    Buffer(u64, Alloc),
+    Image(u64, Alloc, Vec<u64>),
     Framebuffer(u64),
     Set(usize, u64, [u32; 5]),
 }
@@ -234,12 +268,15 @@ impl Default for Submission {
     }
 }
 
-/// Host-visible upload buffer reused by synchronous uploads.
-struct Staging {
+/// Host-visible upload buffer chunk reused across batched transfer submissions.
+struct StagingChunk {
     buffer: u64,
-    memory: u64,
+    alloc: Alloc,
     mapped: *mut u8,
-    size: u64,
+    capacity: u64,
+    cursor: u64,
+    serial: u64,
+    active: bool,
 }
 
 /// Optional device features, enabled whenever the adapter supports them.
@@ -254,13 +291,40 @@ struct Features {
     fragment_stores: bool,
     /// `Rg16Float`/`R16Float` storage textures.
     storage_formats: bool,
+    /// Hardware BC1..BC7 block compression.
+    bc_compression: bool,
+    /// Hardware ASTC LDR block compression.
+    astc_compression: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct PassKey {
     /// (VkFormat, loadOp, storeOp)
-    colors: Vec<(i32, i32, i32)>,
+    colors: [(i32, i32, i32); MAX_PASS_COLORS],
+    color_len: u8,
     depth: Option<(i32, i32, i32)>,
+}
+impl PassKey {
+    const fn empty() -> Self {
+        Self {
+            colors: [(0, 0, 0); MAX_PASS_COLORS],
+            color_len: 0,
+            depth: None,
+        }
+    }
+    #[inline]
+    fn colors(&self) -> &[(i32, i32, i32)] {
+        &self.colors[..self.color_len as usize]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FramebufferKey {
+    pass: u64,
+    views: [u64; MAX_PASS_COLORS + 1],
+    len: u8,
+    w: u32,
+    h: u32,
 }
 
 pub(crate) struct Gpu<'w> {
@@ -274,6 +338,7 @@ pub(crate) struct Gpu<'w> {
     features: Features,
     name: String,
     debug: Option<setup::Debug>,
+    slabs: Vec<Slab>,
     buffers: Pool<Buffer>,
     textures: Pool<Texture>,
     samplers: Pool<Sampler>,
@@ -281,16 +346,23 @@ pub(crate) struct Gpu<'w> {
     groups: Pool<BindGroup>,
     sampler_cache: HashMap<[u32; 8], SamplerId>,
     set_layouts: HashMap<Vec<(u32, i32, u32)>, u64>,
+    layout_ids: HashMap<Vec<Entry>, u32>,
     pipeline_layouts: HashMap<(Vec<u64>, u32, u32), u64>,
+    pipeline_cache: u64,
     render_passes: HashMap<PassKey, u64>,
-    framebuffers: HashMap<(u64, Vec<u64>, u32, u32), u64>,
+    framebuffers: HashMap<FramebufferKey, u64>,
     descriptor_pools: Vec<DescriptorPool>,
     command_pool: u64,
-    subs: [Submission; 1 + FRAMES],
+    subs: [Submission; SUB_COUNT],
     frame: usize,
     serial: u64,
     garbage: Vec<(u64, Garbage)>,
-    staging: Option<Staging>,
+    staging: Vec<StagingChunk>,
+    xfer_slot: usize,
+    xfer_recording: bool,
+    xfer_plan: record::Plan,
+    plan: record::Plan,
+    scope: record::Scope,
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     present: Option<swapchain::Presentation<'w>>,
     _window: core::marker::PhantomData<&'w ()>,
@@ -310,7 +382,7 @@ impl Gpu<'_> {
     pub fn acquire(&mut self) -> Result<Option<TextureId>> {
         Err("presentation is not available on this platform".into())
     }
-    pub fn present(&mut self, _: crate::gpu::Encoder) -> Result<()> {
+    pub fn present(&mut self, _: &crate::gpu::Encoder) -> Result<()> {
         Err("presentation is not available on this platform".into())
     }
     pub fn surface_format(&self) -> Format {
@@ -339,6 +411,8 @@ impl<'w> Gpu<'w> {
             uniform_offset_alignment: l.minUniformBufferOffsetAlignment,
             storage_offset_alignment: l.minStorageBufferOffsetAlignment,
             depth_filterable: self.format_features(126) & resources::FEATURE_LINEAR != 0,
+            texture_compression_bc: self.features.bc_compression,
+            texture_compression_astc: self.features.astc_compression,
         }
     }
     pub fn validation_log(&self) -> Option<ValidationLog> {
@@ -436,17 +510,17 @@ impl<'w> Gpu<'w> {
         // completed (or after vkDeviceWaitIdle), and nothing else holds these handles.
         unsafe {
             match g {
-                Garbage::Buffer(buffer, memory) => {
+                Garbage::Buffer(buffer, alloc) => {
                     vkDestroyBuffer(d, buffer, null());
-                    vkFreeMemory(d, memory, null());
+                    self.free_alloc(alloc);
                 }
-                Garbage::Image(image, memory, views) => {
+                Garbage::Image(image, alloc, views) => {
                     for v in views {
                         vkDestroyImageView(d, v, null());
                     }
-                    if memory != 0 {
+                    if alloc.memory != 0 {
                         vkDestroyImage(d, image, null());
-                        vkFreeMemory(d, memory, null());
+                        self.free_alloc(alloc);
                     }
                 }
                 Garbage::Framebuffer(f) => vkDestroyFramebuffer(d, f, null()),
@@ -464,17 +538,20 @@ impl<'w> Gpu<'w> {
     }
     /// Moves every framebuffer that references one of `views` to the garbage list.
     fn forget_views(&mut self, views: &[u64]) {
-        let stale: Vec<_> = self
-            .framebuffers
-            .keys()
-            .filter(|k| k.1.iter().any(|v| views.contains(v)))
-            .cloned()
-            .collect();
-        for key in stale {
-            if let Some(f) = self.framebuffers.remove(&key) {
-                self.garbage.push((self.serial, Garbage::Framebuffer(f)));
-            }
+        if views.is_empty() || self.framebuffers.is_empty() {
+            return;
         }
+        let serial = self.serial;
+        let garbage = &mut self.garbage;
+        self.framebuffers.retain(|k, &mut f| {
+            let hit = k.views[..k.len as usize]
+                .iter()
+                .any(|v| views.contains(v));
+            if hit {
+                garbage.push((serial, Garbage::Framebuffer(f)));
+            }
+            !hit
+        });
     }
 }
 
@@ -487,6 +564,10 @@ impl Drop for Gpu<'_> {
         unsafe {
             let d = self.device;
             if !d.is_null() {
+                if self.xfer_recording {
+                    let _ = vkEndCommandBuffer(self.subs[XFER_BASE + self.xfer_slot].cmd);
+                    self.xfer_recording = false;
+                }
                 vkDeviceWaitIdle(d);
                 for sub in &self.subs {
                     sub.pending.set(None);
@@ -506,6 +587,9 @@ impl Drop for Gpu<'_> {
                 for p in self.pipelines.drain() {
                     vkDestroyPipeline(d, p.handle, null());
                 }
+                if self.pipeline_cache != 0 {
+                    vkDestroyPipelineCache(d, self.pipeline_cache, null());
+                }
                 for (_, l) in self.pipeline_layouts.drain() {
                     vkDestroyPipelineLayout(d, l, null());
                 }
@@ -519,22 +603,27 @@ impl Drop for Gpu<'_> {
                     for (_, v) in t.views {
                         vkDestroyImageView(d, v, null());
                     }
-                    if t.memory != 0 {
+                    if t.alloc.memory != 0 {
                         vkDestroyImage(d, t.image, null());
-                        vkFreeMemory(d, t.memory, null());
+                        self.free_alloc(t.alloc);
                     }
                 }
                 for b in self.buffers.drain() {
                     vkDestroyBuffer(d, b.handle, null());
-                    vkFreeMemory(d, b.memory, null());
+                    self.free_alloc(b.alloc);
                 }
-                if let Some(s) = self.staging.take() {
+                for s in core::mem::take(&mut self.staging) {
                     vkDestroyBuffer(d, s.buffer, null());
-                    vkFreeMemory(d, s.memory, null());
+                    self.free_alloc(s.alloc);
+                }
+                for slab in self.slabs.drain(..) {
+                    vkFreeMemory(d, slab.memory, null());
                 }
                 for sub in &self.subs {
                     vkDestroyFence(d, sub.fence, null());
-                    vkDestroySemaphore(d, sub.acquire, null());
+                    if sub.acquire != 0 {
+                        vkDestroySemaphore(d, sub.acquire, null());
+                    }
                 }
                 vkDestroyCommandPool(d, self.command_pool, null());
                 // Swapchain image views went with the textures above.

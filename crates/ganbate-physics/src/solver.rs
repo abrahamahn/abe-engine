@@ -8,15 +8,40 @@
 //! correction added). Restitution is applied once after the substeps. Contact points are found
 //! once per step; their separation is updated each substep from how far the bodies have moved
 //! (`dp`, `dq`), which is what makes substepping cheap and stable.
+//!
+//! Hot linear/angular velocities live in [`SolverVel`] (24 bytes per body) separate from cold
+//! pose/inertia state in [`SolverBody`], cutting Gauss-Seidel writeback cache traffic by 5.6x
+//! while keeping identical arithmetic order.
 
 use crate::math::{Mat3, Quat, Vec3};
 
-/// Per-body state during a step. Index 0 is the shared static body (zero inverse mass, never
-/// moves): every static body and every body asleep this step maps to it.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SolverBody {
+/// Hot per-body linear and angular velocity mutated by every Gauss-Seidel constraint iteration.
+/// Index 0 is the shared static slot (always zero).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct SolverVel {
     pub v: Vec3,
     pub w: Vec3,
+}
+
+impl SolverVel {
+    pub const ZERO: SolverVel = SolverVel {
+        v: Vec3::ZERO,
+        w: Vec3::ZERO,
+    };
+
+    /// Velocity of the material point at offset `r` from the centre of mass.
+    #[inline]
+    pub fn point_velocity(&self, r: Vec3) -> Vec3 {
+        self.v + self.w.cross(r)
+    }
+}
+
+/// Cold per-body pose delta and inverse mass/inertia during a step (read-only during inner
+/// constraint solves; mutated only once per substep in [`integrate_positions`]). Index 0 is the
+/// shared static body (zero inverse mass, never moves): every static body and every body asleep
+/// this step maps to it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SolverBody {
     /// How far the centre of mass has moved this step.
     pub dp: Vec3,
     /// How far the body has turned this step (world frame): `rotation = dq * rotation0`.
@@ -40,8 +65,6 @@ pub(crate) struct SolverBody {
 
 impl SolverBody {
     pub const STATIC: SolverBody = SolverBody {
-        v: Vec3::ZERO,
-        w: Vec3::ZERO,
         dp: Vec3::ZERO,
         dq: Quat::IDENTITY,
         inv_mass: Vec3::ZERO,
@@ -51,22 +74,16 @@ impl SolverBody {
 
     /// Applies impulse `p` at offset `r` from the centre of mass (as the body is turned now).
     #[inline]
-    pub fn apply(&mut self, p: Vec3, r: Vec3) {
-        self.v += self.inv_mass.mul_elem(p);
-        self.w += self.inv_inertia.mul_vec(r.cross(p));
+    pub fn apply(&self, vel: &mut SolverVel, p: Vec3, r: Vec3) {
+        vel.v += self.inv_mass.mul_elem(p);
+        vel.w += self.inv_inertia.mul_vec(r.cross(p));
     }
 
     /// Applies a contact's impulse `p` at its anchor `r` (both of the start of the step).
     #[inline]
-    fn apply_contact(&mut self, p: Vec3, r: Vec3) {
-        self.v += self.inv_mass.mul_elem(p);
-        self.w += self.contact_inv_inertia.mul_vec(r.cross(p));
-    }
-
-    /// Velocity of the material point at offset `r` from the centre of mass.
-    #[inline]
-    pub fn point_velocity(&self, r: Vec3) -> Vec3 {
-        self.v + self.w.cross(r)
+    fn apply_contact(&self, vel: &mut SolverVel, p: Vec3, r: Vec3) {
+        vel.v += self.inv_mass.mul_elem(p);
+        vel.w += self.contact_inv_inertia.mul_vec(r.cross(p));
     }
 
     /// `1 / (effective mass)` contribution of this body for a contact's impulse along `d` at
@@ -194,17 +211,27 @@ pub(crate) struct IntegrationInputs<'a> {
     pub max_angular_speed: f32,
 }
 
-pub(crate) fn integrate_velocities(bodies: &mut [SolverBody], inputs: &IntegrationInputs, h: f32) {
-    for (b, input) in bodies.iter_mut().skip(1).zip(inputs.per_body) {
+pub(crate) fn integrate_velocities(
+    bodies: &[SolverBody],
+    vels: &mut [SolverVel],
+    inputs: &IntegrationInputs,
+    h: f32,
+) {
+    for ((b, vel), input) in bodies
+        .iter()
+        .skip(1)
+        .zip(vels.iter_mut().skip(1))
+        .zip(inputs.per_body)
+    {
         if input.kinematic_turn.is_some() {
             continue;
         }
         let accel = b.inv_mass.mul_elem(input.force)
             + gravity_masked(inputs.gravity * input.gravity_scale, b.inv_mass);
-        let v = (b.v + accel * h) * input.linear_damping;
-        let w = (b.w + turn(&b.inv_inertia, input.torque) * h) * input.angular_damping;
-        b.v = clamp_length(v, inputs.max_linear_speed);
-        b.w = clamp_length(w, inputs.max_angular_speed);
+        let v = (vel.v + accel * h) * input.linear_damping;
+        let w = (vel.w + turn(&b.inv_inertia, input.torque) * h) * input.angular_damping;
+        vel.v = clamp_length(v, inputs.max_linear_speed);
+        vel.w = clamp_length(w, inputs.max_angular_speed);
     }
 }
 
@@ -270,12 +297,22 @@ fn gravity_masked(g: Vec3, inv_mass: Vec3) -> Vec3 {
 }
 
 /// Moves every non-static body by its velocity over one substep.
-pub(crate) fn integrate_positions(bodies: &mut [SolverBody], inputs: &IntegrationInputs, h: f32) {
-    for (b, input) in bodies.iter_mut().skip(1).zip(inputs.per_body) {
-        b.dp += b.v * h;
+pub(crate) fn integrate_positions(
+    bodies: &mut [SolverBody],
+    vels: &[SolverVel],
+    inputs: &IntegrationInputs,
+    h: f32,
+) {
+    for ((b, vel), input) in bodies
+        .iter_mut()
+        .skip(1)
+        .zip(vels.iter().skip(1))
+        .zip(inputs.per_body)
+    {
+        b.dp += vel.v * h;
         b.dq = match input.kinematic_turn {
             Some(turn) => (turn * b.dq).normalize(),
-            None => b.dq.integrate(b.w, h),
+            None => b.dq.integrate(vel.w, h),
         };
     }
 }
@@ -285,6 +322,7 @@ pub(crate) fn integrate_positions(bodies: &mut [SolverBody], inputs: &Integratio
 pub(crate) fn prepare_point(
     c: &ContactConstraint,
     bodies: &[SolverBody],
+    vels: &[SolverVel],
     fa: &BodyFrame,
     fb: &BodyFrame,
     point: Vec3,
@@ -293,6 +331,7 @@ pub(crate) fn prepare_point(
     friction_impulse: Vec3,
 ) -> ConstraintPoint {
     let (ba, bb) = (&bodies[c.a], &bodies[c.b]);
+    let (va, vb) = (&vels[c.a], &vels[c.b]);
     let anchor_a = point - fa.center;
     let anchor_b = point - fb.center;
     let n = c.normal;
@@ -301,7 +340,7 @@ pub(crate) fn prepare_point(
     let tangent_mass = c
         .tangents
         .map(|t| mass(ba.inverse_mass_along(anchor_a, t) + bb.inverse_mass_along(anchor_b, t)));
-    let dv = bb.point_velocity(anchor_b) - ba.point_velocity(anchor_a);
+    let dv = vb.point_velocity(anchor_b) - va.point_velocity(anchor_a);
     ConstraintPoint {
         anchor_a,
         anchor_b,
@@ -318,28 +357,33 @@ pub(crate) fn prepare_point(
     }
 }
 
-pub(crate) fn warm_start_contacts(constraints: &[ContactConstraint], bodies: &mut [SolverBody]) {
+pub(crate) fn warm_start_contacts(
+    constraints: &[ContactConstraint],
+    bodies: &[SolverBody],
+    vels: &mut [SolverVel],
+) {
     for c in constraints {
-        let (mut ba, mut bb) = (bodies[c.a], bodies[c.b]);
+        let (ba, bb) = (&bodies[c.a], &bodies[c.b]);
+        let (mut va, mut vb) = (vels[c.a], vels[c.b]);
         for p in &c.points[..c.count] {
             let impulse = c.normal * p.normal_impulse
                 + c.tangents[0] * p.tangent_impulse[0]
                 + c.tangents[1] * p.tangent_impulse[1];
-            ba.apply_contact(-impulse, p.anchor_a);
-            bb.apply_contact(impulse, p.anchor_b);
+            ba.apply_contact(&mut va, -impulse, p.anchor_a);
+            bb.apply_contact(&mut vb, impulse, p.anchor_b);
         }
-        write_back(bodies, c.a, ba, c.b, bb);
+        write_back(vels, c.a, va, c.b, vb);
     }
 }
 
-/// Writes two solver bodies back, never touching the static slot.
+/// Writes two solver velocities back, never touching the static slot.
 #[inline]
-fn write_back(bodies: &mut [SolverBody], a: usize, ba: SolverBody, b: usize, bb: SolverBody) {
+fn write_back(vels: &mut [SolverVel], a: usize, va: SolverVel, b: usize, vb: SolverVel) {
     if a != 0 {
-        bodies[a] = ba;
+        vels[a] = va;
     }
     if b != 0 {
-        bodies[b] = bb;
+        vels[b] = vb;
     }
 }
 
@@ -353,13 +397,15 @@ fn write_back(bodies: &mut [SolverBody], a: usize, ba: SolverBody, b: usize, bb:
 /// and a ball meeting a wall at a slant went into it).
 pub(crate) fn solve_contacts(
     constraints: &mut [ContactConstraint],
-    bodies: &mut [SolverBody],
+    bodies: &[SolverBody],
+    vels: &mut [SolverVel],
     ctx: &StepContext,
     use_bias: bool,
     reverse: bool,
 ) {
     for c in constraints.iter_mut() {
-        let (mut ba, mut bb) = (bodies[c.a], bodies[c.b]);
+        let (ba, bb) = (&bodies[c.a], &bodies[c.b]);
+        let (mut va, mut vb) = (vels[c.a], vels[c.b]);
         let n = c.normal;
         let count = c.count;
         // A's surface is a radius along the normal from its core, B's a radius against it.
@@ -388,7 +434,7 @@ pub(crate) fn solve_contacts(
             } else {
                 (0.0, 1.0, 0.0)
             };
-            let vn = n.dot(bb.point_velocity(p.anchor_b) - ba.point_velocity(p.anchor_a));
+            let vn = n.dot(vb.point_velocity(p.anchor_b) - va.point_velocity(p.anchor_a));
             let impulse =
                 -p.normal_mass * mass_scale * (vn + bias) - impulse_scale * p.normal_impulse;
             let total = saturate(p.normal_impulse + impulse);
@@ -396,12 +442,12 @@ pub(crate) fn solve_contacts(
             p.normal_impulse = total;
             p.max_normal_impulse = p.max_normal_impulse.max(delta);
             let impulse = n * delta;
-            ba.apply_contact(-impulse, p.anchor_a);
-            bb.apply_contact(impulse, p.anchor_b);
+            ba.apply_contact(&mut va, -impulse, p.anchor_a);
+            bb.apply_contact(&mut vb, impulse, p.anchor_b);
         }
         for k in 0..count {
             let p = &mut c.points[if reverse { count - 1 - k } else { k }];
-            let dv = bb.point_velocity(p.anchor_b) - ba.point_velocity(p.anchor_a);
+            let dv = vb.point_velocity(p.anchor_b) - va.point_velocity(p.anchor_a);
             let old = p.tangent_impulse;
             let mut new = [
                 old[0] - p.tangent_mass[0] * dv.dot(c.tangents[0]),
@@ -419,10 +465,10 @@ pub(crate) fn solve_contacts(
             }
             p.tangent_impulse = new;
             let impulse = c.tangents[0] * (new[0] - old[0]) + c.tangents[1] * (new[1] - old[1]);
-            ba.apply_contact(-impulse, p.anchor_a);
-            bb.apply_contact(impulse, p.anchor_b);
+            ba.apply_contact(&mut va, -impulse, p.anchor_a);
+            bb.apply_contact(&mut vb, impulse, p.anchor_b);
         }
-        write_back(bodies, c.a, ba, c.b, bb);
+        write_back(vels, c.a, va, c.b, vb);
     }
 }
 
@@ -439,31 +485,33 @@ fn saturate(total: f32) -> f32 {
 /// target a separating speed of `restitution × approach speed`.
 pub(crate) fn apply_restitution(
     constraints: &mut [ContactConstraint],
-    bodies: &mut [SolverBody],
+    bodies: &[SolverBody],
+    vels: &mut [SolverVel],
     ctx: &StepContext,
 ) {
     for c in constraints.iter_mut() {
         if c.restitution == 0.0 {
             continue;
         }
-        let (mut ba, mut bb) = (bodies[c.a], bodies[c.b]);
+        let (ba, bb) = (&bodies[c.a], &bodies[c.b]);
+        let (mut va, mut vb) = (vels[c.a], vels[c.b]);
         for p in c.points[..c.count].iter_mut() {
             if p.relative_velocity > -ctx.restitution_threshold || p.max_normal_impulse == 0.0 {
                 continue;
             }
             let vn = c
                 .normal
-                .dot(bb.point_velocity(p.anchor_b) - ba.point_velocity(p.anchor_a));
+                .dot(vb.point_velocity(p.anchor_b) - va.point_velocity(p.anchor_a));
             let impulse = -p.normal_mass * (vn + c.restitution * p.relative_velocity);
             let total = saturate(p.normal_impulse + impulse);
             let delta = total - p.normal_impulse;
             p.normal_impulse = total;
             p.max_normal_impulse = p.max_normal_impulse.max(delta);
             let impulse = c.normal * delta;
-            ba.apply_contact(-impulse, p.anchor_a);
-            bb.apply_contact(impulse, p.anchor_b);
+            ba.apply_contact(&mut va, -impulse, p.anchor_a);
+            bb.apply_contact(&mut vb, impulse, p.anchor_b);
         }
-        write_back(bodies, c.a, ba, c.b, bb);
+        write_back(vels, c.a, va, c.b, vb);
     }
 }
 
@@ -548,7 +596,7 @@ mod tests {
             max_push_velocity: 3.0,
             restitution_threshold: 1.0,
         };
-        let mut bodies = vec![
+        let bodies = vec![
             SolverBody::STATIC,
             SolverBody {
                 inv_mass: Vec3::ONE,
@@ -557,6 +605,7 @@ mod tests {
                 ..SolverBody::STATIC
             },
         ];
+        let mut vels = vec![SolverVel::ZERO, SolverVel::ZERO];
         let (t1, t2) = Vec3::Y.orthonormal_basis();
         let mut c = vec![ContactConstraint {
             a: 0,
@@ -584,6 +633,7 @@ mod tests {
         c[0].points[0] = prepare_point(
             &c[0],
             &bodies,
+            &vels,
             &fa,
             &fb,
             Vec3::ZERO,
@@ -591,32 +641,38 @@ mod tests {
             0.0,
             Vec3::ZERO,
         );
-        solve_contacts(&mut c, &mut bodies, &ctx, true, false);
-        let push = bodies[1].v.y;
+        solve_contacts(&mut c, &bodies, &mut vels, &ctx, true, false);
+        let push = vels[1].v.y;
         let expected = ctx.static_softness.bias_rate * 0.001 * ctx.static_softness.mass_scale;
         assert!(
             push > 0.0 && (push - expected).abs() < 1e-3 * expected,
             "pushed apart at {push} m/s, expected {expected}"
         );
-        solve_contacts(&mut c, &mut bodies, &ctx, false, true);
+        solve_contacts(&mut c, &bodies, &mut vels, &ctx, false, true);
         assert!(
-            bodies[1].v.y.abs() < 1e-6,
+            vels[1].v.y.abs() < 1e-6,
             "the relax pass leaves no push velocity: {:?}",
-            bodies[1].v
+            vels[1].v
         );
     }
 
     #[test]
     fn a_resting_point_stops_a_falling_body_without_bouncing() {
         // One dynamic unit mass resting on the static slot through a single contact point.
-        let mut bodies = vec![
+        let bodies = vec![
             SolverBody::STATIC,
             SolverBody {
-                v: Vec3::new(0.0, -2.0, 0.0),
                 inv_mass: Vec3::ONE,
                 inv_inertia: Mat3::IDENTITY,
                 contact_inv_inertia: Mat3::IDENTITY,
                 ..SolverBody::STATIC
+            },
+        ];
+        let mut vels = vec![
+            SolverVel::ZERO,
+            SolverVel {
+                v: Vec3::new(0.0, -2.0, 0.0),
+                w: Vec3::ZERO,
             },
         ];
         let ctx = StepContext {
@@ -653,21 +709,31 @@ mod tests {
             center: Vec3::new(0.0, 0.5, 0.0),
             ..fa
         };
-        c[0].points[0] = prepare_point(&c[0], &bodies, &fa, &fb, Vec3::ZERO, 0.0, 0.0, Vec3::ZERO);
-        // The soft pass takes out most of the approach; the relax pass the rest.
-        solve_contacts(&mut c, &mut bodies, &ctx, true, false);
-        assert!(
-            bodies[1].v.y < 0.0 && bodies[1].v.y > -0.2,
-            "{:?}",
-            bodies[1].v
+        c[0].points[0] = prepare_point(
+            &c[0],
+            &bodies,
+            &vels,
+            &fa,
+            &fb,
+            Vec3::ZERO,
+            0.0,
+            0.0,
+            Vec3::ZERO,
         );
-        solve_contacts(&mut c, &mut bodies, &ctx, false, true);
+        // The soft pass takes out most of the approach; the relax pass the rest.
+        solve_contacts(&mut c, &bodies, &mut vels, &ctx, true, false);
         assert!(
-            bodies[1].v.y.abs() < 1e-4,
+            vels[1].v.y < 0.0 && vels[1].v.y > -0.2,
+            "{:?}",
+            vels[1].v
+        );
+        solve_contacts(&mut c, &bodies, &mut vels, &ctx, false, true);
+        assert!(
+            vels[1].v.y.abs() < 1e-4,
             "the approach is cancelled: {:?}",
-            bodies[1].v
+            vels[1].v
         );
         assert!((c[0].points[0].normal_impulse - 2.0).abs() < 1e-3);
-        assert_eq!(bodies[0].v, Vec3::ZERO, "the static slot never moves");
+        assert_eq!(vels[0].v, Vec3::ZERO, "the static slot never moves");
     }
 }

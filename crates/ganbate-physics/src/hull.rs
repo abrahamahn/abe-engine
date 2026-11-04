@@ -20,14 +20,16 @@ pub const MAX_HULL_VERTICES: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HalfEdge {
     /// The vertex this half-edge starts at.
-    pub origin: u32,
+    pub origin: u16,
     /// The opposite half-edge (`index ^ 1`).
-    pub twin: u32,
+    pub twin: u16,
     /// The next half-edge round the same face.
-    pub next: u32,
+    pub next: u16,
     /// The face on this half-edge's left (seen from outside).
-    pub face: u32,
+    pub face: u16,
 }
+
+const _: () = assert!(std::mem::size_of::<HalfEdge>() == 8);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HullFace {
@@ -44,6 +46,12 @@ pub struct ConvexHull {
     pub faces: Vec<HullFace>,
     /// A point strictly inside (the mean of the vertices).
     pub centroid: Vec3,
+    pub(crate) inner_radius: f32,
+    pub(crate) outer_face_dist: f32,
+    pub(crate) reach: f32,
+    pub(crate) max_abs_coord: f32,
+    pub(crate) vertex_edge_offsets: Vec<u16>,
+    pub(crate) vertex_edges: Vec<u16>,
 }
 
 impl ConvexHull {
@@ -145,16 +153,19 @@ impl ConvexHull {
         if vertices.iter().any(|v| !v.is_finite()) {
             return Err("hull vertex is not finite".into());
         }
+        if loops.len() >= u16::MAX as usize {
+            return Err("too many faces".into());
+        }
         let mut edges: Vec<HalfEdge> = Vec::new();
         // Directed edge (from, to) → half-edge index, kept sorted for a deterministic build.
-        let mut directed: std::collections::BTreeMap<(u32, u32), u32> = Default::default();
+        let mut directed: std::collections::BTreeMap<(u32, u32), u16> = Default::default();
         let mut faces = Vec::with_capacity(loops.len());
         for (f, lp) in loops.iter().enumerate() {
             if lp.len() < 3 {
                 return Err(format!("face {f} has fewer than 3 vertices"));
             }
-            let mut first = u32::MAX;
-            let mut prev = u32::MAX;
+            let mut first = u16::MAX;
+            let mut prev = u16::MAX;
             for j in 0..lp.len() {
                 let (a, b) = (lp[j], lp[(j + 1) % lp.len()]);
                 if a as usize >= vertices.len() || b as usize >= vertices.len() || a == b {
@@ -168,28 +179,31 @@ impl ConvexHull {
                 let e = if let Some(&twin) = directed.get(&(b, a)) {
                     twin ^ 1
                 } else {
-                    let k = edges.len() as u32;
+                    if edges.len() + 2 >= u16::MAX as usize {
+                        return Err("too many half-edges".into());
+                    }
+                    let k = edges.len() as u16;
                     let blank = HalfEdge {
                         origin: 0,
                         twin: 0,
-                        next: u32::MAX,
-                        face: u32::MAX,
+                        next: u16::MAX,
+                        face: u16::MAX,
                     };
                     edges.push(HalfEdge {
-                        origin: a,
+                        origin: a as u16,
                         twin: k + 1,
                         ..blank
                     });
                     edges.push(HalfEdge {
-                        origin: b,
+                        origin: b as u16,
                         twin: k,
                         ..blank
                     });
                     k
                 };
                 directed.insert((a, b), e);
-                edges[e as usize].face = f as u32;
-                if prev != u32::MAX {
+                edges[e as usize].face = f as u16;
+                if prev != u16::MAX {
                     edges[prev as usize].next = e;
                 } else {
                     first = e;
@@ -215,26 +229,79 @@ impl ConvexHull {
             faces.push(HullFace {
                 normal: normal.to_vec3(),
                 offset: (normal.dot(sum) / lp.len() as f64) as f32,
-                edge: first,
+                edge: u32::from(first),
             });
         }
         if edges
             .iter()
-            .any(|e| e.face == u32::MAX || e.next == u32::MAX)
+            .any(|e| e.face == u16::MAX || e.next == u16::MAX)
         {
             return Err("the faces do not close: some edge has only one face".into());
         }
         let centroid =
             vertices.iter().fold(Vec3::ZERO, |s, &v| s + v) * (1.0 / vertices.len() as f32);
-        Ok(ConvexHull {
+        let mut hull = ConvexHull {
             vertices,
             edges,
             faces,
             centroid,
-        })
+            inner_radius: 0.0,
+            outer_face_dist: 0.0,
+            reach: 0.0,
+            max_abs_coord: 0.0,
+            vertex_edge_offsets: Vec::new(),
+            vertex_edges: Vec::new(),
+        };
+        hull.recompute_invariants();
+        Ok(hull)
+    }
+
+    fn recompute_invariants(&mut self) {
+        let r = self.faces.iter().fold(f32::INFINITY, |r, f| {
+            r.min(f.offset - f.normal.dot(self.centroid))
+        });
+        self.inner_radius = if r.is_finite() { r.max(0.0) } else { 0.0 };
+        self.outer_face_dist = self
+            .faces
+            .iter()
+            .fold(0.0f32, |m, f| m.max(f.offset - f.normal.dot(self.centroid)));
+        self.reach = self
+            .vertices
+            .iter()
+            .fold(0.0f32, |m, p| m.max((*p - self.centroid).length_squared()))
+            .sqrt();
+        self.max_abs_coord = self
+            .vertices
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs().max_element()));
+
+        let nv = self.vertices.len();
+        let mut offsets = vec![0u16; nv + 1];
+        for e in &self.edges {
+            let o = e.origin as usize;
+            if o < nv {
+                offsets[o + 1] += 1;
+            }
+        }
+        for v in 0..nv {
+            offsets[v + 1] += offsets[v];
+        }
+        let mut cursor = offsets.clone();
+        let mut vertex_edges = vec![0u16; self.edges.len()];
+        for (idx, e) in self.edges.iter().enumerate() {
+            let o = e.origin as usize;
+            if o < nv {
+                let pos = cursor[o] as usize;
+                vertex_edges[pos] = idx as u16;
+                cursor[o] += 1;
+            }
+        }
+        self.vertex_edge_offsets = offsets;
+        self.vertex_edges = vertex_edges;
     }
 
     /// The index of the vertex farthest along `d` (the first of equals).
+    #[inline]
     pub fn support_index(&self, d: Vec3) -> usize {
         let mut best = 0;
         let mut best_d = f32::NEG_INFINITY;
@@ -297,14 +364,14 @@ impl ConvexHull {
             let mut e = face.edge;
             let mut n = 0;
             loop {
-                if self.edges[e as usize].face != f as u32 {
+                if self.edges[e as usize].face as usize != f {
                     return Err(format!("face {f}'s loop leaves the face"));
                 }
                 let v = self.vertices[self.edges[e as usize].origin as usize];
                 if (face.normal.dot(v) - face.offset).abs() > tol * 10.0 {
                     return Err(format!("face {f} is not planar"));
                 }
-                e = self.edges[e as usize].next;
+                e = u32::from(self.edges[e as usize].next);
                 n += 1;
                 if e == face.edge {
                     break;
@@ -333,7 +400,7 @@ impl ConvexHull {
         let mut e = start;
         loop {
             out.push(self.vertices[self.edges[e as usize].origin as usize]);
-            e = self.edges[e as usize].next;
+            e = u32::from(self.edges[e as usize].next);
             if e == start {
                 break;
             }
@@ -472,6 +539,7 @@ impl ConvexHull {
             face.normal = normal;
             face.offset = offset;
         }
+        hull.recompute_invariants();
         hull.validate()
             .map_err(|e| format!("convex hull: the result is not valid: {e}"))?;
         Ok(hull)
@@ -491,9 +559,9 @@ impl ConvexHull {
         let mut second = [0.0f64; 6];
         for face in &self.faces {
             let a = at(face.edge);
-            let mut e = self.edges[face.edge as usize].next;
+            let mut e = u32::from(self.edges[face.edge as usize].next);
             let mut b = at(e);
-            e = self.edges[e as usize].next;
+            e = u32::from(self.edges[e as usize].next);
             while e != face.edge {
                 let c = at(e);
                 let det = a.dot(b.cross(c));
@@ -510,7 +578,7 @@ impl ConvexHull {
                     second[5] += k * u.z * u.x;
                 }
                 b = c;
-                e = self.edges[e as usize].next;
+                e = u32::from(self.edges[e as usize].next);
             }
         }
         if volume.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
@@ -1172,7 +1240,7 @@ mod tests {
         broken.edges.pop();
         assert!(broken.validate().is_err());
         let mut broken = hull.clone();
-        broken.edges[0].origin = u32::MAX;
+        broken.edges[0].origin = u16::MAX;
         assert!(broken.validate().is_err());
         let mut broken = hull;
         broken.faces[0].edge = u32::MAX;

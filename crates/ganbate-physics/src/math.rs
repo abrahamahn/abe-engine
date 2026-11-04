@@ -286,6 +286,7 @@ impl Quat {
     }
     /// A rotation of `angle` radians about the unit vector `axis` (the engine's own sine and
     /// cosine, so the same bits on every platform).
+    #[inline]
     pub fn from_axis_angle(axis: Vec3, angle: f32) -> Self {
         let (s, c) = sin_cos(angle * 0.5);
         let a = axis.normalize_or_zero();
@@ -307,6 +308,7 @@ impl Quat {
         Self::from_axis_angle(axis, angle as f32)
     }
     /// The shortest rotation taking unit vector `from` onto unit vector `to`.
+    #[inline]
     pub fn from_rotation_arc(from: Vec3, to: Vec3) -> Self {
         let d = from.dot(to);
         if d < -0.999_999 {
@@ -360,6 +362,7 @@ impl Quat {
         Self::new(self.x + dq.x, self.y + dq.y, self.z + dq.z, self.w + dq.w).normalize()
     }
     /// The rotation matrix.
+    #[inline]
     pub fn to_mat3(self) -> Mat3 {
         let (x, y, z, w) = (self.x, self.y, self.z, self.w);
         let (x2, y2, z2) = (x + x, y + y, z + z);
@@ -414,6 +417,7 @@ impl Quat {
     }
     /// The rotation's angle about `axis` (a unit vector), in `(-π, π]`, by swing-twist
     /// decomposition. Deterministic: uses [`atan2`].
+    #[inline]
     pub fn twist_angle(self, axis: Vec3) -> f32 {
         // q and -q are the same rotation; take the one with w >= 0 so the angle stays in (-π, π].
         let (s, c) = (self.vector().dot(axis), self.w);
@@ -549,6 +553,7 @@ impl Mat3 {
         Self::from_cols(self.cols[0] * s, self.cols[1] * s, self.cols[2] * s)
     }
     /// `R M Rᵀ`: this matrix (an inertia tensor in a local frame) seen in a frame rotated by `q`.
+    #[inline]
     pub fn rotated(&self, q: Quat) -> Self {
         let r = q.to_mat3();
         r * *self * r.transpose()
@@ -556,6 +561,78 @@ impl Mat3 {
     #[inline]
     pub fn is_finite(&self) -> bool {
         self.cols.iter().all(|c| c.is_finite())
+    }
+}
+
+/// A symmetric 3×3 matrix stored as its six upper-triangle components (24 bytes vs 36 for [`Mat3`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SymMat3 {
+    pub xx: f32,
+    pub yy: f32,
+    pub zz: f32,
+    pub xy: f32,
+    pub xz: f32,
+    pub yz: f32,
+}
+
+impl SymMat3 {
+    pub const ZERO: Self = Self {
+        xx: 0.0,
+        yy: 0.0,
+        zz: 0.0,
+        xy: 0.0,
+        xz: 0.0,
+        yz: 0.0,
+    };
+
+    #[inline]
+    pub const fn new(xx: f32, yy: f32, zz: f32, xy: f32, xz: f32, yz: f32) -> Self {
+        Self {
+            xx,
+            yy,
+            zz,
+            xy,
+            xz,
+            yz,
+        }
+    }
+
+    #[inline]
+    pub const fn from_diagonal(d: Vec3) -> Self {
+        Self::new(d.x, d.y, d.z, 0.0, 0.0, 0.0)
+    }
+
+    #[inline]
+    pub fn from_mat3(m: &Mat3) -> Self {
+        Self::new(
+            m.cols[0].x,
+            m.cols[1].y,
+            m.cols[2].z,
+            m.cols[1].x,
+            m.cols[2].x,
+            m.cols[2].y,
+        )
+    }
+
+    #[inline]
+    pub fn to_mat3(self) -> Mat3 {
+        Mat3::from_cols(
+            Vec3::new(self.xx, self.xy, self.xz),
+            Vec3::new(self.xy, self.yy, self.yz),
+            Vec3::new(self.xz, self.yz, self.zz),
+        )
+    }
+
+    #[inline]
+    pub fn diagonal(self) -> Vec3 {
+        Vec3::new(self.xx, self.yy, self.zz)
+    }
+
+    #[inline]
+    pub fn mul_vec(self, v: Vec3) -> Vec3 {
+        Vec3::new(self.xx, self.xy, self.xz) * v.x
+            + Vec3::new(self.xy, self.yy, self.yz) * v.y
+            + Vec3::new(self.xz, self.yz, self.zz) * v.z
     }
 }
 
@@ -776,6 +853,7 @@ impl Aabb {
     }
     /// Where a ray `origin + t·dir` enters this box, for `t` in `[0, max_t]` (slab test; a ray
     /// starting inside enters at 0).
+    #[inline]
     pub fn ray_entry(&self, origin: Vec3, inv_dir: Vec3, max_t: f32) -> Option<f32> {
         let mut t0 = 0.0f32;
         let mut t1 = max_t;

@@ -125,6 +125,7 @@ struct Texture {
     pixel_format: u64,
     /// The texture type it was created with.
     ty: u64,
+    sw_decompress: Option<ganbate_core::world::TextureCompression>,
     views: Vec<(ViewKey, Obj)>,
     swapchain: bool,
 }
@@ -214,6 +215,8 @@ pub(crate) struct Gpu<'w> {
     name: String,
     /// iOS GPUs before Apple4 (A11) cannot clamp depth.
     depth_clamp: bool,
+    bc_compression: bool,
+    astc_compression: bool,
     buffers: Pool<Buffer>,
     textures: Pool<Texture>,
     samplers: Pool<Sampler>,
@@ -287,11 +290,15 @@ impl<'w> Gpu<'w> {
                     && send!(d, "supportsFamily:", family => i64; i8) != 0
             };
             let depth_clamp = cfg!(target_os = "macos") || supports(ffi::family::APPLE4);
+            let bc_compression = cfg!(target_os = "macos") || supports(ffi::family::MAC2);
+            let astc_compression = supports(ffi::family::APPLE2) || supports(ffi::family::APPLE4);
             Ok(Self {
                 device,
                 queue,
                 name,
                 depth_clamp,
+                bc_compression,
+                astc_compression,
                 buffers: Pool::default(),
                 textures: Pool::default(),
                 samplers: Pool::default(),
@@ -327,6 +334,8 @@ impl<'w> Gpu<'w> {
             uniform_offset_alignment: 256,
             storage_offset_alignment: 256,
             depth_filterable: false,
+            texture_compression_bc: self.bc_compression,
+            texture_compression_astc: self.astc_compression,
         }
     }
 
@@ -375,13 +384,12 @@ impl<'w> Gpu<'w> {
     /// Waits for every committed command buffer with a serial up to `serial`; reports the
     /// first that failed.
     fn wait_serial(&mut self, serial: u64) -> Result<()> {
+        if self.in_flight.first().is_none_or(|&(s, _)| s > serial) {
+            return Ok(());
+        }
+        let split = self.in_flight.partition_point(|&(s, _)| s <= serial);
         let mut result = Ok(());
-        let mut keep = Vec::with_capacity(self.in_flight.len());
-        for (s, cb) in std::mem::take(&mut self.in_flight) {
-            if s > serial {
-                keep.push((s, cb));
-                continue;
-            }
+        for (_, cb) in self.in_flight.drain(..split) {
             // SAFETY: waiting on and querying a committed command buffer.
             unsafe {
                 send!(cb.id(), "waitUntilCompleted"; ());
@@ -395,7 +403,6 @@ impl<'w> Gpu<'w> {
                 }
             }
         }
-        self.in_flight = keep;
         result
     }
 

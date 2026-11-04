@@ -13,6 +13,8 @@
 //! A simulation steps in fixed time slices and gives the same bits for the same inputs on every
 //! platform (see [`math`]).
 
+#![forbid(unsafe_code)]
+
 mod ccd;
 pub mod character;
 pub mod collide;
@@ -25,6 +27,7 @@ pub mod query;
 pub mod ray;
 pub mod scene;
 pub mod shape;
+pub(crate) mod small_buf;
 pub mod solver;
 pub mod tree;
 pub mod world;

@@ -166,6 +166,20 @@ impl<'w> Gpu<'w> {
         Ok(layout)
     }
 
+    fn intern_layout_id(&mut self, entries: &[Entry]) -> u32 {
+        if entries.is_empty() {
+            return 0;
+        }
+        if let Some(&id) = self.layout_ids.get(entries) {
+            return id;
+        }
+        let id = (self.layout_ids.len() as u32)
+            .checked_add(1)
+            .expect("too many unique bind group layouts");
+        self.layout_ids.insert(entries.to_vec(), id);
+        id
+    }
+
     /// Group layouts (with empty layouts for gaps) and the pipeline layout.
     fn layouts(
         &mut self,
@@ -213,8 +227,11 @@ impl<'w> Gpu<'w> {
         }
         let mut layouts = Vec::with_capacity(groups.len());
         for entries in groups {
+            let id = self.intern_layout_id(&entries);
+            let set_layout = self.set_layout(&entries)?;
             layouts.push(GroupLayout {
-                set_layout: self.set_layout(&entries)?,
+                id,
+                set_layout,
                 entries,
             });
         }
@@ -278,33 +295,36 @@ impl<'w> Gpu<'w> {
                 initialLayout: layout,
                 finalLayout: layout,
             };
-        let mut attachments: Vec<VkAttachmentDescription> = key
-            .colors
-            .iter()
-            .map(|c| describe(*c, track::COLOR_ATTACHMENT))
-            .collect();
-        let colors: Vec<VkAttachmentReference> = (0..key.colors.len() as u32)
-            .map(|attachment| VkAttachmentReference {
-                attachment,
+        let key_colors = key.colors();
+        // SAFETY: zeroed attachment structs are overwritten up to `att_len` / `key_colors.len()`.
+        let mut attachments =
+            [unsafe { core::mem::zeroed::<VkAttachmentDescription>() }; MAX_PASS_COLORS + 1];
+        let mut colors = [unsafe { core::mem::zeroed::<VkAttachmentReference>() }; MAX_PASS_COLORS];
+        for (i, &c) in key_colors.iter().enumerate() {
+            attachments[i] = describe(c, track::COLOR_ATTACHMENT);
+            colors[i] = VkAttachmentReference {
+                attachment: i as u32,
                 layout: track::COLOR_ATTACHMENT,
-            })
-            .collect();
+            };
+        }
+        let mut att_len = key_colors.len();
         let depth = VkAttachmentReference {
-            attachment: attachments.len() as u32,
+            attachment: att_len as u32,
             layout: track::DEPTH_ATTACHMENT,
         };
         if let Some(d) = key.depth {
-            attachments.push(describe(d, track::DEPTH_ATTACHMENT));
+            attachments[att_len] = describe(d, track::DEPTH_ATTACHMENT);
+            att_len += 1;
         }
         // SAFETY: zero is a valid VkSubpassDescription (no attachments, graphics bind point).
         let mut subpass: VkSubpassDescription = unsafe { core::mem::zeroed() };
-        subpass.colorAttachmentCount = colors.len() as u32;
+        subpass.colorAttachmentCount = key_colors.len() as u32;
         subpass.pColorAttachments = colors.as_ptr();
         if key.depth.is_some() {
             subpass.pDepthStencilAttachment = &depth;
         }
         let mut ci = VkRenderPassCreateInfo::new();
-        ci.attachmentCount = attachments.len() as u32;
+        ci.attachmentCount = att_len as u32;
         ci.pAttachments = attachments.as_ptr();
         ci.subpassCount = 1;
         ci.pSubpasses = &subpass;
@@ -312,12 +332,20 @@ impl<'w> Gpu<'w> {
         let pass = create("vkCreateRenderPass", |o| unsafe {
             vkCreateRenderPass(self.device, &ci, null(), o)
         })?;
-        self.render_passes.insert(key.clone(), pass);
+        self.render_passes.insert(*key, pass);
         Ok(pass)
     }
 
     pub(super) fn framebuffer(&mut self, pass: u64, views: &[u64], w: u32, h: u32) -> Result<u64> {
-        let key = (pass, views.to_vec(), w, h);
+        let mut view_arr = [0u64; MAX_PASS_COLORS + 1];
+        view_arr[..views.len()].copy_from_slice(views);
+        let key = FramebufferKey {
+            pass,
+            views: view_arr,
+            len: views.len() as u8,
+            w,
+            h,
+        };
         if let Some(&f) = self.framebuffers.get(&key) {
             return Ok(f);
         }
@@ -411,7 +439,7 @@ impl<'w> Gpu<'w> {
         if d.colors.is_empty() && d.depth.is_none() {
             return Err("create_render_pipeline: no colour target and no depth".into());
         }
-        if d.colors.len() > self.limits.maxColorAttachments as usize {
+        if d.colors.len() > (self.limits.maxColorAttachments as usize).min(MAX_PASS_COLORS) {
             return Err(format!(
                 "{} colour targets exceed the device limit",
                 d.colors.len()
@@ -467,14 +495,12 @@ impl<'w> Gpu<'w> {
             stages.push((f, FRAGMENT_BIT));
         }
         let (groups, layout, push_size, push_stages) = self.layouts(&stages)?;
-        let key = PassKey {
-            colors: d
-                .colors
-                .iter()
-                .map(|c| (vk_format(c.format), 2, 0))
-                .collect(),
-            depth: d.depth.map(|z| (vk_format(z.format), 2, 0)),
-        };
+        let mut key = PassKey::empty();
+        key.color_len = d.colors.len() as u8;
+        for (i, c) in d.colors.iter().enumerate() {
+            key.colors[i] = (vk_format(c.format), 2, 0);
+        }
+        key.depth = d.depth.map(|z| (vk_format(z.format), 2, 0));
         let pass = self.render_pass(&key)?;
 
         let binding = VkVertexInputBindingDescription {
@@ -587,7 +613,7 @@ impl<'w> Gpu<'w> {
         // destroyed once the pipeline exists.
         let handle = unsafe {
             let result = create("vkCreateGraphicsPipelines", |o| {
-                vkCreateGraphicsPipelines(self.device, 0, 1, &pi, null(), o)
+                vkCreateGraphicsPipelines(self.device, self.pipeline_cache, 1, &pi, null(), o)
             });
             vkDestroyShaderModule(self.device, vs, null());
             if let Some(fs) = fs {
@@ -620,7 +646,7 @@ impl<'w> Gpu<'w> {
         // SAFETY: the create info outlives the call; the module may be destroyed afterwards.
         let handle = unsafe {
             let result = create("vkCreateComputePipelines", |o| {
-                vkCreateComputePipelines(self.device, 0, 1, &ci, null(), o)
+                vkCreateComputePipelines(self.device, self.pipeline_cache, 1, &ci, null(), o)
             });
             vkDestroyShaderModule(self.device, module, null());
             result?
@@ -663,33 +689,54 @@ impl<'w> Gpu<'w> {
         }
         // Reflection lists only what the entry points statically use, so entries for other
         // bindings are ignored, and a group the pipeline does not use gets an empty group.
-        let used = self.pipeline(pipeline)?.groups.get(group as usize).cloned();
-        let Some(layout) = used.filter(|g| !g.entries.is_empty()) else {
+        let mut inline_entries = [Entry {
+            binding: 0,
+            kind: BindingKind::Sampler { comparison: false },
+            stages: 0,
+        }; 32];
+        let mut overflow_entries = Vec::new();
+        let (layout_id, set_layout, entry_count) = {
+            let p = self.pipeline(pipeline)?;
+            match p.groups.get(group as usize).filter(|g| !g.entries.is_empty()) {
+                Some(g) => {
+                    if g.entries.len() <= inline_entries.len() {
+                        inline_entries[..g.entries.len()].copy_from_slice(&g.entries);
+                    } else {
+                        overflow_entries.extend_from_slice(&g.entries);
+                    }
+                    (g.id, g.set_layout, g.entries.len())
+                }
+                None => (0, 0, 0),
+            }
+        };
+        if entry_count == 0 {
             if group as usize >= MAX_BIND_GROUPS {
                 return Err(format!("@group({group}) is above the supported 0..=7"));
             }
             let empty = BindGroup {
                 set: 0,
                 pool: usize::MAX,
-                layout: GroupLayout {
-                    set_layout: 0,
-                    entries: Vec::new(),
-                },
+                layout_id: 0,
                 bound: Vec::new(),
                 counts: [0; 5],
             };
             return Ok(BindGroupId::from_raw(self.groups.insert(empty)?));
+        }
+        let layout_entries = if entry_count <= inline_entries.len() {
+            &inline_entries[..entry_count]
+        } else {
+            overflow_entries.as_slice()
         };
-        let mut images = Vec::with_capacity(layout.entries.len());
-        let mut buffers = Vec::with_capacity(layout.entries.len());
-        let mut bound = Vec::with_capacity(layout.entries.len());
+        let mut images = Vec::with_capacity(entry_count);
+        let mut buffers = Vec::with_capacity(entry_count);
+        let mut bound = Vec::with_capacity(entry_count);
         let mut counts = [0u32; 5];
-        for e in &layout.entries {
+        for e in layout_entries {
             let (_, res) = *entries
                 .iter()
                 .find(|(b, _)| *b == e.binding)
                 .ok_or_else(|| format!("@group({group}) @binding({}) is missing", e.binding))?;
-            let at = format!("@group({group}) @binding({})", e.binding);
+            let at = || format!("@group({group}) @binding({})", e.binding);
             counts[descriptor_slot(&e.kind)] += 1;
             let stages = shader_pipeline_stages(e.stages);
             match (e.kind, res) {
@@ -713,11 +760,12 @@ impl<'w> Gpu<'w> {
                         )
                     };
                     if !b.desc.usage.contains(usage) {
-                        return Err(format!("{at}: {id:?} lacks {usage:?} usage"));
+                        return Err(format!("{}: {id:?} lacks {usage:?} usage", at()));
                     }
                     if offset >= b.desc.size || offset % align.max(1) != 0 {
                         return Err(format!(
-                            "{at}: offset {offset} must be inside the buffer and a multiple of {align}"
+                            "{}: offset {offset} must be inside the buffer and a multiple of {align}",
+                            at()
                         ));
                     }
                     let range = if size == 0 {
@@ -726,12 +774,16 @@ impl<'w> Gpu<'w> {
                         size
                     };
                     if offset + range > b.desc.size || range > u64::from(max) {
-                        return Err(format!("{at}: range {range} at {offset} is out of bounds"));
+                        return Err(format!(
+                            "{}: range {range} at {offset} is out of bounds",
+                            at()
+                        ));
                     }
                     if let BindingKind::UniformBuffer { size: need } = e.kind {
                         if range < u64::from(need) {
                             return Err(format!(
-                                "{at}: the shader reads {need} bytes but only {range} are bound"
+                                "{}: the shader reads {need} bytes but only {range} are bound",
+                                at()
                             ));
                         }
                     }
@@ -765,7 +817,7 @@ impl<'w> Gpu<'w> {
                     match e.kind {
                         BindingKind::Texture { sample, .. } => {
                             if !desc.usage.contains(TextureUsage::SAMPLED) {
-                                return Err(format!("{at}: {id:?} lacks SAMPLED usage"));
+                                return Err(format!("{}: {id:?} lacks SAMPLED usage", at()));
                             }
                             let ok = match sample {
                                 SampleType::Depth => desc.format.is_depth(),
@@ -774,18 +826,20 @@ impl<'w> Gpu<'w> {
                             };
                             if !ok {
                                 return Err(format!(
-                                    "{at}: a {sample:?} texture binding cannot sample {:?}",
+                                    "{}: a {sample:?} texture binding cannot sample {:?}",
+                                    at(),
                                     desc.format
                                 ));
                             }
                         }
                         BindingKind::StorageTexture { format, .. } => {
                             if !desc.usage.contains(TextureUsage::STORAGE) {
-                                return Err(format!("{at}: {id:?} lacks STORAGE usage"));
+                                return Err(format!("{}: {id:?} lacks STORAGE usage", at()));
                             }
                             if texel_format(format) != desc.format {
                                 return Err(format!(
-                                    "{at}: the shader writes {format:?} but {id:?} is {:?}",
+                                    "{}: the shader writes {format:?} but {id:?} is {:?}",
+                                    at(),
                                     desc.format
                                 ));
                             }
@@ -793,7 +847,7 @@ impl<'w> Gpu<'w> {
                         _ => unreachable!("matched texture kinds above"),
                     }
                     let (key, mips, layers) =
-                        view_for(view, res, &desc, storage).map_err(|m| format!("{at}: {m}"))?;
+                        view_for(view, res, &desc, storage).map_err(|m| format!("{}: {m}", at()))?;
                     let image_view = self.view(id, key)?;
                     let (layout, access) = if storage {
                         (track::GENERAL, access::SHADER_WRITE)
@@ -817,13 +871,13 @@ impl<'w> Gpu<'w> {
                     });
                 }
                 (BindingKind::Sampler { comparison }, Resource::Sampler(id)) => {
-                    let s = self
-                        .samplers
-                        .get(id.raw())
-                        .ok_or_else(|| format!("{at}: {id:?} does not belong to this device"))?;
+                    let s = self.samplers.get(id.raw()).ok_or_else(|| {
+                        format!("{}: {id:?} does not belong to this device", at())
+                    })?;
                     if s.comparison != comparison {
                         return Err(format!(
-                            "{at}: the shader declares a {} but {id:?} is {}",
+                            "{}: the shader declares a {} but {id:?} is {}",
+                            at(),
                             if comparison {
                                 "sampler_comparison"
                             } else {
@@ -847,10 +901,10 @@ impl<'w> Gpu<'w> {
                     ));
                     bound.push(Bound::Sampler(id));
                 }
-                (kind, res) => return Err(format!("{at} expects {kind:?} but got {res:?}")),
+                (kind, res) => return Err(format!("{} expects {kind:?} but got {res:?}", at())),
             }
         }
-        let (pool, set) = self.allocate_set(layout.set_layout, counts)?;
+        let (pool, set) = self.allocate_set(set_layout, counts)?;
         let mut writes = Vec::with_capacity(images.len() + buffers.len());
         for (binding, ty, info) in &images {
             let mut w = VkWriteDescriptorSet::new();
@@ -877,7 +931,7 @@ impl<'w> Gpu<'w> {
         let group = BindGroup {
             set,
             pool,
-            layout,
+            layout_id,
             bound,
             counts,
         };

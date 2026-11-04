@@ -73,7 +73,7 @@
 )]
 mod encoder;
 mod types;
-pub(crate) use encoder::Command;
+pub(crate) use encoder::{Command, PassView, Span, TransferCmd};
 pub use encoder::Encoder;
 pub use ganbate_shader as shader;
 pub use types::*;
@@ -154,6 +154,7 @@ impl ValidationLog {
 ))]
 pub struct Device<'w> {
     gpu: Gpu<'w>,
+    encoders: std::sync::Mutex<Vec<Encoder>>,
 }
 
 #[cfg(any(
@@ -167,6 +168,7 @@ impl Device<'static> {
     pub fn headless() -> Result<Self> {
         Ok(Self {
             gpu: Gpu::headless()?,
+            encoders: std::sync::Mutex::new(Vec::new()),
         })
     }
 }
@@ -189,6 +191,7 @@ impl<'w> Device<'w> {
     pub fn for_window(window: &'w crate::window::Window) -> Result<Self> {
         Ok(Self {
             gpu: Gpu::for_window(window)?,
+            encoders: std::sync::Mutex::new(Vec::new()),
         })
     }
     pub fn name(&self) -> &str {
@@ -290,11 +293,25 @@ impl<'w> Device<'w> {
         self.gpu.destroy_bind_group(g)
     }
     pub fn encoder(&self) -> Encoder {
-        Encoder::new()
+        self.encoders
+            .lock()
+            .ok()
+            .and_then(|mut pool| pool.pop())
+            .unwrap_or_default()
+    }
+    fn recycle_encoder(&self, mut e: Encoder) {
+        e.clear();
+        if let Ok(mut pool) = self.encoders.lock()
+            && pool.len() < 4
+        {
+            pool.push(e);
+        }
     }
     /// Executes `e` and waits for completion.
     pub fn submit(&mut self, e: Encoder) -> Result<()> {
-        self.gpu.submit(e)
+        let r = self.gpu.submit(&e);
+        self.recycle_encoder(e);
+        r
     }
     /// The next swapchain texture, or `None` while the window is hidden, minimized or the
     /// surface is temporarily unavailable. Recreates the swapchain after resizes. Calling it
@@ -314,7 +331,9 @@ impl<'w> Device<'w> {
     }
     /// Submits `e`, which renders into the texture returned by `acquire`, and presents it.
     pub fn present(&mut self, e: Encoder) -> Result<()> {
-        self.gpu.present(e)
+        let r = self.gpu.present(&e);
+        self.recycle_encoder(e);
+        r
     }
     /// 0 or 1: which per-frame resources the next frame may overwrite. When `present` returns,
     /// the GPU has finished the earlier frame that used this slot.
@@ -338,6 +357,7 @@ impl<'w> Device<'w> {
 #[cfg(target_arch = "wasm32")]
 pub struct Device<'w> {
     gpu: Web<'w>,
+    encoders: std::sync::Mutex<Vec<Encoder>>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -371,6 +391,7 @@ impl Device<'static> {
                 Some(WebApi::WebGl2) => Web::Gl(webgl::Gpu::open(presentable)?),
                 _ => Web::Gpu(webgpu::Gpu::open(presentable)?),
             },
+            encoders: std::sync::Mutex::new(Vec::new()),
         })
     }
     /// The host's device, without presentation.
@@ -469,11 +490,25 @@ impl Device<'_> {
         web!(mut self, g => g.destroy_bind_group(b))
     }
     pub fn encoder(&self) -> Encoder {
-        Encoder::new()
+        self.encoders
+            .lock()
+            .ok()
+            .and_then(|mut pool| pool.pop())
+            .unwrap_or_default()
+    }
+    fn recycle_encoder(&self, mut e: Encoder) {
+        e.clear();
+        if let Ok(mut pool) = self.encoders.lock()
+            && pool.len() < 4
+        {
+            pool.push(e);
+        }
     }
     /// Records `e` and submits it without waiting.
     pub fn submit(&mut self, e: Encoder) -> Result<()> {
-        web!(mut self, g => g.submit(e))
+        let r = web!(mut self, g => g.submit(&e));
+        self.recycle_encoder(e);
+        r
     }
     /// The canvas texture at the canvas's current size, or `None` while it has no area.
     pub fn acquire(&mut self) -> Result<Option<TextureId>> {
@@ -490,10 +525,134 @@ impl Device<'_> {
     /// Submits `e`, which renders into the canvas texture; the browser presents it when the
     /// current animation frame callback returns.
     pub fn present(&mut self, e: Encoder) -> Result<()> {
-        web!(mut self, g => g.present(e))
+        let r = web!(mut self, g => g.present(&e));
+        self.recycle_encoder(e);
+        r
     }
     /// 0 or 1, alternating with every `present`.
     pub fn frame_slot(&self) -> usize {
         web!(self, g => g.frame_slot())
+    }
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "windows", target_vendor = "apple")
+))]
+mod tests {
+    use super::*;
+    use ganbate_core::world::TextureCompression;
+
+    #[test]
+    fn compressed_bc1_bc7_and_astc4x4_textures_upload_and_sample() {
+        let Ok(mut dev) = Device::headless() else {
+            return; // Headless GPU unavailable on this host.
+        };
+        let shader_src = "
+            @group(0) @binding(0) var tex: texture_2d<f32>;
+            @group(0) @binding(1) var smp: sampler;
+            struct VOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+            @vertex fn vs(@builtin(vertex_index) vi: u32) -> VOut {
+                let uv = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+                var o: VOut;
+                o.pos = vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+                o.uv = uv;
+                return o;
+            }
+            @fragment fn fs(in: VOut) -> @location(0) vec4f {
+                return textureSample(tex, smp, in.uv);
+            }
+        ";
+        let vs = compile_shader(shader_src, shader::Stage::Vertex, "vs").unwrap();
+        let fs = compile_shader(shader_src, shader::Stage::Fragment, "fs").unwrap();
+        let pipe = dev
+            .create_render_pipeline(&RenderPipelineDesc {
+                vertex: &vs,
+                fragment: Some(&fs),
+                vertex_layout: None,
+                topology: Topology::TriangleList,
+                cull: Cull::None,
+                front_ccw: true,
+                depth: None,
+                colors: vec![ColorTarget {
+                    format: Format::Rgba8Unorm,
+                    blend: Blend::Replace,
+                    write_mask: 0xF,
+                }],
+            })
+            .unwrap();
+        let sampler = dev
+            .create_sampler(&SamplerDesc {
+                filter: Filter::Nearest,
+                mip_filter: Filter::Nearest,
+                ..SamplerDesc::default()
+            })
+            .unwrap();
+        let dst = dev
+            .create_texture(&TextureDesc::new(
+                4,
+                4,
+                Format::Rgba8Unorm,
+                TextureUsage::COLOR_TARGET | TextureUsage::COPY_SRC,
+            ))
+            .unwrap();
+        let rb = dev
+            .create_buffer(&BufferDesc {
+                size: 4 * 4 * 4,
+                usage: BufferUsage::COPY_DST,
+                memory: Memory::Readback,
+            })
+            .unwrap();
+
+        let expected_rgba = [212u8, 84, 168, 255];
+        for (comp, fmt) in [
+            (TextureCompression::Bc1, Format::Bc1RgbaUnorm),
+            (TextureCompression::Bc7, Format::Bc7RgbaUnorm),
+            (TextureCompression::Astc4x4, Format::Astc4x4Unorm),
+        ] {
+            let mut desc =
+                TextureDesc::new(8, 8, fmt, TextureUsage::SAMPLED | TextureUsage::COPY_DST);
+            desc.mips = 3; // 8x8, 4x4, 2x2 (includes sub-block tail mip)
+            let tex = dev.create_texture(&desc).unwrap();
+            for mip in 0..3 {
+                let (w, h) = desc.mip_size(mip);
+                let mut src = Vec::with_capacity((w * h * 4) as usize);
+                for _ in 0..(w * h) {
+                    src.extend_from_slice(&expected_rgba);
+                }
+                let blocks = ganbate_assets::bc::encode_rgba8(comp, &src, w, h).unwrap();
+                dev.write_texture(tex, mip, 0, &blocks).unwrap();
+            }
+            let bg = dev
+                .create_bind_group(
+                    pipe,
+                    0,
+                    &[(0, Resource::Texture(tex)), (1, Resource::Sampler(sampler))],
+                )
+                .unwrap();
+            let mut enc = dev.encoder();
+            enc.begin_pass(PassDesc {
+                colors: vec![Attachment::clear(dst, [0.0; 4])],
+                depth: None,
+            });
+            enc.set_pipeline(pipe);
+            enc.set_bind_group(0, bg);
+            enc.draw(3, 1, 0, 0);
+            enc.end_pass();
+            enc.copy_texture_to_buffer(dst, 0, 0, rb, 0);
+            dev.submit(enc).unwrap();
+
+            let pixels = dev.read_buffer(rb).unwrap();
+            for ch in 0..4 {
+                assert!(
+                    pixels[ch].abs_diff(expected_rgba[ch]) <= 12,
+                    "{fmt:?} ch {ch}: got {} vs {}",
+                    pixels[ch],
+                    expected_rgba[ch]
+                );
+            }
+            dev.destroy_bind_group(bg);
+            dev.destroy_texture(tex);
+        }
     }
 }

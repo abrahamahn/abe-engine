@@ -9,6 +9,7 @@ use crate::math::{Aabb, Iso, Vec3};
 use crate::mesh::TriangleRef;
 use crate::ray;
 use crate::shape::{Convex, ConvexShape, Shape, transform_aabb};
+use crate::small_buf::SmallBuf;
 use crate::world::{BodyId, ColliderId, PhysicsWorld, QueryFilter};
 
 /// A surface stops a cast only when the motion heads into it by more than this (the cosine of
@@ -203,18 +204,9 @@ impl PhysicsWorld {
                 });
             }
         };
-        let mut candidates: Vec<u32> = Vec::new();
-        for tree in [&self.static_tree, &self.moving_tree] {
-            tree.query(&swept, &mut |_, c| {
-                if self.passes(c, filter) {
-                    candidates.push(c);
-                }
-                true
-            });
-        }
-        candidates.sort_unstable();
-        candidates.dedup();
-        for c in candidates {
+        let mut candidates = SmallBuf::<u32, 64>::new(0);
+        self.fill_candidates(&swept, filter, &mut candidates);
+        for &c in candidates.as_slice() {
             let col = &self.colliders[c as usize];
             let ciso = self.collider_iso(c);
             let centre = ciso.inverse_point(moving.center());
@@ -252,9 +244,9 @@ impl PhysicsWorld {
         c: u32,
         speculative: f32,
     ) -> Option<(Vec3, f32)> {
-        let mut manifolds = Vec::new();
+        let mut manifolds: [collide::Manifold; collide::MAX_MESH_MANIFOLDS] = Default::default();
         let col = &self.colliders[c as usize];
-        collide::collide(
+        let len = collide::collide_stack(
             shape,
             iso,
             &col.shape,
@@ -262,7 +254,7 @@ impl PhysicsWorld {
             speculative,
             &mut manifolds,
         );
-        manifolds
+        manifolds[..len]
             .iter()
             .filter(|m| m.count > 0)
             .map(|m| (-m.normal, m.min_separation()))
@@ -284,10 +276,11 @@ impl PhysicsWorld {
         if !shape.is_convex() {
             return;
         }
-        let mut scratch = Vec::new();
-        for c in self.query_candidates(&shape.aabb(iso), filter) {
+        let mut candidates = SmallBuf::<u32, 64>::new(0);
+        self.fill_candidates(&shape.aabb(iso), filter, &mut candidates);
+        for &c in candidates.as_slice() {
             let col = &self.colliders[c as usize];
-            if collide::overlaps(shape, iso, &col.shape, &self.collider_iso(c), &mut scratch)
+            if collide::overlaps(shape, iso, &col.shape, &self.collider_iso(c))
                 && !f(self.collider_id(c))
             {
                 return;
@@ -295,8 +288,12 @@ impl PhysicsWorld {
         }
     }
 
-    fn query_candidates(&self, bounds: &Aabb, filter: &QueryFilter) -> Vec<u32> {
-        let mut candidates: Vec<u32> = Vec::new();
+    fn fill_candidates<const N: usize>(
+        &self,
+        bounds: &Aabb,
+        filter: &QueryFilter,
+        candidates: &mut SmallBuf<u32, N>,
+    ) {
         for tree in [&self.static_tree, &self.moving_tree] {
             tree.query(bounds, &mut |_, c| {
                 if self.passes(c, filter) {
@@ -305,9 +302,7 @@ impl PhysicsWorld {
                 true
             });
         }
-        candidates.sort_unstable();
-        candidates.dedup();
-        candidates
+        candidates.sort_dedup();
     }
 
     /// The contact manifolds a convex `shape` at `iso` would have with the world's colliders
@@ -326,12 +321,12 @@ impl PhysicsWorld {
             return;
         }
         let bounds: Aabb = shape.aabb(iso).expand(speculative);
-        let candidates = self.query_candidates(&bounds, filter);
-        let mut manifolds = Vec::new();
-        for c in candidates {
-            manifolds.clear();
+        let mut candidates = SmallBuf::<u32, 64>::new(0);
+        self.fill_candidates(&bounds, filter, &mut candidates);
+        let mut manifolds: [Manifold; collide::MAX_MESH_MANIFOLDS] = Default::default();
+        for &c in candidates.as_slice() {
             let ciso = self.collider_iso(c);
-            collide::collide(
+            let len = collide::collide_stack(
                 shape,
                 iso,
                 &self.colliders[c as usize].shape,
@@ -339,7 +334,7 @@ impl PhysicsWorld {
                 speculative,
                 &mut manifolds,
             );
-            for m in &manifolds {
+            for m in &manifolds[..len] {
                 if m.count > 0 {
                     f(self.collider_id(c), m);
                 }

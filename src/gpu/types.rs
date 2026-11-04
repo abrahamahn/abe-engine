@@ -59,15 +59,29 @@ pub enum Format {
     R32Float,
     Rgba32Float,
     Depth32Float,
+    /// 4x4 block-compressed BC1 / DXT1 (8 bytes per 4x4 block, 4 bpp, 1-bit punch-through alpha).
+    Bc1RgbaUnorm,
+    Bc1RgbaSrgb,
+    /// 4x4 block-compressed BC7 / BPTC (16 bytes per 4x4 block, 8 bpp, high-precision RGBA).
+    Bc7RgbaUnorm,
+    Bc7RgbaSrgb,
+    /// 4x4 block-compressed ASTC LDR (16 bytes per 4x4 block, 8 bpp, mobile/Apple RGBA).
+    Astc4x4Unorm,
+    Astc4x4Srgb,
 }
 impl Format {
-    /// Bytes per texel, which is also the row stride unit of tightly packed uploads/readbacks.
+    /// Bytes per texel for uncompressed formats (returns block byte size for compressed formats;
+    /// prefer [`Self::row_bytes`] and [`Self::mip_byte_len`] for upload math).
     pub const fn texel_size(self) -> u32 {
         match self {
             Self::R8Unorm => 1,
             Self::R16Float => 2,
-            Self::Rgba16Float => 8,
-            Self::Rgba32Float => 16,
+            Self::Rgba16Float | Self::Bc1RgbaUnorm | Self::Bc1RgbaSrgb => 8,
+            Self::Rgba32Float
+            | Self::Bc7RgbaUnorm
+            | Self::Bc7RgbaSrgb
+            | Self::Astc4x4Unorm
+            | Self::Astc4x4Srgb => 16,
             _ => 4,
         }
     }
@@ -75,7 +89,81 @@ impl Format {
         matches!(self, Self::Depth32Float)
     }
     pub const fn is_srgb(self) -> bool {
-        matches!(self, Self::Rgba8Srgb | Self::Bgra8Srgb)
+        matches!(
+            self,
+            Self::Rgba8Srgb
+                | Self::Bgra8Srgb
+                | Self::Bc1RgbaSrgb
+                | Self::Bc7RgbaSrgb
+                | Self::Astc4x4Srgb
+        )
+    }
+    pub const fn is_compressed(self) -> bool {
+        matches!(
+            self,
+            Self::Bc1RgbaUnorm
+                | Self::Bc1RgbaSrgb
+                | Self::Bc7RgbaUnorm
+                | Self::Bc7RgbaSrgb
+                | Self::Astc4x4Unorm
+                | Self::Astc4x4Srgb
+        )
+    }
+    /// Block footprint `(width, height)` in texels (`(4, 4)` for BC/ASTC, `(1, 1)` otherwise).
+    pub const fn block_dimensions(self) -> (u32, u32) {
+        if self.is_compressed() {
+            (4, 4)
+        } else {
+            (1, 1)
+        }
+    }
+    /// Bytes per texel block (`8` for BC1, `16` for BC7/ASTC 4x4, `texel_size()` otherwise).
+    pub const fn block_bytes(self) -> u32 {
+        match self {
+            Self::Bc1RgbaUnorm | Self::Bc1RgbaSrgb => 8,
+            Self::Bc7RgbaUnorm
+            | Self::Bc7RgbaSrgb
+            | Self::Astc4x4Unorm
+            | Self::Astc4x4Srgb => 16,
+            _ => self.texel_size(),
+        }
+    }
+    /// Tightly packed row pitch in bytes (per row of texel blocks for compressed formats).
+    pub const fn row_bytes(self, width: u32) -> u32 {
+        let (bw, _) = self.block_dimensions();
+        let w = if width == 0 { 1 } else { width };
+        w.div_ceil(bw) * self.block_bytes()
+    }
+    /// Total tightly packed byte length of a `width x height` mip subresource.
+    pub const fn mip_byte_len(self, width: u32, height: u32) -> u64 {
+        let (_, bh) = self.block_dimensions();
+        let h = if height == 0 { 1 } else { height };
+        (self.row_bytes(width) as u64) * (h.div_ceil(bh) as u64)
+    }
+    /// Maps a cooked [`ganbate_core::world::TextureCompression`] + sRGB flag to a GPU [`Format`].
+    pub const fn from_compression(
+        comp: ganbate_core::world::TextureCompression,
+        srgb: bool,
+    ) -> Self {
+        use ganbate_core::world::TextureCompression;
+        match (comp, srgb) {
+            (TextureCompression::Bc1, false) => Self::Bc1RgbaUnorm,
+            (TextureCompression::Bc1, true) => Self::Bc1RgbaSrgb,
+            (TextureCompression::Bc7, false) => Self::Bc7RgbaUnorm,
+            (TextureCompression::Bc7, true) => Self::Bc7RgbaSrgb,
+            (TextureCompression::Astc4x4, false) => Self::Astc4x4Unorm,
+            (TextureCompression::Astc4x4, true) => Self::Astc4x4Srgb,
+        }
+    }
+    /// Returns the cooked block compression scheme if `self` is compressed.
+    pub const fn compression(self) -> Option<ganbate_core::world::TextureCompression> {
+        use ganbate_core::world::TextureCompression;
+        match self {
+            Self::Bc1RgbaUnorm | Self::Bc1RgbaSrgb => Some(TextureCompression::Bc1),
+            Self::Bc7RgbaUnorm | Self::Bc7RgbaSrgb => Some(TextureCompression::Bc7),
+            Self::Astc4x4Unorm | Self::Astc4x4Srgb => Some(TextureCompression::Astc4x4),
+            _ => None,
+        }
     }
 }
 
@@ -404,13 +492,59 @@ pub struct Limits {
     /// `Depth32Float` can be sampled through a non-comparison `Filter::Linear` sampler.
     /// (Comparison samplers may always filter linearly.) Use `Filter::Nearest` otherwise.
     pub depth_filterable: bool,
+    /// Native hardware sampling of BC1 and BC7 compressed textures (transparently falls back to
+    /// software RGBA8 upload when false).
+    pub texture_compression_bc: bool,
+    /// Native hardware sampling of ASTC 4x4 LDR compressed textures (transparently falls back to
+    /// software RGBA8 upload when false).
+    pub texture_compression_astc: bool,
+}
+
+/// Zero-copy view of `values` as little-endian bytes on little-endian targets.
+#[cfg(target_endian = "little")]
+#[inline]
+pub(crate) fn as_le_bytes_f32(values: &[f32]) -> &[u8] {
+    // SAFETY: `f32` has no padding or uninitialized bytes and `u8` has alignment 1.
+    unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values)) }
+}
+
+/// Zero-copy view of `values` as little-endian bytes on little-endian targets.
+#[cfg(target_endian = "little")]
+#[inline]
+pub(crate) fn as_le_bytes_u32(values: &[u32]) -> &[u8] {
+    // SAFETY: `u32` has no padding or uninitialized bytes and `u8` has alignment 1.
+    unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values)) }
 }
 
 /// Little-endian bytes of `values`, for `write_buffer` and `push_constants`.
+#[inline]
 pub fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    #[cfg(target_endian = "little")]
+    {
+        as_le_bytes_f32(values).to_vec()
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = Vec::with_capacity(values.len() * 4);
+        for v in values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
 }
 /// Little-endian bytes of `values`, for `write_buffer` and `push_constants`.
+#[inline]
 pub fn u32_bytes(values: &[u32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    #[cfg(target_endian = "little")]
+    {
+        as_le_bytes_u32(values).to_vec()
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = Vec::with_capacity(values.len() * 4);
+        for v in values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
 }

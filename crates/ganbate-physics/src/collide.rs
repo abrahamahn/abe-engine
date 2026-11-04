@@ -71,14 +71,18 @@ pub struct ManifoldPoint {
 pub struct Manifold {
     pub normal: Vec3,
     pub points: [ManifoldPoint; MAX_MANIFOLD_POINTS],
-    pub count: usize,
+    pub count: u8,
 }
 
+const _: () = assert!(std::mem::size_of::<Manifold>() == 96);
+
 impl Manifold {
+    #[inline]
     pub fn points(&self) -> &[ManifoldPoint] {
-        &self.points[..self.count]
+        &self.points[..usize::from(self.count)]
     }
     /// The smallest separation of its points (`f32::INFINITY` when empty).
+    #[inline]
     pub fn min_separation(&self) -> f32 {
         self.points()
             .iter()
@@ -96,13 +100,28 @@ pub fn collide(
     speculative: f32,
     out: &mut Vec<Manifold>,
 ) {
+    let mut buf: [Manifold; MAX_MESH_MANIFOLDS] = Default::default();
+    let len = collide_stack(a, iso_a, b, iso_b, speculative, &mut buf);
+    out.extend_from_slice(&buf[..len]);
+}
+
+/// Writes the contact manifolds between `a` and `b` into a fixed stack buffer (at most
+/// [`MAX_MESH_MANIFOLDS`]) and returns how many were written, with zero heap allocation.
+pub(crate) fn collide_stack(
+    a: &Shape,
+    iso_a: &Iso,
+    b: &Shape,
+    iso_b: &Iso,
+    speculative: f32,
+    out: &mut [Manifold; MAX_MESH_MANIFOLDS],
+) -> usize {
     let spec = if speculative.is_nan() {
         0.0
     } else {
         speculative
     };
     match (StaticGeometry::of(a), StaticGeometry::of(b)) {
-        (Some(_), Some(_)) => {}
+        (Some(_), Some(_)) => 0,
         (Some(g), None) => collide_static(g, iso_a, b, iso_b, spec, false, out),
         (None, Some(g)) => collide_static(g, iso_b, a, iso_a, spec, true, out),
         (None, None) => {
@@ -118,8 +137,12 @@ pub fn collide(
             };
             if let Some(mut m) = m {
                 unique_ids(&mut m);
-                push_finite(m, out);
+                if let Some(m) = sanitize_finite(m) {
+                    out[0] = m;
+                    return 1;
+                }
             }
+            0
         }
     }
 }
@@ -244,22 +267,20 @@ fn capsule_ends(iso: &Iso, half_height: f32) -> (Vec3, Vec3) {
 /// Moves a manifold computed in the frame `iso` places into the world.
 fn to_world(m: &mut Manifold, iso: &Iso) {
     m.normal = iso.vector(m.normal);
-    for p in &mut m.points[..m.count] {
+    for p in &mut m.points[..usize::from(m.count)] {
         p.point = iso.point(p.point);
     }
 }
 
-/// Appends `m` with a unit normal and only finite points; drops it when nothing usable is left.
-fn push_finite(mut m: Manifold, out: &mut Vec<Manifold>) {
-    let Some(n) = m.normal.try_normalize() else {
-        return;
-    };
+/// Normalizes `m.normal` and retains only finite points; returns `None` when nothing usable is left.
+fn sanitize_finite(mut m: Manifold) -> Option<Manifold> {
+    let n = m.normal.try_normalize()?;
     if !n.is_finite() {
-        return;
+        return None;
     }
     m.normal = n;
-    let mut k = 0;
-    for i in 0..m.count.min(MAX_MANIFOLD_POINTS) {
+    let mut k = 0usize;
+    for i in 0..usize::from(m.count).min(MAX_MANIFOLD_POINTS) {
         let p = m.points[i];
         if p.point.is_finite() && p.separation.is_finite() {
             m.points[k] = p;
@@ -269,10 +290,8 @@ fn push_finite(mut m: Manifold, out: &mut Vec<Manifold>) {
     for p in &mut m.points[k..] {
         *p = ManifoldPoint::default();
     }
-    m.count = k;
-    if k > 0 {
-        out.push(m);
-    }
+    m.count = k as u8;
+    (k > 0).then_some(m)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -345,7 +364,7 @@ const TAG_REFERENCE_SIDE: u32 = 0x8000_0000;
 /// Makes the ids of a convex pair's manifold nonzero and distinct (a hash collision is
 /// vanishingly rare; this keeps the contract even then).
 fn unique_ids(m: &mut Manifold) {
-    for i in 0..m.count {
+    for i in 0..usize::from(m.count) {
         let mut id = m.points[i].id;
         while id == 0 || m.points[..i].iter().any(|p| p.id == id) {
             id = mix(id, 0x5bd1_e995);
@@ -360,7 +379,7 @@ fn unique_ids(m: &mut Manifold) {
 fn assign_triangle_ids(m: &mut Manifold, triangle: u32) {
     let local_count = (1u32 << LOCAL_ID_BITS) - 1;
     let mut order = [0usize, 1, 2, 3];
-    let n = m.count.min(MAX_MANIFOLD_POINTS);
+    let n = usize::from(m.count).min(MAX_MANIFOLD_POINTS);
     // Insertion sort of at most four entries by full hash (ties keep their order).
     for i in 1..n {
         let mut j = i;
@@ -409,31 +428,45 @@ struct Poly<'a> {
     vertices: &'a [Vec3],
     edges: &'a [HalfEdge],
     faces: &'a [HullFace],
+    vertex_edge_offsets: &'a [u16],
+    vertex_edges: &'a [u16],
     /// A point inside (on the plane, for a triangle).
     centroid: Vec3,
     /// About half the smallest thickness (0 for a triangle): scales tolerances.
     size: f32,
+    /// Largest `|coord|` over all vertices (used for SAT rounding slack).
+    max_abs_coord: f32,
 }
 
 impl<'a> Poly<'a> {
+    #[inline]
     fn of_hull(h: &'a ConvexHull) -> Poly<'a> {
-        let size = h
-            .faces
-            .iter()
-            .fold(f32::INFINITY, |m, f| {
-                m.min(f.offset - f.normal.dot(h.centroid))
-            })
-            .max(0.0);
         Poly {
             vertices: &h.vertices,
             edges: &h.edges,
             faces: &h.faces,
+            vertex_edge_offsets: &h.vertex_edge_offsets,
+            vertex_edges: &h.vertex_edges,
             centroid: h.centroid,
-            size,
+            size: h.inner_radius,
+            max_abs_coord: h.max_abs_coord,
+        }
+    }
+
+    /// Outgoing half-edge indices from vertex `v`, in ascending half-edge index order.
+    #[inline]
+    fn vertex_outgoing(&self, v: usize) -> &'a [u16] {
+        if v + 1 < self.vertex_edge_offsets.len() {
+            let start = self.vertex_edge_offsets[v] as usize;
+            let end = self.vertex_edge_offsets[v + 1] as usize;
+            &self.vertex_edges[start..end]
+        } else {
+            &[]
         }
     }
 
     /// The index of the vertex farthest along `d` (the first of equals).
+    #[inline]
     fn support(&self, d: Vec3) -> usize {
         let mut best = 0;
         let mut best_d = f32::NEG_INFINITY;
@@ -448,6 +481,7 @@ impl<'a> Poly<'a> {
     }
 
     /// The half-edges round face `f`, counter-clockwise seen from outside.
+    #[inline]
     fn face_loop(&self, f: usize) -> FaceLoop<'a> {
         let start = self.faces[f].edge;
         FaceLoop {
@@ -459,6 +493,7 @@ impl<'a> Poly<'a> {
     }
 
     /// The vertex at the end of half-edge `e`.
+    #[inline]
     fn head(&self, e: usize) -> Vec3 {
         self.vertices[self.edges[self.edges[e].next as usize].origin as usize]
     }
@@ -483,12 +518,13 @@ struct FaceLoop<'a> {
 
 impl Iterator for FaceLoop<'_> {
     type Item = usize;
+    #[inline]
     fn next(&mut self) -> Option<usize> {
         if self.left == 0 {
             return None;
         }
         let e = self.next;
-        self.next = self.edges[e as usize].next;
+        self.next = u32::from(self.edges[e as usize].next);
         self.left = if self.next == self.start {
             0
         } else {
@@ -498,7 +534,7 @@ impl Iterator for FaceLoop<'_> {
     }
 }
 
-const fn half_edge(origin: u32, twin: u32, next: u32, face: u32) -> HalfEdge {
+const fn half_edge(origin: u16, twin: u16, next: u16, face: u16) -> HalfEdge {
     HalfEdge {
         origin,
         twin,
@@ -537,6 +573,17 @@ const CUBOID_EDGES: [HalfEdge; 24] = [
 ];
 /// The first half-edge of each cuboid face (−X, +X, −Y, +Y, −Z, +Z).
 const CUBOID_FACE_EDGES: [u32; 6] = [0, 8, 16, 5, 7, 19];
+const CUBOID_VERTEX_OFFSETS: [u16; 9] = [0, 3, 6, 9, 12, 15, 18, 21, 24];
+const CUBOID_VERTEX_EDGES: [u16; 24] = [
+    0, 7, 16, // v0
+    8, 15, 17, // v1
+    5, 6, 23, // v2
+    9, 10, 22, // v3
+    1, 2, 19, // v4
+    13, 14, 18, // v5
+    3, 4, 20, // v6
+    11, 12, 21, // v7
+];
 
 /// A box as a polytope, built on the stack.
 #[derive(Clone, Copy, Debug)]
@@ -544,6 +591,7 @@ struct BoxPoly {
     vertices: [Vec3; 8],
     faces: [HullFace; 6],
     size: f32,
+    max_abs_coord: f32,
 }
 
 impl BoxPoly {
@@ -566,15 +614,20 @@ impl BoxPoly {
             vertices,
             faces,
             size: h.min_element().max(0.0),
+            max_abs_coord: h.abs().max_element(),
         }
     }
+    #[inline]
     fn view(&self) -> Poly<'_> {
         Poly {
             vertices: &self.vertices,
             edges: &CUBOID_EDGES,
             faces: &self.faces,
+            vertex_edge_offsets: &CUBOID_VERTEX_OFFSETS,
+            vertex_edges: &CUBOID_VERTEX_EDGES,
             centroid: Vec3::ZERO,
             size: self.size,
+            max_abs_coord: self.max_abs_coord,
         }
     }
 }
@@ -597,6 +650,7 @@ impl PolyShape<'_> {
             _ => None,
         }
     }
+    #[inline]
     fn view(&self) -> Poly<'_> {
         match self {
             PolyShape::Box(b) => b.view(),
@@ -615,6 +669,8 @@ const TRIANGLE_EDGES: [HalfEdge; 6] = [
     half_edge(2, 5, 0, 0),
     half_edge(0, 4, 3, 1),
 ];
+const TRIANGLE_VERTEX_OFFSETS: [u16; 4] = [0, 2, 4, 6];
+const TRIANGLE_VERTEX_EDGES: [u16; 6] = [0, 5, 1, 2, 3, 4];
 
 /// A mesh triangle in the colliding convex's frame.
 #[derive(Clone, Copy, Debug)]
@@ -664,8 +720,11 @@ impl TriPoly {
             vertices: &self.vertices,
             edges: &TRIANGLE_EDGES,
             faces: &self.faces,
+            vertex_edge_offsets: &TRIANGLE_VERTEX_OFFSETS,
+            vertex_edges: &TRIANGLE_VERTEX_EDGES,
             centroid: (a + b + c) * (1.0 / 3.0),
             size: 0.0,
+            max_abs_coord: a.abs().max(b.abs()).max(c.abs()).max_element(),
         }
     }
 
@@ -905,9 +964,9 @@ fn point_poly(poly: &Poly, c: Vec3, cutoff: f32) -> Option<PolyPoint> {
             d2 = dd;
             q = x;
             feature = if s <= 0.0 {
-                Feature::Vertex(h.origin)
+                Feature::Vertex(u32::from(h.origin))
             } else if s >= 1.0 {
-                Feature::Vertex(t.origin)
+                Feature::Vertex(u32::from(t.origin))
             } else {
                 Feature::Edge(e as u32)
             };
@@ -1438,7 +1497,7 @@ fn build(normal: Vec3, c: &[ClipVertex], base: u32) -> Option<Manifold> {
             id: mix(base, c[i].key),
         };
     }
-    m.count = count;
+    m.count = count as u8;
     Some(m)
 }
 
@@ -1518,10 +1577,10 @@ fn face_contact(
 /// vertex's region of normals may be thin, and a corner of a neighbouring region lie nearer to
 /// `-ni`; the manifold would then report a gap where the shapes overlap.
 fn incident_face(inc: &Poly, ni: Vec3) -> usize {
-    let deepest = inc.support(-ni) as u32;
+    let deepest = inc.support(-ni);
     let (mut fi, mut lowest) = (usize::MAX, f32::INFINITY);
-    for h in inc.edges.iter().filter(|h| h.origin == deepest) {
-        let g = h.face as usize;
+    for &e in inc.vertex_outgoing(deepest) {
+        let g = inc.edges[e as usize].face as usize;
         let d = inc.faces[g].normal.dot(ni);
         if d < lowest || (d == lowest && g < fi) {
             lowest = d;
@@ -1562,7 +1621,7 @@ impl FaceClip<'_, '_> {
             a[len] = ClipVertex {
                 p: self.incf.point(self.inc.vertices[o as usize]),
                 sep: 0.0,
-                key: mix(KEY_VERTEX, o),
+                key: mix(KEY_VERTEX, u32::from(o)),
                 edge: TAG_INCIDENT_EDGE | e as u32,
             };
             len += 1;
@@ -1712,7 +1771,7 @@ fn capsule_capsule(
         };
         for (point, separation, code) in pair {
             if separation <= spec {
-                m.points[m.count] = ManifoldPoint {
+                m.points[usize::from(m.count)] = ManifoldPoint {
                     point,
                     separation,
                     id: mix(KIND_CAPSULES, 8 + code),
@@ -1836,9 +1895,9 @@ fn segment_poly_outside(
         let d = (c1 - c2).length();
         if best.is_none_or(|bb| d < bb.2) {
             let feature = if u <= 0.0 {
-                Feature::Vertex(h.origin)
+                Feature::Vertex(u32::from(h.origin))
             } else if u >= 1.0 {
-                Feature::Vertex(t.origin)
+                Feature::Vertex(u32::from(t.origin))
             } else {
                 Feature::Edge(e as u32)
             };
@@ -1866,8 +1925,8 @@ fn segment_poly_outside(
             consider(poly.edges[e as usize + 1].face as usize);
         }
         Feature::Vertex(v) => {
-            for h in poly.edges.iter().filter(|h| h.origin == v) {
-                consider(h.face as usize);
+            for &e in poly.vertex_outgoing(v as usize) {
+                consider(poly.edges[e as usize].face as usize);
             }
         }
     }
@@ -1917,7 +1976,7 @@ fn parallel_manifold(
     };
     for (point, separation, code) in pair {
         if separation <= spec {
-            m.points[m.count] = ManifoldPoint {
+            m.points[usize::from(m.count)] = ManifoldPoint {
                 point,
                 separation,
                 id: mix(base, code),
@@ -1955,7 +2014,7 @@ fn segment_face_points(
         let height = n.dot(p) - face.offset;
         let sep = height - r;
         if sep <= spec {
-            m.points[m.count] = ManifoldPoint {
+            m.points[usize::from(m.count)] = ManifoldPoint {
                 point: p - n * (0.5 * (height + r)),
                 separation: sep,
                 id: mix(mix(mix(KIND_CAPSULE_FACE, f as u32), which), code),
@@ -2095,14 +2154,32 @@ fn on_arc(n: Vec3, a: Vec3, b: Vec3) -> bool {
 /// (skipped below what an edge needs to replace the best face); points of A bound B's faces and
 /// edges likewise. A resting pair of 256-vertex hulls tests a few dozen axes instead of half a
 /// million edge pairs.
+#[derive(Clone, Copy)]
+struct KeptEdgeA {
+    edge: u16,
+    a: Vec3,
+    b: Vec3,
+    b_x_a: Vec3,
+    p0: Vec3,
+    ea: Vec3,
+    la2: f32,
+}
+
+impl KeptEdgeA {
+    const ZERO: Self = Self {
+        edge: 0,
+        a: Vec3::ZERO,
+        b: Vec3::ZERO,
+        b_x_a: Vec3::ZERO,
+        p0: Vec3::ZERO,
+        ea: Vec3::ZERO,
+        la2: 0.0,
+    };
+}
+
 fn poly_poly(pa: &Poly, pb: &Poly, rel: &Frame, spec: f32) -> Option<Manifold> {
     // The bounds and the separations they bound round differently: skip only below this much.
-    let reach = |p: &Poly| {
-        p.vertices
-            .iter()
-            .fold(0.0f32, |m, v| m.max(v.abs().max_element()))
-    };
-    let slack = 1e-5 * (reach(pa) + reach(pb) + rel.pos.abs().max_element());
+    let slack = 1e-5 * (pa.max_abs_coord + pb.max_abs_coord + rel.pos.abs().max_element());
     // A's face normals: B's deepest vertex below each face. First the face B's centre lies
     // farthest in front of: its separation is a floor for the best.
     let cb = rel.point(pb.centroid);
@@ -2170,6 +2247,8 @@ fn poly_poly(pa: &Poly, pb: &Poly, rel: &Frame, spec: f32) -> Option<Manifold> {
     let tol = abs_tolerance(pa.size.min(pb.size));
     let best = s_a.max(s_b);
     let need = (best + EDGE_REL_TOL * best.abs() + tol).min(spec) - slack;
+    const FAST_KEPT_A: usize = 32;
+    let mut kept_fast = [KeptEdgeA::ZERO; FAST_KEPT_A];
     let mut kept = [0u16; 3 * MAX_HULL_VERTICES];
     let every_a = pa.edges.len() / 2 > kept.len();
     let mut count_a = 0;
@@ -2177,65 +2256,108 @@ fn poly_poly(pa: &Poly, pb: &Poly, rel: &Frame, spec: f32) -> Option<Manifold> {
         count_a = pa.edges.len() / 2;
     } else {
         for i in (0..pa.edges.len()).step_by(2) {
-            let a = pa.faces[pa.edges[i].face as usize].normal;
-            let b = pa.faces[pa.edges[i + 1].face as usize].normal;
-            let p0 = pa.vertices[pa.edges[i].origin as usize];
+            let (ha, ta) = (pa.edges[i], pa.edges[i + 1]);
+            let a = pa.faces[ha.face as usize].normal;
+            let b = pa.faces[ta.face as usize].normal;
+            let p0 = pa.vertices[ha.origin as usize];
             let bound = arc_max(a, b, vb - p0).min(arc_max(a, b, cb - p0) - pb.size);
             if bound >= need || bound.is_nan() {
+                if count_a < FAST_KEPT_A {
+                    let ea = pa.vertices[ta.origin as usize] - p0;
+                    kept_fast[count_a] = KeptEdgeA {
+                        edge: i as u16,
+                        a,
+                        b,
+                        b_x_a: b.cross(a),
+                        p0,
+                        ea,
+                        la2: ea.length_squared(),
+                    };
+                }
                 kept[count_a] = i as u16;
                 count_a += 1;
             }
         }
     }
+    let use_fast_a = !every_a && count_a <= FAST_KEPT_A;
     let mut edge: Option<(f32, usize, usize, Vec3)> = None;
-    for j in (0..pb.edges.len()).step_by(2) {
-        let (hb, tb) = (pb.edges[j], pb.edges[j + 1]);
-        let (cl, dl) = (
-            pb.faces[hb.face as usize].normal,
-            pb.faces[tb.face as usize].normal,
-        );
-        let q0l = pb.vertices[hb.origin as usize];
-        let bound = arc_max(cl, dl, ua - q0l).min(arc_max(cl, dl, ca - q0l) - pa.size);
-        if bound < need {
-            continue;
-        }
-        let q0 = rel.point(q0l);
-        let eb = rel.point(pb.vertices[tb.origin as usize]) - q0;
-        let c = -rel.vector(cl);
-        let d = -rel.vector(dl);
-        let d_x_c = d.cross(c);
-        let lb2 = eb.length_squared();
-        let pairs = (0..count_a).map(|k| if every_a { 2 * k } else { usize::from(kept[k]) });
-        for i in pairs {
-            let (ha, ta) = (pa.edges[i], pa.edges[i + 1]);
-            let a = pa.faces[ha.face as usize].normal;
-            let b = pa.faces[ta.face as usize].normal;
-            if !minkowski_face(a, b, b.cross(a), c, d, d_x_c) {
+    if count_a > 0 {
+        for j in (0..pb.edges.len()).step_by(2) {
+            let (hb, tb) = (pb.edges[j], pb.edges[j + 1]);
+            let (cl, dl) = (
+                pb.faces[hb.face as usize].normal,
+                pb.faces[tb.face as usize].normal,
+            );
+            let q0l = pb.vertices[hb.origin as usize];
+            let bound = arc_max(cl, dl, ua - q0l).min(arc_max(cl, dl, ca - q0l) - pa.size);
+            if bound < need {
                 continue;
             }
-            let p0 = pa.vertices[ha.origin as usize];
-            let ea = pa.vertices[ta.origin as usize] - p0;
-            let axis = ea.cross(eb);
-            let l2 = axis.length_squared();
-            if l2 <= EDGE_SKIP_SIN * EDGE_SKIP_SIN * ea.length_squared() * lb2 {
-                continue;
-            }
-            let mut n = axis * (1.0 / l2.sqrt());
-            if n.dot(p0 - pa.centroid) < 0.0 {
-                n = -n;
-            }
-            // Rounding passes arcs that only touch (a face of each shape nearly parallel): the
-            // axis then lies off them and is no face of the Minkowski difference, and its
-            // separation means nothing. The face axes cover that direction.
-            if !on_arc(n, a, b) || !on_arc(n, c, d) {
-                continue;
-            }
-            let s = n.dot(q0 - p0);
-            if s > spec {
-                return None;
-            }
-            if edge.is_none_or(|(bs, ..)| s > bs) {
-                edge = Some((s, i, j, n));
+            let q0 = rel.point(q0l);
+            let eb = rel.point(pb.vertices[tb.origin as usize]) - q0;
+            let c = -rel.vector(cl);
+            let d = -rel.vector(dl);
+            let d_x_c = d.cross(c);
+            let lb2 = eb.length_squared();
+            if use_fast_a {
+                for ka in &kept_fast[..count_a] {
+                    if !minkowski_face(ka.a, ka.b, ka.b_x_a, c, d, d_x_c) {
+                        continue;
+                    }
+                    let axis = ka.ea.cross(eb);
+                    let l2 = axis.length_squared();
+                    if l2 <= EDGE_SKIP_SIN * EDGE_SKIP_SIN * ka.la2 * lb2 {
+                        continue;
+                    }
+                    let mut n = axis * (1.0 / l2.sqrt());
+                    if n.dot(ka.p0 - pa.centroid) < 0.0 {
+                        n = -n;
+                    }
+                    if !on_arc(n, ka.a, ka.b) || !on_arc(n, c, d) {
+                        continue;
+                    }
+                    let s = n.dot(q0 - ka.p0);
+                    if s > spec {
+                        return None;
+                    }
+                    if edge.is_none_or(|(bs, ..)| s > bs) {
+                        edge = Some((s, usize::from(ka.edge), j, n));
+                    }
+                }
+            } else {
+                let pairs = (0..count_a).map(|k| if every_a { 2 * k } else { usize::from(kept[k]) });
+                for i in pairs {
+                    let (ha, ta) = (pa.edges[i], pa.edges[i + 1]);
+                    let a = pa.faces[ha.face as usize].normal;
+                    let b = pa.faces[ta.face as usize].normal;
+                    if !minkowski_face(a, b, b.cross(a), c, d, d_x_c) {
+                        continue;
+                    }
+                    let p0 = pa.vertices[ha.origin as usize];
+                    let ea = pa.vertices[ta.origin as usize] - p0;
+                    let axis = ea.cross(eb);
+                    let l2 = axis.length_squared();
+                    if l2 <= EDGE_SKIP_SIN * EDGE_SKIP_SIN * ea.length_squared() * lb2 {
+                        continue;
+                    }
+                    let mut n = axis * (1.0 / l2.sqrt());
+                    if n.dot(p0 - pa.centroid) < 0.0 {
+                        n = -n;
+                    }
+                    // Rounding passes arcs that only touch (a face of each shape nearly parallel): the
+                    // axis then lies off them and is no face of the Minkowski difference, and its
+                    // separation means nothing. The face axes cover that direction.
+                    if !on_arc(n, a, b) || !on_arc(n, c, d) {
+                        continue;
+                    }
+                    let s = n.dot(q0 - p0);
+                    if s > spec {
+                        return None;
+                    }
+                    if edge.is_none_or(|(bs, ..)| s > bs) {
+                        edge = Some((s, i, j, n));
+                    }
+                }
             }
         }
     }
@@ -2654,12 +2776,11 @@ pub(crate) fn overlaps(
     iso: &Iso,
     other: &Shape,
     at: &Iso,
-    scratch: &mut Vec<Manifold>,
 ) -> bool {
     let Some(g) = StaticGeometry::of(other) else {
-        scratch.clear();
-        collide(convex, iso, other, at, 0.0, scratch);
-        return scratch
+        let mut buf: [Manifold; MAX_MESH_MANIFOLDS] = Default::default();
+        let len = collide_stack(convex, iso, other, at, 0.0, &mut buf);
+        return buf[..len]
             .iter()
             .any(|m| m.count > 0 && m.min_separation() < 0.0);
     };
@@ -2688,8 +2809,8 @@ fn collide_static(
     iso_c: &Iso,
     spec: f32,
     geometry_is_b: bool,
-    out: &mut Vec<Manifold>,
-) {
+    out: &mut [Manifold; MAX_MESH_MANIFOLDS],
+) -> usize {
     // Contacts of triangles the centre is in front of, with normals of their own; and the rest,
     // which count only when there are none of those (see below).
     let mut contacts = MeshContacts::default();
@@ -2717,7 +2838,7 @@ fn collide_static(
     if contacts.len == 0 {
         contacts = fallback;
     }
-    contacts.finish(iso_c, geometry_is_b, out);
+    contacts.finish(iso_c, geometry_is_b, out)
 }
 
 /// The manifolds of one convex against many triangles, merged by normal.
@@ -2756,7 +2877,7 @@ impl MeshContacts {
     }
 
     /// Deepest first, into the world.
-    fn finish(self, iso: &Iso, flip: bool, out: &mut Vec<Manifold>) {
+    fn finish(self, iso: &Iso, flip: bool, out: &mut [Manifold; MAX_MESH_MANIFOLDS]) -> usize {
         let mut list: [Manifold; MAX_MESH_MANIFOLDS] = Default::default();
         for (m, g) in list.iter_mut().zip(&self.list[..self.len]) {
             *m = g.manifold();
@@ -2769,14 +2890,19 @@ impl MeshContacts {
                 j -= 1;
             }
         }
+        let mut written = 0;
         for m in list.iter_mut() {
             let mut m = std::mem::take(m);
             to_world(&mut m, iso);
             if flip {
                 m.normal = -m.normal;
             }
-            push_finite(m, out);
+            if let Some(m) = sanitize_finite(m) {
+                out[written] = m;
+                written += 1;
+            }
         }
+        written
     }
 }
 
@@ -2829,7 +2955,7 @@ impl MeshGroup {
             let h = std::f32::consts::FRAC_1_SQRT_2;
             self.dirs = [u, v, (u + v) * h, (u - v) * h];
             self.slots = [self.first.points[0]; GROUP_SLOTS];
-            for i in 1..self.first.count {
+            for i in 1..usize::from(self.first.count) {
                 self.offer(self.first.points[i]);
             }
         }
@@ -2915,7 +3041,7 @@ impl MeshGroup {
                 id: c[i].key,
             };
         }
-        m.count = count;
+        m.count = count as u8;
         m
     }
 }
@@ -2949,6 +3075,8 @@ mod tests {
         let hull = ConvexHull::cuboid(h);
         let b = BoxPoly::new(h);
         assert_eq!(hull.edges.as_slice(), &CUBOID_EDGES[..]);
+        assert_eq!(hull.vertex_edge_offsets.as_slice(), &CUBOID_VERTEX_OFFSETS[..]);
+        assert_eq!(hull.vertex_edges.as_slice(), &CUBOID_VERTEX_EDGES[..]);
         assert_eq!(hull.vertices.as_slice(), &b.vertices[..]);
         for (f, face) in hull.faces.iter().enumerate() {
             assert_eq!(face.edge, b.faces[f].edge);
@@ -3621,7 +3749,7 @@ mod tests {
                 id,
             };
         }
-        m.count = points.len();
+        m.count = points.len() as u8;
         m
     }
 
@@ -3670,9 +3798,9 @@ mod tests {
                     .collect();
                 contacts.add(patch(&points));
             }
-            let mut out = vec![];
-            contacts.finish(&Iso::IDENTITY, false, &mut out);
-            assert_eq!(out.len(), 1);
+            let mut out: [Manifold; MAX_MESH_MANIFOLDS] = Default::default();
+            let out_len = contacts.finish(&Iso::IDENTITY, false, &mut out);
+            assert_eq!(out_len, 1);
             let mut ids: Vec<u32> = out[0].points().iter().map(|p| p.id).collect();
             ids.sort_unstable();
             assert_eq!(ids, vec![10, 20, 30, 40], "order {order}: {:?}", out[0]);
@@ -3685,7 +3813,7 @@ mod tests {
         contacts.add(patch(&[(0.0, 0.0, -1e-4, 1), (1.0, 0.0, -1e-4, 2)]));
         contacts.add(patch(&[(1.0, 1.0, -1e-4, 3), (0.5, 0.4, -3e-3, 4)]));
         contacts.add(patch(&[(0.0, 1.0, -1e-4, 5), (0.5, 0.0, -1e-4, 6)]));
-        let mut out = vec![];
+        let mut out: [Manifold; MAX_MESH_MANIFOLDS] = Default::default();
         contacts.finish(&Iso::IDENTITY, false, &mut out);
         assert_eq!(out[0].points[0].id, 4, "{:?}", out[0]);
         assert_eq!(out[0].count, 4);
@@ -3693,7 +3821,7 @@ mod tests {
         let mut contacts = MeshContacts::default();
         contacts.add(patch(&[(0.0, 0.0, -1e-4, 1), (1.0, 0.0, -1e-4, 2)]));
         contacts.add(patch(&[(1.0, 0.0, -2e-4, 7), (1.0, 1.0, -1e-4, 3)]));
-        let mut out = vec![];
+        let mut out: [Manifold; MAX_MESH_MANIFOLDS] = Default::default();
         contacts.finish(&Iso::IDENTITY, false, &mut out);
         let ids: Vec<u32> = out[0].points().iter().map(|p| p.id).collect();
         assert!(ids.contains(&7) && !ids.contains(&2), "{:?}", out[0]);

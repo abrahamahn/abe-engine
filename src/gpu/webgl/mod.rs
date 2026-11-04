@@ -71,6 +71,12 @@ fn format_code(f: Format) -> u32 {
         Format::R32Float => 9,
         Format::Rgba32Float => 10,
         Format::Depth32Float => 11,
+        Format::Bc1RgbaUnorm => 12,
+        Format::Bc1RgbaSrgb => 13,
+        Format::Bc7RgbaUnorm => 14,
+        Format::Bc7RgbaSrgb => 15,
+        Format::Astc4x4Unorm => 16,
+        Format::Astc4x4Srgb => 17,
     }
 }
 fn is_float32(f: Format) -> bool {
@@ -122,6 +128,7 @@ struct Texture {
     /// [`ffi::SURFACE`] for the canvas texture.
     js: u32,
     desc: TextureDesc,
+    sw_decompress: Option<ganbate_core::world::TextureCompression>,
     surface: bool,
     /// A `TEXTURE_2D_ARRAY` (more than one layer).
     array: bool,
@@ -173,6 +180,7 @@ struct Pipeline {
     program: usize,
     /// Reflected bindings per group: `(binding, kind)`, sorted by binding.
     groups: Vec<Vec<(u32, BindingKind)>>,
+    group_ids: Vec<u32>,
     push_size: u32,
     colors: Vec<Format>,
     depth: Option<Format>,
@@ -199,8 +207,8 @@ enum Bound {
 }
 
 struct BindGroup {
-    /// The layout the group was created for: `None` for a group the pipeline does not use.
-    layout: Option<Vec<(u32, BindingKind)>>,
+    /// Interned group layout id (`0` for an empty group).
+    layout_id: u32,
     entries: Vec<(u32, Bound)>,
 }
 
@@ -222,6 +230,9 @@ struct DeviceInfo {
     float_blend: bool,
     /// `OES_draw_buffers_indexed`: blend state and write masks per colour target.
     indexed_buffers: bool,
+    s3tc: bool,
+    bptc: bool,
+    astc: bool,
     max_anisotropy: f32,
 }
 
@@ -241,6 +252,9 @@ pub(crate) struct Gpu<'w> {
     sampler_cache: HashMap<[u32; 6], SamplerId>,
     /// Vertex layouts (stride and attribute words) by id.
     layouts: HashMap<Vec<u32>, u32>,
+    layout_ids: HashMap<Vec<(u32, BindingKind)>, u32>,
+    cmd_buf: Vec<u32>,
+    ring: record::Ring,
     /// Vertex arrays, created while recording.
     vaos: RefCell<HashMap<VaoKey, u32>>,
     /// The canvas texture, once `acquire` has registered it.
@@ -275,6 +289,9 @@ impl Gpu<'static> {
             float_linear: w[10] & 2 != 0,
             float_blend: w[10] & 4 != 0,
             indexed_buffers: w[10] & 8 != 0,
+            s3tc: w[10] & 16 != 0,
+            bptc: w[10] & 32 != 0,
+            astc: w[10] & 64 != 0,
             max_anisotropy: f32::from_bits(w[11]).max(1.0),
         };
         if presentable && ffi::canvas().is_none() {
@@ -292,6 +309,9 @@ impl Gpu<'static> {
             program_cache: HashMap::new(),
             sampler_cache: HashMap::new(),
             layouts: HashMap::new(),
+            layout_ids: HashMap::new(),
+            cmd_buf: Vec::new(),
+            ring: record::Ring::default(),
             vaos: RefCell::new(HashMap::new()),
             surface: None,
             presentable,
@@ -314,6 +334,8 @@ impl<'w> Gpu<'w> {
             uniform_offset_alignment: u64::from(self.info.uniform_align),
             storage_offset_alignment: 16,
             depth_filterable: false,
+            texture_compression_bc: self.info.s3tc && self.info.bptc,
+            texture_compression_astc: self.info.astc,
         }
     }
     pub fn frame_slot(&self) -> usize {
@@ -480,6 +502,20 @@ impl<'w> Gpu<'w> {
             ));
         }
         let depth = d.format.is_depth();
+        if d.format.is_compressed()
+            && d.usage.bits()
+                & (TextureUsage::COLOR_TARGET
+                    | TextureUsage::DEPTH_TARGET
+                    | TextureUsage::STORAGE
+                    | TextureUsage::COPY_SRC)
+                    .bits()
+                != 0
+        {
+            return Err(format!(
+                "create_texture: compressed format {:?} supports only SAMPLED | COPY_DST",
+                d.format
+            ));
+        }
         if depth && d.usage.contains(TextureUsage::COLOR_TARGET) {
             return Err("create_texture: a depth format cannot be a colour target".into());
         }
@@ -492,10 +528,30 @@ impl<'w> Gpu<'w> {
         if d.usage.contains(TextureUsage::STORAGE) {
             return Err("create_texture: WebGL 2 has no storage textures".into());
         }
+        let mut sw_decompress = None;
+        let actual_format = if let Some(comp) = d.format.compression() {
+            let hw = match comp {
+                ganbate_core::world::TextureCompression::Bc1 => self.info.s3tc,
+                ganbate_core::world::TextureCompression::Bc7 => self.info.bptc,
+                ganbate_core::world::TextureCompression::Astc4x4 => self.info.astc,
+            };
+            if hw && d.width % 4 == 0 && d.height % 4 == 0 {
+                d.format
+            } else {
+                sw_decompress = Some(comp);
+                if d.format.is_srgb() {
+                    Format::Rgba8Srgb
+                } else {
+                    Format::Rgba8Unorm
+                }
+            }
+        } else {
+            d.format
+        };
         let renders = d.usage.contains(TextureUsage::COLOR_TARGET)
-            || (d.usage.contains(TextureUsage::COPY_DST) && !depth)
+            || (d.usage.contains(TextureUsage::COPY_DST) && !depth && !actual_format.is_compressed())
             || (d.mips > 1 && d.usage.contains(TextureUsage::COPY_SRC));
-        if renders && is_float(d.format) && !self.info.color_float {
+        if renders && is_float(actual_format) && !self.info.color_float {
             return Err(format!(
                 "create_texture: rendering to {:?} needs EXT_color_buffer_float",
                 d.format
@@ -506,12 +562,13 @@ impl<'w> Gpu<'w> {
             (d.width, d.height),
             d.layers,
             d.mips,
-            format_code(d.format),
+            format_code(actual_format),
             array,
         )?;
         match self.textures.insert(Texture {
             js,
             desc: *d,
+            sw_decompress,
             surface: false,
             array,
         }) {
@@ -546,16 +603,21 @@ impl<'w> Gpu<'w> {
             ));
         }
         let (w, h) = t.desc.mip_size(mip);
-        let row = w * t.desc.format.texel_size();
-        if data.len() as u64 != u64::from(row) * u64::from(h) {
+        let expected = t.desc.format.mip_byte_len(w, h);
+        if data.len() as u64 != expected {
             return Err(format!(
-                "write_texture: expected {} bytes for {w}x{h} {:?}, got {}",
-                u64::from(row) * u64::from(h),
+                "write_texture: expected {expected} bytes for {w}x{h} {:?}, got {}",
                 t.desc.format,
                 data.len()
             ));
         }
-        ffi::write_texture(t.js, (mip, layer), (w, h), data);
+        let (js, sw) = (t.js, t.sw_decompress);
+        if let Some(comp) = sw {
+            let decoded = ganbate_assets::bc::decode_rgba8(comp, data, w, h)?;
+            ffi::write_texture(js, (mip, layer), (w, h), &decoded);
+        } else {
+            ffi::write_texture(js, (mip, layer), (w, h), data);
+        }
         Ok(())
     }
 
@@ -565,7 +627,10 @@ impl<'w> Gpu<'w> {
         if !t.desc.usage.contains(need) {
             return Err(format!("generate_mips: {id:?} needs COPY_SRC | COPY_DST"));
         }
-        if t.desc.format.is_depth() || (is_float32(t.desc.format) && !self.info.float_linear) {
+        if t.desc.format.is_depth()
+            || t.desc.format.is_compressed()
+            || (is_float32(t.desc.format) && !self.info.float_linear)
+        {
             return Err(format!(
                 "generate_mips: {:?} cannot be filtered linearly on this device",
                 t.desc.format
@@ -875,6 +940,19 @@ impl<'w> Gpu<'w> {
             stages.push(f);
         }
         let groups = Self::reflect(&stages)?;
+        let mut group_ids = Vec::with_capacity(groups.len());
+        for g in &groups {
+            let gid = if g.is_empty() {
+                0
+            } else if let Some(&id) = self.layout_ids.get(g) {
+                id
+            } else {
+                let id = self.layout_ids.len() as u32 + 1;
+                self.layout_ids.insert(g.clone(), id);
+                id
+            };
+            group_ids.push(gid);
+        }
         let push_size = stages
             .iter()
             .map(|s| s.push_constant_size)
@@ -934,6 +1012,7 @@ impl<'w> Gpu<'w> {
             js,
             program,
             groups,
+            group_ids,
             push_size,
             colors: d.colors.iter().map(|c| c.format).collect(),
             depth: d.depth.map(|z| z.format),
@@ -1044,26 +1123,46 @@ impl<'w> Gpu<'w> {
                 MAX_GROUPS - 1
             ));
         }
-        let layout = self
-            .pipeline(pipeline)?
-            .groups
-            .get(group as usize)
-            .cloned()
-            .filter(|l| !l.is_empty());
-        let Some(layout) = layout else {
+        let mut inline_layout = [(0u32, BindingKind::Sampler { comparison: false }); 32];
+        let mut overflow_layout = Vec::new();
+        let (layout_id, entry_count) = {
+            let p = self.pipeline(pipeline)?;
+            match p
+                .groups
+                .get(group as usize)
+                .filter(|l| !l.is_empty())
+                .map(|l| (p.group_ids[group as usize], l))
+            {
+                Some((id, l)) => {
+                    if l.len() <= inline_layout.len() {
+                        inline_layout[..l.len()].copy_from_slice(l);
+                    } else {
+                        overflow_layout.extend_from_slice(l);
+                    }
+                    (id, l.len())
+                }
+                None => (0, 0),
+            }
+        };
+        if entry_count == 0 {
             let empty = BindGroup {
-                layout: None,
+                layout_id: 0,
                 entries: Vec::new(),
             };
             return Ok(BindGroupId::from_raw(self.groups.insert(empty)?));
+        }
+        let layout = if entry_count <= inline_layout.len() {
+            &inline_layout[..entry_count]
+        } else {
+            overflow_layout.as_slice()
         };
-        let mut bound = Vec::with_capacity(layout.len());
-        for &(binding, kind) in &layout {
+        let mut bound = Vec::with_capacity(entry_count);
+        for &(binding, kind) in layout {
             let (_, res) = *entries
                 .iter()
                 .find(|(b, _)| *b == binding)
                 .ok_or_else(|| format!("@group({group}) @binding({binding}) is missing"))?;
-            let at = format!("@group({group}) @binding({binding})");
+            let at = || format!("@group({group}) @binding({binding})");
             let entry = match (kind, res) {
                 (
                     BindingKind::UniformBuffer { .. } | BindingKind::StorageBuffer { .. },
@@ -1077,11 +1176,12 @@ impl<'w> Gpu<'w> {
                         (BufferUsage::STORAGE, 16)
                     };
                     if !b.desc.usage.contains(need) {
-                        return Err(format!("{at}: {id:?} lacks {need:?} usage"));
+                        return Err(format!("{}: {id:?} lacks {need:?} usage", at()));
                     }
                     if offset >= b.desc.size || offset % align != 0 {
                         return Err(format!(
-                            "{at}: offset {offset} must be inside the buffer and a multiple of {align}"
+                            "{}: offset {offset} must be inside the buffer and a multiple of {align}",
+                            at()
                         ));
                     }
                     let range = if size == 0 {
@@ -1090,17 +1190,22 @@ impl<'w> Gpu<'w> {
                         size
                     };
                     if range == 0 || offset + range > b.desc.size.next_multiple_of(4) {
-                        return Err(format!("{at}: range {range} at {offset} is out of bounds"));
+                        return Err(format!(
+                            "{}: range {range} at {offset} is out of bounds",
+                            at()
+                        ));
                     }
                     if let BindingKind::UniformBuffer { size: need } = kind {
                         if range < u64::from(need) {
                             return Err(format!(
-                                "{at}: the shader reads {need} bytes but only {range} are bound"
+                                "{}: the shader reads {need} bytes but only {range} are bound",
+                                at()
                             ));
                         }
                         if range > u64::from(self.info.max_uniform_block) {
                             return Err(format!(
-                                "{at}: {range} bytes exceed the device's uniform block size {}",
+                                "{}: {range} bytes exceed the device's uniform block size {}",
+                                at(),
                                 self.info.max_uniform_block
                             ));
                         }
@@ -1119,11 +1224,11 @@ impl<'w> Gpu<'w> {
                 ) => {
                     let t = self.texture(id)?;
                     if t.surface {
-                        return Err(format!("{at}: the canvas texture cannot be bound"));
+                        return Err(format!("{}: the canvas texture cannot be bound", at()));
                     }
                     let desc = t.desc;
                     if !desc.usage.contains(TextureUsage::SAMPLED) {
-                        return Err(format!("{at}: {id:?} lacks SAMPLED usage"));
+                        return Err(format!("{}: {id:?} lacks SAMPLED usage", at()));
                     }
                     let ok = match sample {
                         SampleType::Depth => desc.format.is_depth(),
@@ -1132,7 +1237,8 @@ impl<'w> Gpu<'w> {
                     };
                     if !ok {
                         return Err(format!(
-                            "{at}: a {sample:?} texture binding cannot sample {:?}",
+                            "{}: a {sample:?} texture binding cannot sample {:?}",
+                            at(),
                             desc.format
                         ));
                     }
@@ -1144,51 +1250,58 @@ impl<'w> Gpu<'w> {
                             ((m, m + 1), (0, desc.layers))
                         }
                         Resource::Texture(_) => ((0, desc.mips), (0, desc.layers)),
-                        _ => return Err(format!("{at}: {res:?} is outside the texture")),
+                        _ => return Err(format!("{}: {res:?} is outside the texture", at())),
                     };
                     match view {
                         TextureView::D2 if t.array => {
                             return Err(format!(
-                                "{at}: WebGL 2 cannot view one layer of an array texture as a 2D \
-                                 texture (it has no texture views)"
+                                "{}: WebGL 2 cannot view one layer of an array texture as a 2D \
+                                 texture (it has no texture views)",
+                                at()
                             ));
                         }
                         TextureView::D2Array if !t.array => {
                             return Err(format!(
-                                "{at}: a 2D array binding needs a texture with more than one layer \
-                                 on WebGL 2"
+                                "{}: a 2D array binding needs a texture with more than one layer \
+                                 on WebGL 2",
+                                at()
                             ));
                         }
                         TextureView::D2Array if layers != (0, desc.layers) => {
                             return Err(format!(
-                                "{at}: WebGL 2 binds every layer of an array texture"
+                                "{}: WebGL 2 binds every layer of an array texture",
+                                at()
                             ));
                         }
                         TextureView::Cube => {
-                            return Err(format!("{at}: WebGL 2 cube textures are not supported"));
+                            return Err(format!(
+                                "{}: WebGL 2 cube textures are not supported",
+                                at()
+                            ));
                         }
                         _ => {}
                     }
                     Bound::Texture { id, mips, layers }
                 }
                 (BindingKind::Sampler { comparison }, Resource::Sampler(id)) => {
-                    let s = self.sampler(id).map_err(|e| format!("{at}: {e}"))?;
+                    let s = self.sampler(id).map_err(|e| format!("{}: {e}", at()))?;
                     if s.comparison != comparison {
                         return Err(format!(
-                            "{at}: the shader and {id:?} disagree on comparison sampling"
+                            "{}: the shader and {id:?} disagree on comparison sampling",
+                            at()
                         ));
                     }
                     Bound::Sampler(id)
                 }
                 (BindingKind::StorageTexture { .. }, _) => {
-                    return Err(format!("{at}: WebGL 2 has no storage textures"));
+                    return Err(format!("{}: WebGL 2 has no storage textures", at()));
                 }
-                (kind, res) => return Err(format!("{at} expects {kind:?} but got {res:?}")),
+                (kind, res) => return Err(format!("{} expects {kind:?} but got {res:?}", at())),
             };
             bound.push((binding, entry));
         }
         let g = BindGroup {
-            layout: Some(layout),
+            layout_id,
             entries: bound,
         };
         Ok(BindGroupId::from_raw(self.groups.insert(g)?))
@@ -1200,9 +1313,14 @@ impl<'w> Gpu<'w> {
 
     // ------------------------------------------------------------------ submission
 
-    pub fn submit(&mut self, e: crate::gpu::Encoder) -> Result<()> {
-        let (commands, push) = self.record(&e, None)?;
-        ffi::submit(&commands, &push, false)
+    pub fn submit(&mut self, e: &crate::gpu::Encoder) -> Result<()> {
+        let mut commands = core::mem::take(&mut self.cmd_buf);
+        let mut ring = core::mem::take(&mut self.ring);
+        let res = self.record(e, None, &mut commands, &mut ring);
+        let out = res.and_then(|()| ffi::submit(&commands, &ring.bytes, false));
+        self.cmd_buf = commands;
+        self.ring = ring;
+        out
     }
 
     /// The canvas texture, registered (or resized) to the canvas's current size.
@@ -1231,6 +1349,7 @@ impl<'w> Gpu<'w> {
         let id = TextureId::from_raw(self.textures.insert(Texture {
             js: ffi::SURFACE,
             desc,
+            sw_decompress: None,
             surface: true,
             array: false,
         })?);
@@ -1250,12 +1369,17 @@ impl<'w> Gpu<'w> {
         }
     }
 
-    pub fn present(&mut self, e: crate::gpu::Encoder) -> Result<()> {
+    pub fn present(&mut self, e: &crate::gpu::Encoder) -> Result<()> {
         let surface = self
             .surface
             .ok_or("present: call acquire first to get the canvas texture")?;
-        let (commands, push) = self.record(&e, Some(surface))?;
-        ffi::submit(&commands, &push, true)?;
+        let mut commands = core::mem::take(&mut self.cmd_buf);
+        let mut ring = core::mem::take(&mut self.ring);
+        let res = self.record(e, Some(surface), &mut commands, &mut ring);
+        let out = res.and_then(|()| ffi::submit(&commands, &ring.bytes, true));
+        self.cmd_buf = commands;
+        self.ring = ring;
+        out?;
         self.frame = (self.frame + 1) % 2;
         Ok(())
     }

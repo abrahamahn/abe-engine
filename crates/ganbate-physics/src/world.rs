@@ -14,14 +14,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::collide::{self, MAX_MANIFOLD_POINTS, Manifold};
 use crate::gjk;
-use crate::hull::ConvexHull;
 use crate::joint::{self, JointConstraint, JointDesc, JointImpulses};
 use crate::math::{Aabb, Iso, Mat3, Quat, Vec3};
 use crate::mesh::TriangleRef;
 use crate::shape::{Convex, ConvexShape, MassProperties, Shape};
+use crate::small_buf::SmallBuf;
 use crate::solver::{
     self, BodyFrame, BodyInput, ConstraintPoint, ContactConstraint, IntegrationInputs, Softness,
-    SolverBody, StepContext,
+    SolverBody, SolverVel, StepContext,
 };
 use crate::tree::DynamicTree;
 
@@ -586,31 +586,6 @@ fn centre_through(t: &TriangleRef, at: &Iso, c0: Vec3, d: Vec3, keep: f32) -> Op
     })
 }
 
-/// Hull `h` scaled about its centroid so that its farthest face plane moves in by `skin` and every
-/// other face by less, in proportion to its distance from the centroid: the hull less a skin of
-/// at most `skin` all round (an exact skin would need the hull's faces intersected afresh; this
-/// one errs on keeping too much, never on losing a side the hull would hit something with).
-fn shrunk_hull(h: &ConvexHull, skin: f32) -> ConvexHull {
-    let farthest = h
-        .faces
-        .iter()
-        .fold(0.0f32, |m, f| m.max(f.offset - f.normal.dot(h.centroid)));
-    let k = if farthest > skin {
-        1.0 - skin / farthest
-    } else {
-        1.0
-    };
-    let mut out = h.clone();
-    for v in &mut out.vertices {
-        *v = h.centroid + (*v - h.centroid) * k;
-    }
-    for f in &mut out.faces {
-        let at_centroid = f.normal.dot(h.centroid);
-        f.offset = at_centroid + (f.offset - at_centroid) * k;
-    }
-    out
-}
-
 /// The mass properties of colliders (as a function of a scale on every density) with the mass
 /// brought into [`MIN_BODY_MASS`]..[`MAX_BODY_MASS`]: out of range, the same shapes are weighed
 /// again with every density scaled alike, so the centre and the shape of the inertia stay (and
@@ -637,59 +612,68 @@ const CARRY_NORMAL_COS: f32 = 0.9;
 /// the same id and a compatible normal. Each remaining point then takes the nearest unclaimed
 /// old point within `match_distance` in collider A's frame whose normal agrees with its own.
 /// The closest pairs claim first, with ties in index order.
-fn carry_impulses(
+fn carry_impulses_into(
     old: &[ContactManifold],
     fresh: &[Manifold],
     iso_a: &Iso,
     match_distance: f32,
-) -> Vec<ContactManifold> {
-    let mut out: Vec<ContactManifold> = fresh
-        .iter()
-        .map(|m| {
-            let mut cm = ContactManifold {
-                manifold: m.clone(),
-                cache: Default::default(),
+    out: &mut Vec<ContactManifold>,
+) {
+    out.clear();
+    out.reserve(fresh.len());
+    for m in fresh {
+        let mut cm = ContactManifold {
+            manifold: m.clone(),
+            cache: Default::default(),
+        };
+        for (i, p) in m.points().iter().enumerate() {
+            cm.cache[i] = CachedPoint {
+                id: p.id,
+                local_a: iso_a.inverse_point(p.point),
+                normal_impulse: 0.0,
+                friction_impulse: Vec3::ZERO,
             };
-            for (i, p) in m.points().iter().enumerate() {
-                cm.cache[i] = CachedPoint {
-                    id: p.id,
-                    local_a: iso_a.inverse_point(p.point),
-                    normal_impulse: 0.0,
-                    friction_impulse: Vec3::ZERO,
-                };
-            }
-            cm
-        })
-        .collect();
+        }
+        out.push(cm);
+    }
     if old.is_empty() {
-        return out;
+        return;
     }
     // Last step's points, flattened: (manifold, point).
-    let olds: Vec<(usize, usize)> = old
-        .iter()
-        .enumerate()
-        .flat_map(|(om, m)| (0..m.manifold.count).map(move |op| (om, op)))
-        .collect();
-    let mut claimed = vec![false; olds.len()];
-    let mut filled = vec![[false; MAX_MANIFOLD_POINTS]; out.len()];
+    let mut olds = SmallBuf::<(usize, usize), 32>::new((0, 0));
+    let mut claimed = SmallBuf::<bool, 32>::new(false);
+    for (om, m) in old.iter().enumerate() {
+        for op in 0..usize::from(m.manifold.count) {
+            olds.push((om, op));
+            claimed.push(false);
+        }
+    }
+    let mut filled =
+        SmallBuf::<[bool; MAX_MANIFOLD_POINTS], 8>::new([false; MAX_MANIFOLD_POINTS]);
+    for _ in 0..out.len() {
+        filled.push([false; MAX_MANIFOLD_POINTS]);
+    }
     let give = |cm: &mut ContactManifold, i: usize, from: &CachedPoint| {
         cm.cache[i].normal_impulse = from.normal_impulse;
         cm.cache[i].friction_impulse = from.friction_impulse;
     };
+    let olds_slice = olds.as_slice();
+    let claimed_slice = claimed.as_mut_slice();
+    let filled_slice = filled.as_mut_slice();
     // Feature ids: the same feature with a compatible surface normal, once.
-    for (cm, done) in out.iter_mut().zip(filled.iter_mut()) {
-        for (i, done) in done.iter_mut().enumerate().take(cm.manifold.count) {
+    for (cm, done) in out.iter_mut().zip(filled_slice.iter_mut()) {
+        for (i, done) in done.iter_mut().enumerate().take(usize::from(cm.manifold.count)) {
             let id = cm.cache[i].id;
             if id == 0 {
                 continue;
             }
-            let found = olds.iter().enumerate().find(|&(o, &(om, op))| {
-                !claimed[o]
+            let found = olds_slice.iter().enumerate().find(|&(o, &(om, op))| {
+                !claimed_slice[o]
                     && old[om].cache[op].id == id
                     && old[om].manifold.normal.dot(cm.manifold.normal) >= CARRY_NORMAL_COS
             });
             if let Some((o, &(om, op))) = found {
-                claimed[o] = true;
+                claimed_slice[o] = true;
                 *done = true;
                 give(cm, i, &old[om].cache[op]);
             }
@@ -700,15 +684,16 @@ fn carry_impulses(
     // vertices lie on the reference face's side planes, so their clip ids flicker from step to
     // step; matched by id only, those points restarted from nothing every step and the stack
     // took two to three times as long to settle).
-    let mut pairs: Vec<(f32, usize, usize, usize)> = Vec::new();
-    for (nm, (cm, done)) in out.iter().zip(&filled).enumerate() {
-        for (i, &done) in done.iter().enumerate().take(cm.manifold.count) {
+    let mut pairs = SmallBuf::<(f32, usize, usize, usize), 32>::new((0.0, 0, 0, 0));
+    for (nm, (cm, done)) in out.iter().zip(&*filled_slice).enumerate() {
+        for (i, &done) in done.iter().enumerate().take(usize::from(cm.manifold.count)) {
             if done {
                 continue;
             }
-            for (o, &(om, op)) in olds.iter().enumerate() {
+            for (o, &(om, op)) in olds_slice.iter().enumerate() {
                 let from = &old[om].cache[op];
-                if claimed[o] || old[om].manifold.normal.dot(cm.manifold.normal) < CARRY_NORMAL_COS
+                if claimed_slice[o]
+                    || old[om].manifold.normal.dot(cm.manifold.normal) < CARRY_NORMAL_COS
                 {
                     continue;
                 }
@@ -719,22 +704,21 @@ fn carry_impulses(
             }
         }
     }
-    pairs.sort_by(|x, y| {
+    pairs.as_mut_slice().sort_by(|x, y| {
         x.0.total_cmp(&y.0)
             .then(x.1.cmp(&y.1))
             .then(x.2.cmp(&y.2))
             .then(x.3.cmp(&y.3))
     });
-    for (_, nm, i, o) in pairs {
-        if claimed[o] || filled[nm][i] {
+    for &( _, nm, i, o) in pairs.as_slice() {
+        if claimed_slice[o] || filled_slice[nm][i] {
             continue;
         }
-        claimed[o] = true;
-        filled[nm][i] = true;
-        let (om, op) = olds[o];
+        claimed_slice[o] = true;
+        filled_slice[nm][i] = true;
+        let (om, op) = olds_slice[o];
         give(&mut out[nm], i, &old[om].cache[op]);
     }
-    out
 }
 
 /// The inverse inertia of a body free to turn only about the world axes where `free` is 1, with
@@ -859,12 +843,47 @@ pub(crate) struct JointSlot {
     pub impulses: JointImpulses,
 }
 
+/// Reusable scratch buffers across steps so steady-state simulation performs zero per-step heap
+/// allocations; cloning a [`PhysicsWorld`] starts the clone with empty scratch buffers.
+#[derive(Default)]
+pub(crate) struct StepScratch {
+    broad_found: Vec<(u32, u32)>,
+    narrow_manifolds: Vec<Manifold>,
+    old_manifolds: Vec<ContactManifold>,
+    wake: Vec<u32>,
+    active_indices: Vec<u32>,
+    slot: Vec<usize>,
+    solver_bodies: Vec<SolverBody>,
+    solver_vels: Vec<SolverVel>,
+    per_body: Vec<BodyInput>,
+    turning: Vec<Turning>,
+    members: Vec<u32>,
+    constraints: Vec<ContactConstraint>,
+    joint_constraints: Vec<(u32, JointConstraint)>,
+    hits: Vec<(u32, f32, Vec3, Vec3)>,
+    sleep_kept: Vec<u32>,
+    sleep_visited: Vec<u32>,
+    sleep_stamp: u32,
+    sleep_stack: Vec<u32>,
+    sleep_island: Vec<u32>,
+}
+
+impl Clone for StepScratch {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
 /// A rigid-body simulation. Cloning gives an independent copy (to restart from a saved state).
 #[derive(Clone)]
 pub struct PhysicsWorld {
     pub settings: Settings,
     pub(crate) bodies: Vec<Body>,
     free_bodies: Vec<u32>,
+    /// Bitset of body indices where `alive && awake && moves()` holds (64 bodies per `u64` word).
+    awake_words: Vec<u64>,
+    /// Count of live `BodyKind::Kinematic` bodies.
+    kinematic_count: usize,
     pub(crate) colliders: Vec<Collider>,
     free_colliders: Vec<u32>,
     pub(crate) joints: Vec<JointSlot>,
@@ -883,6 +902,7 @@ pub struct PhysicsWorld {
     /// The substep count the carried-over impulses are for (0 before the first step).
     warm_substeps: u32,
     steps: u64,
+    scratch: StepScratch,
 }
 
 impl Default for PhysicsWorld {
@@ -897,6 +917,8 @@ impl PhysicsWorld {
             settings,
             bodies: Vec::new(),
             free_bodies: Vec::new(),
+            awake_words: Vec::new(),
+            kinematic_count: 0,
             colliders: Vec::new(),
             free_colliders: Vec::new(),
             joints: Vec::new(),
@@ -910,6 +932,41 @@ impl PhysicsWorld {
             pending: Events::default(),
             warm_substeps: 0,
             steps: 0,
+            scratch: StepScratch::default(),
+        }
+    }
+
+    #[inline]
+    fn set_awake_bit(&mut self, index: u32, awake_moving: bool) {
+        let i = index as usize;
+        let word = i >> 6;
+        let mask = 1u64 << (i & 63);
+        if awake_moving {
+            if word >= self.awake_words.len() {
+                self.awake_words.resize(word + 1, 0);
+            }
+            self.awake_words[word] |= mask;
+        } else if let Some(w) = self.awake_words.get_mut(word) {
+            *w &= !mask;
+        }
+    }
+
+    #[inline]
+    fn has_awake_moving_bodies(&self) -> bool {
+        self.awake_words.iter().any(|&w| w != 0)
+    }
+
+    /// Appends every live, awake, moving body index to `out` in ascending body index order.
+    fn collect_awake_moving(&self, out: &mut Vec<u32>) {
+        out.clear();
+        for (wi, &word) in self.awake_words.iter().enumerate() {
+            let mut w = word;
+            let base = (wi << 6) as u32;
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                out.push(base + bit);
+                w &= w - 1;
+            }
         }
     }
 
@@ -991,7 +1048,12 @@ impl PhysicsWorld {
         if desc.kind == BodyKind::Dynamic {
             // A dynamic body without colliders still needs mass to move.
             self.update_mass(index);
+        } else if desc.kind == BodyKind::Kinematic {
+            self.kinematic_count += 1;
         }
+        let awake_moving =
+            self.bodies[index as usize].awake && self.bodies[index as usize].moves();
+        self.set_awake_bit(index, awake_moving);
         Ok(id)
     }
 
@@ -1014,7 +1076,11 @@ impl PhysicsWorld {
         for c in self.bodies[i].colliders.clone() {
             self.destroy_collider_index(c);
         }
+        if self.bodies[i].kind == BodyKind::Kinematic {
+            self.kinematic_count = self.kinematic_count.saturating_sub(1);
+        }
         self.bodies[i].alive = false;
+        self.set_awake_bit(i as u32, false);
         self.free_bodies.push(i as u32);
     }
 
@@ -1035,7 +1101,7 @@ impl PhysicsWorld {
     }
 
     pub fn awake_body_count(&self) -> usize {
-        self.bodies.iter().filter(|b| b.alive && b.awake).count()
+        self.awake_words.iter().map(|w| w.count_ones() as usize).sum()
     }
 
     pub(crate) fn body(&self, id: BodyId) -> Option<&Body> {
@@ -1719,19 +1785,28 @@ impl PhysicsWorld {
         }
         self.settings = self.settings.sanitized();
         self.steps += 1;
+        if self.move_buffer.is_empty() && !self.has_awake_moving_bodies() {
+            self.rescale_warm_starts(self.settings.substeps.max(1));
+            std::mem::swap(&mut self.events, &mut self.pending);
+            self.pending.contacts.clear();
+            self.pending.sensors.clear();
+            return;
+        }
         self.update_broad_phase();
         self.update_contacts();
-        let moved = self.solve(dt);
+        self.solve(dt);
         // The broad-phase boxes follow the bodies at once, so that continuous collision below and
         // every query between steps (rays, casts, overlaps, the character's sweeps) see each
         // collider where it is now, not where the step started. Colliders that left their box
         // are queued for pair finding at the next step.
+        let moved = std::mem::take(&mut self.scratch.members);
         for &b in &moved {
             self.refresh_body_proxies(b, false);
         }
-        if self.settings.enable_continuous {
+        if self.settings.enable_continuous && !moved.is_empty() {
             self.continuous(&moved, dt);
         }
+        self.scratch.members = moved;
         std::mem::swap(&mut self.events, &mut self.pending);
         self.pending.contacts.clear();
         self.pending.sensors.clear();
@@ -1750,7 +1825,8 @@ impl PhysicsWorld {
         for &c in &moved {
             self.colliders[c as usize].queued = false;
         }
-        let mut found: Vec<(u32, u32)> = Vec::new();
+        let mut found = std::mem::take(&mut self.scratch.broad_found);
+        found.clear();
         for &c in &moved {
             let col = &self.colliders[c as usize];
             if !col.alive {
@@ -1778,7 +1854,7 @@ impl PhysicsWorld {
         }
         found.sort_unstable();
         found.dedup();
-        for (a, b) in found {
+        for &(a, b) in &found {
             let sensor = self.colliders[a as usize].sensor || self.colliders[b as usize].sensor;
             let k = self.contacts.len() as u32;
             let slots = [a, b].map(|c| {
@@ -1796,19 +1872,23 @@ impl PhysicsWorld {
             });
             self.pairs.insert((a, b), k);
         }
+        found.clear();
+        self.scratch.broad_found = found;
+        moved.clear();
         self.move_buffer = moved;
-        self.move_buffer.clear();
     }
 
     /// Updates a body's collider boxes; queues those that left their fat box (or all, when
     /// `force`) for pair finding.
     fn refresh_body_proxies(&mut self, b: u32, force: bool) {
-        let colliders = self.bodies[b as usize].colliders.clone();
-        for c in colliders {
+        let margin = self.aabb_margin();
+        let len = self.bodies[b as usize].colliders.len();
+        for ci in 0..len {
+            let c = self.bodies[b as usize].colliders[ci];
             let tight = self.collider_box(c);
             let col = &self.colliders[c as usize];
             if force || !col.fat.contains(&tight) {
-                let fat = tight.expand(self.aabb_margin());
+                let fat = tight.expand(margin);
                 let (proxy, static_tree) = (col.proxy, col.in_static_tree);
                 if static_tree {
                     self.static_tree.update(proxy, fat);
@@ -1910,121 +1990,211 @@ impl PhysicsWorld {
     /// The narrow phase: new manifolds for every pair with an awake moving body, carried
     /// impulses, begin and end events; pairs whose boxes no longer overlap are dropped.
     fn update_contacts(&mut self) {
-        let mut k = 0;
-        let mut scratch: Vec<Manifold> = Vec::new();
-        let mut wake: Vec<u32> = Vec::new();
-        while k < self.contacts.len() {
-            let (a, b) = (self.contacts[k].a, self.contacts[k].b);
-            let (ca, cb) = (&self.colliders[a as usize], &self.colliders[b as usize]);
-            let (ba, bb) = (
-                &self.bodies[ca.body as usize],
-                &self.bodies[cb.body as usize],
-            );
-            let active = (ba.awake && ba.moves()) || (bb.awake && bb.moves());
-            if !active {
-                k += 1;
-                continue;
-            }
-            if !ca.fat.overlaps(&cb.fat) || !self.should_collide(a, b) {
-                self.destroy_contact(k, true);
-                continue;
-            }
-            let (iso_a, iso_b) = (self.collider_iso(a), self.collider_iso(b));
-            scratch.clear();
-            let sensor = self.contacts[k].sensor;
-            let speculative = if sensor {
-                0.0
-            } else {
-                self.settings.speculative_distance
-            };
-            collide::collide(
-                &ca.shape,
-                &iso_a,
-                &cb.shape,
-                &iso_b,
-                speculative,
-                &mut scratch,
-            );
-            let was_touching = self.contacts[k].touching;
-            let touching = if sensor {
-                scratch.iter().any(|m| m.min_separation() < 0.0)
-            } else {
-                scratch.iter().any(|m| m.count > 0)
-            };
-            if !sensor {
-                let old = std::mem::take(&mut self.contacts[k].manifolds);
-                let match_distance =
-                    2.0 * self.settings.speculative_distance + self.settings.linear_slop;
-                self.contacts[k].manifolds = carry_impulses(&old, &scratch, &iso_a, match_distance);
-            } else {
-                self.contacts[k].manifolds.clear();
-            }
-            self.contacts[k].touching = touching;
-            if touching != was_touching {
-                let (ia, ib) = (self.collider_id(a), self.collider_id(b));
-                if sensor {
-                    let (sensor_id, visitor) = if self.colliders[a as usize].sensor {
-                        (ia, ib)
-                    } else {
-                        (ib, ia)
-                    };
-                    self.pending.sensors.push(if touching {
-                        SensorEvent::Begin {
-                            sensor: sensor_id,
-                            visitor,
-                        }
-                    } else {
-                        SensorEvent::End {
-                            sensor: sensor_id,
-                            visitor,
-                        }
-                    });
-                } else {
-                    self.pending.contacts.push(if touching {
-                        ContactEvent::Begin { a: ia, b: ib }
-                    } else {
-                        ContactEvent::End { a: ia, b: ib }
-                    });
+        let awake_count = self.awake_body_count();
+        if awake_count == 0 {
+            return;
+        }
+        let mut narrow_manifolds = std::mem::take(&mut self.scratch.narrow_manifolds);
+        let mut old_manifolds = std::mem::take(&mut self.scratch.old_manifolds);
+        let mut wake = std::mem::take(&mut self.scratch.wake);
+        let mut active_indices = std::mem::take(&mut self.scratch.active_indices);
+        wake.clear();
+
+        if awake_count.saturating_mul(8) < self.contacts.len() {
+            active_indices.clear();
+            for (wi, &word) in self.awake_words.iter().enumerate() {
+                let mut w = word;
+                let base = (wi << 6) as u32;
+                while w != 0 {
+                    let b = (base + w.trailing_zeros()) as usize;
+                    for &c in &self.bodies[b].colliders {
+                        active_indices.extend_from_slice(&self.colliders[c as usize].contacts);
+                    }
+                    w &= w - 1;
                 }
             }
-            if touching && !sensor {
-                // An awake body that can push wakes a sleeping one it touches: a dynamic body, or
-                // a kinematic one that moves. A kinematic body standing still does not (it would
-                // wake its load the step after the load fell asleep, every time), unless the
-                // contact has just begun (it was put there, or was given a new collider there).
-                let (pa, pb) = (
-                    self.colliders[a as usize].body,
-                    self.colliders[b as usize].body,
+            active_indices.sort_unstable();
+            active_indices.dedup();
+
+            let mut idx = 0;
+            while idx < active_indices.len() {
+                let k = active_indices[idx] as usize;
+                if !self.update_single_contact(
+                    k,
+                    &mut narrow_manifolds,
+                    &mut old_manifolds,
+                    &mut wake,
+                ) {
+                    let last = self.contacts.len();
+                    if k < last && active_indices.last() == Some(&(last as u32)) {
+                        active_indices.pop();
+                    } else {
+                        idx += 1;
+                    }
+                    continue;
+                }
+                idx += 1;
+            }
+        } else {
+            let mut k = 0;
+            while k < self.contacts.len() {
+                let (a, b) = (self.contacts[k].a, self.contacts[k].b);
+                let (ca, cb) = (&self.colliders[a as usize], &self.colliders[b as usize]);
+                let (ba, bb) = (
+                    &self.bodies[ca.body as usize],
+                    &self.bodies[cb.body as usize],
                 );
-                for (p, q) in [(pa, pb), (pb, pa)] {
+                let active = (ba.awake && ba.moves()) || (bb.awake && bb.moves());
+                if !active {
+                    k += 1;
+                    continue;
+                }
+                if !self.update_single_contact(
+                    k,
+                    &mut narrow_manifolds,
+                    &mut old_manifolds,
+                    &mut wake,
+                ) {
+                    continue;
+                }
+                k += 1;
+            }
+        }
+
+        // A moving kinematic body wakes what hangs from it by a joint (islands leave kinematic
+        // bodies out, and so does waking along joints).
+        if self.kinematic_count > 0 {
+            for j in &self.joints {
+                if !j.alive {
+                    continue;
+                }
+                let (x, y) = (j.desc.body_a.index, j.desc.body_b.index);
+                for (p, q) in [(x, y), (y, x)] {
                     let (bp, bq) = (&self.bodies[p as usize], &self.bodies[q as usize]);
-                    if bp.awake && (bp.pushes() || !was_touching) && !bq.awake && bq.is_dynamic() {
+                    if bp.awake && bp.is_kinematic_moving() && !bq.awake && bq.is_dynamic() {
                         wake.push(q);
                     }
                 }
             }
-            k += 1;
         }
-        // A moving kinematic body wakes what hangs from it by a joint (islands leave kinematic
-        // bodies out, and so does waking along joints).
-        for j in &self.joints {
-            if !j.alive {
-                continue;
+        self.wake_islands(&wake);
+
+        self.scratch.narrow_manifolds = narrow_manifolds;
+        self.scratch.old_manifolds = old_manifolds;
+        self.scratch.wake = wake;
+        self.scratch.active_indices = active_indices;
+    }
+
+    /// Updates active contact `k`; returns `false` if the contact was destroyed.
+    fn update_single_contact(
+        &mut self,
+        k: usize,
+        narrow_manifolds: &mut Vec<Manifold>,
+        old_manifolds: &mut Vec<ContactManifold>,
+        wake: &mut Vec<u32>,
+    ) -> bool {
+        let (a, b) = (self.contacts[k].a, self.contacts[k].b);
+        let (ca, cb) = (&self.colliders[a as usize], &self.colliders[b as usize]);
+        if !ca.fat.overlaps(&cb.fat) || !self.should_collide(a, b) {
+            self.destroy_contact(k, true);
+            return false;
+        }
+        let (iso_a, iso_b) = (self.collider_iso(a), self.collider_iso(b));
+        narrow_manifolds.clear();
+        let sensor = self.contacts[k].sensor;
+        let speculative = if sensor {
+            0.0
+        } else {
+            self.settings.speculative_distance
+        };
+        collide::collide(
+            &self.colliders[a as usize].shape,
+            &iso_a,
+            &self.colliders[b as usize].shape,
+            &iso_b,
+            speculative,
+            narrow_manifolds,
+        );
+        let was_touching = self.contacts[k].touching;
+        let touching = if sensor {
+            narrow_manifolds.iter().any(|m| m.min_separation() < 0.0)
+        } else {
+            narrow_manifolds.iter().any(|m| m.count > 0)
+        };
+        if !sensor {
+            let mut manifolds = std::mem::take(&mut self.contacts[k].manifolds);
+            std::mem::swap(&mut manifolds, old_manifolds);
+            let match_distance =
+                2.0 * self.settings.speculative_distance + self.settings.linear_slop;
+            carry_impulses_into(
+                old_manifolds,
+                narrow_manifolds,
+                &iso_a,
+                match_distance,
+                &mut manifolds,
+            );
+            self.contacts[k].manifolds = manifolds;
+        } else {
+            self.contacts[k].manifolds.clear();
+        }
+        self.contacts[k].touching = touching;
+        if touching != was_touching {
+            let (ia, ib) = (self.collider_id(a), self.collider_id(b));
+            if sensor {
+                let (sensor_id, visitor) = if self.colliders[a as usize].sensor {
+                    (ia, ib)
+                } else {
+                    (ib, ia)
+                };
+                self.pending.sensors.push(if touching {
+                    SensorEvent::Begin {
+                        sensor: sensor_id,
+                        visitor,
+                    }
+                } else {
+                    SensorEvent::End {
+                        sensor: sensor_id,
+                        visitor,
+                    }
+                });
+            } else {
+                self.pending.contacts.push(if touching {
+                    ContactEvent::Begin { a: ia, b: ib }
+                } else {
+                    ContactEvent::End { a: ia, b: ib }
+                });
             }
-            let (x, y) = (j.desc.body_a.index, j.desc.body_b.index);
-            for (p, q) in [(x, y), (y, x)] {
+        }
+        if touching && !sensor {
+            // An awake body that can push wakes a sleeping one it touches: a dynamic body, or
+            // a kinematic one that moves. A kinematic body standing still does not (it would
+            // wake its load the step after the load fell asleep, every time), unless the
+            // contact has just begun (it was put there, or was given a new collider there).
+            let (pa, pb) = (
+                self.colliders[a as usize].body,
+                self.colliders[b as usize].body,
+            );
+            for (p, q) in [(pa, pb), (pb, pa)] {
                 let (bp, bq) = (&self.bodies[p as usize], &self.bodies[q as usize]);
-                if bp.awake && bp.is_kinematic_moving() && !bq.awake && bq.is_dynamic() {
+                if bp.awake && (bp.pushes() || !was_touching) && !bq.awake && bq.is_dynamic() {
                     wake.push(q);
                 }
             }
         }
-        self.wake_islands(&wake);
+        true
     }
 
-    /// The soft step over every awake moving body; returns those bodies (index order).
-    fn solve(&mut self, dt: f32) -> Vec<u32> {
+    /// The soft step over every awake moving body; stores those bodies in `self.scratch.members`
+    /// in ascending index order.
+    fn solve(&mut self, dt: f32) {
         self.rescale_warm_starts(self.settings.substeps.max(1));
+        let mut scratch = std::mem::take(&mut self.scratch);
+        self.collect_awake_moving(&mut scratch.members);
+        if scratch.members.is_empty() {
+            self.scratch = scratch;
+            return;
+        }
+
         let s = &self.settings;
         let substeps = s.substeps.max(1);
         let h = dt / substeps as f32;
@@ -2042,34 +2212,37 @@ impl PhysicsWorld {
         };
 
         // Solver bodies: slot 0 is static; then every awake moving body in index order.
-        let mut slot = vec![0usize; self.bodies.len()];
-        let mut solver_bodies = vec![SolverBody::STATIC];
-        let mut per_body = Vec::new();
-        let mut turning = vec![Turning::Fixed];
-        let mut members: Vec<u32> = Vec::new();
-        for (i, b) in self.bodies.iter_mut().enumerate() {
-            if !(b.alive && b.awake && b.moves()) {
-                continue;
-            }
+        if scratch.slot.len() < self.bodies.len() {
+            scratch.slot.resize(self.bodies.len(), 0);
+        }
+        scratch.solver_bodies.clear();
+        scratch.solver_bodies.push(SolverBody::STATIC);
+        scratch.solver_vels.clear();
+        scratch.solver_vels.push(SolverVel::ZERO);
+        scratch.per_body.clear();
+        scratch.turning.clear();
+        scratch.turning.push(Turning::Fixed);
+
+        for &bi in &scratch.members {
+            let i = bi as usize;
+            let b = &mut self.bodies[i];
             b.center0 = b.center;
             b.rotation0 = b.rotation;
-            slot[i] = solver_bodies.len();
-            members.push(i as u32);
+            scratch.slot[i] = scratch.solver_bodies.len();
             // Every setter keeps locked axes at zero already; this makes sure of it, since
             // nothing in the solve could take such a velocity away again.
             let (v, w) = b.allowed_velocities(b.linear_velocity, b.angular_velocity);
             let inv_inertia = b.world_inv_inertia();
-            solver_bodies.push(SolverBody {
-                v,
-                w,
+            scratch.solver_vels.push(SolverVel { v, w });
+            scratch.solver_bodies.push(SolverBody {
                 dp: Vec3::ZERO,
                 dq: Quat::IDENTITY,
                 inv_mass: b.inv_mass_vector(),
                 inv_inertia,
                 contact_inv_inertia: inv_inertia,
             });
-            turning.push(b.turning());
-            per_body.push(BodyInput {
+            scratch.turning.push(b.turning());
+            scratch.per_body.push(BodyInput {
                 force: b.force,
                 torque: b.torque,
                 gravity_scale: b.gravity_scale,
@@ -2079,31 +2252,43 @@ impl PhysicsWorld {
                     .then(|| Quat::from_angular_velocity(w, h)),
             });
         }
-        let frame = |w: &PhysicsWorld, b: u32| {
-            let body = &w.bodies[b as usize];
-            BodyFrame {
-                center: body.center,
-                rotation: body.rotation,
-                local_center: body.local_center,
-                index: slot[b as usize],
-            }
-        };
 
         // Contact constraints.
-        let mut constraints: Vec<ContactConstraint> = Vec::new();
-        for (k, c) in self.contacts.iter().enumerate() {
+        scratch.constraints.clear();
+        let build_contact_constraint = |w: &PhysicsWorld,
+                                        k: usize,
+                                        slot: &[usize],
+                                        solver_bodies: &[SolverBody],
+                                        solver_vels: &[SolverVel],
+                                        constraints: &mut Vec<ContactConstraint>| {
+            let c = &w.contacts[k];
             if !c.touching || c.sensor {
-                continue;
+                return;
             }
-            let (ca, cb) = (&self.colliders[c.a as usize], &self.colliders[c.b as usize]);
-            let (fa, fb) = (frame(self, ca.body), frame(self, cb.body));
-            if fa.index == 0 && fb.index == 0 {
-                continue;
+            let (ca, cb) = (&w.colliders[c.a as usize], &w.colliders[c.b as usize]);
+            let ia = slot[ca.body as usize];
+            let ib = slot[cb.body as usize];
+            if ia == 0 && ib == 0 {
+                return;
             }
+            let ba = &w.bodies[ca.body as usize];
+            let bb = &w.bodies[cb.body as usize];
+            let fa = BodyFrame {
+                center: ba.center,
+                rotation: ba.rotation,
+                local_center: ba.local_center,
+                index: ia,
+            };
+            let fb = BodyFrame {
+                center: bb.center,
+                rotation: bb.rotation,
+                local_center: bb.local_center,
+                index: ib,
+            };
             let friction = (ca.friction * cb.friction).sqrt();
             let restitution = ca.restitution.max(cb.restitution);
-            let either_static = solver_bodies[fa.index].inv_mass == Vec3::ZERO
-                || solver_bodies[fb.index].inv_mass == Vec3::ZERO;
+            let either_static = solver_bodies[ia].inv_mass == Vec3::ZERO
+                || solver_bodies[ib].inv_mass == Vec3::ZERO;
             for (mi, m) in c.manifolds.iter().enumerate() {
                 if m.manifold.count == 0 {
                     continue;
@@ -2111,8 +2296,8 @@ impl PhysicsWorld {
                 let n = m.manifold.normal;
                 let (t1, t2) = n.orthonormal_basis();
                 let mut cc = ContactConstraint {
-                    a: fa.index,
-                    b: fb.index,
+                    a: ia,
+                    b: ib,
                     normal: n,
                     tangents: [t1, t2],
                     friction,
@@ -2123,16 +2308,17 @@ impl PhysicsWorld {
                         ctx.contact_softness
                     },
                     points: [ConstraintPoint::default(); 4],
-                    count: m.manifold.count,
+                    count: usize::from(m.manifold.count),
                     source: (k as u32, mi as u32),
                     rounding: (ca.shape.radius(), cb.shape.radius()),
                 };
-                for i in 0..m.manifold.count {
+                for i in 0..usize::from(m.manifold.count) {
                     let p = m.manifold.points[i];
                     let cache = m.cache[i];
                     cc.points[i] = solver::prepare_point(
                         &cc,
-                        &solver_bodies,
+                        solver_bodies,
+                        solver_vels,
                         &fa,
                         &fb,
                         p.point,
@@ -2143,82 +2329,201 @@ impl PhysicsWorld {
                 }
                 constraints.push(cc);
             }
+        };
+
+        if scratch.members.len().saturating_mul(8) < self.contacts.len() {
+            scratch.active_indices.clear();
+            for &b in &scratch.members {
+                for &c in &self.bodies[b as usize].colliders {
+                    scratch
+                        .active_indices
+                        .extend_from_slice(&self.colliders[c as usize].contacts);
+                }
+            }
+            scratch.active_indices.sort_unstable();
+            scratch.active_indices.dedup();
+            for &k in &scratch.active_indices {
+                build_contact_constraint(
+                    self,
+                    k as usize,
+                    &scratch.slot,
+                    &scratch.solver_bodies,
+                    &scratch.solver_vels,
+                    &mut scratch.constraints,
+                );
+            }
+        } else {
+            for k in 0..self.contacts.len() {
+                build_contact_constraint(
+                    self,
+                    k,
+                    &scratch.slot,
+                    &scratch.solver_bodies,
+                    &scratch.solver_vels,
+                    &mut scratch.constraints,
+                );
+            }
         }
 
         // Joint constraints.
-        let mut joint_constraints: Vec<(u32, JointConstraint)> = Vec::new();
-        for (j, slot_j) in self.joints.iter().enumerate() {
+        scratch.joint_constraints.clear();
+        let build_joint_constraint = |w: &PhysicsWorld,
+                                      j: usize,
+                                      slot: &[usize],
+                                      solver_bodies: &[SolverBody],
+                                      joint_constraints: &mut Vec<(u32, JointConstraint)>| {
+            let slot_j = &w.joints[j];
             if !slot_j.alive {
-                continue;
+                return;
             }
             let (Some(a), Some(b)) = (
-                self.body_index(slot_j.desc.body_a),
-                self.body_index(slot_j.desc.body_b),
+                w.body_index(slot_j.desc.body_a),
+                w.body_index(slot_j.desc.body_b),
             ) else {
-                continue;
+                return;
             };
-            let (fa, fb) = (frame(self, a as u32), frame(self, b as u32));
-            if fa.index == 0 && fb.index == 0 {
-                continue;
+            let ia = slot[a];
+            let ib = slot[b];
+            if ia == 0 && ib == 0 {
+                return;
             }
+            let ba = &w.bodies[a];
+            let bb = &w.bodies[b];
+            let fa = BodyFrame {
+                center: ba.center,
+                rotation: ba.rotation,
+                local_center: ba.local_center,
+                index: ia,
+            };
+            let fb = BodyFrame {
+                center: bb.center,
+                rotation: bb.rotation,
+                local_center: bb.local_center,
+                index: ib,
+            };
             let jc = joint::prepare(
                 &slot_j.desc,
                 &fa,
                 &fb,
-                &solver_bodies,
+                solver_bodies,
                 &ctx,
                 slot_j.impulses,
             );
             joint_constraints.push((j as u32, jc));
+        };
+
+        if scratch.members.len().saturating_mul(8) < self.joints.len() {
+            scratch.active_indices.clear();
+            for &b in &scratch.members {
+                scratch
+                    .active_indices
+                    .extend_from_slice(&self.bodies[b as usize].joints);
+            }
+            scratch.active_indices.sort_unstable();
+            scratch.active_indices.dedup();
+            for &j in &scratch.active_indices {
+                build_joint_constraint(
+                    self,
+                    j as usize,
+                    &scratch.slot,
+                    &scratch.solver_bodies,
+                    &mut scratch.joint_constraints,
+                );
+            }
+        } else {
+            for j in 0..self.joints.len() {
+                build_joint_constraint(
+                    self,
+                    j,
+                    &scratch.slot,
+                    &scratch.solver_bodies,
+                    &mut scratch.joint_constraints,
+                );
+            }
         }
 
         let inputs = IntegrationInputs {
             gravity: self.settings.gravity,
-            per_body: &per_body,
+            per_body: &scratch.per_body,
             max_linear_speed: self.settings.max_linear_speed,
             max_angular_speed: 0.25 * std::f32::consts::PI * ctx.inv_h,
         };
         for sub in 0..substeps {
-            solver::integrate_velocities(&mut solver_bodies, &inputs, h);
-            for (_, jc) in &joint_constraints {
-                joint::warm_start(jc, &mut solver_bodies);
+            solver::integrate_velocities(
+                &scratch.solver_bodies,
+                &mut scratch.solver_vels,
+                &inputs,
+                h,
+            );
+            for (_, jc) in &scratch.joint_constraints {
+                joint::warm_start(jc, &scratch.solver_bodies, &mut scratch.solver_vels);
             }
-            solver::warm_start_contacts(&constraints, &mut solver_bodies);
-            for (j, jc) in joint_constraints.iter_mut() {
+            solver::warm_start_contacts(
+                &scratch.constraints,
+                &scratch.solver_bodies,
+                &mut scratch.solver_vels,
+            );
+            for (j, jc) in scratch.joint_constraints.iter_mut() {
                 let desc = self.joints[*j as usize].desc;
-                joint::solve(jc, &desc, &mut solver_bodies, &ctx, true);
+                joint::solve(
+                    jc,
+                    &desc,
+                    &scratch.solver_bodies,
+                    &mut scratch.solver_vels,
+                    &ctx,
+                    true,
+                );
             }
             solver::solve_contacts(
-                &mut constraints,
-                &mut solver_bodies,
+                &mut scratch.constraints,
+                &scratch.solver_bodies,
+                &mut scratch.solver_vels,
                 &ctx,
                 true,
                 sub % 2 == 1,
             );
-            solver::integrate_positions(&mut solver_bodies, &inputs, h);
-            for (sb, t) in solver_bodies.iter_mut().zip(&turning) {
+            solver::integrate_positions(
+                &mut scratch.solver_bodies,
+                &scratch.solver_vels,
+                &inputs,
+                h,
+            );
+            for (sb, t) in scratch.solver_bodies.iter_mut().zip(&scratch.turning) {
                 if let Some(m) = t.after(sb.dq) {
                     sb.inv_inertia = m;
                 }
             }
-            for (j, jc) in joint_constraints.iter_mut() {
+            for (j, jc) in scratch.joint_constraints.iter_mut() {
                 let desc = self.joints[*j as usize].desc;
-                joint::solve(jc, &desc, &mut solver_bodies, &ctx, false);
+                joint::solve(
+                    jc,
+                    &desc,
+                    &scratch.solver_bodies,
+                    &mut scratch.solver_vels,
+                    &ctx,
+                    false,
+                );
             }
             solver::solve_contacts(
-                &mut constraints,
-                &mut solver_bodies,
+                &mut scratch.constraints,
+                &scratch.solver_bodies,
+                &mut scratch.solver_vels,
                 &ctx,
                 false,
                 sub % 2 == 0,
             );
         }
-        solver::apply_restitution(&mut constraints, &mut solver_bodies, &ctx);
+        solver::apply_restitution(
+            &mut scratch.constraints,
+            &scratch.solver_bodies,
+            &mut scratch.solver_vels,
+            &ctx,
+        );
 
         // Store impulses for warm starting, and report hits.
         let hit_threshold = self.settings.hit_event_threshold;
-        let mut hits: BTreeMap<u32, (f32, Vec3, Vec3)> = BTreeMap::new();
-        for cc in &constraints {
+        scratch.hits.clear();
+        for cc in &scratch.constraints {
             let (k, mi) = (cc.source.0 as usize, cc.source.1 as usize);
             let cm = &mut self.contacts[k].manifolds[mi];
             for i in 0..cc.count {
@@ -2229,14 +2534,18 @@ impl PhysicsWorld {
                 let approach = -p.relative_velocity;
                 if approach > hit_threshold && p.max_normal_impulse > 0.0 {
                     let point = cm.manifold.points[i].point;
-                    let e = hits.entry(k as u32).or_insert((0.0, point, cc.normal));
-                    if approach > e.0 {
-                        *e = (approach, point, cc.normal);
+                    let ku = k as u32;
+                    if let Some(last) = scratch.hits.last_mut().filter(|last| last.0 == ku) {
+                        if approach > last.1 {
+                            *last = (ku, approach, point, cc.normal);
+                        }
+                    } else {
+                        scratch.hits.push((ku, approach, point, cc.normal));
                     }
                 }
             }
         }
-        for (k, (speed, point, normal)) in hits {
+        for &(k, speed, point, normal) in &scratch.hits {
             let c = &self.contacts[k as usize];
             self.pending.contacts.push(ContactEvent::Hit {
                 a: self.collider_id(c.a),
@@ -2246,16 +2555,19 @@ impl PhysicsWorld {
                 speed,
             });
         }
-        for (j, jc) in &joint_constraints {
+        for (j, jc) in &scratch.joint_constraints {
             self.joints[*j as usize].impulses = jc.impulses;
         }
 
-        // Write the bodies back.
-        for &b in &members {
-            let sb = solver_bodies[slot[b as usize]];
+        // Write the bodies back and clear their temporary slot assignments.
+        for &b in &scratch.members {
+            let sidx = scratch.slot[b as usize];
+            scratch.slot[b as usize] = 0;
+            let sb = &scratch.solver_bodies[sidx];
+            let sv = scratch.solver_vels[sidx];
             let body = &mut self.bodies[b as usize];
-            body.linear_velocity = sb.v;
-            body.angular_velocity = sb.w;
+            body.linear_velocity = sv.v;
+            body.angular_velocity = sv.w;
             body.center = body.center0 + sb.dp;
             body.rotation = body.reachable((sb.dq * body.rotation0).normalize());
             body.position = body.center - body.rotation.rotate(body.local_center);
@@ -2263,10 +2575,10 @@ impl PhysicsWorld {
             body.torque = Vec3::ZERO;
         }
 
+        self.scratch = scratch;
         if self.settings.enable_sleep {
-            self.update_sleep(dt, &members);
+            self.update_sleep(dt);
         }
-        members
     }
 
     /// The impulses carried over from the last step warm-start each substep, so they are per
@@ -2297,10 +2609,12 @@ impl PhysicsWorld {
     }
 
     /// Sleep timers, then islands (bodies linked by touching contacts and joints) that have all
-    /// been still for `time_to_sleep` go to sleep together.
-    fn update_sleep(&mut self, dt: f32, members: &[u32]) {
+    /// been still for `time_to_sleep` go to sleep together. Runs in `O(awake)` using adjacency
+    /// traversal instead of scanning all sleeping bodies and contacts in the world.
+    fn update_sleep(&mut self, dt: f32) {
+        let mut scratch = std::mem::take(&mut self.scratch);
         let threshold = self.settings.sleep_threshold;
-        for &b in members {
+        for &b in &scratch.members {
             let body = &mut self.bodies[b as usize];
             let still = body.linear_velocity.length() < threshold
                 && body.angular_velocity.length() * body.max_extent < threshold;
@@ -2312,98 +2626,31 @@ impl PhysicsWorld {
         }
         // A moving kinematic body keeps what it touches, and what hangs from it by a joint,
         // awake, however slowly it moves (islands leave kinematic bodies out).
-        let mut kept: Vec<u32> = Vec::new();
-        for c in &self.contacts {
-            if !c.touching || c.sensor {
-                continue;
-            }
-            let (pa, pb) = (
-                self.colliders[c.a as usize].body,
-                self.colliders[c.b as usize].body,
-            );
-            for (p, q) in [(pa, pb), (pb, pa)] {
-                if self.bodies[p as usize].is_kinematic_moving() {
-                    kept.push(q);
+        if self.kinematic_count > 0 {
+            scratch.sleep_kept.clear();
+            for (p, bp) in self.bodies.iter().enumerate() {
+                if bp.alive && bp.is_kinematic_moving() {
+                    self.push_neighbours(p as u32, &mut scratch.sleep_kept);
                 }
             }
-        }
-        for j in &self.joints {
-            if !j.alive {
-                continue;
-            }
-            let (x, y) = (j.desc.body_a.index, j.desc.body_b.index);
-            for (p, q) in [(x, y), (y, x)] {
-                if self.bodies[p as usize].is_kinematic_moving() {
-                    kept.push(q);
-                }
+            for &q in &scratch.sleep_kept {
+                self.bodies[q as usize].sleep_time = 0.0;
             }
         }
-        for q in kept {
-            self.bodies[q as usize].sleep_time = 0.0;
+
+        scratch.sleep_stamp = scratch.sleep_stamp.wrapping_add(1);
+        if scratch.sleep_stamp == 0 {
+            scratch.sleep_visited.fill(0);
+            scratch.sleep_stamp = 1;
         }
-        // Union-find over awake dynamic bodies.
-        let n = self.bodies.len();
-        let mut parent: Vec<u32> = (0..n as u32).collect();
-        fn find(parent: &mut [u32], mut x: u32) -> u32 {
-            while parent[x as usize] != x {
-                parent[x as usize] = parent[parent[x as usize] as usize];
-                x = parent[x as usize];
-            }
-            x
+        if scratch.sleep_visited.len() < self.bodies.len() {
+            scratch.sleep_visited.resize(self.bodies.len(), 0);
         }
-        let union = |parent: &mut Vec<u32>, a: u32, b: u32| {
-            let (ra, rb) = (find(parent, a), find(parent, b));
-            if ra != rb {
-                let (lo, hi) = (ra.min(rb), ra.max(rb));
-                parent[hi as usize] = lo;
-            }
-        };
-        let linkable = |w: &PhysicsWorld, b: usize| w.bodies[b].alive && w.bodies[b].is_dynamic();
-        for c in &self.contacts {
-            if !c.touching || c.sensor {
-                continue;
-            }
-            let (pa, pb) = (
-                self.colliders[c.a as usize].body,
-                self.colliders[c.b as usize].body,
-            );
-            if linkable(self, pa as usize) && linkable(self, pb as usize) {
-                union(&mut parent, pa, pb);
-            }
-        }
-        for j in &self.joints {
-            if !j.alive {
-                continue;
-            }
-            let (a, b) = (j.desc.body_a.index, j.desc.body_b.index);
-            if linkable(self, a as usize) && linkable(self, b as usize) {
-                union(&mut parent, a, b);
-            }
-        }
-        let mut min_sleep: BTreeMap<u32, f32> = BTreeMap::new();
-        for &b in members {
-            if !self.bodies[b as usize].is_dynamic() {
-                continue;
-            }
-            let r = find(&mut parent, b);
-            let t = self.bodies[b as usize].sleep_time;
-            let e = min_sleep.entry(r).or_insert(f32::INFINITY);
-            *e = e.min(if self.bodies[b as usize].can_sleep {
-                t
-            } else {
-                0.0
-            });
-        }
-        // Islands that include a body that is already asleep (touching an awake one through a
-        // joint, say) are not put to sleep from here; waking has priority.
-        for (b, body) in self.bodies.iter().enumerate() {
-            if body.alive && body.is_dynamic() && !body.awake {
-                let r = find(&mut parent, b as u32);
-                min_sleep.insert(r, 0.0);
-            }
-        }
+        let stamp = scratch.sleep_stamp;
         let time_to_sleep = self.settings.time_to_sleep;
-        for &b in members {
+
+        for mi in 0..scratch.members.len() {
+            let b = scratch.members[mi];
             let body = &self.bodies[b as usize];
             if !body.is_dynamic() {
                 // A kinematic body sleeps on its own once it has stopped.
@@ -2413,19 +2660,78 @@ impl PhysicsWorld {
                     && body.angular_velocity == Vec3::ZERO
                 {
                     self.bodies[b as usize].awake = false;
+                    self.set_awake_bit(b, false);
                 }
                 continue;
             }
-            let r = find(&mut parent, b);
+            if scratch.sleep_visited[b as usize] == stamp {
+                continue;
+            }
+
+            scratch.sleep_visited[b as usize] = stamp;
+            scratch.sleep_stack.clear();
+            scratch.sleep_island.clear();
+            scratch.sleep_stack.push(b);
+            let mut min_sleep = f32::INFINITY;
+
+            while let Some(u) = scratch.sleep_stack.pop() {
+                scratch.sleep_island.push(u);
+                let bu = &self.bodies[u as usize];
+                min_sleep = min_sleep.min(if bu.can_sleep { bu.sleep_time } else { 0.0 });
+
+                for &c in &bu.colliders {
+                    for &k in &self.colliders[c as usize].contacts {
+                        let ct = &self.contacts[k as usize];
+                        if !ct.touching || ct.sensor {
+                            continue;
+                        }
+                        let v = self.colliders[ct.other(c) as usize].body;
+                        let bv = &self.bodies[v as usize];
+                        if !bv.alive || !bv.is_dynamic() {
+                            continue;
+                        }
+                        if !bv.awake {
+                            // Touching an already-asleep dynamic body prevents sleeping here;
+                            // waking has priority.
+                            min_sleep = 0.0;
+                        } else if scratch.sleep_visited[v as usize] != stamp {
+                            scratch.sleep_visited[v as usize] = stamp;
+                            scratch.sleep_stack.push(v);
+                        }
+                    }
+                }
+                for &j in &bu.joints {
+                    let d = &self.joints[j as usize].desc;
+                    for v in [d.body_a.index, d.body_b.index] {
+                        if v == u {
+                            continue;
+                        }
+                        let bv = &self.bodies[v as usize];
+                        if !bv.alive || !bv.is_dynamic() {
+                            continue;
+                        }
+                        if !bv.awake {
+                            min_sleep = 0.0;
+                        } else if scratch.sleep_visited[v as usize] != stamp {
+                            scratch.sleep_visited[v as usize] = stamp;
+                            scratch.sleep_stack.push(v);
+                        }
+                    }
+                }
+            }
+
             // Still for at least one step, whatever time_to_sleep is (zero included).
-            let still_for = min_sleep.get(&r).copied().unwrap_or(0.0);
-            if still_for > 0.0 && still_for >= time_to_sleep {
-                let body = &mut self.bodies[b as usize];
-                body.awake = false;
-                body.linear_velocity = Vec3::ZERO;
-                body.angular_velocity = Vec3::ZERO;
+            if min_sleep > 0.0 && min_sleep >= time_to_sleep {
+                for &u in &scratch.sleep_island {
+                    let body = &mut self.bodies[u as usize];
+                    body.awake = false;
+                    body.linear_velocity = Vec3::ZERO;
+                    body.angular_velocity = Vec3::ZERO;
+                    self.set_awake_bit(u, false);
+                }
             }
         }
+        self.scratch = scratch;
     }
 
     /// Wakes a body: a dynamic one with its island (see [`Self::wake_islands`]), a kinematic one
@@ -2455,6 +2761,7 @@ impl PhysicsWorld {
                 stack.push(b);
             } else {
                 body.awake = true;
+                self.set_awake_bit(b, true);
             }
         }
         let asleep = |b: &Body| b.alive && !b.awake && b.is_dynamic();
@@ -2466,6 +2773,7 @@ impl PhysicsWorld {
             }
             body.awake = true;
             body.sleep_time = 0.0;
+            self.set_awake_bit(x, true);
             near.clear();
             self.push_neighbours(x, &mut near);
             stack.extend(
@@ -2811,7 +3119,7 @@ impl PhysicsWorld {
             body.rotation,
         );
         let mut best: Option<CcdHit> = None;
-        let mut candidates = Vec::new();
+        let mut candidates = SmallBuf::<(u32, Vec3), 32>::new((0, Vec3::ZERO));
         for &c in &body.colliders {
             let col = &self.colliders[c as usize];
             if col.sensor {
@@ -2853,27 +3161,35 @@ impl PhysicsWorld {
             );
             // Shave the skin beside the path so a seam between flush boxes is not a wall.
             let skin = slop.min(0.75 * col.shape.inner_radius());
-            let shrunk = match shape {
-                ConvexShape::Hull(h) => Some(shrunk_hull(h, skin)),
-                _ => None,
+            let mut shrunk_verts = [Vec3::ZERO; crate::hull::MAX_HULL_VERTICES];
+            let shrunk_hull_len = if let ConvexShape::Hull(h) = shape {
+                let farthest = h.outer_face_dist;
+                let k = if farthest > skin {
+                    1.0 - skin / farthest
+                } else {
+                    1.0
+                };
+                let n = h.vertices.len();
+                for (dst, &v) in shrunk_verts[..n].iter_mut().zip(&h.vertices) {
+                    *dst = h.centroid + (v - h.centroid) * k;
+                }
+                Some((n, h.centroid))
+            } else {
+                None
             };
-            let inner_shape = match (shape, &shrunk) {
-                (ConvexShape::Sphere(r), _) => ConvexShape::Sphere(r - skin),
-                (
-                    ConvexShape::Capsule {
-                        half_height,
-                        radius,
-                    },
-                    _,
-                ) => ConvexShape::Capsule {
+            let inner_shape = match shape {
+                ConvexShape::Sphere(r) => ConvexShape::Sphere(r - skin),
+                ConvexShape::Capsule {
+                    half_height,
+                    radius,
+                } => ConvexShape::Capsule {
                     half_height,
                     radius: radius - skin,
                 },
-                (ConvexShape::Box(h), _) => ConvexShape::Box(h - Vec3::splat(skin)),
-                (ConvexShape::Hull(_), Some(h)) => ConvexShape::Hull(h),
-                (other, _) => other,
+                ConvexShape::Box(h) => ConvexShape::Box(h - Vec3::splat(skin)),
+                other => other,
             };
-            for &(other, target_travel) in &candidates {
+            for &(other, target_travel) in candidates.as_slice() {
                 let oc = &self.colliders[other as usize];
                 if oc.sensor || !self.should_collide(c, other) {
                     continue;
@@ -2954,13 +3270,39 @@ impl PhysicsWorld {
                             let target = Convex::new(os, at);
                             let front =
                                 |s: &Convex| s.support_core(direction).dot(direction) + s.radius();
-                            let ahead = direction
-                                * (front(&moving) - front(&Convex::new(inner_shape, from)));
-                            let inner = Convex::new(
-                                inner_shape,
-                                Iso::new(from.position + ahead, from.rotation),
-                            );
-                            if gjk::cast(&inner, relative, &target, 0.0).is_some() {
+                            let inner_hit = if let Some((n, centroid)) = shrunk_hull_len {
+                                let verts = &shrunk_verts[..n];
+                                let local_d = from.inverse_vector(direction);
+                                let mut best_i = 0;
+                                let mut best_d = f32::NEG_INFINITY;
+                                for (i, v) in verts.iter().enumerate() {
+                                    let p = v.dot(local_d);
+                                    if p > best_d {
+                                        best_d = p;
+                                        best_i = i;
+                                    }
+                                }
+                                let inner_front = from.point(verts[best_i]).dot(direction);
+                                let ahead = direction * (front(&moving) - inner_front);
+                                gjk::cast_hull_vertices(
+                                    verts,
+                                    centroid,
+                                    Iso::new(from.position + ahead, from.rotation),
+                                    relative,
+                                    &target,
+                                    0.0,
+                                )
+                                .is_some()
+                            } else {
+                                let ahead = direction
+                                    * (front(&moving) - front(&Convex::new(inner_shape, from)));
+                                let inner = Convex::new(
+                                    inner_shape,
+                                    Iso::new(from.position + ahead, from.rotation),
+                                );
+                                gjk::cast(&inner, relative, &target, 0.0).is_some()
+                            };
+                            if inner_hit {
                                 take(time_of_impact(
                                     &moving,
                                     &core,
@@ -3049,6 +3391,7 @@ mod tests {
             b.linear_velocity = Vec3::ZERO;
             b.angular_velocity = Vec3::ZERO;
         }
+        w.awake_words.fill(0);
     }
 
     /// End events of contacts removed between steps (here: a visitor destroyed inside a sensor)
@@ -3335,17 +3678,18 @@ mod tests {
                 friction_impulse: Vec3::new(impulse, 0.0, 0.0),
             };
         }
-        cm.manifold.count = points.len();
+        cm.manifold.count = points.len() as u8;
         cm
     }
 
     /// The impulses each new point starts with.
     fn carried(old: &[ContactManifold], fresh: &[ContactManifold]) -> Vec<Vec<f32>> {
         let fresh: Vec<Manifold> = fresh.iter().map(|m| m.manifold.clone()).collect();
-        carry_impulses(old, &fresh, &Iso::IDENTITY, 0.045)
-            .iter()
+        let mut out = Vec::new();
+        carry_impulses_into(old, &fresh, &Iso::IDENTITY, 0.045, &mut out);
+        out.iter()
             .map(|m| {
-                m.cache[..m.manifold.count]
+                m.cache[..usize::from(m.manifold.count)]
                     .iter()
                     .map(|c| {
                         assert_eq!(c.friction_impulse.x, c.normal_impulse);
@@ -3546,6 +3890,20 @@ mod tests {
             );
         }
         assert_eq!(entries, 2 * w.contacts.len());
+        let expected_kinematic = w
+            .bodies
+            .iter()
+            .filter(|b| b.alive && b.kind == BodyKind::Kinematic)
+            .count();
+        assert_eq!(w.kinematic_count, expected_kinematic, "kinematic_count");
+        for (i, b) in w.bodies.iter().enumerate() {
+            let expected = b.alive && b.awake && b.moves();
+            let got = w
+                .awake_words
+                .get(i >> 6)
+                .is_some_and(|&word| (word & (1u64 << (i & 63))) != 0);
+            assert_eq!(got, expected, "awake_words bit for body {i}");
+        }
     }
 
     /// A small deterministic random sequence.

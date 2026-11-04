@@ -18,6 +18,12 @@ pub(super) fn pixel_format(f: Format) -> u64 {
         Format::R32Float => R32_FLOAT,
         Format::Rgba32Float => RGBA32_FLOAT,
         Format::Depth32Float => DEPTH32_FLOAT,
+        Format::Bc1RgbaUnorm => BC1_RGBA,
+        Format::Bc1RgbaSrgb => BC1_RGBA_SRGB,
+        Format::Bc7RgbaUnorm => BC7_RGBA_UNORM,
+        Format::Bc7RgbaSrgb => BC7_RGBA_UNORM_SRGB,
+        Format::Astc4x4Unorm => ASTC_4X4_LDR,
+        Format::Astc4x4Srgb => ASTC_4X4_SRGB,
     }
 }
 
@@ -231,6 +237,20 @@ impl<'w> Gpu<'w> {
             return Err("create_texture: usage is empty".into());
         }
         let depth = d.format.is_depth();
+        if d.format.is_compressed()
+            && d.usage.bits()
+                & (TextureUsage::COLOR_TARGET
+                    | TextureUsage::DEPTH_TARGET
+                    | TextureUsage::STORAGE
+                    | TextureUsage::COPY_SRC)
+                    .bits()
+                != 0
+        {
+            return Err(format!(
+                "create_texture: compressed format {:?} supports only SAMPLED | COPY_DST",
+                d.format
+            ));
+        }
         if depth && d.usage.contains(TextureUsage::COLOR_TARGET)
             || !depth && d.usage.contains(TextureUsage::DEPTH_TARGET)
         {
@@ -255,53 +275,91 @@ impl<'w> Gpu<'w> {
                 d.format
             ));
         }
-        let mut usage = 0;
-        if d.usage.contains(TextureUsage::SAMPLED) || d.usage.contains(TextureUsage::COPY_SRC) {
-            // Copy sources are also sampled by scaled blits.
-            usage |= ffi::usage::SHADER_READ;
-        }
-        if d.usage.contains(TextureUsage::STORAGE) {
-            usage |= ffi::usage::SHADER_WRITE;
-        }
-        if d.usage.contains(TextureUsage::COLOR_TARGET)
-            || d.usage.contains(TextureUsage::DEPTH_TARGET)
-            || (!depth && d.usage.contains(TextureUsage::COPY_DST))
-        {
-            // Colour copy destinations are rendered to by scaled blits.
-            usage |= ffi::usage::RENDER_TARGET;
-        }
+        let mut sw_decompress = None;
+        let mut actual_format = if let Some(comp) = d.format.compression() {
+            let hw = match comp {
+                ganbate_core::world::TextureCompression::Bc1
+                | ganbate_core::world::TextureCompression::Bc7 => self.bc_compression,
+                ganbate_core::world::TextureCompression::Astc4x4 => self.astc_compression,
+            };
+            if hw && d.width % 4 == 0 && d.height % 4 == 0 {
+                d.format
+            } else {
+                sw_decompress = Some(comp);
+                if d.format.is_srgb() {
+                    Format::Rgba8Srgb
+                } else {
+                    Format::Rgba8Unorm
+                }
+            }
+        } else {
+            d.format
+        };
         let ty = if d.layers > 1 {
             ffi::texture_type::D2_ARRAY
         } else {
             ffi::texture_type::D2
         };
-        let format = pixel_format(d.format);
         autoreleasepool(|| {
-            let desc = Self::new_object(class!("MTLTextureDescriptor"), "MTLTextureDescriptor")?;
-            // SAFETY: setters on a texture descriptor, then an owned texture or nil.
-            let obj = unsafe {
-                let t = desc.id();
-                send!(t, "setTextureType:", ty as NSUInteger => NSUInteger; ());
-                send!(t, "setPixelFormat:", format as NSUInteger => NSUInteger; ());
-                send!(t, "setWidth:", d.width as NSUInteger => NSUInteger; ());
-                send!(t, "setHeight:", d.height as NSUInteger => NSUInteger; ());
-                send!(t, "setMipmapLevelCount:", d.mips as NSUInteger => NSUInteger; ());
-                send!(t, "setArrayLength:", d.layers as NSUInteger => NSUInteger; ());
-                send!(t, "setUsage:", usage as NSUInteger => NSUInteger; ());
-                send!(t, "setStorageMode:", ffi::STORAGE_MODE_PRIVATE as NSUInteger => NSUInteger; ());
-                Obj::owned(send!(self.device.id(), "newTextureWithDescriptor:", t => Id; Id))
-            }
-            .ok_or_else(|| {
-                format!(
-                    "create_texture: {}x{} {:?} ({} layers, {} mips) is not supported on {}",
-                    d.width, d.height, d.format, d.layers, d.mips, self.name
-                )
-            })?;
+            let make = |fmt: Format| -> Result<(Obj, u64)> {
+                let mut usage = 0;
+                if d.usage.contains(TextureUsage::SAMPLED)
+                    || d.usage.contains(TextureUsage::COPY_SRC)
+                {
+                    usage |= ffi::usage::SHADER_READ;
+                }
+                if d.usage.contains(TextureUsage::STORAGE) {
+                    usage |= ffi::usage::SHADER_WRITE;
+                }
+                if d.usage.contains(TextureUsage::COLOR_TARGET)
+                    || d.usage.contains(TextureUsage::DEPTH_TARGET)
+                    || (!depth && !fmt.is_compressed() && d.usage.contains(TextureUsage::COPY_DST))
+                {
+                    usage |= ffi::usage::RENDER_TARGET;
+                }
+                let pf = pixel_format(fmt);
+                let desc =
+                    Self::new_object(class!("MTLTextureDescriptor"), "MTLTextureDescriptor")?;
+                // SAFETY: setters on a texture descriptor, then an owned texture or nil.
+                let obj = unsafe {
+                    let t = desc.id();
+                    send!(t, "setTextureType:", ty as NSUInteger => NSUInteger; ());
+                    send!(t, "setPixelFormat:", pf as NSUInteger => NSUInteger; ());
+                    send!(t, "setWidth:", d.width as NSUInteger => NSUInteger; ());
+                    send!(t, "setHeight:", d.height as NSUInteger => NSUInteger; ());
+                    send!(t, "setMipmapLevelCount:", d.mips as NSUInteger => NSUInteger; ());
+                    send!(t, "setArrayLength:", d.layers as NSUInteger => NSUInteger; ());
+                    send!(t, "setUsage:", usage as NSUInteger => NSUInteger; ());
+                    send!(t, "setStorageMode:", ffi::STORAGE_MODE_PRIVATE as NSUInteger => NSUInteger; ());
+                    Obj::owned(send!(self.device.id(), "newTextureWithDescriptor:", t => Id; Id))
+                }
+                .ok_or_else(|| {
+                    format!(
+                        "create_texture: {}x{} {:?} ({} layers, {} mips) is not supported on {}",
+                        d.width, d.height, fmt, d.layers, d.mips, self.name
+                    )
+                })?;
+                Ok((obj, pf))
+            };
+            let (obj, format) = match make(actual_format) {
+                Ok(pair) => pair,
+                Err(_) if actual_format.is_compressed() => {
+                    sw_decompress = d.format.compression();
+                    actual_format = if d.format.is_srgb() {
+                        Format::Rgba8Srgb
+                    } else {
+                        Format::Rgba8Unorm
+                    };
+                    make(actual_format)?
+                }
+                Err(e) => return Err(e),
+            };
             let raw = self.textures.insert(Texture {
                 obj,
                 desc: *d,
                 pixel_format: format,
                 ty,
+                sw_decompress,
                 views: Vec::new(),
                 swapchain: false,
             })?;
@@ -366,8 +424,7 @@ impl<'w> Gpu<'w> {
             ));
         }
         let (w, h) = t.desc.mip_size(mip);
-        let texel = u64::from(t.desc.format.texel_size());
-        let expected = u64::from(w) * u64::from(h) * texel;
+        let expected = t.desc.format.mip_byte_len(w, h);
         if data.len() as u64 != expected {
             return Err(format!(
                 "write_texture: a {w}x{h} {:?} subresource takes {expected} bytes, got {}",
@@ -375,9 +432,16 @@ impl<'w> Gpu<'w> {
                 data.len()
             ));
         }
-        let dst = t.obj.clone();
+        let (dst, sw, fmt) = (t.obj.clone(), t.sw_decompress, t.desc.format);
+        let decoded;
+        let (payload, row_bytes) = if let Some(comp) = sw {
+            decoded = ganbate_assets::bc::decode_rgba8(comp, data, w, h)?;
+            (decoded.as_slice(), w * 4)
+        } else {
+            (data, fmt.row_bytes(w))
+        };
         autoreleasepool(|| {
-            let staging = self.stage(data)?;
+            let staging = self.stage(payload)?;
             self.immediate(|_, cb| {
                 // SAFETY: the staging buffer holds the tightly packed rows of one subresource.
                 // One image is copied, so its image stride is 0 (as wgpu does: a non-zero
@@ -389,7 +453,7 @@ impl<'w> Gpu<'w> {
                         "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
                         staging => Id,
                         0usize => NSUInteger,
-                        (u64::from(w) * texel) as NSUInteger => NSUInteger,
+                        row_bytes as NSUInteger => NSUInteger,
                         0usize => NSUInteger,
                         MTLSize { width: w as usize, height: h as usize, depth: 1 } => MTLSize,
                         dst.id() => Id,
@@ -415,7 +479,10 @@ impl<'w> Gpu<'w> {
         {
             return Err("generate_mips: the texture needs COPY_SRC | COPY_DST usage".into());
         }
-        if d.format.is_depth() || matches!(d.format, Format::R32Float | Format::Rgba32Float) {
+        if d.format.is_depth()
+            || d.format.is_compressed()
+            || matches!(d.format, Format::R32Float | Format::Rgba32Float)
+        {
             return Err(format!(
                 "generate_mips: {:?} cannot be filtered on every Apple GPU",
                 d.format

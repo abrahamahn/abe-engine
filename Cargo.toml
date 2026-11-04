@@ -7,15 +7,36 @@ publish = false
 description = "Ganbate Studio's native 3D renderer"
 
 [workspace]
-members = ["crates/ganbate-agent", "crates/ganbate-core", "crates/ganbate-assets", "crates/ganbate-audio",
+members = [
+    "crates/ganbate-agent",
+    "crates/ganbate-assets",
+    "crates/ganbate-audio",
+    "crates/ganbate-core",
+    "crates/ganbate-jobs",
+    "crates/ganbate-physics",
+    "crates/ganbate-pipeline",
+    "crates/ganbate-scene",
     "crates/ganbate-seq",
-    "crates/ganbate-vfx", "crates/ganbate-physics", "crates/ganbate-pipeline", "crates/ganbate-scene", "crates/ganbate-shader", "crates/ganbate-studio", "crates/ganbate-web"]
+    "crates/ganbate-shader",
+    "crates/ganbate-studio",
+    "crates/ganbate-vfx",
+    "crates/ganbate-web",
+]
 resolver = "3"
 
 [dependencies]
 ganbate-core = { path = "crates/ganbate-core" }
 ganbate-assets = { path = "crates/ganbate-assets" }
+ganbate-jobs = { path = "crates/ganbate-jobs" }
 ganbate-pipeline = { path = "crates/ganbate-pipeline" }
 ganbate-scene = { path = "crates/ganbate-scene" }
 ganbate-shader = { path = "crates/ganbate-shader" }
 ganbate-physics = { path = "crates/ganbate-physics" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+

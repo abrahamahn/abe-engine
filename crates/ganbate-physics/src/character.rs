@@ -41,6 +41,7 @@ use crate::gjk;
 use crate::math::{Iso, Vec3};
 use crate::mesh::TriangleRef;
 use crate::shape::{Convex, ConvexShape, Shape, transform_aabb};
+use crate::small_buf::SmallBuf;
 use crate::world::{BodyId, BodyKind, ColliderId, PhysicsWorld, QueryFilter};
 
 /// A touching surface stops a motion only when the motion heads into it by more than this (the
@@ -369,7 +370,7 @@ impl Character {
         let moving = Convex::new(core, iso);
         // Grown past the skin by the casts' own tolerance.
         let bounds = shape.aabb(&iso).sweep(motion).expand(1.25 * skin + 1e-3);
-        let mut candidates: Vec<u32> = Vec::new();
+        let mut candidates = SmallBuf::<u32, 64>::new(0);
         for tree in [&world.static_tree, &world.moving_tree] {
             tree.query(&bounds, &mut |_, c| {
                 let skip = except.is_some_and(|b| b.index == world.colliders[c as usize].body);
@@ -379,9 +380,8 @@ impl Character {
                 true
             });
         }
-        candidates.sort_unstable();
-        candidates.dedup();
-        for c in candidates {
+        candidates.sort_dedup();
+        for &c in candidates.as_slice() {
             let col = &world.colliders[c as usize];
             let ciso = world.collider_iso(c);
             let mut test = |other: &Convex, triangle: Option<&TriangleRef>| {
@@ -865,46 +865,50 @@ impl Character {
     fn depenetrate(&mut self, world: &PhysicsWorld) {
         let skin = self.skin();
         let shape = self.shape();
+        let mut planes = SmallBuf::<(Vec3, f32), 16>::new((Vec3::ZERO, 0.0));
+        let mut fixed = SmallBuf::<bool, 16>::new(false);
+        let mut targets = SmallBuf::<f32, 16>::new(0.0);
+        let mut inside = SmallBuf::<f32, 16>::new(0.0);
         for _ in 0..4 {
             let iso = Iso::from_position(self.position);
             // (normal from the capsule to the surface, separation), and whether it is static.
-            let mut planes: Vec<(Vec3, f32)> = Vec::new();
-            let mut fixed: Vec<bool> = Vec::new();
+            planes.clear();
+            fixed.clear();
             world.contacts_with(&shape, &iso, skin, &self.settings.filter, &mut |c, m| {
                 planes.push((m.normal, m.min_separation()));
                 let body = world.collider_body(c);
                 fixed.push(body.and_then(|b| world.body_kind(b)) == Some(BodyKind::Static));
             });
-            if !planes.iter().any(|&(_, s)| s < CROWDED * skin) {
+            let ps = planes.as_slice();
+            let fs = fixed.as_slice();
+            if !ps.iter().any(|&(_, s)| s < CROWDED * skin) {
                 break;
             }
             // Where each surface should end: a skin away, or its share of the room between it
             // and one facing it closer than that.
-            let targets: Vec<f32> = planes
-                .iter()
-                .zip(&fixed)
-                .map(|(&(n, s), &level)| {
-                    planes
-                        .iter()
-                        .zip(&fixed)
-                        .filter(|&(&(m, _), _)| n.dot(m) < -OPPOSED)
-                        .fold(skin, |t, (&(_, r), &other)| {
-                            t.min(match (level, other) {
-                                (true, false) => skin,
-                                (false, true) => s + r - skin,
-                                _ => 0.5 * (s + r),
-                            })
-                        })
-                })
-                .collect();
-            let push = least_push(&planes, &targets).or_else(|| {
-                // Only out of what it is inside, coming no closer to anything else.
-                let inside: Vec<f32> = planes
+            targets.clear();
+            for (&(n, s), &level) in ps.iter().zip(fs) {
+                let t = ps
                     .iter()
-                    .zip(&targets)
-                    .map(|(&(_, s), &t)| t.min(s.max(0.0)))
-                    .collect();
-                least_push(&planes, &inside)
+                    .zip(fs)
+                    .filter(|&(&(m, _), _)| n.dot(m) < -OPPOSED)
+                    .fold(skin, |t, (&(_, r), &other)| {
+                        t.min(match (level, other) {
+                            (true, false) => skin,
+                            (false, true) => s + r - skin,
+                            _ => 0.5 * (s + r),
+                        })
+                    });
+                targets.push(t);
+            }
+            let ts = targets.as_slice();
+            let push = least_push(ps, ts).or_else(|| {
+                // Only out of what it is inside, coming no closer to anything else.
+                inside.clear();
+                for (&(_, s), &t) in ps.iter().zip(ts) {
+                    inside.push(t.min(s.max(0.0)));
+                }
+                least_push(ps, inside.as_slice())
             });
             match push {
                 Some(push) if push.length_squared() >= 1e-12 => self.position += push,

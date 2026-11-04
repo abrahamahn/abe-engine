@@ -232,6 +232,7 @@ struct Slot {
     fence: u64,
     buffer: u64,
     memory: u64,
+    mapped: *mut u8,
     capacity: usize,
 }
 struct Target {
@@ -389,6 +390,7 @@ impl<'a> Chain<'a> {
                     fence: sync.fence()?,
                     buffer: 0,
                     memory: 0,
+                    mapped: null_mut(),
                     capacity: 0,
                 });
             }
@@ -430,23 +432,32 @@ impl<'a> Chain<'a> {
                         .checked_next_power_of_two()
                         .ok_or("vertex buffer size overflow")?;
                     let (buf, mem) = self.resources.buffer(capacity as u64, 0x80)?;
+                    let mapped = match create("map frame vertices", |o| {
+                        vkMapMemory(dev, mem, 0, capacity as u64, 0, o)
+                    }) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            self.resources.release_buffer(buf, mem);
+                            return Err(e);
+                        }
+                    };
                     if slot.buffer != 0 {
+                        if !slot.mapped.is_null() {
+                            vkUnmapMemory(dev, slot.memory);
+                        }
                         self.resources.release_buffer(slot.buffer, slot.memory);
                     }
                     slot.buffer = buf;
                     slot.memory = mem;
+                    slot.mapped = mapped.cast::<u8>();
                     slot.capacity = capacity;
                     stats.vertex_allocations += 1;
                 }
-                let mapped = create("map frame vertices", |o| {
-                    vkMapMemory(dev, slot.memory, 0, bytes as u64, 0, o)
-                })?;
                 core::ptr::copy_nonoverlapping(
                     vertices.as_ptr().cast::<u8>(),
-                    mapped.cast::<u8>(),
+                    slot.mapped,
                     bytes,
                 );
-                vkUnmapMemory(dev, slot.memory);
             }
             let mut index = 0;
             let acquire = vkAcquireNextImageKHR(
@@ -487,7 +498,7 @@ impl<'a> Chain<'a> {
             check(vkEndCommandBuffer(slot.cmd), "vkEndCommandBuffer")?;
             // Reset only after successful acquire and recording, just before submitting.
             check(vkResetFences(dev, 1, &slot.fence), "vkResetFences")?;
-            let stages = 0x1_0000u32; // ALL_COMMANDS; covers the color and depth attachments
+            let stages = 0x700u32; // COLOR_ATTACHMENT_OUTPUT | EARLY/LATE_FRAGMENT_TESTS
             let mut submit = VkSubmitInfo::new();
             submit.waitSemaphoreCount = 1;
             submit.pWaitSemaphores = &slot.available;

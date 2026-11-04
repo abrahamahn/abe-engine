@@ -1,4 +1,5 @@
 //! First-party asset import and binary cooking tools.
+pub mod bc;
 pub mod cooked;
 pub mod glb;
 pub mod image;

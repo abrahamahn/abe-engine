@@ -1,5 +1,5 @@
 //! Buffers, textures, views and samplers; synchronous uploads, mip generation and readback.
-use super::record::{Key, Plan, Scope};
+use super::record::Key;
 use super::track::{access, stage};
 use super::*;
 use crate::gpu::{Address, BufferUsage, Compare, Filter, Memory, SamplerDesc, TextureUsage};
@@ -7,6 +7,9 @@ use crate::gpu::{Address, BufferUsage, Compare, Filter, Memory, SamplerDesc, Tex
 const DEVICE_LOCAL: u32 = 0x1;
 const HOST_VISIBLE_COHERENT: u32 = 0x2 | 0x4;
 const HOST_CACHED: u32 = 0x8;
+const SLAB_DEVICE_BYTES: u64 = 16 << 20;
+const SLAB_HOST_BYTES: u64 = 4 << 20;
+const STAGING_CHUNK_MIN: u64 = 4 << 20;
 /// VkFormatFeatureFlagBits.
 pub(super) const FEATURE_SAMPLED: u32 = 0x1;
 pub(super) const FEATURE_STORAGE: u32 = 0x2;
@@ -16,8 +19,6 @@ pub(super) const FEATURE_DEPTH: u32 = 0x200;
 pub(super) const FEATURE_BLIT_SRC: u32 = 0x400;
 pub(super) const FEATURE_BLIT_DST: u32 = 0x800;
 pub(super) const FEATURE_LINEAR: u32 = 0x1000;
-/// Stages that may sample a texture uploaded by `write_texture`.
-const ANY_SHADER: u32 = stage::VERTEX_SHADER | stage::FRAGMENT_SHADER | stage::COMPUTE;
 
 pub(super) fn vk_format(f: Format) -> i32 {
     match f {
@@ -32,6 +33,12 @@ pub(super) fn vk_format(f: Format) -> i32 {
         Format::R32Float => 100,
         Format::Rgba32Float => 109,
         Format::Depth32Float => 126,
+        Format::Bc1RgbaUnorm => 133,
+        Format::Bc1RgbaSrgb => 134,
+        Format::Bc7RgbaUnorm => 145,
+        Format::Bc7RgbaSrgb => 146,
+        Format::Astc4x4Unorm => 157,
+        Format::Astc4x4Srgb => 158,
     }
 }
 pub(super) fn vk_compare(c: Compare) -> i32 {
@@ -63,27 +70,177 @@ impl<'w> Gpu<'w> {
         }
     }
 
-    fn allocate(&self, req: VkMemoryRequirements, required: u32, preferred: u32) -> Result<u64> {
+    fn pick_memory_type(&self, type_bits: u32, required: u32, preferred: u32) -> Result<(u32, bool)> {
         let types = &self.memory.memoryTypes[..self.memory.memoryTypeCount as usize];
         let find = |flags: u32| {
             (0..types.len()).find(|&i| {
-                req.memoryTypeBits & (1 << i) != 0 && types[i].propertyFlags & flags == flags
+                type_bits & (1 << i) != 0 && types[i].propertyFlags & flags == flags
             })
         };
         let index = find(required | preferred)
             .or_else(|| find(required))
             .ok_or_else(|| format!("no memory type with property flags {required:#x}"))?;
-        let mut info = VkMemoryAllocateInfo::new();
-        info.allocationSize = req.size;
-        info.memoryTypeIndex = index as u32;
-        // SAFETY: the allocate info outlives the call; the caller owns the memory.
-        create("vkAllocateMemory", |o| unsafe {
-            vkAllocateMemory(self.device, &info, null(), o)
-        })
+        let host_visible =
+            types[index].propertyFlags & HOST_VISIBLE_COHERENT == HOST_VISIBLE_COHERENT;
+        Ok((index as u32, host_visible))
     }
 
-    /// Creates a buffer bound to its own allocation and maps host-visible memory.
-    fn raw_buffer(&self, size: u64, usage: u32, memory: Memory) -> Result<(u64, u64, *mut u8)> {
+    fn alloc_dedicated(&self, size: u64, memory_type: u32, map: bool) -> Result<(u64, *mut u8)> {
+        let mut info = VkMemoryAllocateInfo::new();
+        info.allocationSize = size;
+        info.memoryTypeIndex = memory_type;
+        // SAFETY: the allocate info outlives the call; the caller owns the memory.
+        let mem = create("vkAllocateMemory", |o| unsafe {
+            vkAllocateMemory(self.device, &info, null(), o)
+        })?;
+        if !map {
+            return Ok((mem, null_mut()));
+        }
+        let mut mapped = null_mut();
+        // SAFETY: `mem` was just allocated from a host-visible memory type and is unmapped.
+        let rc = unsafe { vkMapMemory(self.device, mem, 0, u64::MAX, 0, &mut mapped) };
+        if rc != 0 {
+            unsafe { vkFreeMemory(self.device, mem, null()) };
+            return Err(format!("vkMapMemory: VkResult {rc}"));
+        }
+        Ok((mem, mapped.cast()))
+    }
+
+    fn take_from_slab(slab: &mut Slab, size: u64, align: u64) -> Option<(u64, *mut u8)> {
+        let idx = slab.free.iter().position(|&(off, len)| {
+            let aligned = off.next_multiple_of(align);
+            aligned
+                .checked_add(size)
+                .is_some_and(|end| end <= off + len)
+        })?;
+        let (off, len) = slab.free.remove(idx);
+        let aligned = off.next_multiple_of(align);
+        let end = aligned + size;
+        let slab_end = off + len;
+        let mut ins = idx;
+        if aligned > off {
+            slab.free.insert(ins, (off, aligned - off));
+            ins += 1;
+        }
+        if end < slab_end {
+            slab.free.insert(ins, (end, slab_end - end));
+        }
+        let ptr = if slab.mapped.is_null() {
+            null_mut()
+        } else {
+            // SAFETY: `aligned + size <= slab_capacity`, and the whole slab is persistently mapped.
+            unsafe { slab.mapped.add(aligned as usize) }
+        };
+        Some((aligned, ptr))
+    }
+
+    /// Suballocates memory from segregated buffer/image slabs (falling back to dedicated blocks
+    /// for large resources), avoiding per-object `vkAllocateMemory` / `vkMapMemory` overhead.
+    fn suballocate(
+        &mut self,
+        req: VkMemoryRequirements,
+        required: u32,
+        preferred: u32,
+        optimal_image: bool,
+        need_map: bool,
+    ) -> Result<(Alloc, *mut u8)> {
+        let (memory_type, host_visible) =
+            self.pick_memory_type(req.memoryTypeBits, required, preferred)?;
+        let map = need_map && host_visible;
+        let slab_cap = if host_visible {
+            SLAB_HOST_BYTES
+        } else {
+            SLAB_DEVICE_BYTES
+        };
+        let align = req.alignment.max(1);
+        if req.size <= slab_cap / 2 {
+            for (s_idx, slab) in self.slabs.iter_mut().enumerate() {
+                if slab.memory_type == memory_type
+                    && slab.optimal_image == optimal_image
+                    && (!map || !slab.mapped.is_null())
+                    && let Some((offset, ptr)) = Self::take_from_slab(slab, req.size, align)
+                {
+                    return Ok((
+                        Alloc {
+                            memory: slab.memory,
+                            offset,
+                            size: req.size,
+                            slab: s_idx as u32,
+                        },
+                        ptr,
+                    ));
+                }
+            }
+            if let Ok((mem, mapped)) = self.alloc_dedicated(slab_cap, memory_type, host_visible) {
+                let s_idx = self.slabs.len() as u32;
+                let mut slab = Slab {
+                    memory: mem,
+                    memory_type,
+                    optimal_image,
+                    mapped,
+                    free: vec![(0, slab_cap)],
+                };
+                let (offset, ptr) =
+                    Self::take_from_slab(&mut slab, req.size, align).expect("fresh slab fits");
+                self.slabs.push(slab);
+                return Ok((
+                    Alloc {
+                        memory: mem,
+                        offset,
+                        size: req.size,
+                        slab: s_idx,
+                    },
+                    ptr,
+                ));
+            }
+        }
+        let (mem, ptr) = self.alloc_dedicated(req.size, memory_type, map)?;
+        Ok((
+            Alloc {
+                memory: mem,
+                offset: 0,
+                size: req.size,
+                slab: u32::MAX,
+            },
+            ptr,
+        ))
+    }
+
+    pub(super) fn free_alloc(&mut self, alloc: Alloc) {
+        if alloc.slab == u32::MAX {
+            if alloc.memory != 0 {
+                // SAFETY: dedicated allocation no longer referenced by any live resource or GPU work.
+                unsafe { vkFreeMemory(self.device, alloc.memory, null()) };
+            }
+            return;
+        }
+        let Some(slab) = self.slabs.get_mut(alloc.slab as usize) else {
+            return;
+        };
+        let pos = slab.free.partition_point(|&(off, _)| off < alloc.offset);
+        slab.free.insert(pos, (alloc.offset, alloc.size));
+        // Coalesce with right neighbor if contiguous.
+        if pos + 1 < slab.free.len() {
+            let (cur_off, cur_len) = slab.free[pos];
+            let (nxt_off, nxt_len) = slab.free[pos + 1];
+            if cur_off + cur_len == nxt_off {
+                slab.free[pos].1 = cur_len + nxt_len;
+                slab.free.remove(pos + 1);
+            }
+        }
+        // Coalesce with left neighbor if contiguous.
+        if pos > 0 {
+            let (prv_off, prv_len) = slab.free[pos - 1];
+            let (cur_off, cur_len) = slab.free[pos];
+            if prv_off + prv_len == cur_off {
+                slab.free[pos - 1].1 = prv_len + cur_len;
+                slab.free.remove(pos);
+            }
+        }
+    }
+
+    /// Creates a buffer bound to suballocated (or dedicated) memory and returns its mapped pointer.
+    fn raw_buffer(&mut self, size: u64, usage: u32, memory: Memory) -> Result<(u64, Alloc, *mut u8)> {
         let mut ci = VkBufferCreateInfo::new();
         ci.size = size;
         ci.usage = usage;
@@ -93,30 +250,28 @@ impl<'w> Gpu<'w> {
             Memory::Upload => (HOST_VISIBLE_COHERENT, 0),
             Memory::Readback => (HOST_VISIBLE_COHERENT, HOST_CACHED),
         };
+        let need_map = memory != Memory::Device;
         // SAFETY: create infos outlive each call. On failure every object created so far is
-        // destroyed before returning; on success the caller owns buffer and memory.
+        // destroyed before returning; on success the caller owns buffer and suballocation.
         unsafe {
             let buffer = create("vkCreateBuffer", |o| vkCreateBuffer(dev, &ci, null(), o))?;
             let mut req = core::mem::zeroed();
             vkGetBufferMemoryRequirements(dev, buffer, &mut req);
-            let mem = match self.allocate(req, required, preferred) {
-                Ok(m) => m,
+            let (alloc, mapped) = match self.suballocate(req, required, preferred, false, need_map)
+            {
+                Ok(pair) => pair,
                 Err(e) => {
                     vkDestroyBuffer(dev, buffer, null());
                     return Err(e);
                 }
             };
-            let mut mapped = null_mut();
-            let mut rc = vkBindBufferMemory(dev, buffer, mem, 0);
-            if rc == 0 && memory != Memory::Device {
-                rc = vkMapMemory(dev, mem, 0, u64::MAX, 0, &mut mapped);
-            }
+            let rc = vkBindBufferMemory(dev, buffer, alloc.memory, alloc.offset);
             if rc != 0 {
                 vkDestroyBuffer(dev, buffer, null());
-                vkFreeMemory(dev, mem, null());
-                return Err(format!("bind or map buffer memory: VkResult {rc}"));
+                self.free_alloc(alloc);
+                return Err(format!("vkBindBufferMemory: VkResult {rc}"));
             }
-            Ok((buffer, mem, mapped.cast()))
+            Ok((buffer, alloc, mapped))
         }
     }
 
@@ -140,10 +295,10 @@ impl<'w> Gpu<'w> {
                 usage |= bit;
             }
         }
-        let (handle, memory, mapped) = self.raw_buffer(d.size, usage, d.memory)?;
+        let (handle, alloc, mapped) = self.raw_buffer(d.size, usage, d.memory)?;
         let buffer = Buffer {
             handle,
-            memory,
+            alloc,
             desc: *d,
             mapped,
             state: State::default(),
@@ -152,10 +307,103 @@ impl<'w> Gpu<'w> {
         match self.buffers.insert(buffer) {
             Ok(raw) => Ok(BufferId::from_raw(raw)),
             Err(e) => {
-                self.free(Garbage::Buffer(handle, memory));
+                self.free(Garbage::Buffer(handle, alloc));
                 Err(e)
             }
         }
+    }
+
+    fn ensure_xfer_cmd(&mut self) -> Result<Handle> {
+        if !self.xfer_recording {
+            let slot = XFER_BASE + self.xfer_slot;
+            self.begin(slot)?;
+            self.xfer_plan.reset();
+            self.xfer_recording = true;
+        }
+        Ok(self.subs[XFER_BASE + self.xfer_slot].cmd)
+    }
+
+    /// Submits any pending staged buffer/texture transfers and mip blits to the queue.
+    pub(super) fn flush_transfers(&mut self, wait: bool) -> Result<()> {
+        if !self.xfer_recording {
+            return Ok(());
+        }
+        self.xfer_recording = false;
+        let slot = XFER_BASE + self.xfer_slot;
+        self.xfer_slot = (self.xfer_slot + 1) % XFER_SLOTS;
+        let cmd = self.subs[slot].cmd;
+        let mut plan = core::mem::take(&mut self.xfer_plan);
+        let res = self.execute(slot, cmd, &mut plan, None);
+        self.xfer_plan = plan;
+        res?;
+        let serial = self.serial;
+        for c in &mut self.staging {
+            if c.active {
+                c.active = false;
+                c.cursor = 0;
+                c.serial = serial;
+            }
+        }
+        if wait {
+            self.wait(slot)?;
+        }
+        Ok(())
+    }
+
+    /// Suballocates `data` in the host-visible staging pool, opening a transfer batch if needed.
+    fn stage(&mut self, data: &[u8]) -> Result<(Handle, u64, u64)> {
+        let size = data.len() as u64;
+        let align = self.limits.optimalBufferCopyOffsetAlignment.max(16);
+        let _ = self.ensure_xfer_cmd()?;
+        let mut done = self.completed();
+        let find_chunk = |chunks: &[StagingChunk], done: u64| {
+            chunks.iter().position(|c| {
+                if c.active {
+                    let off = c.cursor.next_multiple_of(align);
+                    off.checked_add(size).is_some_and(|end| end <= c.capacity)
+                } else {
+                    c.serial <= done && size <= c.capacity
+                }
+            })
+        };
+        let mut idx = find_chunk(&self.staging, done);
+        if idx.is_none() && self.staging.len() >= 4 {
+            self.flush_transfers(true)?;
+            let _ = self.ensure_xfer_cmd()?;
+            done = self.completed();
+            idx = find_chunk(&self.staging, done);
+        }
+        let cmd = self.subs[XFER_BASE + self.xfer_slot].cmd;
+        let idx = match idx {
+            Some(i) => i,
+            None => {
+                let capacity = size.max(STAGING_CHUNK_MIN).next_power_of_two();
+                let (buffer, alloc, mapped) = self.raw_buffer(capacity, 0x1, Memory::Upload)?;
+                self.staging.push(StagingChunk {
+                    buffer,
+                    alloc,
+                    mapped,
+                    capacity,
+                    cursor: 0,
+                    serial: 0,
+                    active: false,
+                });
+                self.staging.len() - 1
+            }
+        };
+        let c = &mut self.staging[idx];
+        let offset = if c.active {
+            c.cursor.next_multiple_of(align)
+        } else {
+            c.active = true;
+            0
+        };
+        c.cursor = offset + size;
+        // SAFETY: `offset + size <= c.capacity`, and this subrange is exclusively written here.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), c.mapped.add(offset as usize), data.len())
+        };
+        Ok((cmd, c.buffer, offset))
     }
 
     pub fn write_buffer(&mut self, id: BufferId, offset: u64, data: &[u8]) -> Result<()> {
@@ -190,24 +438,29 @@ impl<'w> Gpu<'w> {
             return Err("write_buffer: Memory::Device buffers need BufferUsage::COPY_DST".into());
         }
         let handle = b.handle;
-        let staging = self.stage(data)?;
-        self.immediate(|gpu, cmd, plan| {
-            let mut scope = Scope::default();
+        let (cmd, staging, src_offset) = self.stage(data)?;
+        let mut plan = core::mem::take(&mut self.xfer_plan);
+        let mut scope = core::mem::take(&mut self.scope);
+        scope.clear();
+        let res = (|| -> Result<()> {
             scope.add(
                 Key::Buffer(id),
                 Use::buffer(stage::TRANSFER, access::TRANSFER_WRITE),
             )?;
-            gpu.apply(plan, &scope)?;
-            gpu.flush(cmd, plan);
+            self.apply(&mut plan, &scope)?;
+            self.flush(cmd, &mut plan);
             let region = VkBufferCopy {
-                srcOffset: 0,
+                srcOffset: src_offset,
                 dstOffset: offset,
                 size: data.len() as u64,
             };
             // SAFETY: both buffers are alive and large enough; cmd is recording.
             unsafe { vkCmdCopyBuffer(cmd, staging, handle, 1, &region) };
             Ok(())
-        })
+        })();
+        self.xfer_plan = plan;
+        self.scope = scope;
+        res
     }
 
     pub fn read_buffer(&self, id: BufferId) -> Result<Vec<u8>> {
@@ -219,44 +472,6 @@ impl<'w> Gpu<'w> {
         // SAFETY: the mapping covers `size` bytes; the GPU no longer writes the buffer and its
         // writes were made visible to the host by a barrier in the submission that wrote it.
         Ok(unsafe { core::slice::from_raw_parts(b.mapped, b.desc.size as usize) }.to_vec())
-    }
-
-    /// Copies `data` into the shared staging buffer (growing it) and returns that buffer.
-    fn stage(&mut self, data: &[u8]) -> Result<u64> {
-        self.wait(IMMEDIATE)?;
-        let size = data.len() as u64;
-        if self.staging.as_ref().is_none_or(|s| s.size < size) {
-            if let Some(old) = self.staging.take() {
-                self.free(Garbage::Buffer(old.buffer, old.memory));
-            }
-            let capacity = size.max(1 << 16).next_power_of_two();
-            let (buffer, memory, mapped) = self.raw_buffer(capacity, 0x1, Memory::Upload)?;
-            self.staging = Some(Staging {
-                buffer,
-                memory,
-                mapped,
-                size: capacity,
-            });
-        }
-        let s = self.staging.as_ref().expect("staging buffer created above");
-        // SAFETY: the mapping holds at least `size` bytes and the only submission that reads
-        // the staging buffer (the synchronous one) is idle.
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), s.mapped, data.len()) };
-        Ok(s.buffer)
-    }
-
-    /// Records one synchronous submission, submits it and waits for completion.
-    pub(super) fn immediate(
-        &mut self,
-        record: impl FnOnce(&mut Self, Handle, &mut Plan) -> Result<()>,
-    ) -> Result<()> {
-        let cmd = self.begin(IMMEDIATE)?;
-        let mut plan = Plan::default();
-        record(self, cmd, &mut plan)?;
-        self.execute(IMMEDIATE, cmd, plan, None)?;
-        self.wait(IMMEDIATE)?;
-        self.collect();
-        Ok(())
     }
 
     pub fn create_texture(&mut self, d: &TextureDesc) -> Result<TextureId> {
@@ -281,7 +496,42 @@ impl<'w> Gpu<'w> {
             return Err("create_texture: usage is empty".into());
         }
         let depth = d.format.is_depth();
-        let format = vk_format(d.format);
+        if d.format.is_compressed()
+            && d.usage.bits()
+                & (TextureUsage::COLOR_TARGET
+                    | TextureUsage::DEPTH_TARGET
+                    | TextureUsage::STORAGE
+                    | TextureUsage::COPY_SRC)
+                    .bits()
+                != 0
+        {
+            return Err(format!(
+                "create_texture: compressed format {:?} supports only SAMPLED | COPY_DST",
+                d.format
+            ));
+        }
+        let mut sw_decompress = None;
+        let actual_format = if let Some(comp) = d.format.compression() {
+            let feature_enabled = match comp {
+                ganbate_core::world::TextureCompression::Bc1
+                | ganbate_core::world::TextureCompression::Bc7 => self.features.bc_compression,
+                ganbate_core::world::TextureCompression::Astc4x4 => self.features.astc_compression,
+            };
+            let hw_features = self.format_features(vk_format(d.format));
+            if feature_enabled && (hw_features & FEATURE_SAMPLED != 0) {
+                d.format
+            } else {
+                sw_decompress = Some(comp);
+                if d.format.is_srgb() {
+                    Format::Rgba8Srgb
+                } else {
+                    Format::Rgba8Unorm
+                }
+            }
+        } else {
+            d.format
+        };
+        let format = vk_format(actual_format);
         let features = self.format_features(format);
         let mut usage = 0;
         for (flag, bit, feature) in [
@@ -332,33 +582,34 @@ impl<'w> Gpu<'w> {
         ci.usage = usage;
         let dev = self.device;
         // SAFETY: create infos outlive each call; partial objects are destroyed on failure.
-        let (image, memory) = unsafe {
+        let (image, alloc) = unsafe {
             let image = create("vkCreateImage", |o| vkCreateImage(dev, &ci, null(), o))?;
             let mut req = core::mem::zeroed();
             vkGetImageMemoryRequirements(dev, image, &mut req);
-            let memory = match self.allocate(req, 0, DEVICE_LOCAL) {
-                Ok(m) => m,
+            let (alloc, _) = match self.suballocate(req, 0, DEVICE_LOCAL, true, false) {
+                Ok(pair) => pair,
                 Err(e) => {
                     vkDestroyImage(dev, image, null());
                     return Err(e);
                 }
             };
             if let Err(e) = check(
-                vkBindImageMemory(dev, image, memory, 0),
+                vkBindImageMemory(dev, image, alloc.memory, alloc.offset),
                 "vkBindImageMemory",
             ) {
                 vkDestroyImage(dev, image, null());
-                vkFreeMemory(dev, memory, null());
+                self.free_alloc(alloc);
                 return Err(e);
             }
-            (image, memory)
+            (image, alloc)
         };
         let texture = Texture {
             image,
-            memory,
+            alloc,
             desc: *d,
             format,
             aspect: if depth { 2 } else { 1 },
+            sw_decompress,
             states: vec![State::default(); (d.mips * d.layers) as usize],
             views: Vec::new(),
             swapchain: false,
@@ -367,7 +618,7 @@ impl<'w> Gpu<'w> {
         match self.textures.insert(texture) {
             Ok(raw) => Ok(TextureId::from_raw(raw)),
             Err(e) => {
-                self.free(Garbage::Image(image, memory, Vec::new()));
+                self.free(Garbage::Image(image, alloc, Vec::new()));
                 Err(e)
             }
         }
@@ -423,7 +674,7 @@ impl<'w> Gpu<'w> {
             ));
         }
         let (w, h) = t.desc.mip_size(mip);
-        let expected = u64::from(w) * u64::from(h) * u64::from(t.desc.format.texel_size());
+        let expected = t.desc.format.mip_byte_len(w, h);
         if data.len() as u64 != expected {
             return Err(format!(
                 "write_texture: a {w}x{h} {:?} subresource takes {expected} bytes, got {}",
@@ -431,17 +682,25 @@ impl<'w> Gpu<'w> {
                 data.len()
             ));
         }
-        let (image, aspect) = (t.image, t.aspect);
-        let sampled = t.desc.usage.contains(TextureUsage::SAMPLED);
-        let staging = self.stage(data)?;
-        self.immediate(|gpu, cmd, plan| {
-            let mut scope = Scope::default();
+        let (image, aspect, sw) = (t.image, t.aspect, t.sw_decompress);
+        let decoded;
+        let payload = if let Some(comp) = sw {
+            decoded = ganbate_assets::bc::decode_rgba8(comp, data, w, h)?;
+            decoded.as_slice()
+        } else {
+            data
+        };
+        let (cmd, staging, src_offset) = self.stage(payload)?;
+        let mut plan = core::mem::take(&mut self.xfer_plan);
+        let mut scope = core::mem::take(&mut self.scope);
+        scope.clear();
+        let res = (|| -> Result<()> {
             let copy = Use::new(track::TRANSFER_DST, stage::TRANSFER, access::TRANSFER_WRITE);
             scope.add(Key::Texture(id, mip, layer), copy.discarding())?;
-            gpu.apply(plan, &scope)?;
-            gpu.flush(cmd, plan);
+            self.apply(&mut plan, &scope)?;
+            self.flush(cmd, &mut plan);
             let region = VkBufferImageCopy {
-                bufferOffset: 0,
+                bufferOffset: src_offset,
                 bufferRowLength: 0,
                 bufferImageHeight: 0,
                 imageSubresource: VkImageSubresourceLayers {
@@ -457,20 +716,16 @@ impl<'w> Gpu<'w> {
                     depth: 1,
                 },
             };
-            // SAFETY: the staging buffer holds `expected` bytes; the image subresource is in
-            // TRANSFER_DST_OPTIMAL after the barrier above.
+            // SAFETY: the staging buffer holds `expected` bytes at `src_offset`; the image
+            // subresource is in TRANSFER_DST_OPTIMAL after the barrier above.
             unsafe {
                 vkCmdCopyBufferToImage(cmd, staging, image, track::TRANSFER_DST, 1, &region);
             }
-            if sampled {
-                let mut scope = Scope::default();
-                let read = Use::new(track::SHADER_READ_ONLY, ANY_SHADER, access::SHADER_READ);
-                scope.add(Key::Texture(id, mip, layer), read)?;
-                gpu.apply(plan, &scope)?;
-                gpu.flush(cmd, plan);
-            }
             Ok(())
-        })
+        })();
+        self.xfer_plan = plan;
+        self.scope = scope;
+        res
     }
 
     pub fn generate_mips(&mut self, id: TextureId) -> Result<()> {
@@ -484,22 +739,31 @@ impl<'w> Gpu<'w> {
             return Err("generate_mips: the texture needs COPY_SRC | COPY_DST usage".into());
         }
         let needed = FEATURE_BLIT_SRC | FEATURE_BLIT_DST | FEATURE_LINEAR;
-        if d.format.is_depth() || self.format_features(t.format) & needed != needed {
+        if d.format.is_depth()
+            || d.format.is_compressed()
+            || self.format_features(t.format) & needed != needed
+        {
             return Err(format!(
                 "generate_mips: {:?} cannot be blitted with linear filtering",
                 d.format
             ));
         }
+        if d.mips <= 1 {
+            return Ok(());
+        }
         let (image, aspect) = (t.image, t.aspect);
-        self.immediate(|gpu, cmd, plan| {
+        let cmd = self.ensure_xfer_cmd()?;
+        let mut plan = core::mem::take(&mut self.xfer_plan);
+        let mut scope = core::mem::take(&mut self.scope);
+        let res = (|| -> Result<()> {
             for mip in 1..d.mips {
-                let mut scope = Scope::default();
+                scope.clear();
                 let src = Use::new(track::TRANSFER_SRC, stage::TRANSFER, access::TRANSFER_READ);
                 let dst = Use::new(track::TRANSFER_DST, stage::TRANSFER, access::TRANSFER_WRITE);
                 scope.add_texture(id, (mip - 1, mip), (0, d.layers), src)?;
                 scope.add_texture(id, (mip, mip + 1), (0, d.layers), dst.discarding())?;
-                gpu.apply(plan, &scope)?;
-                gpu.flush(cmd, plan);
+                self.apply(&mut plan, &scope)?;
+                self.flush(cmd, &mut plan);
                 let blit = blit_region(&d, aspect, (mip - 1, 0, d.layers), &d, (mip, 0));
                 // SAFETY: both subresource ranges were transitioned above; the image is alive.
                 unsafe {
@@ -515,15 +779,11 @@ impl<'w> Gpu<'w> {
                     );
                 }
             }
-            if d.usage.contains(TextureUsage::SAMPLED) {
-                let mut scope = Scope::default();
-                let read = Use::new(track::SHADER_READ_ONLY, ANY_SHADER, access::SHADER_READ);
-                scope.add_texture(id, (0, d.mips), (0, d.layers), read)?;
-                gpu.apply(plan, &scope)?;
-                gpu.flush(cmd, plan);
-            }
             Ok(())
-        })
+        })();
+        self.xfer_plan = plan;
+        self.scope = scope;
+        res
     }
 
     pub fn create_sampler(&mut self, d: &SamplerDesc) -> Result<SamplerId> {
@@ -585,18 +845,26 @@ impl<'w> Gpu<'w> {
     }
 
     pub fn destroy_buffer(&mut self, id: BufferId) {
-        if let Some(b) = self.buffers.remove(id.raw()) {
-            self.discard(Garbage::Buffer(b.handle, b.memory));
+        if self.buffers.get(id.raw()).is_some() {
+            if self.xfer_recording {
+                let _ = self.flush_transfers(false);
+            }
+            if let Some(b) = self.buffers.remove(id.raw()) {
+                self.discard(Garbage::Buffer(b.handle, b.alloc));
+            }
         }
     }
     pub fn destroy_texture(&mut self, id: TextureId) {
         if self.textures.get(id.raw()).is_none_or(|t| t.swapchain) {
             return;
         }
+        if self.xfer_recording {
+            let _ = self.flush_transfers(false);
+        }
         if let Some(t) = self.textures.remove(id.raw()) {
             let views: Vec<u64> = t.views.iter().map(|(_, v)| *v).collect();
             self.forget_views(&views);
-            self.discard(Garbage::Image(t.image, t.memory, views));
+            self.discard(Garbage::Image(t.image, t.alloc, views));
         }
     }
     pub fn destroy_bind_group(&mut self, id: BindGroupId) {

@@ -23,26 +23,76 @@
 //! - Queries and rays walk the tree with a small explicit stack, rays nearer child first. Nothing
 //!   allocates per query.
 
+use std::num::NonZeroU32;
+
 use crate::math::{Aabb, Vec3};
 
 pub const NULL: u32 = u32::MAX;
 
 /// The height that marks a node on the free list.
-const FREE: u32 = u32::MAX;
+const FREE: u16 = u16::MAX;
+
+const FREE_CHILDREN: [NonZeroU32; 2] = [NonZeroU32::MAX; 2];
+
+#[inline]
+fn encode_child(c: u32) -> NonZeroU32 {
+    NonZeroU32::new(c + 1).expect("child index < NULL")
+}
+
+#[inline]
+fn decode_child(c: NonZeroU32) -> u32 {
+    c.get() - 1
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NodePayload<T: Copy> {
+    Internal([NonZeroU32; 2]),
+    Leaf(T),
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Node<T: Copy> {
     aabb: Aabb,
     /// The parent (`NULL` at the root), or the next free node while on the free list.
     parent: u32,
-    /// An internal node's two children; both `NULL` for a leaf.
-    children: [u32; 2],
     /// The depth of the deepest leaf below: 0 for a leaf, [`FREE`] when free.
-    height: u32,
+    height: u16,
     /// The depth of the shallowest leaf below (0 for a leaf).
-    short: u32,
-    /// A leaf's payload.
-    data: Option<T>,
+    short: u16,
+    /// Internal children or leaf payload (overlapping in 8 bytes for 32-bit payloads).
+    payload: NodePayload<T>,
+}
+
+const _: () = assert!(std::mem::size_of::<Node<u32>>() == 40);
+
+impl<T: Copy> Node<T> {
+    #[inline]
+    fn children(&self) -> [u32; 2] {
+        match self.payload {
+            NodePayload::Internal([a, b]) => [decode_child(a), decode_child(b)],
+            NodePayload::Leaf(_) => [NULL; 2],
+        }
+    }
+
+    #[inline]
+    fn set_child(&mut self, slot: usize, child: u32) {
+        if let NodePayload::Internal(c) = &mut self.payload {
+            c[slot] = encode_child(child);
+        } else {
+            unreachable!("set_child on leaf node");
+        }
+    }
+
+    #[inline]
+    fn leaf_data(&self) -> Option<T> {
+        if self.height == 0
+            && let NodePayload::Leaf(d) = self.payload
+        {
+            Some(d)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -93,10 +143,9 @@ impl<T: Copy> DynamicTree<T> {
         self.nodes[leaf as usize] = Node {
             aabb,
             parent: NULL,
-            children: [NULL; 2],
             height: 0,
             short: 0,
-            data: Some(data),
+            payload: NodePayload::Leaf(data),
         };
         self.leaves += 1;
         self.insert_leaf(leaf);
@@ -129,7 +178,7 @@ impl<T: Copy> DynamicTree<T> {
 
     pub fn data(&self, proxy: u32) -> T {
         self.expect_live(proxy);
-        self.nodes[proxy as usize].data.expect("live proxy")
+        self.nodes[proxy as usize].leaf_data().expect("live proxy")
     }
 
     /// Number of live proxies.
@@ -147,7 +196,7 @@ impl<T: Copy> DynamicTree<T> {
         if self.root == NULL {
             0
         } else {
-            self.nodes[self.root as usize].height
+            u32::from(self.nodes[self.root as usize].height)
         }
     }
 
@@ -156,7 +205,7 @@ impl<T: Copy> DynamicTree<T> {
         if self.root == NULL {
             return;
         }
-        let mut stack = WalkStack::<u32, 64>::new(NULL);
+        let mut stack = WalkStack::<u32, 32>::new(NULL);
         stack.push(self.root);
         while let Some(i) = stack.pop() {
             let node = &self.nodes[i as usize];
@@ -164,14 +213,15 @@ impl<T: Copy> DynamicTree<T> {
                 continue;
             }
             if node.height == 0 {
-                if let Some(data) = node.data
+                if let NodePayload::Leaf(data) = node.payload
                     && !f(i, data)
                 {
                     return;
                 }
             } else {
-                stack.push(node.children[1]);
-                stack.push(node.children[0]);
+                let [c0, c1] = node.children();
+                stack.push(c1);
+                stack.push(c0);
             }
         }
     }
@@ -201,7 +251,7 @@ impl<T: Copy> DynamicTree<T> {
         };
         // Each entry carries where the ray enters the node's box, so a node that a later hit
         // has moved out of reach is dropped without another slab test.
-        let mut stack = WalkStack::<(u32, f32), 64>::new((NULL, 0.0));
+        let mut stack = WalkStack::<(u32, f32), 32>::new((NULL, 0.0));
         stack.push((self.root, t));
         while let Some((i, entry)) = stack.pop() {
             if entry > max_t {
@@ -209,7 +259,7 @@ impl<T: Copy> DynamicTree<T> {
             }
             let node = &self.nodes[i as usize];
             if node.height == 0 {
-                if let Some(data) = node.data {
+                if let NodePayload::Leaf(data) = node.payload {
                     let m = f(i, data, max_t);
                     if m < 0.0 {
                         return;
@@ -219,7 +269,7 @@ impl<T: Copy> DynamicTree<T> {
                 }
                 continue;
             }
-            let [a, b] = node.children;
+            let [a, b] = node.children();
             let ta = self.nodes[a as usize].aabb.ray_entry(origin, inv, max_t);
             let tb = self.nodes[b as usize].aabb.ray_entry(origin, inv, max_t);
             match (ta, tb) {
@@ -282,22 +332,19 @@ impl<T: Copy> DynamicTree<T> {
                 match node.height {
                     FREE => return Err(format!("node {i} is in the tree but free")),
                     0 => {
-                        if node.children != [NULL; 2] || node.short != 0 {
-                            return Err(format!(
-                                "leaf {i} has children {:?} and shortest path {}",
-                                node.children, node.short
-                            ));
+                        if node.short != 0 {
+                            return Err(format!("leaf {i} has shortest path {}", node.short));
                         }
-                        if node.data.is_none() {
+                        if !matches!(node.payload, NodePayload::Leaf(_)) {
                             return Err(format!("leaf {i} has no data"));
                         }
                         leaves += 1;
                     }
                     height => {
-                        if node.data.is_some() {
+                        if !matches!(node.payload, NodePayload::Internal(_)) {
                             return Err(format!("internal node {i} holds data"));
                         }
-                        let [a, b] = node.children;
+                        let [a, b] = node.children();
                         for c in [a, b] {
                             let child = self
                                 .nodes
@@ -361,7 +408,7 @@ impl<T: Copy> DynamicTree<T> {
         let live = self
             .nodes
             .get(proxy as usize)
-            .is_some_and(|n| n.height == 0 && n.data.is_some());
+            .is_some_and(|n| n.height == 0 && matches!(n.payload, NodePayload::Leaf(_)));
         assert!(live, "proxy {proxy} is not live");
     }
 
@@ -376,10 +423,9 @@ impl<T: Copy> DynamicTree<T> {
         self.nodes.push(Node {
             aabb: Aabb::EMPTY,
             parent: NULL,
-            children: [NULL; 2],
             height: FREE,
             short: 0,
-            data: None,
+            payload: NodePayload::Internal(FREE_CHILDREN),
         });
         i as u32
     }
@@ -388,10 +434,9 @@ impl<T: Copy> DynamicTree<T> {
         self.nodes[i as usize] = Node {
             aabb: Aabb::EMPTY,
             parent: self.free,
-            children: [NULL; 2],
             height: FREE,
             short: 0,
-            data: None,
+            payload: NodePayload::Internal(FREE_CHILDREN),
         };
         self.free = i;
     }
@@ -411,10 +456,9 @@ impl<T: Copy> DynamicTree<T> {
         self.nodes[parent as usize] = Node {
             aabb: s.aabb.union(aabb),
             parent: old_parent,
-            children: [sibling, leaf],
             height: s.height + 1,
             short: 1,
-            data: None,
+            payload: NodePayload::Internal([encode_child(sibling), encode_child(leaf)]),
         };
         self.nodes[sibling as usize].parent = parent;
         self.nodes[leaf as usize].parent = parent;
@@ -434,7 +478,7 @@ impl<T: Copy> DynamicTree<T> {
         }
         let parent = self.nodes[leaf as usize].parent;
         let grandparent = self.nodes[parent as usize].parent;
-        let [a, b] = self.nodes[parent as usize].children;
+        let [a, b] = self.nodes[parent as usize].children();
         let sibling = if a == leaf { b } else { a };
         if grandparent == NULL {
             self.root = sibling;
@@ -454,10 +498,11 @@ impl<T: Copy> DynamicTree<T> {
 
     fn replace_child(&mut self, parent: u32, old: u32, new: u32) {
         let p = &mut self.nodes[parent as usize];
-        if p.children[0] == old {
-            p.children[0] = new;
+        let [c0, _] = p.children();
+        if c0 == old {
+            p.set_child(0, new);
         } else {
-            p.children[1] = new;
+            p.set_child(1, new);
         }
     }
 
@@ -478,7 +523,9 @@ impl<T: Copy> DynamicTree<T> {
             let node = &self.nodes[index as usize];
             let direct = cost(&node.aabb.union(*leaf));
             // `best == NULL` takes a first candidate even when costs overflow to NaN.
-            if depth + node.height < budget && (best == NULL || inherited + direct < best_cost) {
+            if depth + u32::from(node.height) < budget
+                && (best == NULL || inherited + direct < best_cost)
+            {
                 best = index;
                 best_cost = inherited + direct;
             }
@@ -489,8 +536,8 @@ impl<T: Copy> DynamicTree<T> {
                 return if best == NULL { index } else { best };
             }
             inherited += direct - cost(&node.aabb);
-            let [a, b] = node.children;
-            let open = |c: u32| depth + 1 + self.nodes[c as usize].short < budget;
+            let [a, b] = node.children();
+            let open = |c: u32| depth + 1 + u32::from(self.nodes[c as usize].short) < budget;
             let (open_a, open_b) = (open(a), open(b));
             let lower_a = if open_a {
                 self.lower_bound(a, leaf, leaf_cost, inherited)
@@ -547,7 +594,7 @@ impl<T: Copy> DynamicTree<T> {
     }
 
     fn refit(&mut self, i: u32) {
-        let [a, b] = self.nodes[i as usize].children;
+        let [a, b] = self.nodes[i as usize].children();
         let (na, nb) = (self.nodes[a as usize], self.nodes[b as usize]);
         let node = &mut self.nodes[i as usize];
         node.aabb = na.aabb.union(nb.aabb);
@@ -562,18 +609,20 @@ impl<T: Copy> DynamicTree<T> {
         if node.height < 2 {
             return;
         }
+        let node_children = node.children();
         let mut best: Option<(usize, usize)> = None;
         let mut best_gain = 0.0f32;
         for slot in 0..2 {
-            let x = self.nodes[node.children[slot] as usize];
-            let other = self.nodes[node.children[1 - slot] as usize];
+            let x = self.nodes[node_children[slot] as usize];
+            let other = self.nodes[node_children[1 - slot] as usize];
             if other.height == 0 {
                 continue;
             }
+            let other_children = other.children();
             let other_cost = cost(&other.aabb);
             for inner in 0..2 {
-                let y = self.nodes[other.children[inner] as usize];
-                let z = self.nodes[other.children[1 - inner] as usize];
+                let y = self.nodes[other_children[inner] as usize];
+                let z = self.nodes[other_children[1 - inner] as usize];
                 // After the swap `other` holds (x, z) and `a` holds (y, other).
                 let other_height = 1 + x.height.max(z.height);
                 if 1 + y.height.max(other_height) > node.height {
@@ -594,11 +643,12 @@ impl<T: Copy> DynamicTree<T> {
     /// Swaps `a`'s child in `slot` with the grandchild in `inner` under `a`'s other child, and
     /// refits the other child and `a` (whose box covers the same leaves as before).
     fn swap(&mut self, a: u32, slot: usize, inner: usize) {
-        let x = self.nodes[a as usize].children[slot];
-        let c = self.nodes[a as usize].children[1 - slot];
-        let y = self.nodes[c as usize].children[inner];
-        self.nodes[a as usize].children[slot] = y;
-        self.nodes[c as usize].children[inner] = x;
+        let a_children = self.nodes[a as usize].children();
+        let x = a_children[slot];
+        let c = a_children[1 - slot];
+        let y = self.nodes[c as usize].children()[inner];
+        self.nodes[a as usize].set_child(slot, y);
+        self.nodes[c as usize].set_child(inner, x);
         self.nodes[x as usize].parent = c;
         self.nodes[y as usize].parent = a;
         self.refit(c);
@@ -618,8 +668,9 @@ impl<T: Copy> DynamicTree<T> {
                 leaves.push(i);
             } else {
                 internal.push(i);
-                stack.push(node.children[1]);
-                stack.push(node.children[0]);
+                let [c0, c1] = node.children();
+                stack.push(c1);
+                stack.push(c0);
             }
         }
         for &i in internal.iter().rev() {
@@ -677,10 +728,9 @@ impl<T: Copy> DynamicTree<T> {
         self.nodes[parent as usize] = Node {
             aabb: Aabb::EMPTY,
             parent: NULL,
-            children: [a, b],
             height: 0,
             short: 0,
-            data: None,
+            payload: NodePayload::Internal([encode_child(a), encode_child(b)]),
         };
         self.nodes[a as usize].parent = parent;
         self.nodes[b as usize].parent = parent;
@@ -1083,14 +1133,14 @@ mod tests {
         );
         let first_leaf = |tree: &DynamicTree<u32>, mut i: u32| {
             while tree.nodes[i as usize].height > 0 {
-                i = tree.nodes[i as usize].children[0];
+                i = tree.nodes[i as usize].children()[0];
             }
             i
         };
         let mut keep = vec![];
         let mut i = tree.root;
         while tree.nodes[i as usize].height > 0 {
-            let [a, b] = tree.nodes[i as usize].children;
+            let [a, b] = tree.nodes[i as usize].children();
             let (deep, side) = if tree.nodes[a as usize].height >= tree.nodes[b as usize].height {
                 (a, b)
             } else {

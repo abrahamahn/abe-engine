@@ -28,6 +28,12 @@ pub mod pixel {
     pub const BGRA8_UNORM_SRGB: u64 = 81;
     pub const RGBA16_FLOAT: u64 = 115;
     pub const RGBA32_FLOAT: u64 = 125;
+    pub const BC1_RGBA: u64 = 130;
+    pub const BC1_RGBA_SRGB: u64 = 131;
+    pub const BC7_RGBA_UNORM: u64 = 152;
+    pub const BC7_RGBA_UNORM_SRGB: u64 = 153;
+    pub const ASTC_4X4_SRGB: u64 = 186;
+    pub const ASTC_4X4_LDR: u64 = 204;
     pub const DEPTH32_FLOAT: u64 = 252;
 }
 
@@ -136,6 +142,7 @@ pub mod status {
 
 /// `MTLGPUFamily` values for `supportsFamily:`.
 pub mod family {
+    pub const APPLE2: i64 = 1002;
     pub const APPLE4: i64 = 1004;
     pub const APPLE7: i64 = 1007;
     pub const MAC2: i64 = 2002;

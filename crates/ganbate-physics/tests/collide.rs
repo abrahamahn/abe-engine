@@ -36,7 +36,10 @@ fn none(a: &Shape, ia: &Iso, b: &Shape, ib: &Iso, spec: f32) {
 fn check_contract(out: &[Manifold], spec: f32) {
     let mut all_ids = Vec::new();
     for m in out {
-        assert!(m.count >= 1 && m.count <= MAX_MANIFOLD_POINTS, "{m:?}");
+        assert!(
+            m.count >= 1 && usize::from(m.count) <= MAX_MANIFOLD_POINTS,
+            "{m:?}"
+        );
         assert!(m.normal.is_finite(), "{m:?}");
         assert!(
             (m.normal.length() - 1.0).abs() < 1e-5,
@@ -1292,7 +1295,7 @@ fn a_heightfield_collides_like_the_mesh_of_its_triangles() {
         for (ma, mb) in a.iter().zip(&b) {
             assert!((ma.normal - mb.normal).length() < 1e-5, "{ma:?} {mb:?}");
             assert_eq!(ma.count, mb.count, "{ma:?} {mb:?}");
-            for (pa, pb) in ma.points[..ma.count].iter().zip(&mb.points[..mb.count]) {
+            for (pa, pb) in ma.points().iter().zip(mb.points()) {
                 assert_eq!(pa.id, pb.id);
                 assert!((pa.point - pb.point).length() < 1e-4, "{pa:?} {pb:?}");
                 assert!(

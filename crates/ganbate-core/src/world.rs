@@ -36,15 +36,25 @@ impl Transform {
             1.,
         ]))
     }
+    #[inline]
     pub fn compose(self, local: Self) -> Self {
+        let a = self.0;
+        let b = local.0;
         let mut out = [0.0; 16];
-        for (i, v) in out.iter_mut().enumerate() {
-            let row = i % 4;
-            let col = (i / 4) * 4;
-            *v = (0..4).map(|k| self.0[row + 4 * k] * local.0[col + k]).sum();
+        for col in 0..4 {
+            let c = col * 4;
+            let b0 = b[c];
+            let b1 = b[c + 1];
+            let b2 = b[c + 2];
+            let b3 = b[c + 3];
+            out[c] = a[0] * b0 + a[4] * b1 + a[8] * b2 + a[12] * b3;
+            out[c + 1] = a[1] * b0 + a[5] * b1 + a[9] * b2 + a[13] * b3;
+            out[c + 2] = a[2] * b0 + a[6] * b1 + a[10] * b2 + a[14] * b3;
+            out[c + 3] = a[3] * b0 + a[7] * b1 + a[11] * b2 + a[15] * b3;
         }
         Self(out)
     }
+    #[inline]
     pub fn point(self, Vec3(x, y, z): Vec3) -> Vec3 {
         let m = self.0;
         Vec3(
@@ -53,6 +63,7 @@ impl Transform {
             m[2] * x + m[6] * y + m[10] * z + m[14],
         )
     }
+    #[inline]
     pub fn valid(self) -> bool {
         self.0.iter().all(|v| v.is_finite())
             && [self.0[3], self.0[7], self.0[11], self.0[15]] == [0., 0., 0., 1.]
@@ -146,15 +157,94 @@ impl Default for Material {
 /// natively, and the engine decodes PNG itself.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EncodedImage {
-    /// `image/png`, `image/jpeg` or `image/webp`.
+    /// `image/png`, `image/jpeg` or `image/webp` (or a `texture/*` block-compression tag when
+    /// [`Texture::levels`] holds hardware-compressed blocks).
     pub mime: String,
     pub data: Vec<u8>,
 }
 pub const IMAGE_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/webp"];
 
-/// RGBA8 texels, level 0 first. Level `i` is `max(1, width >> i)` by `max(1, height >> i)`;
-/// `levels` holds the complete chain down to 1x1, or only level 0 (the renderer makes the
-/// rest), or nothing while the image is still `encoded`.
+/// Hardware block-compressed texture codec stored in [`Texture::levels`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TextureCompression {
+    /// S3TC BC1 (`DXT1`) 4x4 RGBA blocks (8 bytes per block, 1-bit punchthrough alpha).
+    Bc1 = 0,
+    /// BPTC BC7 4x4 RGBA blocks (16 bytes per block, full 8-bit colour and alpha).
+    Bc7 = 1,
+    /// ASTC 4x4 LDR RGBA blocks (16 bytes per block).
+    Astc4x4 = 2,
+}
+impl TextureCompression {
+    #[inline]
+    pub const fn codec_id(self) -> u32 {
+        self as u32
+    }
+    #[inline]
+    pub const fn from_codec_id(id: u32) -> Option<Self> {
+        match id {
+            0 => Some(Self::Bc1),
+            1 => Some(Self::Bc7),
+            2 => Some(Self::Astc4x4),
+            _ => None,
+        }
+    }
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bc1 => "bc1",
+            Self::Bc7 => "bc7",
+            Self::Astc4x4 => "astc-4x4",
+        }
+    }
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "bc1" | "dxt1" => Some(Self::Bc1),
+            "bc7" | "bptc" => Some(Self::Bc7),
+            "astc" | "astc4x4" | "astc-4x4" | "astc_4x4" => Some(Self::Astc4x4),
+            _ => None,
+        }
+    }
+    #[inline]
+    pub const fn mime_tag(self) -> &'static str {
+        match self {
+            Self::Bc1 => "texture/bc1",
+            Self::Bc7 => "texture/bc7",
+            Self::Astc4x4 => "texture/astc-4x4",
+        }
+    }
+    #[inline]
+    pub fn from_mime_tag(mime: &str) -> Option<Self> {
+        match mime {
+            "texture/bc1" => Some(Self::Bc1),
+            "texture/bc7" => Some(Self::Bc7),
+            "texture/astc-4x4" => Some(Self::Astc4x4),
+            _ => None,
+        }
+    }
+    #[inline]
+    pub const fn block_dimensions(self) -> (u32, u32) {
+        (4, 4)
+    }
+    #[inline]
+    pub const fn block_bytes(self) -> u32 {
+        match self {
+            Self::Bc1 => 8,
+            Self::Bc7 | Self::Astc4x4 => 16,
+        }
+    }
+    #[inline]
+    pub const fn mip_byte_len(self, width: u32, height: u32) -> usize {
+        let (bw, bh) = self.block_dimensions();
+        let w = if width == 0 { 1 } else { width };
+        let h = if height == 0 { 1 } else { height };
+        (w.div_ceil(bw) as usize) * (h.div_ceil(bh) as usize) * (self.block_bytes() as usize)
+    }
+}
+
+/// RGBA8 texels (or block-compressed mips when [`Texture::compression`] is `Some`), level 0 first.
+/// Level `i` is `max(1, width >> i)` by `max(1, height >> i)`; `levels` holds the complete chain
+/// down to 1x1, or only level 0 (the renderer makes the rest for uncompressed textures), or
+/// nothing while a file-format image is still `encoded`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Texture {
     pub width: u32,
@@ -164,6 +254,38 @@ pub struct Texture {
     pub encoded: Option<EncodedImage>,
 }
 impl Texture {
+    /// Creates a block-compressed texture whose mip levels hold [`TextureCompression`] blocks.
+    pub fn compressed(
+        width: u32,
+        height: u32,
+        srgb: bool,
+        compression: TextureCompression,
+        levels: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            srgb,
+            levels,
+            encoded: Some(EncodedImage {
+                mime: compression.mime_tag().to_string(),
+                data: Vec::new(),
+            }),
+        }
+    }
+    /// Block-compression codec when [`Texture::levels`] holds compressed 4x4 blocks.
+    #[inline]
+    pub fn compression(&self) -> Option<TextureCompression> {
+        let e = self.encoded.as_ref()?;
+        if !e.data.is_empty() {
+            return None;
+        }
+        TextureCompression::from_mime_tag(&e.mime)
+    }
+    #[inline]
+    pub fn is_compressed(&self) -> bool {
+        self.compression().is_some()
+    }
     /// Levels in a complete chain for a nonempty texture.
     pub fn level_count(width: u32, height: u32) -> usize {
         (u32::BITS - width.max(height).max(1).leading_zeros()) as usize
@@ -180,6 +302,19 @@ impl Texture {
                 self.width, self.height
             ));
         }
+        let full = Self::level_count(self.width, self.height);
+        if let Some(comp) = self.compression() {
+            if self.levels.len() != full && self.levels.len() != 1 {
+                return Err("incomplete mip chain".into());
+            }
+            for (i, level) in self.levels.iter().enumerate() {
+                let (w, h) = Self::level_extent(self.width, self.height, i);
+                if level.len() != comp.mip_byte_len(w, h) {
+                    return Err(format!("level {i} is not {w}x{h} {}", comp.name()));
+                }
+            }
+            return Ok(());
+        }
         if let Some(e) = &self.encoded {
             if !self.levels.is_empty() {
                 return Err("an encoded image also has texels".into());
@@ -189,7 +324,6 @@ impl Texture {
             }
             return Ok(());
         }
-        let full = Self::level_count(self.width, self.height);
         if self.levels.len() != full && self.levels.len() != 1 {
             return Err("incomplete mip chain".into());
         }
