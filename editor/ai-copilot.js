@@ -30,7 +30,17 @@ export const UX_TIERS = Object.freeze({
   },
 });
 
-const GBS_DIRECT_PREFIX = /^(tx|spawn|place|ring|attach|move|rotate|look_at|cam\s+frame|look\s+patch)\b/i;
+const GBS_DIRECT_PREFIX = /^(tx\s+|look\s+patch\s+|cam\s+frame\s+)/i;
+
+function isDirectGbsLine(line) {
+  if (GBS_DIRECT_PREFIX.test(line)) return true;
+  if (/^(spawn|place|ring|attach|move|rotate|look_at)\b/.test(line)) {
+    return /\$|\[.*\]|\b(radius|face|snap|yaw|pitch|roll|gap|clearance)=|\bsnap\s+onto\b|;\s*\w/.test(
+      line,
+    ) || /^(spawn|look_at)\s+[A-Za-z0-9_]+\s+(empty|all|@selection|[a-z]+:)/.test(line);
+  }
+  return false;
+}
 
 const LIGHTING_KEYWORDS = [
   { re: /\b(night|midnight|moon|dark)\b/i, time: 22.0, preset: 'night', label: 'Night (22:00)' },
@@ -190,7 +200,7 @@ export function compileNaturalPromptToGbs(promptText, context = {}) {
 
   // Direct `.gbs` passthrough when the author or LLM already wrote `.gbs`
   const firstLine = raw.split(/\r?\n|;/)[0].trim();
-  if (GBS_DIRECT_PREFIX.test(firstLine)) {
+  if (isDirectGbsLine(firstLine)) {
     const normalized = raw
       .split(/\r?\n|;\s*/)
       .map((l) => l.trim())
@@ -407,7 +417,7 @@ export function extractGbsFromLlmReply(content = '') {
   return candidate
     .split(/\r?\n/)
     .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith('#') && GBS_DIRECT_PREFIX.test(l))
+    .filter((l) => l && !l.startsWith('#') && /^(tx|spawn|place|ring|attach|move|rotate|look_at|cam\s+frame|look\s+patch)\b/i.test(l))
     .join('\n');
 }
 
@@ -895,6 +905,7 @@ export function mountAiCopilot(container, hooks = {}) {
       if (tab) activeTab = tab;
       root.hidden = false;
       hooks.onToggle?.(true);
+      renderBody();
       void refreshCatalogAndContext().then(() => renderBody());
     },
     close: () => {
