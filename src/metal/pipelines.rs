@@ -531,7 +531,7 @@ impl<'w> Gpu<'w> {
                 .iter()
                 .find(|(b, _)| *b == e.binding)
                 .ok_or_else(|| format!("@group({group}) @binding({}) is missing", e.binding))?;
-            let at = format!("@group({group}) @binding({})", e.binding);
+            let at = || format!("@group({group}) @binding({})", e.binding);
             let b = match (e.kind, res) {
                 (
                     BindingKind::UniformBuffer { .. } | BindingKind::StorageBuffer { .. },
@@ -545,11 +545,12 @@ impl<'w> Gpu<'w> {
                         (BufferUsage::STORAGE, limits.storage_offset_alignment)
                     };
                     if !b.desc.usage.contains(usage) {
-                        return Err(format!("{at}: {id:?} lacks {usage:?} usage"));
+                        return Err(format!("{}: {id:?} lacks {usage:?} usage", at()));
                     }
                     if offset >= b.desc.size || offset % align != 0 {
                         return Err(format!(
-                            "{at}: offset {offset} must be inside the buffer and a multiple of {align}"
+                            "{}: offset {offset} must be inside the buffer and a multiple of {align}",
+                            at()
                         ));
                     }
                     let range = if size == 0 {
@@ -558,13 +559,17 @@ impl<'w> Gpu<'w> {
                         size
                     };
                     if offset + range > b.desc.size {
-                        return Err(format!("{at}: range {range} at {offset} is out of bounds"));
+                        return Err(format!(
+                            "{}: range {range} at {offset} is out of bounds",
+                            at()
+                        ));
                     }
                     if let BindingKind::UniformBuffer { size: need } = e.kind
                         && range < u64::from(need)
                     {
                         return Err(format!(
-                            "{at}: the shader reads {need} bytes but only {range} are bound"
+                            "{}: the shader reads {need} bytes but only {range} are bound",
+                            at()
                         ));
                     }
                     Bound::Buffer {
@@ -584,7 +589,7 @@ impl<'w> Gpu<'w> {
                     match e.kind {
                         BindingKind::Texture { sample, .. } => {
                             if !desc.usage.contains(TextureUsage::SAMPLED) {
-                                return Err(format!("{at}: {id:?} lacks SAMPLED usage"));
+                                return Err(format!("{}: {id:?} lacks SAMPLED usage", at()));
                             }
                             let ok = match sample {
                                 SampleType::Depth => desc.format.is_depth(),
@@ -594,18 +599,20 @@ impl<'w> Gpu<'w> {
                             };
                             if !ok {
                                 return Err(format!(
-                                    "{at}: a {sample:?} texture binding cannot sample {:?}",
+                                    "{}: a {sample:?} texture binding cannot sample {:?}",
+                                    at(),
                                     desc.format
                                 ));
                             }
                         }
                         BindingKind::StorageTexture { format, .. } => {
                             if !desc.usage.contains(TextureUsage::STORAGE) {
-                                return Err(format!("{at}: {id:?} lacks STORAGE usage"));
+                                return Err(format!("{}: {id:?} lacks STORAGE usage", at()));
                             }
                             if texel_format(format) != desc.format {
                                 return Err(format!(
-                                    "{at}: the shader writes {format:?} but {id:?} is {:?}",
+                                    "{}: the shader writes {format:?} but {id:?} is {:?}",
+                                    at(),
                                     desc.format
                                 ));
                             }
@@ -613,7 +620,7 @@ impl<'w> Gpu<'w> {
                         _ => unreachable!("matched texture kinds above"),
                     }
                     let (key, mips, layers) =
-                        view_for(view, res, &desc, storage).map_err(|m| format!("{at}: {m}"))?;
+                        view_for(view, res, &desc, storage).map_err(|m| format!("{}: {m}", at()))?;
                     let obj = self.view(id, key)?;
                     Bound::Texture {
                         id,
@@ -623,13 +630,13 @@ impl<'w> Gpu<'w> {
                     }
                 }
                 (BindingKind::Sampler { comparison }, Resource::Sampler(id)) => {
-                    let s = self
-                        .samplers
-                        .get(id.raw())
-                        .ok_or_else(|| format!("{at}: {id:?} does not belong to this device"))?;
+                    let s = self.samplers.get(id.raw()).ok_or_else(|| {
+                        format!("{}: {id:?} does not belong to this device", at())
+                    })?;
                     if s.comparison != comparison {
                         return Err(format!(
-                            "{at}: the shader declares a {} but {id:?} is {}",
+                            "{}: the shader declares a {} but {id:?} is {}",
+                            at(),
                             if comparison {
                                 "sampler_comparison"
                             } else {
@@ -644,7 +651,7 @@ impl<'w> Gpu<'w> {
                     }
                     Bound::Sampler(id)
                 }
-                (kind, res) => return Err(format!("{at} expects {kind:?} but got {res:?}")),
+                (kind, res) => return Err(format!("{} expects {kind:?} but got {res:?}", at())),
             };
             bound.push((e.binding, b));
         }

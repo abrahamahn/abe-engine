@@ -8,7 +8,9 @@
 // lifetime and synchronization rules). Everything here runs on the page's main thread.
 
 const FORMATS = [null, 'rgba8unorm', 'rgba8unorm-srgb', 'bgra8unorm', 'bgra8unorm-srgb',
-  'rgba16float', 'rg16float', 'r16float', 'r8unorm', 'r32float', 'rgba32float', 'depth32float'];
+  'rgba16float', 'rg16float', 'r16float', 'r8unorm', 'r32float', 'rgba32float', 'depth32float',
+  'bc1-rgba-unorm', 'bc1-rgba-unorm-srgb', 'bc7-rgba-unorm', 'bc7-rgba-unorm-srgb',
+  'astc-4x4-unorm', 'astc-4x4-unorm-srgb'];
 const SURFACE = 0xFFFFFFFF;
 const EMPTY_GROUP = 0xFFFFFFFE;
 const PUSH_RENDER = 0xFFFFFFFD;
@@ -42,7 +44,8 @@ export async function createGpu(canvas) {
   }
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) throw new Error('WebGPU is available but no adapter was found.');
-  const wanted = ['depth-clip-control', 'float32-filterable', 'float32-blendable'];
+  const wanted = ['depth-clip-control', 'float32-filterable', 'float32-blendable',
+    'texture-compression-bc', 'texture-compression-astc'];
   const requiredFeatures = wanted.filter((f) => adapter.features.has(f));
   const A = adapter.limits;
   const device = await adapter.requestDevice({
@@ -80,6 +83,7 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
   let lastError = '';
   let memory = null;
   let surfaceTexture = null;
+  let surfaceView = null;
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
@@ -121,7 +125,9 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     ? { texture: currentTexture(), format: gpu.format, views: new Map() }
     : objects[h >>> 0]);
   const viewOf = (t, dimension, baseMipLevel, mipLevelCount, baseArrayLayer, arrayLayerCount) => {
-    const key = `${dimension}/${baseMipLevel}/${mipLevelCount}/${baseArrayLayer}/${arrayLayerCount}`;
+    const dim = dimension === '2d' ? 0 : dimension === '2d-array' ? 1 : 2;
+    const key = dim + baseMipLevel * 4 + mipLevelCount * 128
+      + baseArrayLayer * 4096 + arrayLayerCount * 16777216;
     let v = t.views.get(key);
     if (!v) {
       v = t.texture.createView({ dimension, baseMipLevel, mipLevelCount, baseArrayLayer, arrayLayerCount });
@@ -130,7 +136,10 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     return v;
   };
   const attachment = (h, mip, layer) => {
-    if (h >>> 0 === SURFACE) return currentTexture().createView();
+    if (h >>> 0 === SURFACE) {
+      if (!surfaceView) surfaceView = currentTexture().createView();
+      return surfaceView;
+    }
     return viewOf(objects[h], '2d', mip, 1, layer, 1);
   };
 
@@ -142,12 +151,25 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
   });
   const pushRenderLayout = pushLayout(GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT);
   const pushComputeLayout = pushLayout(GPUShaderStage.COMPUTE);
+  // Static pass cache: promotes repeated identical render pass command streams into GPURenderBundles.
+  const bundleBuckets = new Map();
+  let bundleEntries = 0;
+  let bundleCompiled = 0;
+  let bundleReplays = 0;
+  const clearBundles = () => {
+    bundleBuckets.clear();
+    bundleEntries = 0;
+    bundleCompiled = 0;
+  };
   let ring = null;
   const ensureRing = (len) => {
     if (ring && ring.size >= len) return;
     let size = 65536;
     while (size < len) size *= 2;
-    if (ring) ring.buffer.destroy();
+    if (ring) {
+      ring.buffer.destroy();
+      clearBundles();
+    }
     const buffer = device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const group = (layout) => device.createBindGroup({
       layout, entries: [{ binding: 0, resource: { buffer, offset: 0, size: PUSH_SLOT } }],
@@ -167,6 +189,7 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
   // Blits and mip generation are render passes.
   const blitModule = device.createShaderModule({ code: BLIT_WGSL });
   const blitPipelines = new Map();
+  let nextBlitId = 0;
   const blitSamplers = [device.createSampler({}),
     device.createSampler({ magFilter: 'linear', minFilter: 'linear' })];
   const blitPipeline = (format, linear) => {
@@ -187,7 +210,7 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
         fragment: { module: blitModule, entryPoint: 'fs', targets: [{ format }] },
         primitive: { topology: 'triangle-list' },
       });
-      p = { pipeline, layout };
+      p = { id: ++nextBlitId, pipeline, layout };
       blitPipelines.set(key, p);
     }
     return p;
@@ -196,13 +219,18 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     const s = objects[src];
     const dstFormat = dst >>> 0 === SURFACE ? gpu.format : objects[dst].format;
     const p = blitPipeline(dstFormat, linear);
-    const bindGroup = device.createBindGroup({
-      layout: p.layout,
-      entries: [
-        { binding: 0, resource: viewOf(s, '2d', srcMip, 1, srcLayer, 1) },
-        { binding: 1, resource: blitSamplers[linear ? 1 : 0] },
-      ],
-    });
+    const bgKey = p.id + srcMip * 256 + srcLayer * 8192;
+    let bindGroup = s.blitGroups && s.blitGroups.get(bgKey);
+    if (!bindGroup) {
+      bindGroup = device.createBindGroup({
+        layout: p.layout,
+        entries: [
+          { binding: 0, resource: viewOf(s, '2d', srcMip, 1, srcLayer, 1) },
+          { binding: 1, resource: blitSamplers[linear ? 1 : 0] },
+        ],
+      });
+      if (s.blitGroups) s.blitGroups.set(bgKey, bindGroup);
+    }
     const pass = enc.beginRenderPass({
       colorAttachments: [{ view: attachment(dst, dstMip, dstLayer), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] }],
     });
@@ -210,6 +238,36 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     pass.setBindGroup(0, bindGroup);
     pass.draw(3);
     pass.end();
+  };
+
+  const canBundle = typeof device.createRenderBundleEncoder === 'function';
+  const wordsEqual = (saved, c, start, len) => {
+    for (let k = 0; k < len; k++) {
+      if (saved[k] !== c[start + k]) return false;
+    }
+    return true;
+  };
+  const recordBundleBody = (rbe, c, start, end) => {
+    const u64 = (idx) => c[idx] + c[idx + 1] * 4294967296;
+    let p = start;
+    while (p < end) {
+      const bop = c[p++];
+      switch (bop) {
+        case 3: rbe.setPipeline(objects[c[p++]]); break;
+        case 4: {
+          const index = c[p]; const g = c[p + 1]; const n = c[p + 2];
+          if (n === 0) rbe.setBindGroup(index, group(g));
+          else rbe.setBindGroup(index, group(g), c, p + 3, n);
+          p += 3 + n;
+          break;
+        }
+        case 5: rbe.setVertexBuffer(c[p], objects[c[p + 1]], u64(p + 2)); p += 4; break;
+        case 6: rbe.setIndexBuffer(objects[c[p]], 'uint32', u64(p + 1)); p += 3; break;
+        case 9: rbe.draw(c[p], c[p + 1], c[p + 2], c[p + 3]); p += 4; break;
+        case 10: rbe.drawIndexed(c[p], c[p + 1], c[p + 2], c[p + 3] | 0, c[p + 4]); p += 5; break;
+        default: throw new Error(`unsupported bundle op ${bop}`);
+      }
+    }
   };
 
   const execute = (cmdPtr, words, pushPtr, pushLen) => {
@@ -222,8 +280,7 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     }
     const enc = device.createCommandEncoder();
     let pass = null;
-    const u64 = (i) => c[i] + c[i + 1] * 4294967296;
-    const offsets = (i, n) => Array.from(c.subarray(i, i + n));
+    const u64 = (idx) => c[idx] + c[idx + 1] * 4294967296;
     let i = 0;
     while (i < c.length) {
       const op = c[i++];
@@ -232,9 +289,14 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
           const colors = c[i++];
           const hasDepth = c[i++];
           const colorAttachments = [];
+          const colorFormats = canBundle ? [] : null;
+          let h = (2166136261 ^ colors) >>> 0;
           for (let k = 0; k < colors; k++) {
+            const th = c[i];
+            const fmt = th >>> 0 === SURFACE ? gpu.format : objects[th].format;
+            if (colorFormats) colorFormats.push(fmt);
             colorAttachments.push({
-              view: attachment(c[i], c[i + 1], c[i + 2]),
+              view: attachment(th, c[i + 1], c[i + 2]),
               loadOp: c[i + 3] ? 'clear' : 'load',
               storeOp: c[i + 4] ? 'store' : 'discard',
               clearValue: [f[i + 5], f[i + 6], f[i + 7], f[i + 8]],
@@ -242,7 +304,9 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
             i += 9;
           }
           let depthStencilAttachment;
+          let depthStencilFormat;
           if (hasDepth) {
+            depthStencilFormat = objects[c[i]].format;
             depthStencilAttachment = {
               view: attachment(c[i], c[i + 1], c[i + 2]),
               depthLoadOp: c[i + 3] ? 'clear' : 'load',
@@ -251,6 +315,75 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
             };
             i += 6;
           }
+          if (canBundle) {
+            const bodyStart = i;
+            let scan = i;
+            let eligible = true;
+            let draws = 0;
+            while (scan < c.length) {
+              const bop = c[scan];
+              if (bop === 2) break;
+              switch (bop) {
+                case 3: scan += 2; break;
+                case 4: scan += 4 + c[scan + 3]; break;
+                case 5: scan += 5; break;
+                case 6: scan += 4; break;
+                case 9: draws++; scan += 5; break;
+                case 10: draws++; scan += 6; break;
+                case 7:
+                case 8:
+                  eligible = false; scan += 5; break;
+                default:
+                  eligible = false; scan = c.length; break;
+              }
+            }
+            if (eligible && draws > 0 && scan < c.length && c[scan] === 2) {
+              const bodyLen = scan - bodyStart;
+              const fmtKey = `${colorFormats.join(',')}|${depthStencilFormat || ''}`;
+              for (let k = 0; k < fmtKey.length; k++) {
+                h = Math.imul(h ^ fmtKey.charCodeAt(k), 16777619) >>> 0;
+              }
+              for (let p = bodyStart; p < scan; p++) {
+                h = Math.imul(h ^ c[p], 16777619) >>> 0;
+              }
+              let bucket = bundleBuckets.get(h);
+              let entry = null;
+              if (bucket) {
+                for (let b = 0; b < bucket.length; b++) {
+                  const cand = bucket[b];
+                  if (cand.fmtKey === fmtKey && cand.words.length === bodyLen
+                    && wordsEqual(cand.words, c, bodyStart, bodyLen)) {
+                    entry = cand;
+                    break;
+                  }
+                }
+              }
+              if (entry) {
+                if (!entry.bundle) {
+                  const rbe = device.createRenderBundleEncoder({
+                    colorFormats,
+                    depthStencilFormat,
+                  });
+                  recordBundleBody(rbe, c, bodyStart, scan);
+                  entry.bundle = rbe.finish();
+                  bundleCompiled++;
+                }
+                const rp = enc.beginRenderPass({ colorAttachments, depthStencilAttachment });
+                rp.executeBundles([entry.bundle]);
+                rp.end();
+                bundleReplays++;
+                i = scan + 1;
+                break;
+              }
+              if (bundleEntries >= 128) clearBundles();
+              if (!bucket) {
+                bucket = [];
+                bundleBuckets.set(h, bucket);
+              }
+              bucket.push({ fmtKey, words: c.slice(bodyStart, scan), bundle: null });
+              bundleEntries++;
+            }
+          }
           pass = enc.beginRenderPass({ colorAttachments, depthStencilAttachment });
           break;
         }
@@ -258,7 +391,8 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
         case 3: pass.setPipeline(objects[c[i++]]); break;
         case 4: {
           const index = c[i]; const g = c[i + 1]; const n = c[i + 2];
-          pass.setBindGroup(index, group(g), offsets(i + 3, n));
+          if (n === 0) pass.setBindGroup(index, group(g));
+          else pass.setBindGroup(index, group(g), c, i + 3, n);
           i += 3 + n;
           break;
         }
@@ -275,7 +409,8 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
           i += 2;
           for (let k = 0; k < n; k++) {
             const index = c[i]; const g = c[i + 1]; const no = c[i + 2];
-            cp.setBindGroup(index, group(g), offsets(i + 3, no));
+            if (no === 0) cp.setBindGroup(index, group(g));
+            else cp.setBindGroup(index, group(g), c, i + 3, no);
             i += 3 + no;
           }
           cp.dispatchWorkgroups(c[i], c[i + 1], c[i + 2]);
@@ -313,7 +448,9 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
       const L = device.limits;
       const features = (device.features.has('depth-clip-control') ? 1 : 0)
         | (device.features.has('float32-filterable') ? 2 : 0)
-        | (device.features.has('float32-blendable') ? 4 : 0);
+        | (device.features.has('float32-blendable') ? 4 : 0)
+        | (device.features.has('texture-compression-bc') ? 8 : 0)
+        | (device.features.has('texture-compression-astc') ? 16 : 0);
       const v = [L.maxTextureDimension2D, L.maxTextureArrayLayers, L.maxBindGroups,
         L.minUniformBufferOffsetAlignment, L.minStorageBufferOffsetAlignment,
         L.maxUniformBufferBindingSize, Math.min(L.maxStorageBufferBindingSize, 0xFFFFFFFF),
@@ -343,13 +480,17 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
         size: [width, height, layers], mipLevelCount: mips, format: FORMATS[format], usage,
       }),
       format: FORMATS[format],
+      compressed: format >= 12,
       views: new Map(),
+      blitGroups: new Map(),
     })),
     gpu_write_texture(h, mip, layer, width, height, bytesPerRow, ptr, len) {
+      const t = objects[h >>> 0];
+      const rowsPerImage = t.compressed ? Math.max(1, height >>> 2) : height;
       device.queue.writeTexture(
-        { texture: objects[h >>> 0].texture, mipLevel: mip, origin: [0, 0, layer] },
+        { texture: t.texture, mipLevel: mip, origin: [0, 0, layer] },
         memory.buffer,
-        { offset: ptr >>> 0, bytesPerRow, rowsPerImage: height },
+        { offset: ptr >>> 0, bytesPerRow, rowsPerImage },
         [width, height, 1],
       );
     },
@@ -461,6 +602,7 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
       h >>>= 0;
       const o = objects[h];
       if (!o) return;
+      clearBundles();
       if (o.texture && o.texture.destroy) o.texture.destroy();
       else if (o instanceof GPUBuffer) o.destroy();
       objects[h] = null;
@@ -479,9 +621,11 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     errors,
     attach(instance) { memory = instance.exports.memory; },
     /** Forgets the canvas texture of the last frame (call once per animation frame). */
-    nextFrame() { surfaceTexture = null; },
+    nextFrame() { surfaceTexture = null; surfaceView = null; },
     /** The canvas texture of the current frame, if one was rendered. */
     frameTexture() { return surfaceTexture; },
+    /** Telemetry for cached GPURenderBundle passes. */
+    bundleStats: () => ({ cached: bundleCompiled, candidates: bundleEntries, replays: bundleReplays }),
   };
 }
 
@@ -534,6 +678,10 @@ export function createGl(canvas) {
     aniso: gl.getExtension('EXT_texture_filter_anisotropic'),
     provoking: gl.getExtension('WEBGL_provoking_vertex'),
     indexed: gl.getExtension('OES_draw_buffers_indexed'),
+    s3tc: gl.getExtension('WEBGL_compressed_texture_s3tc') || gl.getExtension('EXT_texture_compression_s3tc'),
+    s3tcSrgb: gl.getExtension('WEBGL_compressed_texture_s3tc_srgb') || gl.getExtension('EXT_texture_compression_s3tc_srgb'),
+    bptc: gl.getExtension('EXT_texture_compression_bptc'),
+    astc: gl.getExtension('WEBGL_compressed_texture_astc'),
   };
   // Flat varyings come from the first vertex, as on Vulkan and WebGPU.
   if (ext.provoking) ext.provoking.provokingVertexWEBGL(ext.provoking.FIRST_VERTEX_CONVENTION_WEBGL);
@@ -544,7 +692,7 @@ export function createGl(canvas) {
 }
 
 /** The import object for the wasm module on WebGL 2 and the host state behind it. */
-export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onError = () => {}, checkErrors = true } = {}) {
+export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onError = () => {}, checkErrors = false } = {}) {
   const { gl, ext, canvas } = gpu;
   const objects = [null];
   const freeList = [];
@@ -601,6 +749,12 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
     { internal: gl.R32F, format: gl.RED, type: gl.FLOAT, size: 4, channels: 1, float: true },
     { internal: gl.RGBA32F, format: gl.RGBA, type: gl.FLOAT, size: 16, channels: 4, float: true },
     { internal: gl.DEPTH_COMPONENT32F, format: gl.DEPTH_COMPONENT, type: gl.FLOAT, size: 4, depth: true },
+    { internal: 0x83F1, compressed: true }, // COMPRESSED_RGBA_S3TC_DXT1_EXT
+    { internal: 0x8C4F, compressed: true }, // COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT
+    { internal: 0x8E8C, compressed: true }, // COMPRESSED_RGBA_BPTC_UNORM_EXT
+    { internal: 0x8E8D, compressed: true }, // COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT
+    { internal: 0x93B0, compressed: true }, // COMPRESSED_RGBA_ASTC_4x4_KHR
+    { internal: 0x93D0, compressed: true }, // COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR
   ];
   const COMPARES = [0, gl.NEVER, gl.LESS, gl.LEQUAL, gl.EQUAL, gl.GREATER, gl.GEQUAL, gl.NOTEQUAL, gl.ALWAYS];
   const WRAP = [gl.REPEAT, gl.CLAMP_TO_EDGE, gl.MIRRORED_REPEAT];
@@ -681,15 +835,45 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
   };
   const readFbo = gl.createFramebuffer();
 
-  // Fixed-function state, applied by difference.
-  const fixed = {};
+  // Fixed-function state, applied by difference with a stable hidden class (no property deletion).
+  const fixed = {
+    [gl.CULL_FACE]: undefined,
+    [gl.DEPTH_TEST]: undefined,
+    [gl.POLYGON_OFFSET_FILL]: undefined,
+    [gl.BLEND]: undefined,
+    [gl.SCISSOR_TEST]: undefined,
+    cullFace: undefined,
+    frontFace: undefined,
+    depthFunc: undefined,
+    depthMask: undefined,
+    bias: undefined,
+    slope: undefined,
+    drawBuffers: undefined,
+    blendMode: undefined,
+    colorMask: undefined,
+  };
   const setFlag = (cap, on) => {
     if (fixed[cap] !== on) {
       if (on) gl.enable(cap); else gl.disable(cap);
       fixed[cap] = on;
     }
   };
-  const resetFixed = () => { for (const k of Object.keys(fixed)) delete fixed[k]; };
+  const resetFixed = () => {
+    fixed[gl.CULL_FACE] = undefined;
+    fixed[gl.DEPTH_TEST] = undefined;
+    fixed[gl.POLYGON_OFFSET_FILL] = undefined;
+    fixed[gl.BLEND] = undefined;
+    fixed[gl.SCISSOR_TEST] = undefined;
+    fixed.cullFace = undefined;
+    fixed.frontFace = undefined;
+    fixed.depthFunc = undefined;
+    fixed.depthMask = undefined;
+    fixed.bias = undefined;
+    fixed.slope = undefined;
+    fixed.drawBuffers = undefined;
+    fixed.blendMode = undefined;
+    fixed.colorMask = undefined;
+  };
   let current = null; // pipeline
   let currentProgram = null;
   const applyPipeline = (p) => {
@@ -727,9 +911,9 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
         if (t.blend) blendFunc((...a) => x.blendFuncSeparateiOES(i, ...a), t.blend);
         x.colorMaskiOES(i, !!(t.mask & 1), !!(t.mask & 2), !!(t.mask & 4), !!(t.mask & 8));
       });
-      delete fixed[gl.BLEND];
-      delete fixed.blendMode;
-      delete fixed.colorMask;
+      fixed[gl.BLEND] = undefined;
+      fixed.blendMode = undefined;
+      fixed.colorMask = undefined;
       return;
     }
     setFlag(gl.BLEND, p.blend !== 0);
@@ -886,8 +1070,8 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
   };
 
   const execute = (cmdPtr, words, pushPtr, pushLen) => {
-    const c = u32(cmdPtr, words).slice();
-    const f = new Float32Array(c.buffer);
+    const c = u32(cmdPtr, words);
+    const f = new Float32Array(memory.buffer, cmdPtr >>> 0, words >>> 0);
     pushLen >>>= 0;
     if (pushLen) {
       gl.bindBuffer(gl.UNIFORM_BUFFER, ring);
@@ -1065,7 +1249,8 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
     gl_info(out, cap) {
       const P = (p) => gl.getParameter(p);
       const features = (ext.colorFloat ? 1 : 0) | (ext.floatLinear ? 2 : 0) | (ext.floatBlend ? 4 : 0)
-        | (ext.indexed ? 8 : 0);
+        | (ext.indexed ? 8 : 0) | (ext.s3tc && ext.s3tcSrgb ? 16 : 0)
+        | (ext.bptc ? 32 : 0) | (ext.astc ? 64 : 0);
       const aniso = ext.aniso ? P(ext.aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT) : 1;
       f32[0] = aniso;
       const v = [P(gl.MAX_TEXTURE_SIZE), P(gl.MAX_ARRAY_TEXTURE_LAYERS), P(gl.MAX_UNIFORM_BLOCK_SIZE),
@@ -1118,11 +1303,20 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
     gl_write_texture(h, mip, layer, w, hgt, ptr, len) {
       const t = objects[h >>> 0];
       const fm = t.f;
-      let data = u8(ptr, len).slice();
+      bindScratch(t);
+      if (fm.compressed) {
+        const view = u8(ptr, len);
+        if (t.target === gl.TEXTURE_2D_ARRAY) {
+          gl.compressedTexSubImage3D(t.target, mip, 0, 0, layer, w, hgt, 1, fm.internal, view);
+        } else {
+          gl.compressedTexSubImage2D(t.target, mip, 0, 0, w, hgt, fm.internal, view);
+        }
+        return;
+      }
+      let data = fm.bgra || fm.type !== gl.UNSIGNED_BYTE ? u8(ptr, len).slice() : u8(ptr, len);
       if (fm.bgra) for (let k = 0; k < data.length; k += 4) { const r = data[k]; data[k] = data[k + 2]; data[k + 2] = r; }
       if (fm.type === gl.HALF_FLOAT) data = new Uint16Array(data.buffer);
       else if (fm.type === gl.FLOAT) data = new Float32Array(data.buffer);
-      bindScratch(t);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       if (t.target === gl.TEXTURE_2D_ARRAY) gl.texSubImage3D(t.target, mip, 0, 0, layer, w, hgt, 1, fm.format, fm.type, data);
       else gl.texSubImage2D(t.target, mip, 0, 0, w, hgt, fm.format, fm.type, data);
@@ -1240,6 +1434,7 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
     attach(instance) { memory = instance.exports.memory; },
     nextFrame() {},
     frameTexture() { return surface; },
+    bundleStats: () => ({ cached: 0, candidates: 0, replays: 0 }),
     /** The canvas texture's pixels as RGBA rows, top row first. */
     readSurface() {
       const s = surface;
@@ -1399,7 +1594,12 @@ async function boot(options) {
     gpu = createGl(canvas);
   }
   onLog(0, `${gpu.adapterName}; features: ${gpu.features.join(', ') || 'none'}; canvas ${gpu.format}`);
-  const hostOptions = { onLog, onStatus: options.onStatus || (() => {}), onError: fail };
+  const hostOptions = {
+    onLog,
+    onStatus: options.onStatus || (() => {}),
+    onError: fail,
+    checkErrors: !!options.checkErrors,
+  };
   const host = gpu.api === 'webgl2' ? createGlHost(gpu, hostOptions) : createHost(gpu, hostOptions);
   onPhase('Loading the engine', 0);
   const wasmResponse = await fetch(options.wasm);
@@ -1444,7 +1644,7 @@ async function readPixels(gpu, texture, host) {
  * canvas) and resolves with the canvas pixels and any errors.
  */
 export async function startSelfTest(options) {
-  const { gpu, host, x, errors, fail } = await boot(options);
+  const { gpu, host, x, errors, fail } = await boot({ ...options, checkErrors: true });
   if (options.sizeCanvas) options.sizeCanvas();
   const pixels = await new Promise((resolve, reject) => requestAnimationFrame(() => {
     host.nextFrame();
@@ -1805,9 +2005,18 @@ export async function createEngine(options) {
       const up = v.up || [0, 1, 0];
       const shift = v.shift || [0, 0];
       const f = v.focus;
-      const [p] = place(f32([...v.eye, ...v.target, ...up, v.fov ?? 50, shift[0], shift[1],
-        v.near ?? 0.08, f ? f.distance : 0, f ? f.depth ?? 4 : 0, f ? f.blur ?? 0.006 : 0,
-        f ? 1 : 0]));
+      const p = reserve(68);
+      const dst = new Float32Array(x.memory.buffer, p, 17);
+      dst[0] = v.eye[0]; dst[1] = v.eye[1]; dst[2] = v.eye[2];
+      dst[3] = v.target[0]; dst[4] = v.target[1]; dst[5] = v.target[2];
+      dst[6] = up[0]; dst[7] = up[1]; dst[8] = up[2];
+      dst[9] = v.fov ?? 50;
+      dst[10] = shift[0]; dst[11] = shift[1];
+      dst[12] = v.near ?? 0.08;
+      dst[13] = f ? f.distance : 0;
+      dst[14] = f ? f.depth ?? 4 : 0;
+      dst[15] = f ? f.blur ?? 0.006 : 0;
+      dst[16] = f ? 1 : 0;
       ok('setView', x.ganbate_rt_set_view(p));
     },
     /** Time of day in hours and the animation clock in seconds. */
@@ -1834,6 +2043,7 @@ export async function createEngine(options) {
       return true;
     },
     frames: () => x.ganbate_rt_frames(),
+    bundleStats: () => (host.bundleStats ? host.bundleStats() : { cached: 0, candidates: 0, replays: 0 }),
     /** The last frame's pixels (RGBA rows, top first); for tests. */
     async capture() {
       const texture = host.frameTexture();
@@ -1912,16 +2122,19 @@ export async function createEngine(options) {
     },
     /** Many at once: `[{instance, matrix, visible = true}]`. */
     setInstances(list) {
-      const words = new ArrayBuffer(list.length * 72);
-      const u = new Uint32Array(words);
-      const f = new Float32Array(words);
-      list.forEach((r, k) => {
-        u[k * 18] = r.instance;
-        u[k * 18 + 1] = r.visible === false ? 0 : 1;
-        f.set(r.matrix, k * 18 + 2);
-      });
-      const [p] = place(new Uint8Array(words));
-      ok('setInstances', x.ganbate_rt_instances_set(p, list.length));
+      const n = list.length;
+      if (!n) return;
+      const p = reserve(n * 72);
+      const u = new Uint32Array(x.memory.buffer, p, n * 18);
+      const f = new Float32Array(x.memory.buffer, p, n * 18);
+      for (let k = 0; k < n; k++) {
+        const r = list[k];
+        const base = k * 18;
+        u[base] = r.instance;
+        u[base + 1] = r.visible === false ? 0 : 1;
+        f.set(r.matrix, base + 2);
+      }
+      ok('setInstances', x.ganbate_rt_instances_set(p, n));
     },
     setInstanceMaterial(instance, material) {
       ok('setInstanceMaterial', x.ganbate_rt_instance_material(instance, material));

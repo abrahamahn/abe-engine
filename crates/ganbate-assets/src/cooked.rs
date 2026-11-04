@@ -23,6 +23,8 @@
 //! - texture: width, height, sRGB (0/1), kind. Kind 0: level count (the complete chain, or 1
 //!   for the top level alone), then each level's RGBA8 texels. Kind 1: an encoded image (MIME
 //!   type length, the type zero-padded to 4 bytes, data length, the data zero-padded to 4).
+//!   Kind 2: block-compressed mip chain (codec id `0=BC1`, `1=BC7`, `2=ASTC 4x4`, level count,
+//!   then each level's compressed block bytes).
 //! - light: position (3 f32), colour (3 f32), intensity, range.
 //!
 //! Version 4 (written by `encode_scene`): version 3 followed by an entity table: the entity
@@ -41,7 +43,8 @@ use ganbate_core::{
     world::{
         AlphaMode, Emission, EncodedImage, EntityRecord, EntityTable, IMAGE_TYPES, Instance,
         MAX_ENTITIES, MAX_ENTITY_DATA, MAX_LIGHTS, MAX_MATERIALS, MAX_NAME_BYTES, MAX_TEXTURE_SIZE,
-        MAX_TEXTURES, Material, Mesh, PointLight, Shading, Texture, Transform, World,
+        MAX_TEXTURES, Material, Mesh, PointLight, Shading, Texture, TextureCompression, Transform,
+        World,
     },
 };
 const MAGIC: &[u8; 4] = b"GBEW";
@@ -596,22 +599,31 @@ fn encode_with(w: &World, compact: bool) -> Result<Vec<u8>, String> {
         put_u32(&mut v, t.width as usize)?;
         put_u32(&mut v, t.height as usize)?;
         put_u32(&mut v, usize::from(t.srgb))?;
-        match &t.encoded {
-            None => {
-                put_u32(&mut v, 0)?;
-                put_u32(&mut v, t.levels.len())?;
-                for level in &t.levels {
-                    v.extend_from_slice(level);
-                }
+        if let Some(comp) = t.compression() {
+            put_u32(&mut v, 2)?;
+            put_u32(&mut v, comp.codec_id() as usize)?;
+            put_u32(&mut v, t.levels.len())?;
+            for level in &t.levels {
+                v.extend_from_slice(level);
             }
-            Some(e) => {
-                put_u32(&mut v, 1)?;
-                put_u32(&mut v, e.mime.len())?;
-                v.extend_from_slice(e.mime.as_bytes());
-                pad4(&mut v);
-                put_u32(&mut v, e.data.len())?;
-                v.extend_from_slice(&e.data);
-                pad4(&mut v);
+        } else {
+            match &t.encoded {
+                None => {
+                    put_u32(&mut v, 0)?;
+                    put_u32(&mut v, t.levels.len())?;
+                    for level in &t.levels {
+                        v.extend_from_slice(level);
+                    }
+                }
+                Some(e) => {
+                    put_u32(&mut v, 1)?;
+                    put_u32(&mut v, e.mime.len())?;
+                    v.extend_from_slice(e.mime.as_bytes());
+                    pad4(&mut v);
+                    put_u32(&mut v, e.data.len())?;
+                    v.extend_from_slice(&e.data);
+                    pad4(&mut v);
+                }
             }
         }
         if v.len() > MAX_BYTES {
@@ -915,7 +927,7 @@ fn decode_v2(r: &mut Read, version: u32) -> Result<World, String> {
         if !limit.contains(&width) || !limit.contains(&height) {
             return Err("invalid texture size".into());
         }
-        let kind = if version >= 3 { r.choice(2)? } else { 0 };
+        let kind = if version >= 3 { r.choice(3)? } else { 0 };
         if kind == 1 {
             let len = r.uint()? as usize;
             if len > 64 {
@@ -942,6 +954,30 @@ fn decode_v2(r: &mut Read, version: u32) -> Result<World, String> {
                     data: data[..size].to_vec(),
                 }),
             });
+            continue;
+        }
+        if kind == 2 {
+            let codec = TextureCompression::from_codec_id(r.uint()?)
+                .ok_or_else(|| "unsupported compressed texture codec".to_string())?;
+            let count = r.uint()? as usize;
+            let full = Texture::level_count(width, height);
+            if count != full && count != 1 {
+                return Err("invalid texture size or mip chain".into());
+            }
+            let sizes: Vec<u64> = (0..count)
+                .map(|i| {
+                    let (w, h) = Texture::level_extent(width, height, i);
+                    codec.mip_byte_len(w, h) as u64
+                })
+                .collect();
+            r.holds(sizes.iter().sum())?;
+            let levels = sizes
+                .into_iter()
+                .map(|n| r.bytes(n).map(<[u8]>::to_vec))
+                .collect::<Result<_, _>>()?;
+            world
+                .textures
+                .push(Texture::compressed(width, height, srgb, codec, levels));
             continue;
         }
         let count = r.uint()? as usize;

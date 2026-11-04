@@ -191,6 +191,8 @@ export interface GanbateEngine {
   /** Draws and presents a frame; false when it skipped (GPU busy). */
   render(): boolean;
   frames(): number;
+  /** Static WebGPU render-bundle cache telemetry (`{ cached, candidates, replays }`). */
+  bundleStats(): { cached: number; candidates: number; replays: number };
   /** The last frame's pixels (RGBA rows, top first). */
   capture(): Promise<{ width: number; height: number; rgba: Uint8ClampedArray }>;
   /** Waits for submitted GPU work (WebGPU; immediate on WebGL 2). */

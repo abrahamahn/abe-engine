@@ -209,17 +209,12 @@ impl Shape {
 
     /// The radius of the largest ball about the centre of the shape's core
     /// ([`ConvexShape::center`]) that lies inside the shape; 0 for meshes and heightfields.
+    #[inline]
     pub fn inner_radius(&self) -> f32 {
         match self {
             Shape::Sphere { radius } | Shape::Capsule { radius, .. } => *radius,
             Shape::Box { half_extents } => half_extents.min_element(),
-            Shape::Hull(h) => {
-                // The nearest face plane from the centre.
-                let r = h.faces.iter().fold(f32::INFINITY, |r, f| {
-                    r.min(f.offset - f.normal.dot(h.centroid))
-                });
-                if r.is_finite() { r.max(0.0) } else { 0.0 }
-            }
+            Shape::Hull(h) => h.inner_radius,
             Shape::Mesh(_) | Shape::Heightfield(_) => 0.0,
         }
     }
@@ -316,6 +311,7 @@ pub enum ConvexShape<'a> {
 
 impl ConvexShape<'_> {
     /// The rounding radius: the shape is its core grown by this much.
+    #[inline]
     pub fn radius(&self) -> f32 {
         match *self {
             ConvexShape::Sphere(r) => r,
@@ -325,6 +321,7 @@ impl ConvexShape<'_> {
     }
 
     /// The farthest point of the *core* along local direction `d` (need not be unit length).
+    #[inline]
     pub fn support_core(&self, d: Vec3) -> Vec3 {
         match *self {
             ConvexShape::Sphere(_) => Vec3::ZERO,
@@ -364,6 +361,7 @@ impl ConvexShape<'_> {
     }
 
     /// A point inside the core (its centre), to start iterative searches from.
+    #[inline]
     pub fn center(&self) -> Vec3 {
         match *self {
             ConvexShape::Hull(h) => h.centroid,
@@ -382,17 +380,21 @@ pub struct Convex<'a> {
 }
 
 impl<'a> Convex<'a> {
+    #[inline]
     pub fn new(shape: ConvexShape<'a>, iso: Iso) -> Self {
         Self { shape, iso }
     }
     /// The core's farthest point along world direction `d`, in world space.
+    #[inline]
     pub fn support_core(&self, d: Vec3) -> Vec3 {
         self.iso
             .point(self.shape.support_core(self.iso.inverse_vector(d)))
     }
+    #[inline]
     pub fn radius(&self) -> f32 {
         self.shape.radius()
     }
+    #[inline]
     pub fn center(&self) -> Vec3 {
         self.iso.point(self.shape.center())
     }

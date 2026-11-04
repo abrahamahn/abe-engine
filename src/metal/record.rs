@@ -6,18 +6,39 @@
 use super::ffi::{self, MTLClearColor, MTLOrigin, MTLScissorRect, MTLSize, MTLViewport};
 use super::*;
 use crate::gpu::{
-    BindGroupId, BufferUsage, Command, Encoder, Filter, Load, PassDesc, TextureUsage,
+    BindGroupId, BufferUsage, Command, Encoder, Filter, Load, PassView, Span, TextureUsage,
+    TransferCmd,
 };
-use core::ops::Range;
 use ganbate_shader::MslIndex;
 
-/// What the replay has bound on the current encoder, to skip redundant calls.
-#[derive(Default)]
+const MAX_BUFFER_SLOTS: usize = 31;
+const MAX_TEXTURE_SLOTS: usize = 32;
+const MAX_SAMPLER_SLOTS: usize = 16;
+
+/// What the replay has bound on the current encoder, stored inline without heap allocations.
 struct Bindings {
-    buffers: HashMap<(u8, u32), (Id, u64)>,
-    textures: HashMap<(u8, u32), Id>,
-    samplers: HashMap<(u8, u32), Id>,
-    bytes: HashMap<(u8, u32), Vec<u8>>,
+    buffers: [[Option<(Id, u64)>; MAX_BUFFER_SLOTS]; 3],
+    textures: [[Option<Id>; MAX_TEXTURE_SLOTS]; 3],
+    samplers: [[Option<Id>; MAX_SAMPLER_SLOTS]; 3],
+    push_set: [bool; 3],
+    push_len: [u16; 3],
+    push_bytes: [[u8; 256]; 3],
+    sizes_len: [u8; 3],
+    sizes_bytes: [[u8; 128]; 3],
+}
+impl Default for Bindings {
+    fn default() -> Self {
+        Self {
+            buffers: [[None; MAX_BUFFER_SLOTS]; 3],
+            textures: [[None; MAX_TEXTURE_SLOTS]; 3],
+            samplers: [[None; MAX_SAMPLER_SLOTS]; 3],
+            push_set: [false; 3],
+            push_len: [0; 3],
+            push_bytes: [[0; 256]; 3],
+            sizes_len: [u8::MAX; 3],
+            sizes_bytes: [[0; 128]; 3],
+        }
+    }
 }
 
 /// State of the render pass being replayed.
@@ -25,13 +46,13 @@ struct Bindings {
 struct DrawState {
     pipeline: Option<PipelineId>,
     groups: [Option<BindGroupId>; 8],
-    vertex: bool,
+    vertex: Option<(Id, u64)>,
     index: Option<(Id, u64)>,
-    push: Option<Range<usize>>,
+    push: Option<Span>,
     bound: Bindings,
 }
 
-fn stage_code(k: StageKind) -> u8 {
+fn stage_code(k: StageKind) -> usize {
     match k {
         StageKind::Vertex => 0,
         StageKind::Fragment => 1,
@@ -121,14 +142,14 @@ impl Target {
 }
 
 impl<'w> Gpu<'w> {
-    pub fn submit(&mut self, e: Encoder) -> Result<()> {
+    pub fn submit(&mut self, e: &Encoder) -> Result<()> {
         e.finish()?;
         autoreleasepool(|| {
             self.collect()?;
             let cb = self.command_buffer()?;
-            self.record(cb.id(), &e, None)?;
+            self.record(cb.id(), e, None)?;
             let serial = self.commit(cb);
-            self.mark_used(&e, serial);
+            self.mark_used(e, serial);
             self.wait_serial(serial)
         })
     }
@@ -145,36 +166,83 @@ impl<'w> Gpu<'w> {
         Ok(t)
     }
 
-    /// Records that the buffers an encoder uses are busy until submission `serial`.
-    pub(super) fn mark_used(&mut self, e: &Encoder, serial: u64) {
-        let mut buffers = Vec::new();
-        let mut groups = Vec::new();
-        for c in &e.commands {
-            match c {
-                Command::SetBindGroup(_, g) => groups.push(*g),
-                Command::SetVertexBuffer(b, _) | Command::SetIndexBuffer(b, _) => buffers.push(*b),
-                Command::CopyTextureToBuffer { dst, .. } => buffers.push(*dst),
-                Command::CopyBufferToBuffer { src, dst, .. } => {
-                    buffers.push(*src);
-                    buffers.push(*dst);
+    fn touch_group(&mut self, g: BindGroupId, serial: u64) {
+        if let Some(group) = self.groups.get(g.raw()) {
+            let mut ids = [BufferId::from_raw(0); 32];
+            let mut n = 0usize;
+            for (_, b) in &group.bound {
+                if let Bound::Buffer { id, .. } = b {
+                    if n < ids.len() {
+                        ids[n] = *id;
+                        n += 1;
+                    }
                 }
-                _ => {}
             }
-        }
-        groups.extend(e.groups.iter().map(|(_, g)| *g));
-        for g in groups {
-            if let Some(group) = self.groups.get(g.raw()) {
-                for (_, b) in &group.bound {
-                    if let Bound::Buffer { id, .. } = b {
-                        buffers.push(*id);
+            for &id in &ids[..n] {
+                if let Some(buf) = self.buffers.get_mut(id.raw()) {
+                    buf.last_use = serial;
+                }
+            }
+            if n == ids.len()
+                && let Some(group) = self.groups.get(g.raw())
+            {
+                let extra: Vec<BufferId> = group
+                    .bound
+                    .iter()
+                    .filter_map(|(_, b)| match b {
+                        Bound::Buffer { id, .. } => Some(*id),
+                        _ => None,
+                    })
+                    .skip(ids.len())
+                    .collect();
+                for id in extra {
+                    if let Some(buf) = self.buffers.get_mut(id.raw()) {
+                        buf.last_use = serial;
                     }
                 }
             }
         }
-        for b in buffers {
-            if let Some(buf) = self.buffers.get_mut(b.raw()) {
-                buf.last_use = serial;
+    }
+
+    /// Records that the buffers an encoder uses are busy until submission `serial`.
+    pub(super) fn mark_used(&mut self, e: &Encoder, serial: u64) {
+        let mut last_group = None;
+        for c in &e.commands {
+            match *c {
+                Command::SetBindGroup(_, g) => {
+                    if last_group != Some(g) {
+                        last_group = Some(g);
+                        self.touch_group(g, serial);
+                    }
+                }
+                Command::SetVertexBuffer(b, _) | Command::SetIndexBuffer(b, _) => {
+                    if let Some(buf) = self.buffers.get_mut(b.raw()) {
+                        buf.last_use = serial;
+                    }
+                }
+                _ => {}
             }
+        }
+        for t in &e.transfers {
+            match *t {
+                TransferCmd::CopyTextureToBuffer { dst, .. } => {
+                    if let Some(buf) = self.buffers.get_mut(dst.raw()) {
+                        buf.last_use = serial;
+                    }
+                }
+                TransferCmd::CopyBufferToBuffer { src, dst, .. } => {
+                    if let Some(buf) = self.buffers.get_mut(src.raw()) {
+                        buf.last_use = serial;
+                    }
+                    if let Some(buf) = self.buffers.get_mut(dst.raw()) {
+                        buf.last_use = serial;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for &(_, g) in &e.groups {
+            self.touch_group(g, serial);
         }
     }
 
@@ -188,45 +256,52 @@ impl<'w> Gpu<'w> {
         let commands = &e.commands;
         let mut i = 0;
         while i < commands.len() {
-            match &commands[i] {
-                Command::BeginPass(desc) => {
-                    let end = commands[i..]
-                        .iter()
-                        .position(|c| matches!(c, Command::EndPass))
-                        .map(|n| i + n)
-                        .ok_or("begin_pass without end_pass")?;
+            match commands[i] {
+                Command::BeginPass {
+                    colors,
+                    depth,
+                    end_cmd,
+                } => {
+                    let end = if end_cmd != u32::MAX {
+                        end_cmd as usize
+                    } else {
+                        return Err("begin_pass without end_pass".into());
+                    };
+                    let desc = e.pass(colors, depth);
                     self.record_pass(cb, e, desc, &commands[i + 1..end], acquired)?;
                     i = end;
                 }
-                Command::Dispatch {
-                    pipeline,
-                    groups,
-                    push,
-                    size,
-                } => self.record_dispatch(
-                    cb,
-                    *pipeline,
-                    &e.groups[groups.clone()],
-                    &e.bytes[push.clone()],
-                    *size,
-                )?,
-                &Command::CopyTextureToBuffer {
-                    src,
-                    mip,
-                    layer,
-                    dst,
-                    offset,
-                } => self.record_texture_copy(cb, (src, mip, layer), dst, offset, acquired)?,
-                &Command::CopyBufferToBuffer {
-                    src,
-                    src_offset,
-                    dst,
-                    dst_offset,
-                    size,
-                } => self.record_buffer_copy(cb, (src, src_offset), (dst, dst_offset), size)?,
-                &Command::Blit { src, dst, filter } => {
-                    self.record_blit(cb, src, dst, filter, acquired)?
-                }
+                Command::Transfer(idx) => match &e.transfers[idx as usize] {
+                    &TransferCmd::Dispatch {
+                        pipeline,
+                        groups,
+                        push,
+                        size,
+                    } => self.record_dispatch(
+                        cb,
+                        pipeline,
+                        &e.groups[groups.range()],
+                        &e.bytes[push.range()],
+                        size,
+                    )?,
+                    &TransferCmd::CopyTextureToBuffer {
+                        src,
+                        mip,
+                        layer,
+                        dst,
+                        offset,
+                    } => self.record_texture_copy(cb, (src, mip, layer), dst, offset, acquired)?,
+                    &TransferCmd::CopyBufferToBuffer {
+                        src,
+                        src_offset,
+                        dst,
+                        dst_offset,
+                        size,
+                    } => self.record_buffer_copy(cb, (src, src_offset), (dst, dst_offset), size)?,
+                    &TransferCmd::Blit { src, dst, filter } => {
+                        self.record_blit(cb, src, dst, filter, acquired)?
+                    }
+                },
                 other => return Err(format!("{other:?} recorded outside a pass")),
             }
             i += 1;
@@ -238,7 +313,7 @@ impl<'w> Gpu<'w> {
         &mut self,
         cb: Id,
         e: &Encoder,
-        desc: &PassDesc,
+        desc: PassView<'_>,
         body: &[Command],
         acquired: Option<TextureId>,
     ) -> Result<()> {
@@ -255,7 +330,8 @@ impl<'w> Gpu<'w> {
             Self::new_object(class!("MTLRenderPassDescriptor"), "MTLRenderPassDescriptor")?;
         let rp = descriptor.id();
         let mut size = None;
-        let mut attached: Vec<(TextureId, u32, u32)> = Vec::new();
+        let mut attached = [(TextureId::from_raw(0), 0u32, 0u32); 9];
+        let mut attached_len = 0usize;
         // SAFETY: (whole function) descriptors and encoders are live; textures were looked up
         // in the pools and stay alive for the command buffer.
         unsafe {
@@ -265,7 +341,7 @@ impl<'w> Gpu<'w> {
                 .iter()
                 .enumerate()
                 .map(|(i, a)| (a, Some(i)))
-                .chain(desc.depth.iter().map(|a| (a, None)));
+                .chain(desc.depth.into_iter().map(|a| (a, None)));
             for (a, index) in attachments {
                 let depth = index.is_none();
                 let t = self.usable(a.texture, acquired)?;
@@ -292,10 +368,11 @@ impl<'w> Gpu<'w> {
                     return Err("begin_pass: attachments differ in size".into());
                 }
                 let sub = (a.texture, a.mip, a.layer);
-                if attached.contains(&sub) {
+                if attached[..attached_len].contains(&sub) {
                     return Err("begin_pass: the same subresource is attached twice".into());
                 }
-                attached.push(sub);
+                attached[attached_len] = sub;
+                attached_len += 1;
                 let target = match index {
                     Some(i) => at_index(colors, i),
                     None => send!(rp, "depthAttachment"; Id),
@@ -330,6 +407,7 @@ impl<'w> Gpu<'w> {
                 }
             }
             // A subresource cannot be an attachment and sampled in the same pass.
+            let mut last_group = None;
             for c in body {
                 match *c {
                     Command::SetBindGroup(_, g) => {
@@ -337,17 +415,23 @@ impl<'w> Gpu<'w> {
                             .groups
                             .get(g.raw())
                             .ok_or_else(|| format!("{g:?} was destroyed"))?;
+                        if last_group == Some(g) {
+                            continue;
+                        }
+                        last_group = Some(g);
                         for (_, b) in &group.bound {
                             if let Bound::Texture {
                                 id, mips, layers, ..
                             } = b
                             {
                                 self.texture(*id)?;
-                                if let Some((_, mip, layer)) = attached.iter().find(|(t, m, l)| {
-                                    t == id
-                                        && (mips.0..mips.1).contains(m)
-                                        && (layers.0..layers.1).contains(l)
-                                }) {
+                                if let Some((_, mip, layer)) =
+                                    attached[..attached_len].iter().find(|(t, m, l)| {
+                                        t == id
+                                            && (mips.0..mips.1).contains(m)
+                                            && (layers.0..layers.1).contains(l)
+                                    })
+                                {
                                     return Err(format!(
                                         "{id:?} mip {mip} layer {layer} is used as an attachment \
                                          and as a sampled texture in one pass"
@@ -394,14 +478,14 @@ impl<'w> Gpu<'w> {
         enc: Id,
         e: &Encoder,
         body: &[Command],
-        desc: &PassDesc,
+        desc: PassView<'_>,
         (w, h): (u32, u32),
     ) -> Result<()> {
-        let pass_colors: Vec<Format> = desc
-            .colors
-            .iter()
-            .map(|a| self.texture(a.texture).map(|t| t.desc.format))
-            .collect::<Result<_>>()?;
+        let mut pass_colors = [Format::Rgba8Unorm; 8];
+        for (i, a) in desc.colors.iter().enumerate() {
+            pass_colors[i] = self.texture(a.texture)?.desc.format;
+        }
+        let pass_colors = &pass_colors[..desc.colors.len()];
         let pass_depth = desc
             .depth
             .map(|a| self.texture(a.texture).map(|t| t.desc.format))
@@ -411,10 +495,11 @@ impl<'w> Gpu<'w> {
             // SAFETY (for every call below): the encoder is recording inside the pass begun by
             // record_pass; all referenced objects were validated as alive.
             unsafe {
-                match c {
-                    &Command::SetPipeline(id) => {
+                match *c {
+                    Command::SetPipeline(id) => {
                         let p = self.pipeline(id)?;
-                        if p.compute || p.colors != pass_colors || p.depth != pass_depth {
+                        if p.compute || p.colors.as_slice() != pass_colors || p.depth != pass_depth
+                        {
                             return Err(format!(
                                 "set_pipeline: {id:?} renders {:?} + depth {:?}, which does not \
                                  match this pass",
@@ -441,31 +526,34 @@ impl<'w> Gpu<'w> {
                             st.pipeline = Some(id);
                         }
                     }
-                    &Command::SetBindGroup(g, id) => {
+                    Command::SetBindGroup(g, id) => {
                         let slot = st
                             .groups
                             .get_mut(g as usize)
                             .ok_or_else(|| format!("set_bind_group: group {g} is out of range"))?;
                         *slot = Some(id);
                     }
-                    &Command::SetVertexBuffer(id, offset) => {
+                    Command::SetVertexBuffer(id, offset) => {
                         let b = self.buffer(id)?;
                         if offset >= b.desc.size {
                             return Err(format!(
                                 "set_vertex_buffer: offset {offset} is past the end"
                             ));
                         }
-                        send!(
-                            enc,
-                            "setVertexBuffer:offset:atIndex:",
-                            b.obj.id() => Id,
-                            offset as NSUInteger => NSUInteger,
-                            ganbate_shader::VERTEX_BUFFER as NSUInteger => NSUInteger;
-                            ()
-                        );
-                        st.vertex = true;
+                        let pair = (b.obj.id(), offset);
+                        if st.vertex != Some(pair) {
+                            send!(
+                                enc,
+                                "setVertexBuffer:offset:atIndex:",
+                                b.obj.id() => Id,
+                                offset as NSUInteger => NSUInteger,
+                                ganbate_shader::VERTEX_BUFFER as NSUInteger => NSUInteger;
+                                ()
+                            );
+                            st.vertex = Some(pair);
+                        }
                     }
-                    &Command::SetIndexBuffer(id, offset) => {
+                    Command::SetIndexBuffer(id, offset) => {
                         let b = self.buffer(id)?;
                         if offset >= b.desc.size || offset % 4 != 0 {
                             return Err(format!(
@@ -474,7 +562,7 @@ impl<'w> Gpu<'w> {
                         }
                         st.index = Some((b.obj.id(), offset));
                     }
-                    &Command::SetViewport([x, y, vw, vh]) => {
+                    Command::SetViewport([x, y, vw, vh]) => {
                         let v = MTLViewport {
                             origin_x: f64::from(x),
                             origin_y: f64::from(y),
@@ -485,7 +573,7 @@ impl<'w> Gpu<'w> {
                         };
                         send!(enc, "setViewport:", v => MTLViewport; ());
                     }
-                    &Command::SetScissor([x, y, sw, sh]) => {
+                    Command::SetScissor([x, y, sw, sh]) => {
                         let (x, y) = (x.min(w), y.min(h));
                         let r = MTLScissorRect {
                             x: x as usize,
@@ -495,8 +583,8 @@ impl<'w> Gpu<'w> {
                         };
                         send!(enc, "setScissorRect:", r => MTLScissorRect; ());
                     }
-                    Command::PushConstants(range) => st.push = Some(range.clone()),
-                    &Command::Draw {
+                    Command::PushConstants(span) => st.push = Some(span),
+                    Command::Draw {
                         vertices,
                         instances,
                         first_vertex,
@@ -516,7 +604,7 @@ impl<'w> Gpu<'w> {
                             );
                         }
                     }
-                    &Command::DrawIndexed {
+                    Command::DrawIndexed {
                         indices,
                         instances,
                         first_index,
@@ -559,15 +647,18 @@ impl<'w> Gpu<'w> {
     ) -> Result<u64> {
         let id = st.pipeline.ok_or("draw without set_pipeline")?;
         let p = self.pipeline(id)?;
-        if p.vertex_input && !st.vertex {
+        if p.vertex_input && st.vertex.is_none() {
             return Err(format!("{id:?} reads vertices but no vertex buffer is set"));
         }
         if indexed && st.index.is_none() {
             return Err("draw_indexed without set_index_buffer".into());
         }
-        let push = match (&st.push, p.push_size) {
+        let push = match (st.push, p.push_size) {
             (_, 0) => None,
-            (Some(r), n) if r.len() >= n as usize => Some(&e.bytes[r.start..r.start + n as usize]),
+            (Some(r), n) if r.len() >= n as usize => {
+                let s = r.start as usize;
+                Some(&e.bytes[s..s + n as usize])
+            }
             (Some(r), n) => {
                 return Err(format!(
                     "{id:?} uses {n} bytes of push constants but only {} are set",
@@ -580,8 +671,7 @@ impl<'w> Gpu<'w> {
                 ));
             }
         };
-        let groups: Vec<Option<BindGroupId>> = st.groups.to_vec();
-        self.bind_groups(p, id, &groups, enc, push, &mut st.bound)?;
+        self.bind_groups(p, id, &st.groups, enc, push, &mut st.bound)?;
         Ok(p.raster
             .as_ref()
             .map_or(ffi::primitive::TRIANGLE, |r| r.primitive))
@@ -598,7 +688,7 @@ impl<'w> Gpu<'w> {
         push: Option<&[u8]>,
         bound: &mut Bindings,
     ) -> Result<()> {
-        let mut resolved: Vec<Option<&BindGroup>> = vec![None; p.groups.len()];
+        let mut resolved: [Option<&BindGroup>; 8] = [None; 8];
         for (g, layout) in p.groups.iter().enumerate() {
             if layout.is_empty() {
                 continue;
@@ -640,16 +730,24 @@ impl<'w> Gpu<'w> {
                     match (slot.index, find(slot.group, slot.binding)?) {
                         (MslIndex::Buffer(i), Bound::Buffer { id, offset, .. }) => {
                             let b = self.buffer(*id)?.obj.id();
-                            if bound.buffers.get(&(code, i)) != Some(&(b, *offset)) {
+                            let idx = i as usize;
+                            if idx >= MAX_BUFFER_SLOTS
+                                || bound.buffers[code][idx] != Some((b, *offset))
+                            {
                                 target.buffer(b, *offset, i);
-                                bound.buffers.insert((code, i), (b, *offset));
+                                if idx < MAX_BUFFER_SLOTS {
+                                    bound.buffers[code][idx] = Some((b, *offset));
+                                }
                             }
                         }
                         (MslIndex::Texture(i), Bound::Texture { id, obj, .. }) => {
                             self.texture(*id)?;
-                            if bound.textures.get(&(code, i)) != Some(obj) {
+                            let idx = i as usize;
+                            if idx >= MAX_TEXTURE_SLOTS || bound.textures[code][idx] != Some(*obj) {
                                 target.texture(*obj, i);
-                                bound.textures.insert((code, i), *obj);
+                                if idx < MAX_TEXTURE_SLOTS {
+                                    bound.textures[code][idx] = Some(*obj);
+                                }
                             }
                         }
                         (MslIndex::Sampler(i), Bound::Sampler(s)) => {
@@ -659,9 +757,12 @@ impl<'w> Gpu<'w> {
                                 .ok_or_else(|| format!("{s:?} does not belong to this device"))?
                                 .obj
                                 .id();
-                            if bound.samplers.get(&(code, i)) != Some(&s) {
+                            let idx = i as usize;
+                            if idx >= MAX_SAMPLER_SLOTS || bound.samplers[code][idx] != Some(s) {
                                 target.sampler(s, i);
-                                bound.samplers.insert((code, i), s);
+                                if idx < MAX_SAMPLER_SLOTS {
+                                    bound.samplers[code][idx] = Some(s);
+                                }
                             }
                         }
                         (index, b) => {
@@ -673,28 +774,58 @@ impl<'w> Gpu<'w> {
                     }
                 }
             }
-            let mut send_bytes = |data: Vec<u8>, index: u32| {
-                if bound.bytes.get(&(code, index)) != Some(&data) {
-                    // SAFETY: the encoder is recording; Metal copies the bytes.
-                    unsafe { target.bytes(&data, index) };
-                    bound.bytes.insert((code, index), data);
-                }
-            };
             if stage.push
                 && let Some(data) = push
             {
-                send_bytes(data.to_vec(), ganbate_shader::PUSH_CONSTANT_BUFFER);
+                let same = bound.push_set[code]
+                    && bound.push_len[code] as usize == data.len()
+                    && data.len() <= bound.push_bytes[code].len()
+                    && &bound.push_bytes[code][..data.len()] == data;
+                if !same {
+                    // SAFETY: the encoder is recording; Metal copies the bytes.
+                    unsafe { target.bytes(data, ganbate_shader::PUSH_CONSTANT_BUFFER) };
+                    if data.len() <= bound.push_bytes[code].len() {
+                        bound.push_bytes[code][..data.len()].copy_from_slice(data);
+                        bound.push_len[code] = data.len() as u16;
+                        bound.push_set[code] = true;
+                    } else {
+                        bound.push_set[code] = false;
+                    }
+                }
             }
             if !stage.sized.is_empty() {
-                let mut sizes = Vec::with_capacity(stage.sized.len() * 4);
-                for &(group, binding) in &stage.sized {
-                    let size = match find(group, binding)? {
-                        Bound::Buffer { size, .. } => u32::try_from(*size).unwrap_or(u32::MAX),
-                        _ => 0,
-                    };
-                    sizes.extend_from_slice(&size.to_le_bytes());
+                let byte_len = stage.sized.len() * 4;
+                if byte_len <= bound.sizes_bytes[code].len() {
+                    let mut tmp = [0u8; 128];
+                    for (k, &(group, binding)) in stage.sized.iter().enumerate() {
+                        let size = match find(group, binding)? {
+                            Bound::Buffer { size, .. } => u32::try_from(*size).unwrap_or(u32::MAX),
+                            _ => 0,
+                        };
+                        tmp[k * 4..k * 4 + 4].copy_from_slice(&size.to_le_bytes());
+                    }
+                    let slice = &tmp[..byte_len];
+                    if bound.sizes_len[code] as usize != byte_len
+                        || &bound.sizes_bytes[code][..byte_len] != slice
+                    {
+                        // SAFETY: the encoder is recording; Metal copies the bytes.
+                        unsafe { target.bytes(slice, ganbate_shader::SIZES_BUFFER) };
+                        bound.sizes_bytes[code][..byte_len].copy_from_slice(slice);
+                        bound.sizes_len[code] = byte_len as u8;
+                    }
+                } else {
+                    let mut sizes = Vec::with_capacity(byte_len);
+                    for &(group, binding) in &stage.sized {
+                        let size = match find(group, binding)? {
+                            Bound::Buffer { size, .. } => u32::try_from(*size).unwrap_or(u32::MAX),
+                            _ => 0,
+                        };
+                        sizes.extend_from_slice(&size.to_le_bytes());
+                    }
+                    // SAFETY: the encoder is recording; Metal copies the bytes.
+                    unsafe { target.bytes(&sizes, ganbate_shader::SIZES_BUFFER) };
+                    bound.sizes_len[code] = u8::MAX;
                 }
-                send_bytes(sizes, ganbate_shader::SIZES_BUFFER);
             }
         }
         Ok(())

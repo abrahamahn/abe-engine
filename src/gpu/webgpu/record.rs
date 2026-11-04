@@ -21,8 +21,7 @@
 //! * `BLIT` src texture, mip, layer, dst texture, mip, layer, filter (0 nearest, 1 linear)
 use super::ffi::{EMPTY_GROUP, PUSH_COMPUTE, PUSH_RENDER, SURFACE};
 use super::*;
-use crate::gpu::{Command, Encoder, Load, PassDesc};
-use core::ops::Range;
+use crate::gpu::{Command, Encoder, Load, PassView, Span, TransferCmd};
 
 const BEGIN_RENDER: u32 = 1;
 const END_RENDER: u32 = 2;
@@ -43,30 +42,90 @@ fn u64_words(v: u64) -> [u32; 2] {
     [v as u32, (v >> 32) as u32]
 }
 
-/// Push-constant blocks of one submission.
-#[derive(Default)]
+#[inline]
+fn hash_bytes(data: &[u8]) -> usize {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in data {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h as usize
+}
+
+/// Push-constant blocks of one submission, deduplicated without per-block `Vec<u8>` allocations.
 pub(super) struct Ring {
     pub bytes: Vec<u8>,
-    offsets: HashMap<Vec<u8>, u32>,
+    table: Vec<(u64, u32, u32)>,
+    used: usize,
+    stamp: u64,
     slot: u32,
 }
-impl Ring {
-    fn new(align: u32) -> Self {
+impl Default for Ring {
+    fn default() -> Self {
         Self {
-            slot: PUSH_SLOT.next_multiple_of(align.max(1)),
-            ..Self::default()
+            bytes: Vec::new(),
+            table: Vec::new(),
+            used: 0,
+            stamp: 1,
+            slot: PUSH_SLOT,
         }
     }
+}
+impl Ring {
+    fn reset(&mut self, align: u32) {
+        self.bytes.clear();
+        self.used = 0;
+        self.slot = PUSH_SLOT.next_multiple_of(align.max(1));
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            self.table.fill((0, 0, 0));
+            self.stamp = 1;
+        }
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let new_cap = (self.table.len() * 2).max(64);
+        let old = core::mem::replace(&mut self.table, vec![(0, 0, 0); new_cap]);
+        let mask = new_cap - 1;
+        let stamp = self.stamp;
+        for (st, off, len) in old {
+            if st != stamp {
+                continue;
+            }
+            let slice = &self.bytes[off as usize..(off + len) as usize];
+            let mut pos = hash_bytes(slice) & mask;
+            while self.table[pos].0 == stamp {
+                pos = (pos + 1) & mask;
+            }
+            self.table[pos] = (stamp, off, len);
+        }
+    }
+
     /// The offset of a block holding `data`, zero-padded to the slot size.
     fn place(&mut self, data: &[u8]) -> u32 {
-        if let Some(&o) = self.offsets.get(data) {
-            return o;
+        if (self.used + 1) * 2 > self.table.len() {
+            self.grow();
         }
-        let offset = self.bytes.len() as u32;
-        self.bytes.extend_from_slice(data);
-        self.bytes.resize((offset + self.slot) as usize, 0);
-        self.offsets.insert(data.to_vec(), offset);
-        offset
+        let mask = self.table.len() - 1;
+        let mut pos = hash_bytes(data) & mask;
+        loop {
+            let (st, off, len) = self.table[pos];
+            if st != self.stamp {
+                let offset = self.bytes.len() as u32;
+                self.bytes.extend_from_slice(data);
+                self.bytes.resize((offset + self.slot) as usize, 0);
+                self.table[pos] = (self.stamp, offset, data.len() as u32);
+                self.used += 1;
+                return offset;
+            }
+            if len as usize == data.len()
+                && &self.bytes[off as usize..(off + len) as usize] == data
+            {
+                return off;
+            }
+            pos = (pos + 1) & mask;
+        }
     }
 }
 
@@ -78,10 +137,10 @@ struct DrawState {
     groups: [Option<BindGroupId>; MAX_GROUPS],
     /// What the host has bound, per group: (handle, dynamic offset).
     bound: [Option<(u32, Option<u32>)>; MAX_GROUPS],
-    checked: Vec<BindGroupId>,
-    vertex: bool,
-    index: bool,
-    push: Option<Range<usize>>,
+    checked: [Option<BindGroupId>; MAX_GROUPS],
+    vertex: Option<(u32, u64)>,
+    index: Option<(u32, u64)>,
+    push: Option<Span>,
 }
 
 fn bind(out: &mut Vec<u32>, st: &mut DrawState, slot: usize, js: u32, offset: Option<u32>) {
@@ -136,69 +195,74 @@ impl Gpu<'_> {
         &self,
         e: &Encoder,
         acquired: Option<TextureId>,
-    ) -> Result<(Vec<u32>, Vec<u8>)> {
+        out: &mut Vec<u32>,
+        ring: &mut Ring,
+    ) -> Result<()> {
         e.finish()?;
-        let mut out = Vec::with_capacity(e.commands.len() * 6);
-        let mut ring = Ring::new(self.info.uniform_align);
+        out.clear();
+        out.reserve(e.commands.len() * 6);
+        ring.reset(self.info.uniform_align);
         let commands = &e.commands;
         let mut i = 0;
         while i < commands.len() {
-            match &commands[i] {
-                Command::BeginPass(desc) => {
-                    let end = commands[i..]
-                        .iter()
-                        .position(|c| matches!(c, Command::EndPass))
-                        .map(|n| i + n)
-                        .ok_or("begin_pass without end_pass")?;
-                    let body = &commands[i + 1..end];
-                    self.record_pass(e, desc, body, &mut out, &mut ring, acquired)?;
+            match commands[i] {
+                Command::BeginPass {
+                    colors,
+                    depth,
+                    end_cmd,
+                } => {
+                    let end = if end_cmd != u32::MAX {
+                        end_cmd as usize
+                    } else {
+                        return Err("begin_pass without end_pass".into());
+                    };
+                    let desc = e.pass(colors, depth);
+                    self.record_pass(e, desc, &commands[i + 1..end], out, ring, acquired)?;
                     i = end;
                 }
-                Command::Dispatch {
-                    pipeline,
-                    groups,
-                    push,
-                    size,
-                } => self.record_dispatch(
-                    *pipeline,
-                    &e.groups[groups.clone()],
-                    &e.bytes[push.clone()],
-                    *size,
-                    &mut out,
-                    &mut ring,
-                )?,
-                &Command::CopyTextureToBuffer {
-                    src,
-                    mip,
-                    layer,
-                    dst,
-                    offset,
-                } => {
-                    self.record_texture_copy((src, mip, layer), dst, offset, &mut out, acquired)?
-                }
-                &Command::CopyBufferToBuffer {
-                    src,
-                    src_offset,
-                    dst,
-                    dst_offset,
-                    size,
-                } => {
-                    self.record_buffer_copy((src, src_offset), (dst, dst_offset), size, &mut out)?
-                }
-                &Command::Blit { src, dst, filter } => {
-                    self.record_blit(src, dst, filter, &mut out, acquired)?
-                }
+                Command::Transfer(idx) => match &e.transfers[idx as usize] {
+                    &TransferCmd::Dispatch {
+                        pipeline,
+                        groups,
+                        push,
+                        size,
+                    } => self.record_dispatch(
+                        pipeline,
+                        &e.groups[groups.range()],
+                        &e.bytes[push.range()],
+                        size,
+                        out,
+                        ring,
+                    )?,
+                    &TransferCmd::CopyTextureToBuffer {
+                        src,
+                        mip,
+                        layer,
+                        dst,
+                        offset,
+                    } => self.record_texture_copy((src, mip, layer), dst, offset, out, acquired)?,
+                    &TransferCmd::CopyBufferToBuffer {
+                        src,
+                        src_offset,
+                        dst,
+                        dst_offset,
+                        size,
+                    } => self.record_buffer_copy((src, src_offset), (dst, dst_offset), size, out)?,
+                    &TransferCmd::Blit { src, dst, filter } => {
+                        self.record_blit(src, dst, filter, out, acquired)?
+                    }
+                },
                 other => return Err(format!("{other:?} recorded outside a pass")),
             }
             i += 1;
         }
-        Ok((out, ring.bytes))
+        Ok(())
     }
 
     fn record_pass(
         &self,
         e: &Encoder,
-        desc: &PassDesc,
+        desc: PassView<'_>,
         body: &[Command],
         out: &mut Vec<u32>,
         ring: &mut Ring,
@@ -207,26 +271,28 @@ impl Gpu<'_> {
         if desc.colors.is_empty() && desc.depth.is_none() {
             return Err("begin_pass: a pass needs at least one attachment".into());
         }
-        if desc.colors.len() > self.info.max_color_attachments as usize {
+        if desc.colors.len() > (self.info.max_color_attachments as usize).min(8) {
             return Err(format!(
                 "begin_pass: {} colour attachments exceed the device limit",
                 desc.colors.len()
             ));
         }
         let mut size = None;
-        let mut attached: Vec<(TextureId, u32, u32)> = Vec::new();
-        let mut colors = Vec::new();
+        let mut attached = [(TextureId::from_raw(0), 0u32, 0u32); 9];
+        let mut attached_len = 0usize;
+        let mut colors = [Format::Rgba8Unorm; 8];
+        let mut colors_len = 0usize;
         let mut depth_format = None;
-        let mut words = vec![
-            BEGIN_RENDER,
-            desc.colors.len() as u32,
-            u32::from(desc.depth.is_some()),
-        ];
+        let mut words = [0u32; 96];
+        words[0] = BEGIN_RENDER;
+        words[1] = desc.colors.len() as u32;
+        words[2] = u32::from(desc.depth.is_some());
+        let mut word_len = 3usize;
         let attachments = desc
             .colors
             .iter()
             .map(|a| (a, false))
-            .chain(desc.depth.iter().map(|a| (a, true)));
+            .chain(desc.depth.into_iter().map(|a| (a, true)));
         for (a, depth) in attachments {
             let t = self.usable(a.texture, acquired)?;
             let need = if depth {
@@ -254,30 +320,42 @@ impl Gpu<'_> {
                 return Err("begin_pass: attachments differ in size".into());
             }
             let sub = (a.texture, a.mip, a.layer);
-            if attached.contains(&sub) {
+            if attached[..attached_len].contains(&sub) {
                 return Err("begin_pass: the same subresource is attached twice".into());
             }
-            attached.push(sub);
+            attached[attached_len] = sub;
+            attached_len += 1;
             let (load, clear) = match a.load {
                 Load::Load => (0, [0.0; 4]),
                 Load::Clear(v) => (1, v),
                 Load::DontCare => (1, [0.0; 4]),
             };
-            words.extend([t.js, a.mip, a.layer, load, u32::from(a.store)]);
+            words[word_len..word_len + 5]
+                .copy_from_slice(&[t.js, a.mip, a.layer, load, u32::from(a.store)]);
+            word_len += 5;
             if depth {
-                words.push(clear[0].clamp(0.0, 1.0).to_bits());
+                words[word_len] = clear[0].clamp(0.0, 1.0).to_bits();
+                word_len += 1;
                 depth_format = Some(t.desc.format);
             } else {
-                words.extend(clear.map(f32::to_bits));
-                colors.push(t.desc.format);
+                words[word_len..word_len + 4].copy_from_slice(&clear.map(f32::to_bits));
+                word_len += 4;
+                colors[colors_len] = t.desc.format;
+                colors_len += 1;
             }
         }
         // A subresource cannot be an attachment and bound to a shader in the same pass.
+        let mut last_group = None;
         for c in body {
             if let Command::SetBindGroup(_, g) = *c {
-                for b in &self.group(g)?.bound {
+                let grp = self.group(g)?;
+                if last_group == Some(g) {
+                    continue;
+                }
+                last_group = Some(g);
+                for b in &grp.bound {
                     if let Bound::Texture { id, mips, layers } = *b
-                        && attached.iter().any(|&(t, m, l)| {
+                        && attached[..attached_len].iter().any(|&(t, m, l)| {
                             t == id && overlap(mips, (m, m + 1)) && overlap(layers, (l, l + 1))
                         })
                     {
@@ -288,14 +366,15 @@ impl Gpu<'_> {
                 }
             }
         }
-        out.extend(words);
+        out.extend_from_slice(&words[..word_len]);
+        let pass_colors = &colors[..colors_len];
         let (w, h) = size.expect("at least one attachment");
         let mut st = DrawState::default();
         for c in body {
-            match c {
-                &Command::SetPipeline(id) => {
+            match *c {
+                Command::SetPipeline(id) => {
                     let p = self.pipeline(id)?;
-                    if p.compute || p.colors != colors || p.depth != depth_format {
+                    if p.compute || p.colors.as_slice() != pass_colors || p.depth != depth_format {
                         return Err(format!(
                             "set_pipeline: {id:?} renders {:?} + depth {:?}, which does not match \
                              this pass",
@@ -307,14 +386,14 @@ impl Gpu<'_> {
                         st.pipeline = Some(id);
                     }
                 }
-                &Command::SetBindGroup(g, id) => {
+                Command::SetBindGroup(g, id) => {
                     let slot = st
                         .groups
                         .get_mut(g as usize)
                         .ok_or_else(|| format!("set_bind_group: group {g} is out of range"))?;
                     *slot = Some(id);
                 }
-                &Command::SetVertexBuffer(id, offset) => {
+                Command::SetVertexBuffer(id, offset) => {
                     let b = self.buffer(id)?;
                     if !b.desc.usage.contains(BufferUsage::VERTEX) {
                         return Err(format!("set_vertex_buffer: {id:?} lacks VERTEX usage"));
@@ -324,11 +403,13 @@ impl Gpu<'_> {
                             "set_vertex_buffer: offset {offset} must be a multiple of 4 inside the buffer"
                         ));
                     }
-                    out.extend([SET_VERTEX, 0, b.js]);
-                    out.extend(u64_words(offset));
-                    st.vertex = true;
+                    if st.vertex != Some((b.js, offset)) {
+                        out.extend([SET_VERTEX, 0, b.js]);
+                        out.extend(u64_words(offset));
+                        st.vertex = Some((b.js, offset));
+                    }
                 }
-                &Command::SetIndexBuffer(id, offset) => {
+                Command::SetIndexBuffer(id, offset) => {
                     let b = self.buffer(id)?;
                     if !b.desc.usage.contains(BufferUsage::INDEX) {
                         return Err(format!("set_index_buffer: {id:?} lacks INDEX usage"));
@@ -338,20 +419,22 @@ impl Gpu<'_> {
                             "set_index_buffer: offset {offset} must be a multiple of 4 inside the buffer"
                         ));
                     }
-                    out.extend([SET_INDEX, b.js]);
-                    out.extend(u64_words(offset));
-                    st.index = true;
+                    if st.index != Some((b.js, offset)) {
+                        out.extend([SET_INDEX, b.js]);
+                        out.extend(u64_words(offset));
+                        st.index = Some((b.js, offset));
+                    }
                 }
-                &Command::SetViewport(v) => {
+                Command::SetViewport(v) => {
                     out.push(VIEWPORT);
                     out.extend(v.map(f32::to_bits));
                 }
-                &Command::SetScissor([x, y, sw, sh]) => {
+                Command::SetScissor([x, y, sw, sh]) => {
                     let (x, y) = (x.min(w), y.min(h));
                     out.extend([SCISSOR, x, y, sw.min(w - x), sh.min(h - y)]);
                 }
-                Command::PushConstants(range) => st.push = Some(range.clone()),
-                &Command::Draw {
+                Command::PushConstants(span) => st.push = Some(span),
+                Command::Draw {
                     vertices,
                     instances,
                     first_vertex,
@@ -360,7 +443,7 @@ impl Gpu<'_> {
                     self.bind_for_draw(e, &mut st, false, out, ring)?;
                     out.extend([DRAW, vertices, instances, first_vertex, first_instance]);
                 }
-                &Command::DrawIndexed {
+                Command::DrawIndexed {
                     indices,
                     instances,
                     first_index,
@@ -396,10 +479,10 @@ impl Gpu<'_> {
     ) -> Result<()> {
         let id = st.pipeline.ok_or("draw without set_pipeline")?;
         let p = self.pipeline(id)?;
-        if p.vertex_input && !st.vertex {
+        if p.vertex_input && st.vertex.is_none() {
             return Err(format!("{id:?} reads vertices but no vertex buffer is set"));
         }
-        if indexed && !st.index {
+        if indexed && st.index.is_none() {
             return Err("draw_indexed without set_index_buffer".into());
         }
         for (slot, s) in p.slots.iter().enumerate() {
@@ -410,32 +493,33 @@ impl Gpu<'_> {
                         format!("{id:?} uses @group({slot}) but no bind group is set")
                     })?;
                     let g = self.group(gid)?;
-                    if g.layout.as_ref() != Some(layout) {
+                    if g.layout_js != Some(layout.js) {
                         return Err(format!(
                             "{gid:?} was created for a different layout than @group({slot}) of {id:?}"
                         ));
                     }
-                    if !st.checked.contains(&gid) {
+                    if st.checked[slot] != Some(gid) {
                         self.check_bound(g)?;
-                        st.checked.push(gid);
+                        st.checked[slot] = Some(gid);
                     }
                     bind(out, st, slot, g.js, None);
                 }
                 Slot::Push => {
-                    let range = st.push.clone().ok_or_else(|| {
+                    let span = st.push.ok_or_else(|| {
                         format!(
                             "{id:?} uses {} bytes of push constants but none are set",
                             p.push_size
                         )
                     })?;
-                    if range.len() < p.push_size as usize {
+                    if span.len() < p.push_size as usize {
                         return Err(format!(
                             "{id:?} uses {} bytes of push constants but only {} are set",
                             p.push_size,
-                            range.len()
+                            span.len()
                         ));
                     }
-                    let data = &e.bytes[range.start..range.start + p.push_size as usize];
+                    let start = span.start as usize;
+                    let data = &e.bytes[start..start + p.push_size as usize];
                     let offset = ring.place(data);
                     bind(out, st, slot, PUSH_RENDER, Some(offset));
                 }
@@ -477,30 +561,40 @@ impl Gpu<'_> {
                 *slot = Some(group);
             }
         }
-        let mut words = vec![DISPATCH, p.js, p.slots.len() as u32];
+        let mut words = [0u32; 32];
+        words[0] = DISPATCH;
+        words[1] = p.js;
+        words[2] = p.slots.len() as u32;
+        let mut wlen = 3usize;
         for (slot, s) in p.slots.iter().enumerate() {
             match s {
-                Slot::Empty => words.extend([slot as u32, EMPTY_GROUP, 0]),
+                Slot::Empty => {
+                    words[wlen..wlen + 3].copy_from_slice(&[slot as u32, EMPTY_GROUP, 0]);
+                    wlen += 3;
+                }
                 Slot::Group(layout) => {
                     let gid = chosen[slot]
                         .ok_or_else(|| format!("dispatch: {id:?} needs @group({slot})"))?;
                     let g = self.group(gid)?;
-                    if g.layout.as_ref() != Some(layout) {
+                    if g.layout_js != Some(layout.js) {
                         return Err(format!(
                             "{gid:?} was created for a different layout than @group({slot}) of {id:?}"
                         ));
                     }
                     self.check_bound(g)?;
-                    words.extend([slot as u32, g.js, 0]);
+                    words[wlen..wlen + 3].copy_from_slice(&[slot as u32, g.js, 0]);
+                    wlen += 3;
                 }
                 Slot::Push => {
                     let offset = ring.place(&push[..p.push_size as usize]);
-                    words.extend([slot as u32, PUSH_COMPUTE, 1, offset]);
+                    words[wlen..wlen + 4].copy_from_slice(&[slot as u32, PUSH_COMPUTE, 1, offset]);
+                    wlen += 4;
                 }
             }
         }
-        words.extend(size);
-        out.extend(words);
+        words[wlen..wlen + 3].copy_from_slice(&size);
+        wlen += 3;
+        out.extend_from_slice(&words[..wlen]);
         Ok(())
     }
 

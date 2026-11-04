@@ -713,6 +713,24 @@ impl VkShaderModuleCreateInfo {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub(super) struct VkPipelineCacheCreateInfo {
+    pub sType: i32,
+    pub pNext: *const c_void,
+    pub flags: u32,
+    pub initialDataSize: usize,
+    pub pInitialData: *const c_void,
+}
+impl VkPipelineCacheCreateInfo {
+    pub fn new() -> Self {
+        Self {
+            sType: 17,
+            ..unsafe { core::mem::zeroed() }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub(super) struct VkPushConstantRange {
     pub stageFlags: u32,
     pub offset: u32,
@@ -1872,6 +1890,17 @@ unsafe extern "system" {
     pub(super) fn vkDestroyShaderModule(
         device: *mut c_void,
         shaderModule: u64,
+        pAllocator: *const c_void,
+    );
+    pub(super) fn vkCreatePipelineCache(
+        device: *mut c_void,
+        pCreateInfo: *const VkPipelineCacheCreateInfo,
+        pAllocator: *const c_void,
+        pPipelineCache: *mut u64,
+    ) -> i32;
+    pub(super) fn vkDestroyPipelineCache(
+        device: *mut c_void,
+        pipelineCache: u64,
         pAllocator: *const c_void,
     );
     pub(super) fn vkCreatePipelineLayout(

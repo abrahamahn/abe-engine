@@ -6,7 +6,7 @@
 //! semaphore in the colour-output and transfer stages; the first barrier on the swapchain
 //! texture uses those stages as its source scope, chaining after the wait. A final barrier moves
 //! the texture to the present layout.
-use super::record::{Key, Plan, Scope};
+use super::record::Key;
 use super::track::stage;
 use super::*;
 use crate::gpu::{Encoder, TextureUsage};
@@ -170,6 +170,9 @@ impl<'w> Gpu<'w> {
 
     /// Replaces the swapchain. Leaves no chain when the surface has a zero extent.
     fn recreate(&mut self, size: (u32, u32)) -> Result<()> {
+        if self.xfer_recording {
+            self.flush_transfers(true)?;
+        }
         let dev = self.device;
         // SAFETY: waiting for idle makes every swapchain image, view, framebuffer and
         // semaphore unused before they are destroyed.
@@ -189,7 +192,7 @@ impl<'w> Gpu<'w> {
                 let views: Vec<u64> = t.views.iter().map(|(_, v)| *v).collect();
                 self.forget_views(&views);
                 self.collect();
-                self.free(Garbage::Image(t.image, 0, views));
+                self.free(Garbage::Image(t.image, Alloc::NONE, views));
             }
         }
         let p = self.present.as_mut().expect("presentation device");
@@ -284,7 +287,7 @@ impl<'w> Gpu<'w> {
         for image in images {
             let texture = Texture {
                 image,
-                memory: 0,
+                alloc: Alloc::NONE,
                 desc: TextureDesc {
                     width: extent.0,
                     height: extent.1,
@@ -295,6 +298,7 @@ impl<'w> Gpu<'w> {
                 },
                 format: format.format,
                 aspect: 1,
+                sw_decompress: None,
                 states: vec![State::default()],
                 views: Vec::new(),
                 swapchain: true,
@@ -334,7 +338,9 @@ impl<'w> Gpu<'w> {
     }
 
     pub fn acquire(&mut self) -> Result<Option<TextureId>> {
-        self.collect();
+        if !self.garbage.is_empty() {
+            self.collect();
+        }
         let p = self
             .present
             .as_mut()
@@ -396,28 +402,41 @@ impl<'w> Gpu<'w> {
         Ok(None)
     }
 
-    pub fn present(&mut self, e: Encoder) -> Result<()> {
+    pub fn present(&mut self, e: &Encoder) -> Result<()> {
         e.finish()?;
-        let p = self
-            .present
-            .as_ref()
-            .ok_or("present() needs a device created with Device::for_window")?;
-        let (index, id) = p
-            .acquired
-            .ok_or("present() without a texture from acquire()")?;
-        let chain = p.chain.as_ref().expect("an acquired image has a chain");
-        let (swapchain, finished) = (chain.handle, chain.finished[index as usize]);
+        let (index, id, swapchain, finished) = {
+            let p = self
+                .present
+                .as_ref()
+                .ok_or("present() needs a device created with Device::for_window")?;
+            let (index, id) = p
+                .acquired
+                .ok_or("present() without a texture from acquire()")?;
+            let chain = p.chain.as_ref().expect("an acquired image has a chain");
+            (index, id, chain.handle, chain.finished[index as usize])
+        };
+        self.flush_transfers(false)?;
         let slot = 1 + self.frame;
         let cmd = self.begin(slot)?;
-        let mut plan = Plan::default();
-        self.record(cmd, &e, &mut plan, Some(id))?;
-        let mut scope = Scope::default();
-        scope.add(
-            Key::Texture(id, 0, 0),
-            Use::new(track::PRESENT_SRC, stage::BOTTOM, 0),
-        )?;
-        self.apply(&mut plan, &scope)?;
-        self.execute(slot, cmd, plan, Some((self.subs[slot].acquire, finished)))?;
+        let mut plan = core::mem::take(&mut self.plan);
+        plan.reset();
+        let exec_res = (|| -> Result<()> {
+            self.record(cmd, e, &mut plan, Some(id))?;
+            let mut scope = core::mem::take(&mut self.scope);
+            scope.clear();
+            let scope_res = (|| -> Result<()> {
+                scope.add(
+                    Key::Texture(id, 0, 0),
+                    Use::new(track::PRESENT_SRC, stage::BOTTOM, 0),
+                )?;
+                self.apply(&mut plan, &scope)
+            })();
+            self.scope = scope;
+            scope_res?;
+            self.execute(slot, cmd, &mut plan, Some((self.subs[slot].acquire, finished)))
+        })();
+        self.plan = plan;
+        exec_res?;
         let p = self.present.as_mut().expect("presentation device");
         p.acquired = None;
         let mut pi = VkPresentInfoKHR::new();
@@ -436,7 +455,9 @@ impl<'w> Gpu<'w> {
         self.frame = (self.frame + 1) % FRAMES;
         // Free the next slot's per-frame resources before the application writes them.
         self.wait(1 + self.frame)?;
-        self.collect();
+        if !self.garbage.is_empty() {
+            self.collect();
+        }
         Ok(())
     }
 }

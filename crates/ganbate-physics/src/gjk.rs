@@ -83,12 +83,82 @@ pub struct DistanceResult {
     pub iterations: u32,
 }
 
+/// Minimal interface over a local-frame core + rounding radius so stack-backed hull vertices can
+/// run through GJK and conservative advancement with zero heap allocation.
+trait CoreShape: Copy {
+    fn radius(self) -> f32;
+    fn center(self) -> Vec3;
+    fn support_core(self, d: Vec3) -> Vec3;
+    fn reach(self) -> f32;
+}
+
+impl CoreShape for &ConvexShape<'_> {
+    #[inline]
+    fn radius(self) -> f32 {
+        ConvexShape::radius(self)
+    }
+    #[inline]
+    fn center(self) -> Vec3 {
+        ConvexShape::center(self)
+    }
+    #[inline]
+    fn support_core(self, d: Vec3) -> Vec3 {
+        ConvexShape::support_core(self, d)
+    }
+    #[inline]
+    fn reach(self) -> f32 {
+        reach(self)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HullVerts<'a> {
+    vertices: &'a [Vec3],
+    centroid: Vec3,
+}
+
+impl CoreShape for HullVerts<'_> {
+    #[inline]
+    fn radius(self) -> f32 {
+        0.0
+    }
+    #[inline]
+    fn center(self) -> Vec3 {
+        self.centroid
+    }
+    #[inline]
+    fn support_core(self, d: Vec3) -> Vec3 {
+        let mut best = 0;
+        let mut best_d = f32::NEG_INFINITY;
+        for (i, v) in self.vertices.iter().enumerate() {
+            let p = v.dot(d);
+            if p > best_d {
+                best_d = p;
+                best = i;
+            }
+        }
+        self.vertices[best]
+    }
+    #[inline]
+    fn reach(self) -> f32 {
+        let c = self.centroid;
+        self.vertices
+            .iter()
+            .fold(0.0f32, |m, p| m.max((*p - c).length_squared()))
+            .sqrt()
+    }
+}
+
 /// The distance and closest points between two convex shapes.
 pub fn distance(a: &Convex, b: &Convex) -> DistanceResult {
+    distance_impl(&a.shape, &a.iso, b)
+}
+
+fn distance_impl<A: CoreShape>(a_shape: A, a_iso: &Iso, b: &Convex) -> DistanceResult {
     // Work relative to A's centre: the cores' coordinates stay as small as the shapes and the gap
     // between them, wherever they are in the world.
-    let origin = a.center();
-    let core = closest_cores(a, b, origin);
+    let origin = a_iso.point(a_shape.center());
+    let core = closest_cores(a_shape, a_iso, b, origin);
     if core.overlap {
         let p = (core.a + core.b) * 0.5 + origin;
         return DistanceResult {
@@ -102,7 +172,7 @@ pub fn distance(a: &Convex, b: &Convex) -> DistanceResult {
     }
     // Not overlapping means |v| is above the tolerance, so the normal is a unit vector.
     let (normal, length) = (-core.v).normalize_and_length();
-    let (ra, rb) = (a.radius(), b.radius());
+    let (ra, rb) = (a_shape.radius(), b.radius());
     DistanceResult {
         distance: length - ra - rb,
         point_a: (core.a + normal * ra) + origin,
@@ -137,14 +207,37 @@ pub struct CastHit {
 /// no hit (a shape left in the band by an earlier cast can be cast on, away or sideways); and a
 /// path that closes in only to graze past (onto a coplanar neighbour, say) goes on past it.
 pub fn cast(a: &Convex, translation: Vec3, b: &Convex, target: f32) -> Option<CastHit> {
+    cast_impl(&a.shape, a.iso, translation, b, target)
+}
+
+/// Casts a convex hull represented directly by its local `vertices` and `centroid` without
+/// allocating a `ConvexHull` on the heap.
+pub(crate) fn cast_hull_vertices(
+    vertices: &[Vec3],
+    centroid: Vec3,
+    iso: Iso,
+    translation: Vec3,
+    b: &Convex,
+    target: f32,
+) -> Option<CastHit> {
+    cast_impl(HullVerts { vertices, centroid }, iso, translation, b, target)
+}
+
+fn cast_impl<A: CoreShape>(
+    a_shape: A,
+    a_iso: Iso,
+    translation: Vec3,
+    b: &Convex,
+    target: f32,
+) -> Option<CastHit> {
     let target = if target > 0.0 { target } else { 0.0 };
-    let start = distance(a, b);
+    let start = distance_impl(a_shape, &a_iso, b);
     if start.overlap || start.distance <= target {
         let normal = if start.overlap {
             // No separating direction: report the one A came from.
             (-translation)
                 .try_normalize()
-                .or_else(|| (a.center() - b.center()).try_normalize())
+                .or_else(|| (a_iso.point(a_shape.center()) - b.center()).try_normalize())
                 .unwrap_or(Vec3::Y)
         } else {
             -start.normal
@@ -156,7 +249,7 @@ pub fn cast(a: &Convex, translation: Vec3, b: &Convex, target: f32) -> Option<Ca
             started_overlapping: true,
         });
     }
-    let tolerance = cast_tolerance(&a.shape, &b.shape, target);
+    let tolerance = cast_tolerance_reaches(a_shape.reach(), reach(&b.shape), target);
     let hit = |fraction: f32, r: &DistanceResult| CastHit {
         fraction,
         point: r.point_b,
@@ -183,11 +276,8 @@ pub fn cast(a: &Convex, translation: Vec3, b: &Convex, target: f32) -> Option<Ca
             // a graze (past an edge, such as the seam onto a coplanar neighbour, or tangent to a
             // curve) does not, and goes on from there.
             let probe = (fraction + gap / closing).min(1.0);
-            let moved = Convex::new(
-                a.shape,
-                Iso::new(a.iso.position + translation * probe, a.iso.rotation),
-            );
-            let r = distance(&moved, b);
+            let moved_iso = Iso::new(a_iso.position + translation * probe, a_iso.rotation);
+            let r = distance_impl(a_shape, &moved_iso, b);
             if r.overlap || r.distance <= target + 0.5 * gap {
                 return Some(hit(fraction, &current));
             }
@@ -204,11 +294,8 @@ pub fn cast(a: &Convex, translation: Vec3, b: &Convex, target: f32) -> Option<Ca
         // Aim into the middle of the tolerance band, so an approach face first does not land
         // exactly on contact.
         let next = (fraction + (gap - 0.5 * tolerance) / closing).min(1.0);
-        let moved = Convex::new(
-            a.shape,
-            Iso::new(a.iso.position + translation * next, a.iso.rotation),
-        );
-        let r = distance(&moved, b);
+        let moved_iso = Iso::new(a_iso.position + translation * next, a_iso.rotation);
+        let r = distance_impl(a_shape, &moved_iso, b);
         if r.overlap {
             // Rounding carried A into B: the last separated position is the conservative answer.
             return Some(hit(fraction, &current));
@@ -221,8 +308,8 @@ pub fn cast(a: &Convex, translation: Vec3, b: &Convex, target: f32) -> Option<Ca
 }
 
 /// The band within which a cast counts as having reached `target`.
-fn cast_tolerance(a: &ConvexShape, b: &ConvexShape, target: f32) -> f32 {
-    let (ra, rb) = (reach(a), reach(b));
+#[inline]
+fn cast_tolerance_reaches(ra: f32, rb: f32, target: f32) -> f32 {
     CAST_TOLERANCE
         .min(0.01 * ra.min(rb))
         // Stay well above the rounding of `distance` itself (see the module doc).
@@ -232,19 +319,17 @@ fn cast_tolerance(a: &ConvexShape, b: &ConvexShape, target: f32) -> f32 {
 
 /// How far the shape reaches from its centre: the core's farthest point plus the radius.
 fn reach(shape: &ConvexShape) -> f32 {
-    let c = shape.center();
-    let farthest = |points: &[Vec3]| {
-        points
-            .iter()
-            .fold(0.0f32, |m, p| m.max((*p - c).length_squared()))
-            .sqrt()
-    };
     let core = match *shape {
         ConvexShape::Sphere(_) => 0.0,
         ConvexShape::Capsule { half_height, .. } => half_height.abs(),
         ConvexShape::Box(h) => h.length(),
-        ConvexShape::Hull(h) => farthest(&h.vertices),
-        ConvexShape::Triangle(t) => farthest(&t),
+        ConvexShape::Hull(h) => h.reach,
+        ConvexShape::Triangle(t) => {
+            let c = shape.center();
+            t.iter()
+                .fold(0.0f32, |m, p| m.max((*p - c).length_squared()))
+                .sqrt()
+        }
         ConvexShape::Segment { a, b, .. } => (b - a).length() * 0.5,
     };
     core + shape.radius().abs()
@@ -363,18 +448,23 @@ struct SupportPoint {
 /// The farthest point of a core along world direction `d`, relative to a frame origin from which
 /// the convex's position is `offset`.
 #[inline]
-fn support(c: &Convex, offset: Vec3, d: Vec3) -> Vec3 {
-    let iso = &c.iso;
-    iso.rotation
-        .rotate(c.shape.support_core(iso.inverse_vector(d)))
-        + offset
+fn support_shape<S: CoreShape>(shape: S, iso: &Iso, offset: Vec3, d: Vec3) -> Vec3 {
+    iso.rotation.rotate(shape.support_core(iso.inverse_vector(d))) + offset
 }
 
 /// GJK on the cores of `a` and `b`, in world axes shifted to `origin`.
-fn closest_cores(a: &Convex, b: &Convex, origin: Vec3) -> CoreDistance {
-    let (offset_a, offset_b) = (a.iso.position - origin, b.iso.position - origin);
+fn closest_cores<A: CoreShape>(
+    a_shape: A,
+    a_iso: &Iso,
+    b: &Convex,
+    origin: Vec3,
+) -> CoreDistance {
+    let (offset_a, offset_b) = (a_iso.position - origin, b.iso.position - origin);
     let support_point = |d: Vec3| {
-        let (pa, pb) = (support(a, offset_a, d), support(b, offset_b, -d));
+        let (pa, pb) = (
+            support_shape(a_shape, a_iso, offset_a, d),
+            support_shape(&b.shape, &b.iso, offset_b, -d),
+        );
         SupportPoint {
             a: pa,
             b: pb,
@@ -382,7 +472,7 @@ fn closest_cores(a: &Convex, b: &Convex, origin: Vec3) -> CoreDistance {
         }
     };
     // Start with A's point farthest towards B and B's farthest towards A.
-    let center_a = a.iso.rotation.rotate(a.shape.center()) + offset_a;
+    let center_a = a_iso.rotation.rotate(a_shape.center()) + offset_a;
     let center_b = b.iso.rotation.rotate(b.shape.center()) + offset_b;
     let toward_b = center_b - center_a;
     let first = support_point(if toward_b.length_squared() > 0.0 {

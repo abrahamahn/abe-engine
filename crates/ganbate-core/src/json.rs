@@ -129,9 +129,11 @@ impl Parser<'_> {
     fn err(&self, msg: &str) -> String {
         format!("JSON byte {}: {msg}", self.i)
     }
+    #[inline]
     fn byte(&self) -> Option<u8> {
         self.b.get(self.i).copied()
     }
+    #[inline]
     fn eat(&mut self, b: u8) -> bool {
         if self.byte() == Some(b) {
             self.i += 1;
@@ -140,9 +142,16 @@ impl Parser<'_> {
             false
         }
     }
+    #[inline]
     fn space(&mut self) {
-        while matches!(self.byte(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
-            self.i += 1;
+        let len = self.b.len();
+        while self.i < len {
+            let b = self.b[self.i];
+            if b == b' ' || b == b'\n' || b == b'\r' || b == b'\t' {
+                self.i += 1;
+            } else {
+                break;
+            }
         }
     }
     fn value(&mut self, depth: usize) -> Result<Value, String> {
@@ -226,18 +235,39 @@ impl Parser<'_> {
     }
     fn number(&mut self) -> Result<Value, String> {
         let start = self.i;
-        self.eat(b'-');
-        if !self.eat(b'0') {
-            self.digits()?
+        let neg = self.eat(b'-');
+        let mut int_acc = 0u64;
+        let mut int_digits = 0usize;
+        if self.eat(b'0') {
+            int_digits = 1;
+        } else {
+            let d_start = self.i;
+            while let Some(b @ b'0'..=b'9') = self.byte() {
+                if int_digits < 16 {
+                    int_acc = int_acc * 10 + u64::from(b - b'0');
+                }
+                int_digits += 1;
+                self.i += 1;
+            }
+            if self.i == d_start {
+                return Err(self.err("expected digit"));
+            }
         }
+        let mut is_float = false;
         if self.eat(b'.') {
+            is_float = true;
             self.digits()?
         }
         if self.eat(b'e') || self.eat(b'E') {
+            is_float = true;
             if !self.eat(b'+') {
                 self.eat(b'-');
             }
             self.digits()?
+        }
+        if !is_float && int_digits <= 15 {
+            let f = int_acc as f64;
+            return Ok(Value::Number(if neg { -f } else { f }));
         }
         let n = std::str::from_utf8(&self.b[start..self.i])
             .ok()
@@ -263,19 +293,27 @@ impl Parser<'_> {
         if !self.eat(b'"') {
             return Err(self.err("expected string"));
         }
-        let mut out = String::new();
+        let first_start = self.i;
+        let len = self.b.len();
+        while self.i < len {
+            let c = self.b[self.i];
+            if c < 32 || c == b'"' || c == b'\\' {
+                break;
+            }
+            self.i += 1;
+        }
+        let first_end = self.i;
+        if self.eat(b'"') {
+            let s = std::str::from_utf8(&self.b[first_start..first_end])
+                .map_err(|_| self.err("invalid UTF-8"))?;
+            return Ok(s.to_owned());
+        }
+        let mut out = String::with_capacity((first_end - first_start) + 16);
+        out.push_str(
+            std::str::from_utf8(&self.b[first_start..first_end])
+                .map_err(|_| self.err("invalid UTF-8"))?,
+        );
         loop {
-            let start = self.i;
-            while matches!(self.byte(),Some(c) if c>=32 && c!=b'"'&& c!=b'\\') {
-                self.i += 1
-            }
-            out.push_str(
-                std::str::from_utf8(&self.b[start..self.i])
-                    .map_err(|_| self.err("invalid UTF-8"))?,
-            );
-            if self.eat(b'"') {
-                return Ok(out);
-            }
             if !self.eat(b'\\') {
                 return Err(self.err("unterminated string or control character"));
             }
@@ -306,6 +344,21 @@ impl Parser<'_> {
                 }
                 _ => return Err(self.err("invalid string escape")),
             });
+            let start = self.i;
+            while self.i < len {
+                let c = self.b[self.i];
+                if c < 32 || c == b'"' || c == b'\\' {
+                    break;
+                }
+                self.i += 1;
+            }
+            out.push_str(
+                std::str::from_utf8(&self.b[start..self.i])
+                    .map_err(|_| self.err("invalid UTF-8"))?,
+            );
+            if self.eat(b'"') {
+                return Ok(out);
+            }
         }
     }
 }
@@ -317,8 +370,14 @@ pub fn to_canonical(value: &Value) -> Result<String, String> {
 }
 
 fn canonical_within(value: &Value, limits: Limits) -> Result<String, String> {
+    let cap_hint = match value {
+        Value::Object(m) => (m.len() * 32).min(65536).min(limits.bytes),
+        Value::Array(a) => (a.len() * 8).min(65536).min(limits.bytes),
+        Value::String(s) => (s.len() + 3).min(limits.bytes),
+        _ => 32,
+    };
     let mut w = Canonical {
-        out: String::new(),
+        out: String::with_capacity(cap_hint),
         values: 0,
         limits,
     };
@@ -332,7 +391,7 @@ fn canonical_within(value: &Value, limits: Limits) -> Result<String, String> {
 
 /// `value` on one line with the same number and string spelling (for messages and keys).
 pub fn to_compact(value: &Value) -> Result<String, String> {
-    let mut out = String::new();
+    let mut out = String::with_capacity(64);
     write_compact(&mut out, value)?;
     Ok(out)
 }
@@ -343,9 +402,16 @@ fn inline(items: &[Value]) -> bool {
         .all(|v| matches!(v, Value::Number(_) | Value::Bool(_) | Value::Null))
 }
 
+#[inline]
 fn pad(out: &mut String, depth: usize) {
-    for _ in 0..depth {
-        out.push_str("  ");
+    const SPACES: &str = "                                                                                                                                ";
+    let n = depth * 2;
+    if n <= SPACES.len() {
+        out.push_str(&SPACES[..n]);
+    } else {
+        for _ in 0..depth {
+            out.push_str("  ");
+        }
     }
 }
 
@@ -464,6 +530,13 @@ pub fn write_number(out: &mut String, n: f64) -> Result<(), String> {
         out.push('0'); // also -0
         return Ok(());
     }
+    if (-16_777_216.0..=16_777_216.0).contains(&n) {
+        let iv = n as i32;
+        if f64::from(iv) == n {
+            write_i32(out, iv);
+            return Ok(());
+        }
+    }
     let single = n as f32;
     let r = if f64::from(single) == n {
         // Decided on the 32-bit value, whose spelling is what is printed: the float nearest
@@ -482,23 +555,59 @@ pub fn write_number(out: &mut String, n: f64) -> Result<(), String> {
     r.map_err(|e| e.to_string())
 }
 
+#[inline]
+fn write_i32(out: &mut String, v: i32) {
+    let mut mag = if v < 0 {
+        out.push('-');
+        v.unsigned_abs()
+    } else {
+        v as u32
+    };
+    let mut buf = [0u8; 10];
+    let mut pos = buf.len();
+    while mag >= 10 {
+        pos -= 1;
+        buf[pos] = b'0' + (mag % 10) as u8;
+        mag /= 10;
+    }
+    pos -= 1;
+    buf[pos] = b'0' + mag as u8;
+    // SAFETY: `buf[pos..]` contains only ASCII digits `b'0'..=b'9'`.
+    out.push_str(std::str::from_utf8(&buf[pos..]).unwrap());
+}
+
 pub fn write_string(out: &mut String, s: &str) {
     use std::fmt::Write;
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
+    let bytes = s.as_bytes();
+    let mut last = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            0x08 => "\\b",
+            0x0c => "\\f",
+            0..=0x1f => {
+                if last < i {
+                    out.push_str(&s[last..i]);
+                }
+                let _ = write!(out, "\\u{:04x}", b);
+                last = i + 1;
+                continue;
             }
-            c => out.push(c),
+            _ => continue,
+        };
+        if last < i {
+            out.push_str(&s[last..i]);
         }
+        out.push_str(esc);
+        last = i + 1;
+    }
+    if last < bytes.len() {
+        out.push_str(&s[last..]);
     }
     out.push('"');
 }

@@ -38,12 +38,14 @@ pub struct TriangleRef {
     /// -1 on every other edge (a border, a non-manifold or inconsistently wound edge, an
     /// inactive edge).
     pub ridge_cos: [f32; 3],
+    normal: Vec3,
 }
 
 impl TriangleRef {
     /// The unit front-face normal (zero for a degenerate triangle).
+    #[inline]
     pub fn normal(&self) -> Vec3 {
-        face_normal(&self.vertices)
+        self.normal
     }
 }
 
@@ -88,6 +90,7 @@ pub struct TriangleMesh {
     pub active_edges: Vec<u8>,
     /// One per triangle: [`TriangleRef::ridge_cos`].
     pub ridge_cos: Vec<[f32; 3]>,
+    normals: Vec<Vec3>,
     aabb: Aabb,
     /// The hierarchy, root first; built from `vertices` and `triangles` by [`TriangleMesh::new`].
     nodes: Vec<BvhNode>,
@@ -135,19 +138,25 @@ impl TriangleMesh {
             .iter()
             .flatten()
             .fold(Aabb::EMPTY, |b, &i| b.include(vertices[i as usize]));
-        let (active_edges, ridge_cos) = mesh_active_edges(&vertices, &triangles);
+        let normals: Vec<Vec3> = triangles
+            .iter()
+            .map(|t| face_normal(&t.map(|i| vertices[i as usize])))
+            .collect();
+        let (active_edges, ridge_cos) = mesh_active_edges(&vertices, &triangles, &normals);
         let (nodes, order) = build_hierarchy(&vertices, &triangles);
         Ok(TriangleMesh {
             vertices,
             triangles,
             active_edges,
             ridge_cos,
+            normals,
             aabb,
             nodes,
             order,
         })
     }
 
+    #[inline]
     pub fn local_aabb(&self) -> Aabb {
         self.aabb
     }
@@ -158,13 +167,16 @@ impl TriangleMesh {
             vertices: self.corners(i),
             active_edges: self.active_edges[i as usize],
             ridge_cos: self.ridge_cos[i as usize],
+            normal: self.normals[i as usize],
         }
     }
 
+    #[inline]
     fn corners(&self, i: u32) -> [Vec3; 3] {
         self.triangles[i as usize].map(|v| self.vertices[v as usize])
     }
 
+    #[inline]
     fn leaf(&self, node: &BvhNode) -> &[u32] {
         &self.order[node.first as usize..(node.first + node.count) as usize]
     }
@@ -172,7 +184,10 @@ impl TriangleMesh {
     /// Calls `f` for every triangle whose bounds overlap `aabb` (local frame), in a deterministic
     /// order, until `f` returns `false`.
     pub fn query_aabb(&self, aabb: &Aabb, f: &mut dyn FnMut(&TriangleRef) -> bool) {
-        let mut stack = WalkStack::<u32, 64>::new(0);
+        if !self.nodes[0].aabb.overlaps(aabb) {
+            return;
+        }
+        let mut stack = WalkStack::<u32, 32>::new(0);
         stack.push(0);
         while let Some(i) = stack.pop() {
             let node = &self.nodes[i as usize];
@@ -192,6 +207,7 @@ impl TriangleMesh {
                         vertices,
                         active_edges: self.active_edges[t as usize],
                         ridge_cos: self.ridge_cos[t as usize],
+                        normal: self.normals[t as usize],
                     };
                     if !f(&tri) {
                         return;
@@ -220,7 +236,7 @@ impl TriangleMesh {
         let mut limit = max_t;
         // Each entry carries where the ray enters the node's box, so a node beyond the nearest
         // hit so far is dropped without another slab test.
-        let mut stack = WalkStack::<(u32, f32), 64>::new((0, 0.0));
+        let mut stack = WalkStack::<(u32, f32), 32>::new((0, 0.0));
         stack.push((0, t));
         while let Some((i, entry)) = stack.pop() {
             if entry > limit {
@@ -236,7 +252,7 @@ impl TriangleMesh {
                         best = Some(MeshHit {
                             t,
                             triangle: id,
-                            normal: face_normal(&v),
+                            normal: self.normals[id as usize],
                         });
                         limit = t;
                     }
@@ -382,7 +398,11 @@ fn sah_split(items: &mut [u32], boxes: &[Aabb]) -> usize {
 /// The active-edge bits and ridge cosines of every triangle of a mesh. Shared edges are found by
 /// sorting all edges on their welded vertex pairs (never by hashing), so the result is
 /// deterministic.
-fn mesh_active_edges(vertices: &[Vec3], triangles: &[[u32; 3]]) -> (Vec<u8>, Vec<[f32; 3]>) {
+fn mesh_active_edges(
+    vertices: &[Vec3],
+    triangles: &[[u32; 3]],
+    normals: &[Vec3],
+) -> (Vec<u8>, Vec<[f32; 3]>) {
     let weld = weld(vertices);
     // [lower welded vertex, higher welded vertex, 3 · triangle + edge]
     let mut edges: Vec<[u32; 3]> = Vec::with_capacity(triangles.len() * 3);
@@ -406,10 +426,10 @@ fn mesh_active_edges(vertices: &[Vec3], triangles: &[[u32; 3]]) -> (Vec<u8>, Vec
                     // neither side can be called convex or concave.
                     true
                 } else {
-                    let v1 = s1.map(|i| vertices[i as usize]);
-                    let v2 = s2.map(|i| vertices[i as usize]);
-                    let (n1, n2) = (face_normal(&v1), face_normal(&v2));
-                    let ridge = crease_is_active(n1, n2, v1[k1], v1[(k1 + 1) % 3]);
+                    let v1_a = vertices[s1[k1] as usize];
+                    let v1_b = vertices[s1[(k1 + 1) % 3] as usize];
+                    let (n1, n2) = (normals[t1], normals[t2]);
+                    let ridge = crease_is_active(n1, n2, v1_a, v1_b);
                     if ridge {
                         let c = n1.dot(n2);
                         ridge_cos[t1][k1] = c;
@@ -585,11 +605,13 @@ impl Heightfield {
         })
     }
 
+    #[inline]
     pub fn local_aabb(&self) -> Aabb {
         self.aabb
     }
 
     /// The position of sample `(i, j)`.
+    #[inline]
     pub fn sample(&self, i: u32, j: u32) -> Vec3 {
         Vec3::new(
             i as f32 * self.scale.x,
@@ -604,12 +626,14 @@ impl Heightfield {
     /// triangles across it are coplanar or form a valley.
     pub fn triangle(&self, id: u32) -> TriangleRef {
         let vertices = self.corners(id);
-        let (active_edges, ridge_cos) = self.edge_bits(id, &vertices);
+        let normal = face_normal(&vertices);
+        let (active_edges, ridge_cos) = self.edge_bits_with_normal(id, &vertices, normal, None);
         TriangleRef {
             id,
             vertices,
             active_edges,
             ridge_cos,
+            normal,
         }
     }
 
@@ -633,15 +657,24 @@ impl Heightfield {
     }
 
     /// Triangle `id`'s active-edge bits and ridge cosines (see [`TriangleRef`]).
-    fn edge_bits(&self, id: u32, v: &[Vec3; 3]) -> (u8, [f32; 3]) {
-        let n = face_normal(v);
+    fn edge_bits_with_normal(
+        &self,
+        id: u32,
+        v: &[Vec3; 3],
+        n: Vec3,
+        sibling_normal: Option<Vec3>,
+    ) -> (u8, [f32; 3]) {
         let mut bits = 0;
         let mut ridge_cos = [-1.0f32; 3];
         for k in 0..3 {
             let active = match self.neighbour(id, k) {
                 None => true,
                 Some(other) => {
-                    let m = face_normal(&self.corners(other));
+                    let m = if other == (id ^ 1) {
+                        sibling_normal.unwrap_or_else(|| face_normal(&self.corners(other)))
+                    } else {
+                        face_normal(&self.corners(other))
+                    };
                     let ridge = crease_is_active(n, m, v[k], v[(k + 1) % 3]);
                     if ridge {
                         ridge_cos[k] = n.dot(m);
@@ -655,6 +688,7 @@ impl Heightfield {
     }
 
     /// The triangle across edge `edge` of triangle `id`, unless the edge is on the grid's border.
+    #[inline]
     fn neighbour(&self, id: u32, edge: usize) -> Option<u32> {
         let (cw, ch) = (self.columns - 1, self.rows - 1);
         let cell = id / 2;
@@ -673,6 +707,7 @@ impl Heightfield {
     }
 
     /// The lowest and highest sample heights of cell `(i, j)`.
+    #[inline]
     fn cell_heights(&self, i: u32, j: u32) -> (f32, f32) {
         let y = |i: u32, j: u32| self.heights[(j * self.columns + i) as usize] * self.scale.y;
         let (a, b, c, d) = (y(i, j), y(i + 1, j), y(i, j + 1), y(i + 1, j + 1));
@@ -697,20 +732,55 @@ impl Heightfield {
         };
         for j in j0..=j1 {
             for i in i0..=i1 {
+                let (p00, p10, p01, p11) = (
+                    self.sample(i, j),
+                    self.sample(i + 1, j),
+                    self.sample(i, j + 1),
+                    self.sample(i + 1, j + 1),
+                );
+                let y_lo = p00.y.min(p10.y).min(p01.y).min(p11.y);
+                let y_hi = p00.y.max(p10.y).max(p01.y).max(p11.y);
+                if !(aabb.min.y <= y_hi && aabb.max.y >= y_lo) {
+                    continue;
+                }
                 let cell = j * cw + i;
-                for id in [2 * cell, 2 * cell + 1] {
-                    let vertices = self.corners(id);
-                    if Aabb::from_points(&vertices).overlaps(aabb) {
-                        let (active_edges, ridge_cos) = self.edge_bits(id, &vertices);
-                        let tri = TriangleRef {
-                            id,
-                            vertices,
-                            active_edges,
-                            ridge_cos,
-                        };
-                        if !f(&tri) {
-                            return;
-                        }
+                let v0 = [p00, p01, p11];
+                let v1 = [p00, p11, p10];
+                let hit0 = Aabb::from_points(&v0).overlaps(aabb);
+                let hit1 = Aabb::from_points(&v1).overlaps(aabb);
+                if !hit0 && !hit1 {
+                    continue;
+                }
+                let n0 = face_normal(&v0);
+                let n1 = face_normal(&v1);
+                if hit0 {
+                    let id = 2 * cell;
+                    let (active_edges, ridge_cos) =
+                        self.edge_bits_with_normal(id, &v0, n0, Some(n1));
+                    let tri = TriangleRef {
+                        id,
+                        vertices: v0,
+                        active_edges,
+                        ridge_cos,
+                        normal: n0,
+                    };
+                    if !f(&tri) {
+                        return;
+                    }
+                }
+                if hit1 {
+                    let id = 2 * cell + 1;
+                    let (active_edges, ridge_cos) =
+                        self.edge_bits_with_normal(id, &v1, n1, Some(n0));
+                    let tri = TriangleRef {
+                        id,
+                        vertices: v1,
+                        active_edges,
+                        ridge_cos,
+                        normal: n1,
+                    };
+                    if !f(&tri) {
+                        return;
                     }
                 }
             }

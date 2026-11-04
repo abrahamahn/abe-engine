@@ -114,6 +114,7 @@ impl<'w> Gpu<'w> {
                 desc,
                 pixel_format: resources::pixel_format(format),
                 ty: ffi::texture_type::D2,
+                sw_decompress: None,
                 views: Vec::new(),
                 swapchain: true,
             })?;
@@ -125,7 +126,7 @@ impl<'w> Gpu<'w> {
         })
     }
 
-    pub fn present(&mut self, e: Encoder) -> Result<()> {
+    pub fn present(&mut self, e: &Encoder) -> Result<()> {
         e.finish()?;
         let (drawable, id) = self
             .present
@@ -137,11 +138,11 @@ impl<'w> Gpu<'w> {
         let result = autoreleasepool(|| {
             self.collect()?;
             let cb = self.command_buffer()?;
-            self.record(cb.id(), &e, Some(id))?;
+            self.record(cb.id(), e, Some(id))?;
             // SAFETY: scheduling the drawable on the command buffer that renders into it.
             unsafe { send!(cb.id(), "presentDrawable:", drawable.id() => Id; ()) };
             let serial = self.commit(cb);
-            self.mark_used(&e, serial);
+            self.mark_used(e, serial);
             self.frame_serials[self.frame] = serial;
             self.frame = (self.frame + 1) % FRAMES;
             // Two frames in flight: the frame that used the next slot must be done.

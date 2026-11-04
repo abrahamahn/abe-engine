@@ -31,11 +31,16 @@ version = "0.2.0"
 dependencies = [
  "ganbate-assets",
  "ganbate-core",
+ "ganbate-jobs",
  "ganbate-physics",
  "ganbate-pipeline",
  "ganbate-scene",
  "ganbate-shader",
 ]
+
+[[package]]
+name = "ganbate-jobs"
+version = "0.2.0"
 
 [[package]]
 name = "ganbate-physics"

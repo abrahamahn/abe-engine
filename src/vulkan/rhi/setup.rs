@@ -223,6 +223,7 @@ impl<'w> Gpu<'w> {
             features: Features::default(),
             name: String::new(),
             debug: None,
+            slabs: Vec::new(),
             buffers: Pool::default(),
             textures: Pool::default(),
             samplers: Pool::default(),
@@ -230,7 +231,9 @@ impl<'w> Gpu<'w> {
             groups: Pool::default(),
             sampler_cache: HashMap::new(),
             set_layouts: HashMap::new(),
+            layout_ids: HashMap::new(),
             pipeline_layouts: HashMap::new(),
+            pipeline_cache: 0,
             render_passes: HashMap::new(),
             framebuffers: HashMap::new(),
             descriptor_pools: Vec::new(),
@@ -239,7 +242,12 @@ impl<'w> Gpu<'w> {
             frame: 0,
             serial: 0,
             garbage: Vec::new(),
-            staging: None,
+            staging: Vec::new(),
+            xfer_slot: 0,
+            xfer_recording: false,
+            xfer_plan: Default::default(),
+            plan: Default::default(),
+            scope: Default::default(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             present: None,
             _window: core::marker::PhantomData,
@@ -333,6 +341,8 @@ impl<'w> Gpu<'w> {
                 features.fragmentStoresAndAtomics = supported.fragmentStoresAndAtomics;
                 features.shaderStorageImageExtendedFormats =
                     supported.shaderStorageImageExtendedFormats;
+                features.textureCompressionBC = supported.textureCompressionBC;
+                features.textureCompressionASTC_LDR = supported.textureCompressionASTC_LDR;
                 let priority = 1.0f32;
                 let mut q = VkDeviceQueueCreateInfo::new();
                 q.queueFamilyIndex = family as u32;
@@ -366,6 +376,8 @@ impl<'w> Gpu<'w> {
                     vertex_stores: features.vertexPipelineStoresAndAtomics != 0,
                     fragment_stores: features.fragmentStoresAndAtomics != 0,
                     storage_formats: features.shaderStorageImageExtendedFormats != 0,
+                    bc_compression: features.textureCompressionBC != 0,
+                    astc_compression: features.textureCompressionASTC_LDR != 0,
                 };
                 self.name = name;
                 return self.create_submissions();
@@ -382,6 +394,12 @@ impl<'w> Gpu<'w> {
         // SAFETY: create-info structs outlive each call; the handles are owned by self and
         // destroyed in Drop.
         unsafe {
+            let _ = vkCreatePipelineCache(
+                dev,
+                &VkPipelineCacheCreateInfo::new(),
+                null(),
+                &mut self.pipeline_cache,
+            );
             self.command_pool = create("vkCreateCommandPool", |o| {
                 vkCreateCommandPool(dev, &pool, null(), o)
             })?;
@@ -398,7 +416,7 @@ impl<'w> Gpu<'w> {
                 let sub = &mut self.subs[which];
                 sub.cmd = cmd;
                 sub.fence = fence;
-                if which != IMMEDIATE {
+                if (1..=FRAMES).contains(&which) {
                     sub.acquire = create("vkCreateSemaphore", |o| {
                         vkCreateSemaphore(dev, &VkSemaphoreCreateInfo::new(), null(), o)
                     })?;

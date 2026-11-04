@@ -10,9 +10,15 @@ pub mod world;
 pub struct Vec3(pub f32, pub f32, pub f32);
 
 impl Vec3 {
+    #[inline]
+    pub const fn new(x: f32, y: f32, z: f32) -> Self {
+        Self(x, y, z)
+    }
+    #[inline]
     pub fn dot(self, b: Self) -> f32 {
         self.0 * b.0 + self.1 * b.1 + self.2 * b.2
     }
+    #[inline]
     pub fn cross(self, b: Self) -> Self {
         Self(
             self.1 * b.2 - self.2 * b.1,
@@ -20,13 +26,19 @@ impl Vec3 {
             self.0 * b.1 - self.1 * b.0,
         )
     }
+    #[inline]
     pub fn minus(self, b: Self) -> Self {
         Self(self.0 - b.0, self.1 - b.1, self.2 - b.2)
     }
+    #[inline]
     pub fn unit(self) -> Option<Self> {
-        let length = self.dot(self).sqrt();
-        (length.is_finite() && length > 1e-6)
-            .then(|| Self(self.0 / length, self.1 / length, self.2 / length))
+        let len_sq = self.dot(self);
+        if len_sq.is_finite() && len_sq > 1e-12 {
+            let inv = 1.0 / len_sq.sqrt();
+            Some(Self(self.0 * inv, self.1 * inv, self.2 * inv))
+        } else {
+            None
+        }
     }
 }
 
