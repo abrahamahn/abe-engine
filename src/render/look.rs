@@ -79,9 +79,157 @@ pub struct Look {
     pub sparkle: f32,
     /// Procedural surface detail by material name; the first matching rule wins.
     pub details: Vec<DetailRule>,
+    /// Per-material surface response overrides by material-name pattern; the first matching rule wins.
+    pub surface_rules: Vec<SurfaceRule>,
     pub grass: Grass,
     /// Beaches, rock and meadow patches on materials with the [`DetailPreset::Terrain`] detail.
     pub terrain: Terrain,
+    /// Default surface response model for opaque and alpha-blended scene materials.
+    pub surface_model: SurfaceModel,
+    /// Secondary clear-coat lobe weight (0..1) and roughness (0..1) when using `ClearCoat` or
+    /// Look-level clear-coat styling.
+    pub clearcoat: f32,
+    pub clearcoat_roughness: f32,
+    /// Fabric sheen weight (0..1) when using `CharlieCloth` or Look-level sheen styling.
+    pub sheen: f32,
+    /// Subsurface wrap / scatter weight (0..1) and RGB tint (linear).
+    pub subsurface: f32,
+    pub subsurface_color: V3,
+    /// Display-referred tone-mapping curve.
+    pub tonemap: ToneMap,
+    /// Optional scene-linear EV100 camera target (`13.0` is neutral daylight `1.0x` scale).
+    pub ev100: Option<f32>,
+    /// Optional physical camera settings (`aperture`, `shutter_speed`, `iso`, `compensation`).
+    pub camera: Option<CameraExposure>,
+}
+
+/// Reference EV100 (`f/8`, `1/125 s`, `ISO 100`) mapped to unity exposure in Ganbate's sky units.
+pub const REFERENCE_EV100: f32 = 13.0;
+
+/// Converts an EV100 value into a linear exposure multiplier relative to [`REFERENCE_EV100`].
+pub fn ev100_exposure_scale(ev100: f32) -> f32 {
+    2.0f32.powf((REFERENCE_EV100 - ev100).clamp(-16.0, 16.0))
+}
+
+/// Physical camera settings mapped to EV100 exposure.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraExposure {
+    /// Relative aperture f-number (`N`, e.g. `8.0` for `f/8`).
+    pub aperture: f32,
+    /// Shutter duration in seconds (`t`, e.g. `0.008` for `1/125 s`).
+    pub shutter_speed: f32,
+    /// Sensor ISO sensitivity (`100.0` baseline).
+    pub iso: f32,
+    /// Exposure compensation in EV stops (`+1.0` doubles brightness).
+    pub compensation: f32,
+}
+
+impl Default for CameraExposure {
+    fn default() -> Self {
+        Self {
+            aperture: 8.0,
+            shutter_speed: 1.0 / 125.0,
+            iso: 100.0,
+            compensation: 0.0,
+        }
+    }
+}
+
+impl CameraExposure {
+    /// Computes effective EV100 (`log2(N^2 / t) - log2(ISO / 100) - compensation`).
+    pub fn ev100(&self) -> f32 {
+        let n = self.aperture.max(0.5);
+        let t = self.shutter_speed.max(1e-6);
+        let iso = self.iso.max(1.0);
+        (n * n / t).log2() - (iso / 100.0).log2() - self.compensation
+    }
+}
+
+/// Surface response model decoupling material parameters from art-directed or photoreal BRDFs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SurfaceModel {
+    /// Soft two-tone cel ramp with tinted shadows, toon specular, and fresnel rim.
+    #[default]
+    StylizedRamp = 0,
+    /// Crisp cel band with warm terminator scatter, tangent highlight, and light-gated rim.
+    StylizedCharacter = 1,
+    /// Energy-conserving microfacet GGX specular with height-correlated Smith visibility and Burley diffuse.
+    StandardGGX = 2,
+    /// `StandardGGX` base coated with a dielectric (`F0 = 0.04`) secondary specular lobe.
+    ClearCoat = 3,
+    /// Estevez & Kulla Charlie sheen microfacet lobe for woven cloth, velvet, and felt-like fabrics.
+    CharlieCloth = 4,
+    /// Dual-lobe specular with wrapped RGB subsurface scattering and back-lit translucency.
+    SubsurfaceSkin = 5,
+}
+
+impl SurfaceModel {
+    pub const ALL: [Self; 6] = [
+        Self::StylizedRamp,
+        Self::StylizedCharacter,
+        Self::StandardGGX,
+        Self::ClearCoat,
+        Self::CharlieCloth,
+        Self::SubsurfaceSkin,
+    ];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "stylized" | "stylized_ramp" => Self::StylizedRamp,
+            "stylized_character" | "character" => Self::StylizedCharacter,
+            "standard_ggx" | "photoreal" | "ggx" => Self::StandardGGX,
+            "clearcoat" | "clear_coat" => Self::ClearCoat,
+            "charlie_cloth" | "cloth" => Self::CharlieCloth,
+            "subsurface_skin" | "subsurface" | "skin" => Self::SubsurfaceSkin,
+            _ => return None,
+        })
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StylizedRamp => "stylized_ramp",
+            Self::StylizedCharacter => "stylized_character",
+            Self::StandardGGX => "standard_ggx",
+            Self::ClearCoat => "clearcoat",
+            Self::CharlieCloth => "charlie_cloth",
+            Self::SubsurfaceSkin => "subsurface_skin",
+        }
+    }
+}
+
+/// Display-referred tone-mapping operator applied before grading and output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ToneMap {
+    /// Warm Narkowicz ACES curve tuned for Ganbate's stylized palette (engine default).
+    #[default]
+    Stylized = 0,
+    /// Troy Sobotka's AgX transform: smooth chroma-preserving highlight desaturation without hue skew.
+    AgX = 1,
+    /// Stephen Hill's sRGB-to-AP1 fitted ACES RRT+ODT transform for high-contrast photoreal scenes.
+    ACESFitted = 2,
+}
+
+impl ToneMap {
+    pub const ALL: [Self; 3] = [Self::Stylized, Self::AgX, Self::ACESFitted];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "stylized" | "aces_stylized" => Self::Stylized,
+            "agx" => Self::AgX,
+            "aces" | "aces_fitted" => Self::ACESFitted,
+            _ => return None,
+        })
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stylized => "stylized",
+            Self::AgX => "agx",
+            Self::ACESFitted => "aces_fitted",
+        }
+    }
 }
 
 /// A procedural surface pattern a Look file can give materials.
@@ -147,6 +295,26 @@ pub struct DetailRule {
 }
 
 impl DetailRule {
+    /// True when one of the patterns matches `name`.
+    pub fn matches(&self, name: &str) -> bool {
+        self.patterns.iter().any(|p| glob(p, name))
+    }
+}
+
+/// Per-material surface response override matched by material-name glob pattern.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceRule {
+    /// Material-name patterns; `*` matches any run of characters.
+    pub patterns: Vec<String>,
+    pub surface: Option<SurfaceModel>,
+    pub clearcoat: Option<f32>,
+    pub clearcoat_roughness: Option<f32>,
+    pub sheen: Option<f32>,
+    pub sheen_tint: Option<f32>,
+    pub subsurface: Option<f32>,
+}
+
+impl SurfaceRule {
     /// True when one of the patterns matches `name`.
     pub fn matches(&self, name: &str) -> bool {
         self.patterns.iter().any(|p| glob(p, name))
@@ -298,8 +466,31 @@ impl Default for Look {
             foam: 0.6,
             sparkle: 0.5,
             details: vec![],
+            surface_rules: vec![],
             grass: Grass::default(),
             terrain: Terrain::default(),
+            surface_model: SurfaceModel::StylizedRamp,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.15,
+            sheen: 0.0,
+            subsurface: 0.0,
+            subsurface_color: [0.85, 0.28, 0.18],
+            tonemap: ToneMap::Stylized,
+            ev100: None,
+            camera: None,
+        }
+    }
+}
+
+impl Look {
+    /// Scene-linear exposure multiplier combining `exposure` with physical camera (`camera` or `ev100`).
+    pub fn effective_exposure(&self) -> f32 {
+        if let Some(cam) = &self.camera {
+            self.exposure * ev100_exposure_scale(cam.ev100())
+        } else if let Some(ev) = self.ev100 {
+            self.exposure * ev100_exposure_scale(ev)
+        } else {
+            self.exposure
         }
     }
 }
@@ -325,7 +516,7 @@ pub struct View {
 
 /// A lens focused `distance` metres from the eye: nothing nearer blurs, and past it the scene
 /// softens, reaching its full blur `depth` metres further on, `blur` (the blur's radius as a share
-/// of the image height) across. A table in focus keeps its garden behind it soft.
+/// of the image height) across. A foreground subject in focus keeps the scenery behind it soft.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Focus {
     pub distance: f32,
@@ -421,6 +612,20 @@ impl LookFile {
             num(s, "brush", &mut l.brush)?;
             num(s, "bounce", &mut l.bounce)?;
             num(s, "brush_scale", &mut l.brush_scale)?;
+            if let Some(m) = s.get("model") {
+                let name = m.string().map_err(|e| format!("shading.model: {e}"))?;
+                l.surface_model = SurfaceModel::parse(name)
+                    .ok_or_else(|| format!("unknown surface model {name:?}"))?;
+            }
+            num(s, "clearcoat", &mut l.clearcoat)?;
+            num(s, "clearcoat_roughness", &mut l.clearcoat_roughness)?;
+            num(s, "sheen", &mut l.sheen)?;
+            num(s, "subsurface", &mut l.subsurface)?;
+            col(s, "subsurface_color", &mut l.subsurface_color)?;
+            l.clearcoat = l.clearcoat.clamp(0.0, 1.0);
+            l.clearcoat_roughness = l.clearcoat_roughness.clamp(0.02, 1.0);
+            l.sheen = l.sheen.clamp(0.0, 1.0);
+            l.subsurface = l.subsurface.clamp(0.0, 1.0);
         }
         if let Some(p) = root.get("post") {
             let l = &mut file.look;
@@ -444,10 +649,41 @@ impl LookFile {
             num(p, "fog_falloff", &mut l.fog_falloff)?;
             num(p, "sharpen", &mut l.sharpen)?;
             num(p, "sun_shafts", &mut l.sun_shafts)?;
+            if let Some(tm) = p.get("tonemap") {
+                let name = tm.string().map_err(|e| format!("post.tonemap: {e}"))?;
+                l.tonemap =
+                    ToneMap::parse(name).ok_or_else(|| format!("unknown tonemap {name:?}"))?;
+            }
+            if let Some(ev) = p.get("ev100") {
+                l.ev100 = Some(ev.float().map_err(|e| format!("post.ev100: {e}"))?);
+            }
+            if let Some(c) = p.get("camera") {
+                let mut cam = CameraExposure::default();
+                num(c, "aperture", &mut cam.aperture)?;
+                num(c, "shutter_speed", &mut cam.shutter_speed)?;
+                num(c, "iso", &mut cam.iso)?;
+                num(c, "compensation", &mut cam.compensation)?;
+                if !(cam.aperture > 0.0 && cam.shutter_speed > 0.0 && cam.iso > 0.0) {
+                    return Err(
+                        "post.camera: aperture, shutter_speed and iso must be positive".into(),
+                    );
+                }
+                l.camera = Some(cam);
+            }
         }
         if let Some(rules) = root.get("details") {
             for r in rules.array()? {
                 file.look.details.push(parse_detail(r)?);
+                if let Some(sr) = parse_surface_rule(r)? {
+                    file.look.surface_rules.push(sr);
+                }
+            }
+        }
+        if let Some(rules) = root.get("surfaces") {
+            for r in rules.array()? {
+                if let Some(sr) = parse_surface_rule(r)? {
+                    file.look.surface_rules.push(sr);
+                }
             }
         }
         if let Some(g) = root.get("grass") {
@@ -577,15 +813,19 @@ impl LookFile {
     }
 }
 
-fn parse_detail(r: &Value) -> Result<DetailRule, String> {
-    let patterns = match r.get("match").ok_or("detail rule without \"match\"")? {
-        Value::String(s) => vec![s.clone()],
+fn parse_patterns(r: &Value) -> Result<Vec<String>, String> {
+    match r.get("match").ok_or("detail rule without \"match\"")? {
+        Value::String(s) => Ok(vec![s.clone()]),
         Value::Array(a) => a
             .iter()
             .map(|v| v.string().map(str::to_owned))
-            .collect::<Result<_, _>>()?,
-        _ => return Err("detail \"match\" must be a string or an array of strings".into()),
-    };
+            .collect::<Result<_, _>>(),
+        _ => Err("detail \"match\" must be a string or an array of strings".into()),
+    }
+}
+
+fn parse_detail(r: &Value) -> Result<DetailRule, String> {
+    let patterns = parse_patterns(r)?;
     let name = r
         .get("preset")
         .ok_or("detail rule without \"preset\"")?
@@ -616,6 +856,48 @@ fn parse_detail(r: &Value) -> Result<DetailRule, String> {
         rule.color = Some(vec3(c).map_err(|e| format!("detail color: {e}"))?);
     }
     Ok(rule)
+}
+
+fn parse_surface_rule(r: &Value) -> Result<Option<SurfaceRule>, String> {
+    let surface = match r.get("surface") {
+        Some(s) => {
+            let name = s.string().map_err(|e| format!("detail surface: {e}"))?;
+            Some(SurfaceModel::parse(name).ok_or_else(|| format!("unknown surface {name:?}"))?)
+        }
+        None => None,
+    };
+    let opt_clamped = |key: &str, lo: f32, hi: f32| -> Result<Option<f32>, String> {
+        r.get(key)
+            .map(|v| {
+                v.float()
+                    .map(|x| x.clamp(lo, hi))
+                    .map_err(|e| format!("detail {key}: {e}"))
+            })
+            .transpose()
+    };
+    let clearcoat = opt_clamped("clearcoat", 0.0, 1.0)?;
+    let clearcoat_roughness = opt_clamped("clearcoat_roughness", 0.02, 1.0)?;
+    let sheen = opt_clamped("sheen", 0.0, 1.0)?;
+    let sheen_tint = opt_clamped("sheen_tint", 0.0, 1.0)?;
+    let subsurface = opt_clamped("subsurface", 0.0, 1.0)?;
+    if surface.is_none()
+        && clearcoat.is_none()
+        && clearcoat_roughness.is_none()
+        && sheen.is_none()
+        && sheen_tint.is_none()
+        && subsurface.is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(SurfaceRule {
+        patterns: parse_patterns(r)?,
+        surface,
+        clearcoat,
+        clearcoat_roughness,
+        sheen,
+        sheen_tint,
+        subsurface,
+    }))
 }
 
 fn parse_keys(v: &Value) -> Result<Vec<SkyKey>, String> {
@@ -684,7 +966,7 @@ mod tests {
     #[test]
     fn view_focus() {
         let f = LookFile::parse(
-            br##"{"views": [{"name": "table", "eye": [0, 2, 3], "target": [0, 0, 0],
+            br##"{"views": [{"name": "stage", "eye": [0, 2, 3], "target": [0, 0, 0],
                              "focus": {"distance": 3.5}},
                             {"name": "deep", "eye": [0, 2, 3], "target": [0, 0, 0],
                              "focus": {"distance": 2, "depth": 6, "blur": 0.01}}]}"##,
@@ -773,5 +1055,61 @@ mod tests {
         assert!(glob("a*", "abc") && glob("*c", "abc") && glob("a*c", "abc") && glob("*", ""));
         assert!(glob("a*b*c", "a-b-c") && !glob("a*b*c", "a-c") && !glob("ab*ba", "aba"));
         assert!(glob("exact", "exact") && !glob("exact", "exactly"));
+    }
+
+    #[test]
+    fn surface_models_tonemap_and_ev100_camera() {
+        for m in SurfaceModel::ALL {
+            assert_eq!(SurfaceModel::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(
+            SurfaceModel::parse("photoreal"),
+            Some(SurfaceModel::StandardGGX)
+        );
+        for tm in ToneMap::ALL {
+            assert_eq!(ToneMap::parse(tm.as_str()), Some(tm));
+        }
+        assert_eq!(ToneMap::parse("aces"), Some(ToneMap::ACESFitted));
+
+        let sunny = CameraExposure {
+            aperture: 8.0,
+            shutter_speed: 1.0 / 128.0,
+            iso: 100.0,
+            compensation: 0.0,
+        };
+        assert!((sunny.ev100() - 13.0).abs() < 1e-4);
+        assert!((ev100_exposure_scale(13.0) - 1.0).abs() < 1e-5);
+        assert!((ev100_exposure_scale(12.0) - 2.0).abs() < 1e-5);
+        assert!((ev100_exposure_scale(14.0) - 0.5).abs() < 1e-5);
+
+        let f = LookFile::parse(
+            br##"{"shading": {"model": "clearcoat", "clearcoat": 0.9, "clearcoat_roughness": 0.08,
+                             "sheen": 0.4, "subsurface": 0.6, "subsurface_color": "#ff6644"},
+                 "post": {"tonemap": "agx",
+                          "camera": {"aperture": 5.656854, "shutter_speed": 0.0078125, "iso": 100, "compensation": 0.0}},
+                 "details": [{"match": "cloth-*", "preset": "none", "surface": "charlie_cloth",
+                              "sheen": 0.85, "sheen_tint": 0.5}]}"##,
+        )
+        .unwrap();
+        assert_eq!(f.look.surface_model, SurfaceModel::ClearCoat);
+        assert_eq!((f.look.clearcoat, f.look.clearcoat_roughness), (0.9, 0.08));
+        assert_eq!(f.look.tonemap, ToneMap::AgX);
+        // f/5.656854 at 1/128s ISO 100 => EV100 = 12.0 => 2.0x exposure scale.
+        assert!((f.look.effective_exposure() - 2.0).abs() < 1e-3);
+        assert_eq!(
+            f.look.surface_rules[0].surface,
+            Some(SurfaceModel::CharlieCloth)
+        );
+        assert_eq!(
+            (
+                f.look.surface_rules[0].sheen,
+                f.look.surface_rules[0].sheen_tint
+            ),
+            (Some(0.85), Some(0.5))
+        );
+
+        assert!(LookFile::parse(br#"{"shading": {"model": "unknown"}}"#).is_err());
+        assert!(LookFile::parse(br#"{"post": {"tonemap": "reinhard"}}"#).is_err());
+        assert!(LookFile::parse(br#"{"post": {"camera": {"aperture": 0}}}"#).is_err());
     }
 }

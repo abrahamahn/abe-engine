@@ -122,6 +122,7 @@ use core::fmt;
 mod ast;
 mod builtins;
 mod check;
+pub mod compose;
 mod consteval;
 mod emit;
 pub mod glsl;
@@ -136,9 +137,56 @@ pub mod wgsl;
 #[cfg(test)]
 mod tests;
 
+pub use compose::{ShaderLibrary, compose};
 pub use msl::{
     MAX_RESOURCE_BUFFERS, Msl, MslIndex, MslSlot, PUSH_CONSTANT_BUFFER, SIZES_BUFFER, VERTEX_BUFFER,
 };
+
+/// Compile-time specialization value for a module-scope `const` declaration.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpecValue {
+    Bool(bool),
+    I32(i32),
+    U32(u32),
+    F32(f32),
+}
+
+impl SpecValue {
+    pub(crate) fn type_name(self) -> &'static str {
+        match self {
+            SpecValue::Bool(_) => "bool",
+            SpecValue::I32(_) => "i32",
+            SpecValue::U32(_) => "u32",
+            SpecValue::F32(_) => "f32",
+        }
+    }
+}
+
+/// Options for `#import` composition and compile-time `const` specialization permutations.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CompileOptions<'a> {
+    pub imports: &'a [(&'a str, &'a str)],
+    pub specialize: &'a [(&'a str, SpecValue)],
+}
+
+impl<'a> CompileOptions<'a> {
+    pub const fn new() -> Self {
+        Self {
+            imports: &[],
+            specialize: &[],
+        }
+    }
+
+    pub const fn with_imports(mut self, imports: &'a [(&'a str, &'a str)]) -> Self {
+        self.imports = imports;
+        self
+    }
+
+    pub const fn with_specialize(mut self, specialize: &'a [(&'a str, SpecValue)]) -> Self {
+        self.specialize = specialize;
+        self
+    }
+}
 
 /// Pipeline stage of the selected entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -271,19 +319,50 @@ impl std::error::Error for Error {}
 /// The whole module is parsed and type-checked; only the entry point's call tree and the
 /// resources it uses are emitted and reflected.
 pub fn compile(source: &str, stage: Stage, entry: &str) -> Result<Compiled, Error> {
-    compile_targets(source, stage, entry, cfg!(target_vendor = "apple"))
+    compile_with_options(source, stage, entry, &CompileOptions::new())
+}
+
+/// Compile `entry` from `source` with `#import` modules and `const` specialization overrides.
+pub fn compile_with_options(
+    source: &str,
+    stage: Stage,
+    entry: &str,
+    options: &CompileOptions<'_>,
+) -> Result<Compiled, Error> {
+    compile_targets(source, stage, entry, options, cfg!(target_vendor = "apple"))
 }
 
 /// Like [`compile`], and also emits the entry point as MSL into [`Compiled::msl`] on every
 /// platform (see the `msl` module documentation for the conventions).
 pub fn compile_msl(source: &str, stage: Stage, entry: &str) -> Result<Compiled, Error> {
-    compile_targets(source, stage, entry, true)
+    compile_msl_with_options(source, stage, entry, &CompileOptions::new())
 }
 
-fn compile_targets(source: &str, stage: Stage, entry: &str, msl: bool) -> Result<Compiled, Error> {
-    let tokens = lexer::tokenize(source)?;
+/// [`compile_msl`] with `#import` composition and `const` specialization overrides.
+pub fn compile_msl_with_options(
+    source: &str,
+    stage: Stage,
+    entry: &str,
+    options: &CompileOptions<'_>,
+) -> Result<Compiled, Error> {
+    compile_targets(source, stage, entry, options, true)
+}
+
+fn check_program(source: &str, options: &CompileOptions<'_>) -> Result<ir::Program, Error> {
+    let composed = compose::compose_cow(source, options.imports)?;
+    let tokens = lexer::tokenize(&composed)?;
     let module = parser::parse(tokens)?;
-    let program = check::check(&module)?;
+    check::check_with(&module, options.specialize)
+}
+
+fn compile_targets(
+    source: &str,
+    stage: Stage,
+    entry: &str,
+    options: &CompileOptions<'_>,
+    msl: bool,
+) -> Result<Compiled, Error> {
+    let program = check_program(source, options)?;
     let mut compiled = emit::emit(&program, stage, entry)?;
     if msl {
         compiled.msl = Some(msl::emit(&program, stage, entry)?);
@@ -295,9 +374,17 @@ fn compile_targets(source: &str, stage: Stage, entry: &str, msl: bool) -> Result
 /// the SPIR-V module's; the push-constant block, if used, is the uniform at
 /// [`wgsl::Wgsl::push_constants`].
 pub fn compile_wgsl(source: &str, stage: Stage, entry: &str) -> Result<Compiled, Error> {
-    let tokens = lexer::tokenize(source)?;
-    let module = parser::parse(tokens)?;
-    let program = check::check(&module)?;
+    compile_wgsl_with_options(source, stage, entry, &CompileOptions::new())
+}
+
+/// [`compile_wgsl`] with `#import` composition and `const` specialization overrides.
+pub fn compile_wgsl_with_options(
+    source: &str,
+    stage: Stage,
+    entry: &str,
+    options: &CompileOptions<'_>,
+) -> Result<Compiled, Error> {
+    let program = check_program(source, options)?;
     let mut compiled = emit::emit(&program, stage, entry)?;
     compiled.wgsl = Some(wgsl::emit(&program, stage, entry)?);
     Ok(compiled)
@@ -308,9 +395,17 @@ pub fn compile_wgsl(source: &str, stage: Stage, entry: &str) -> Result<Compiled,
 /// constants as the `ganbate_push` block, and the Vulkan clip-space conventions kept). The
 /// reflection is the SPIR-V module's.
 pub fn compile_glsl(source: &str, stage: Stage, entry: &str) -> Result<Compiled, Error> {
-    let tokens = lexer::tokenize(source)?;
-    let module = parser::parse(tokens)?;
-    let program = check::check(&module)?;
+    compile_glsl_with_options(source, stage, entry, &CompileOptions::new())
+}
+
+/// [`compile_glsl`] with `#import` composition and `const` specialization overrides.
+pub fn compile_glsl_with_options(
+    source: &str,
+    stage: Stage,
+    entry: &str,
+    options: &CompileOptions<'_>,
+) -> Result<Compiled, Error> {
+    let program = check_program(source, options)?;
     let mut compiled = emit::emit(&program, stage, entry)?;
     compiled.glsl = Some(glsl::emit(&program, stage, entry)?);
     Ok(compiled)
@@ -319,9 +414,15 @@ pub fn compile_glsl(source: &str, stage: Stage, entry: &str) -> Result<Compiled,
 /// List the entry points declared in `source` (name and stage) in declaration order, after
 /// checking the whole module.
 pub fn entry_points(source: &str) -> Result<Vec<(String, Stage)>, Error> {
-    let tokens = lexer::tokenize(source)?;
-    let module = parser::parse(tokens)?;
-    let program = check::check(&module)?;
+    entry_points_with_options(source, &CompileOptions::new())
+}
+
+/// [`entry_points`] with `#import` composition and `const` specialization overrides.
+pub fn entry_points_with_options(
+    source: &str,
+    options: &CompileOptions<'_>,
+) -> Result<Vec<(String, Stage)>, Error> {
+    let program = check_program(source, options)?;
     Ok(program
         .functions
         .iter()

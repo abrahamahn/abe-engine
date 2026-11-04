@@ -1,12 +1,16 @@
-//! Render stills of a cooked scene with the stylized renderer.
+//! Render stills of a cooked scene with Ganbate's unified stylized & photoreal renderer.
 //!
 //! ganbate-render --scene world.gbew [--look look.json] [--view NAME | --all-views]
 //!            [--time HOURS] [--weather PRESET] [--width W] [--height H] [--samples N]
 //!            [--seconds S] [--out FILE.png | --out-dir DIR]
+//!            [--realtime-quality | --hybrid-quality]
+//!            [--surface MODEL] [--tonemap stylized|agx|aces] [--ev100 EV]
 //!            [--sequence START_HOURS END_HOURS FRAMES]   (a time-lapse of one view, numbered
 //!                                                         frames in --out-dir)
 use ganbate_engine::gpu::Device;
-use ganbate_engine::render::{Environment, LookFile, Output, Quality, Renderer, View, Weather};
+use ganbate_engine::render::{
+    Environment, LookFile, Output, Quality, Renderer, SurfaceModel, ToneMap, View, Weather,
+};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -30,6 +34,10 @@ fn run() -> Result<(), String> {
     let mut out = PathBuf::from("render.png");
     let mut out_dir: Option<PathBuf> = None;
     let mut realtime = false;
+    let mut hybrid = false;
+    let mut surface_override = None;
+    let mut tonemap_override = None;
+    let mut ev100_override = None;
     let mut sequence: Option<(f32, f32, u32)> = None;
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
@@ -47,6 +55,24 @@ fn run() -> Result<(), String> {
             "--out" => out = PathBuf::from(val()?),
             "--out-dir" => out_dir = Some(PathBuf::from(val()?)),
             "--realtime-quality" => realtime = true,
+            "--hybrid-quality" => hybrid = true,
+            "--surface" => {
+                let s = val()?;
+                surface_override = Some(
+                    SurfaceModel::parse(&s)
+                        .ok_or_else(|| format!("--surface: unknown surface model {s:?}"))?,
+                );
+            }
+            "--tonemap" => {
+                let s = val()?;
+                tonemap_override = Some(
+                    ToneMap::parse(&s)
+                        .ok_or_else(|| format!("--tonemap: unknown tonemap {s:?}"))?,
+                );
+            }
+            "--ev100" => {
+                ev100_override = Some(val()?.parse::<f32>().map_err(|e| format!("--ev100: {e}"))?);
+            }
             "--sequence" => {
                 let a: f32 = val()?
                     .parse()
@@ -78,10 +104,21 @@ fn run() -> Result<(), String> {
         file.weather = Weather::preset(w)
             .ok_or_else(|| format!("unknown weather {w:?}; try {:?}", Weather::PRESETS))?;
     }
+    if let Some(s) = surface_override {
+        file.look.surface_model = s;
+    }
+    if let Some(tm) = tonemap_override {
+        file.look.tonemap = tm;
+    }
+    if let Some(ev) = ev100_override {
+        file.look.ev100 = Some(ev);
+    }
     let mut device = Device::headless()?;
     // Offline stills on slow (software) devices can take minutes per submission.
     device.set_submit_timeout(std::time::Duration::from_secs(1800));
-    let quality = if realtime {
+    let quality = if hybrid {
+        Quality::hybrid_stage()
+    } else if realtime {
         Quality::realtime()
     } else {
         Quality::still()

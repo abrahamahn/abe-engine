@@ -15,15 +15,20 @@ use crate::ir::{
 };
 use crate::lexer::{FloatLit, IntLit, Span};
 use crate::types::*;
-use crate::{Error, SampleType, Stage, TexelFormat, TextureView};
+use crate::{Error, SampleType, SpecValue, Stage, TexelFormat, TextureView};
 
 pub(crate) type R<T> = Result<T, Error>;
 
 /// Maximum depth of lazily resolved module-scope declarations that refer to later ones.
 const MAX_RESOLVE_DEPTH: u32 = 64;
 
+#[cfg(test)]
 pub fn check(module: &ast::Module) -> R<ir::Program> {
-    let mut c = Checker::new(module)?;
+    check_with(module, &[])
+}
+
+pub fn check_with(module: &ast::Module, specialize: &[(&str, SpecValue)]) -> R<ir::Program> {
+    let mut c = Checker::new(module, specialize)?;
     for i in 0..module.decls.len() {
         c.resolve_decl(i)?;
     }
@@ -80,6 +85,7 @@ pub(crate) enum Binding {
     },
 }
 
+#[derive(Clone)]
 struct LoopCx {
     body_scope: usize,
     continue_seen: bool,
@@ -125,9 +131,11 @@ struct Target {
 pub(crate) struct Checker<'a> {
     module: &'a ast::Module,
     names: HashMap<&'a str, usize>,
+    specialize: HashMap<&'a str, SpecValue>,
     states: Vec<State>,
     /// Current depth of nested lazy declaration resolution.
     resolving: u32,
+    dead_depth: u32,
     resolved: Vec<Resolved>,
     pub(crate) structs: Vec<StructInfo>,
     pub(crate) globals: Vec<ir::Global>,
@@ -231,7 +239,7 @@ fn texel_format(name: &str) -> Option<TexelFormat> {
 }
 
 impl<'a> Checker<'a> {
-    fn new(module: &'a ast::Module) -> R<Self> {
+    fn new(module: &'a ast::Module, specialize_list: &'a [(&'a str, SpecValue)]) -> R<Self> {
         let mut names: HashMap<&'a str, usize> = HashMap::new();
         for (i, d) in module.decls.iter().enumerate() {
             if let Some(n) = d.name() {
@@ -248,11 +256,34 @@ impl<'a> Checker<'a> {
                 names.insert(&n.name, i);
             }
         }
+        let mut specialize = HashMap::with_capacity(specialize_list.len());
+        for &(spec_name, spec_val) in specialize_list {
+            let Some(&decl_idx) = names.get(spec_name) else {
+                return Err(Error {
+                    line: 1,
+                    column: 1,
+                    message: format!("unknown specialization constant '{spec_name}'"),
+                });
+            };
+            match &module.decls[decl_idx] {
+                ast::Decl::Const { .. } => {
+                    specialize.insert(spec_name, spec_val);
+                }
+                other => {
+                    let span = other.name().map(|n| n.span).unwrap_or_default();
+                    return Err(span.error(format!(
+                        "'{spec_name}' cannot be specialized because it is not a module-scope 'const'"
+                    )));
+                }
+            }
+        }
         Ok(Checker {
             module,
             names,
+            specialize,
             states: vec![State::Todo; module.decls.len()],
             resolving: 0,
+            dead_depth: 0,
             resolved: vec![Resolved::Pending; module.decls.len()],
             structs: Vec::new(),
             globals: Vec::new(),
@@ -303,9 +334,15 @@ impl<'a> Checker<'a> {
         let r = match &module.decls[i] {
             ast::Decl::Struct(s) => self.resolve_struct(s).map(Resolved::Struct),
             ast::Decl::Alias { ty, .. } => self.resolve_type(ty).map(Resolved::Alias),
-            ast::Decl::Const { ty, init, .. } => self
-                .const_decl(ty.as_ref(), init)
-                .map(|(t, v)| Resolved::Const(t, v)),
+            ast::Decl::Const { name, ty, init } => {
+                let (decl_ty, default_val) = self.const_decl(ty.as_ref(), init)?;
+                if let Some(&spec_val) = self.specialize.get(name.name.as_str()) {
+                    self.apply_spec_const(name, decl_ty, spec_val)
+                        .map(|(t, v)| Resolved::Const(t, v))
+                } else {
+                    Ok(Resolved::Const(decl_ty, default_val))
+                }
+            }
             ast::Decl::Var(v) => self.global_var(v).map(Resolved::Global),
             ast::Decl::Fn(f) => self.fn_signature(f).map(Resolved::Fn),
             ast::Decl::ConstAssert(e) => self.const_assert(e).map(|_| Resolved::Assert),
@@ -341,6 +378,49 @@ impl<'a> Checker<'a> {
             _ => Err(init
                 .span
                 .error("the initializer of a 'const' must be a constant expression")),
+        }
+    }
+
+    fn apply_spec_const(
+        &self,
+        name: &ast::Ident,
+        decl_ty: Ty,
+        spec: SpecValue,
+    ) -> R<(Ty, ConstValue)> {
+        match (&decl_ty, spec) {
+            (Ty::Scalar(Scalar::Bool), SpecValue::Bool(b)) => Ok((BOOL, ConstValue::Bool(b))),
+            (Ty::Scalar(Scalar::I32), SpecValue::I32(v)) => Ok((I32, ConstValue::I32(v))),
+            (Ty::Scalar(Scalar::AbstractInt), SpecValue::I32(v)) => Ok((
+                Ty::Scalar(Scalar::AbstractInt),
+                ConstValue::AbstractInt(v as i64),
+            )),
+            (Ty::Scalar(Scalar::U32), SpecValue::U32(v)) => Ok((U32, ConstValue::U32(v))),
+            (Ty::Scalar(Scalar::AbstractInt), SpecValue::U32(v)) => Ok((
+                Ty::Scalar(Scalar::AbstractInt),
+                ConstValue::AbstractInt(v as i64),
+            )),
+            (Ty::Scalar(Scalar::F32), SpecValue::F32(v)) => {
+                if !v.is_finite() {
+                    return Err(name.span.error("specialization float value must be finite"));
+                }
+                Ok((F32, ConstValue::F32(v)))
+            }
+            (Ty::Scalar(Scalar::AbstractFloat), SpecValue::F32(v))
+            | (Ty::Scalar(Scalar::AbstractInt), SpecValue::F32(v)) => {
+                if !v.is_finite() {
+                    return Err(name.span.error("specialization float value must be finite"));
+                }
+                Ok((
+                    Ty::Scalar(Scalar::AbstractFloat),
+                    ConstValue::AbstractFloat(v as f64),
+                ))
+            }
+            _ => Err(name.span.error(format!(
+                "cannot specialize '{}' of type {} with {}",
+                name.name,
+                self.ty_name(&decl_ty),
+                spec.type_name()
+            ))),
         }
     }
 
@@ -1708,6 +1788,40 @@ impl<'a> Checker<'a> {
                 otherwise,
             } => {
                 let c = self.condition(cond, "'if'")?;
+                if let Some(&ConstValue::Bool(taken)) = c.as_const() {
+                    if taken {
+                        let (t, tf) = self.scoped_block(then)?;
+                        if let Some(s) = otherwise {
+                            self.check_dead_branch(|me| match &s.kind {
+                                SK::Block(b) => me.scoped_block(b).map(|_| ()),
+                                _ => {
+                                    let mut sink = Vec::new();
+                                    me.stmt(s, &mut sink).map(|_| ())
+                                }
+                            })?;
+                        }
+                        if !t.is_empty() {
+                            out.push(Stmt::Block(t));
+                        }
+                        return Ok(tf);
+                    }
+                    self.check_dead_branch(|me| me.scoped_block(then).map(|_| ()))?;
+                    let (o, of) = match otherwise {
+                        None => (Vec::new(), true),
+                        Some(s) => match &s.kind {
+                            SK::Block(b) => self.scoped_block(b)?,
+                            _ => {
+                                let mut o = Vec::new();
+                                let f = self.stmt(s, &mut o)?;
+                                (o, f)
+                            }
+                        },
+                    };
+                    if !o.is_empty() {
+                        out.push(Stmt::Block(o));
+                    }
+                    return Ok(of);
+                }
                 let (t, tf) = self.scoped_block(then)?;
                 let (o, of) = match otherwise {
                     None => (Vec::new(), true),
@@ -1820,10 +1934,51 @@ impl<'a> Checker<'a> {
                 Ok(f)
             }
             SK::ConstAssert(e) => {
-                self.const_assert(e)?;
+                if self.dead_depth == 0 {
+                    self.const_assert(e)?;
+                } else {
+                    let v = self.value(e)?;
+                    if !matches!(v.as_const(), Some(ConstValue::Bool(_))) {
+                        return Err(e
+                            .span
+                            .error("const_assert requires a constant bool expression"));
+                    }
+                }
                 Ok(true)
             }
         }
+    }
+
+    /// Type-checks an unreachable constant `if`/`else` branch so type and syntax errors are
+    /// still reported, then rolls back side effects on function calls, global bindings, locals,
+    /// and stage requirements so dead code is completely pruned from IR and reflection.
+    fn check_dead_branch(&mut self, f: impl FnOnce(&mut Self) -> R<()>) -> R<()> {
+        let const_data_len = self.const_data.len();
+        let globals_len = self.globals.len();
+        let snap = {
+            let fcx = self.fcx_mut();
+            (
+                fcx.locals.len(),
+                fcx.value_names.len(),
+                fcx.calls.clone(),
+                fcx.globals.clone(),
+                fcx.stage_reqs.len(),
+                fcx.loops.clone(),
+            )
+        };
+        self.dead_depth += 1;
+        let res = f(self);
+        self.dead_depth -= 1;
+        self.const_data.truncate(const_data_len);
+        self.globals.truncate(globals_len);
+        let fcx = self.fcx_mut();
+        fcx.locals.truncate(snap.0);
+        fcx.value_names.truncate(snap.1);
+        fcx.calls = snap.2;
+        fcx.globals = snap.3;
+        fcx.stage_reqs.truncate(snap.4);
+        fcx.loops = snap.5;
+        res
     }
 
     fn loop_stmt(

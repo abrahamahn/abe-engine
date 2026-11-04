@@ -1,6 +1,8 @@
-//! A cooked world uploaded for the stylized renderer: one interleaved vertex buffer
-//! (position, normal, uv) in world space, one index buffer, per-material textures, and lamp
-//! lights.
+//! A cooked world uploaded for the renderer: one interleaved vertex buffer (position, normal,
+//! uv, baked hemisphere ao) in world space, one index buffer, spatially chunked per-material
+//! draws with world bounds, per-material textures, and lamp lights.
+
+use std::collections::BTreeMap;
 
 use crate::gpu::{
     BufferDesc, BufferId, BufferUsage, Device, Format, Memory, Result, TextureDesc, TextureId,
@@ -8,18 +10,25 @@ use crate::gpu::{
 };
 use crate::world::{AlphaMode, Emission, Shading, World};
 
-use super::math::{V3, normalize};
+use super::ao::{AoConfig, bake_edit_ao};
+use super::math::{V3, aabb_extent, normalize, transform_point};
 
-/// One indexed draw of one material.
+/// Coarse 3D spatial cell size (metres) used to partition static world geometry per material so
+/// local batching stays tight while off-screen rooms, hills, and water sheets cull cleanly.
+const CHUNK_CELL_METRES: f32 = 28.0;
+
+/// One spatially coherent indexed draw of one material.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DrawItem {
     pub first_index: u32,
     pub count: u32,
     pub material: usize,
     pub water: bool,
+    pub bounds: (V3, V3),
+    pub max_extent: f32,
 }
 
-/// Material constants in the `Draw` push-constant layout (after the model matrix).
+/// Material constants in the `Draw` push-constant layout (after the detail block).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MaterialData {
     pub base_color: [f32; 4],
@@ -75,22 +84,71 @@ pub(super) struct EditInstance {
     pub visible: bool,
 }
 
+/// Provenance of one [`DrawItem`] so dynamic `set_world_instance` edits keep chunk bounds exact.
+pub(super) enum DrawSource {
+    Instances(Vec<u32>),
+    SubMesh {
+        instance: u32,
+        local_indices: Vec<u32>,
+    },
+}
+
 pub(super) struct WorldEdit {
     pub meshes: Vec<EditMesh>,
     /// Per mesh: drawn as water.
     pub water_meshes: Vec<bool>,
+    /// Per mesh: casts baked solid-surface ambient occlusion.
+    pub occluder_meshes: Vec<bool>,
+    /// Per mesh: receives baked vertex ambient occlusion.
+    pub receiver_meshes: Vec<bool>,
     pub instances: Vec<EditInstance>,
     pub lights: Vec<crate::world::PointLight>,
+    pub draw_sources: Vec<DrawSource>,
+    pub vertex_count: usize,
 }
 
-const FLOATS_PER_VERTEX: usize = 8;
+pub(super) const FLOATS_PER_VERTEX: usize = 9;
 
-/// Appends `mesh`'s vertices placed by `m` (position, normal, uv), or all at one point when
+fn cell_of(p: V3) -> [i32; 3] {
+    [
+        (p[0] / CHUNK_CELL_METRES).floor() as i32,
+        (p[1] / CHUNK_CELL_METRES).floor() as i32,
+        (p[2] / CHUNK_CELL_METRES).floor() as i32,
+    ]
+}
+
+fn instance_world_bounds(mesh: &EditMesh, m: &[f32; 16]) -> (V3, V3) {
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for &p in &mesh.positions {
+        let w = transform_point(m, p);
+        for k in 0..3 {
+            lo[k] = lo[k].min(w[k]);
+            hi[k] = hi[k].max(w[k]);
+        }
+    }
+    (lo, hi)
+}
+
+fn union_bounds(a: (V3, V3), b: (V3, V3)) -> (V3, V3) {
+    (
+        [a.0[0].min(b.0[0]), a.0[1].min(b.0[1]), a.0[2].min(b.0[2])],
+        [a.1[0].max(b.1[0]), a.1[1].max(b.1[1]), a.1[2].max(b.1[2])],
+    )
+}
+
+/// Appends `mesh`'s vertices placed by `m` (position, normal, uv, ao), or all at one point when
 /// hidden, which draws nothing.
-fn write_vertices(mesh: &EditMesh, m: &[f32; 16], visible: bool, out: &mut Vec<f32>) {
+fn write_vertices(
+    mesh: &EditMesh,
+    m: &[f32; 16],
+    visible: bool,
+    ao: Option<&[f32]>,
+    out: &mut Vec<f32>,
+) {
     for (i, p) in mesh.positions.iter().enumerate() {
         let w = if visible {
-            super::math::transform_point(m, *p)
+            transform_point(m, *p)
         } else {
             [m[12], m[13], m[14]]
         };
@@ -102,7 +160,8 @@ fn write_vertices(mesh: &EditMesh, m: &[f32; 16], visible: bool, out: &mut Vec<f
             ])
         });
         let uv = mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
-        out.extend_from_slice(&[w[0], w[1], w[2], n[0], n[1], n[2], uv[0], uv[1]]);
+        let v_ao = ao.and_then(|s| s.get(i).copied()).unwrap_or(1.0);
+        out.extend_from_slice(&[w[0], w[1], w[2], n[0], n[1], n[2], uv[0], uv[1], v_ao]);
     }
 }
 
@@ -112,6 +171,7 @@ impl GpuScene {
         let mut vertices: Vec<f32> = vec![];
         let mut indices: Vec<u32> = vec![];
         let mut draws: Vec<DrawItem> = vec![];
+        let mut draw_sources: Vec<DrawSource> = vec![];
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
         let mut land_min = [f32::INFINITY; 3];
@@ -120,7 +180,6 @@ impl GpuScene {
         let mut land_n = 0usize;
         let mut water_sum = 0.0f64;
         let mut water_n = 0usize;
-        // A default material for meshes without one: their flat colour, matte.
         let mut materials: Vec<MaterialData> = world
             .materials
             .iter()
@@ -162,41 +221,21 @@ impl GpuScene {
             .collect();
         let mut names: Vec<String> = world.materials.iter().map(|m| m.name.clone()).collect();
         let mut flat_materials = std::collections::HashMap::new();
-        // Emit instances grouped by material (water last, blended after opaque, each in its
-        // cooked order), so neighbouring instances of one material share one draw however many
-        // separate objects a world keeps.
-        let key = |i: usize| {
-            let mesh = &world.meshes[world.instances[i].mesh as usize];
-            let mat = mesh.material.map(|m| &world.materials[m as usize]);
-            let water = mat.is_some_and(|m| m.shading == Shading::Water);
-            let blend = mat.is_some_and(|m| m.alpha == AlphaMode::Blend);
-            let group = match mesh.material {
-                Some(m) => (0u8, m, [0u32; 3]),
-                None => (1, 0, mesh.color.map(f32::to_bits)),
-            };
-            (
-                water,
-                blend,
-                if blend { (2, i as u32, [0; 3]) } else { group },
-            )
-        };
-        let mut order: Vec<usize> = (0..world.instances.len()).collect();
-        order.sort_by_key(|&i| key(i));
+
         let mut edit = WorldEdit {
             meshes: world
                 .meshes
                 .iter()
-                .map(|m| EditMesh {
-                    positions: m.positions.iter().map(|p| [p.0, p.1, p.2]).collect(),
-                    normals: m.normals.iter().map(|n| [n.0, n.1, n.2]).collect(),
-                    uvs: m.uvs.clone(),
-                    indices: m.indices.clone(),
-                    bounds: super::props::bounds(
-                        &m.positions
-                            .iter()
-                            .map(|p| [p.0, p.1, p.2])
-                            .collect::<Vec<_>>(),
-                    ),
+                .map(|m| {
+                    let positions: Vec<V3> = m.positions.iter().map(|p| [p.0, p.1, p.2]).collect();
+                    let bounds = super::props::bounds(&positions);
+                    EditMesh {
+                        positions,
+                        normals: m.normals.iter().map(|n| [n.0, n.1, n.2]).collect(),
+                        uvs: m.uvs.clone(),
+                        indices: m.indices.clone(),
+                        bounds,
+                    }
                 })
                 .collect(),
             instances: world
@@ -218,23 +257,108 @@ impl GpuScene {
                         .is_some_and(|k| world.materials[k as usize].shading == Shading::Water)
                 })
                 .collect(),
+            occluder_meshes: world
+                .meshes
+                .iter()
+                .map(|m| match m.material {
+                    Some(k) => {
+                        let mat = &world.materials[k as usize];
+                        mat.shading == Shading::Standard && mat.alpha == AlphaMode::Opaque
+                    }
+                    None => true,
+                })
+                .collect(),
+            receiver_meshes: world
+                .meshes
+                .iter()
+                .map(|m| match m.material {
+                    Some(k) => world.materials[k as usize].shading == Shading::Standard,
+                    None => true,
+                })
+                .collect(),
+            draw_sources: Vec::new(),
+            vertex_count: 0,
         };
+
+        let inst_bounds: Vec<(V3, V3)> = world
+            .instances
+            .iter()
+            .map(|inst| instance_world_bounds(&edit.meshes[inst.mesh as usize], &inst.transform.0))
+            .collect();
+
+        let key = |i: usize| {
+            let mesh = &world.meshes[world.instances[i].mesh as usize];
+            let mat = mesh.material.map(|m| &world.materials[m as usize]);
+            let water = mat.is_some_and(|m| m.shading == Shading::Water);
+            let blend = mat.is_some_and(|m| m.alpha == AlphaMode::Blend);
+            let (lo, hi) = inst_bounds[i];
+            let centre = [
+                0.5 * (lo[0] + hi[0]),
+                0.5 * (lo[1] + hi[1]),
+                0.5 * (lo[2] + hi[2]),
+            ];
+            let cell = if blend { [0; 3] } else { cell_of(centre) };
+            let qpos = if blend {
+                [i as i64, 0, 0]
+            } else {
+                [
+                    (centre[0] * 1024.0).round() as i64,
+                    (centre[1] * 1024.0).round() as i64,
+                    (centre[2] * 1024.0).round() as i64,
+                ]
+            };
+            let group = match mesh.material {
+                Some(m) => (0u8, m, [0u32; 3]),
+                None => (1, 0, mesh.color.map(f32::to_bits)),
+            };
+            (
+                water,
+                blend,
+                if blend { (2, i as u32, [0; 3]) } else { group },
+                cell,
+                qpos,
+                mesh.indices.len(),
+            )
+        };
+        let mut order: Vec<usize> = (0..world.instances.len()).collect();
+        order.sort_by_key(|&i| key(i));
+
+        let mut total_verts = 0usize;
+        for &index in &order {
+            let mesh = &world.meshes[world.instances[index].mesh as usize];
+            if mesh.indices.is_empty() {
+                continue;
+            }
+            let base = u32::try_from(total_verts).map_err(|_| "too many vertices")?;
+            edit.instances[index].first_vertex = Some(base);
+            total_verts += mesh.positions.len();
+        }
+        edit.vertex_count = total_verts;
+        let baked_ao = bake_edit_ao(&edit, &AoConfig::default());
+
+        vertices.reserve(total_verts * FLOATS_PER_VERTEX);
+        let mut active_chunk_key: Option<(usize, bool, [i32; 3])> = None;
+
         for &index in &order {
             let inst = &world.instances[index];
             let mesh = &world.meshes[inst.mesh as usize];
             if mesh.indices.is_empty() {
                 continue;
             }
+            let base = edit.instances[index].first_vertex.expect("assigned above");
             let m = inst.transform.0;
-            let base = u32::try_from(vertices.len() / FLOATS_PER_VERTEX)
-                .map_err(|_| "too many vertices")?;
-            edit.instances[index].first_vertex = Some(base);
-            let water = mesh
-                .material
-                .is_some_and(|m| world.materials[m as usize].shading == Shading::Water);
-            write_vertices(&edit.meshes[inst.mesh as usize], &m, true, &mut vertices);
+            let mat_ref = mesh.material.map(|m| &world.materials[m as usize]);
+            let water = mat_ref.is_some_and(|m| m.shading == Shading::Water);
+            let blend = mat_ref.is_some_and(|m| m.alpha == AlphaMode::Blend);
+            write_vertices(
+                &edit.meshes[inst.mesh as usize],
+                &m,
+                true,
+                baked_ao.get(index).map(Vec::as_slice),
+                &mut vertices,
+            );
             for p in &mesh.positions {
-                let w = super::math::transform_point(&m, [p.0, p.1, p.2]);
+                let w = transform_point(&m, [p.0, p.1, p.2]);
                 for k in 0..3 {
                     min[k] = min[k].min(w[k]);
                     max[k] = max[k].max(w[k]);
@@ -248,8 +372,6 @@ impl GpuScene {
                     land_n += 1;
                 }
             }
-            let first_index = indices.len() as u32;
-            indices.extend(mesh.indices.iter().map(|i| i + base));
             let material = match mesh.material {
                 Some(m) => m as usize,
                 None => {
@@ -275,27 +397,91 @@ impl GpuScene {
                     water_n += 1;
                 }
             }
-            let count = mesh.indices.len() as u32;
-            match draws.last_mut() {
-                Some(d)
-                    if d.material == material
-                        && d.water == water
-                        && d.first_index + d.count == first_index =>
-                {
-                    d.count += count;
+
+            let ibounds = inst_bounds[index];
+            let span = aabb_extent(ibounds.0, ibounds.1);
+            let edit_mesh = &edit.meshes[inst.mesh as usize];
+
+            if !blend && span > CHUNK_CELL_METRES * 1.5 && edit_mesh.indices.len() > 32 * 3 {
+                active_chunk_key = None;
+                type CellBucket = (Vec<u32>, (V3, V3));
+                let mut cells: BTreeMap<[i32; 3], CellBucket> = BTreeMap::new();
+                for tri in edit_mesh.indices.chunks_exact(3) {
+                    let wa = transform_point(&m, edit_mesh.positions[tri[0] as usize]);
+                    let wb = transform_point(&m, edit_mesh.positions[tri[1] as usize]);
+                    let wc = transform_point(&m, edit_mesh.positions[tri[2] as usize]);
+                    let tc = [
+                        (wa[0] + wb[0] + wc[0]) * (1.0 / 3.0),
+                        (wa[1] + wb[1] + wc[1]) * (1.0 / 3.0),
+                        (wa[2] + wb[2] + wc[2]) * (1.0 / 3.0),
+                    ];
+                    let entry = cells.entry(cell_of(tc)).or_insert_with(|| {
+                        (Vec::new(), ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]))
+                    });
+                    entry.0.extend_from_slice(tri);
+                    for w in [wa, wb, wc] {
+                        for (k, &wk) in w.iter().enumerate() {
+                            entry.1.0[k] = entry.1.0[k].min(wk);
+                            entry.1.1[k] = entry.1.1[k].max(wk);
+                        }
+                    }
                 }
-                _ => draws.push(DrawItem {
+                for (_cell, (local_indices, b)) in cells {
+                    let first_index = indices.len() as u32;
+                    let count = local_indices.len() as u32;
+                    indices.extend(local_indices.iter().map(|&i| i + base));
+                    draws.push(DrawItem {
+                        first_index,
+                        count,
+                        material,
+                        water,
+                        bounds: b,
+                        max_extent: aabb_extent(b.0, b.1),
+                    });
+                    draw_sources.push(DrawSource::SubMesh {
+                        instance: index as u32,
+                        local_indices,
+                    });
+                }
+                continue;
+            }
+
+            let first_index = indices.len() as u32;
+            indices.extend(mesh.indices.iter().map(|i| i + base));
+            let count = mesh.indices.len() as u32;
+            let centre = [
+                0.5 * (ibounds.0[0] + ibounds.1[0]),
+                0.5 * (ibounds.0[1] + ibounds.1[1]),
+                0.5 * (ibounds.0[2] + ibounds.1[2]),
+            ];
+            let chunk_key = (material, water, cell_of(centre));
+            if !blend
+                && active_chunk_key == Some(chunk_key)
+                && let (Some(d), Some(DrawSource::Instances(insts))) =
+                    (draws.last_mut(), draw_sources.last_mut())
+                && d.first_index + d.count == first_index
+            {
+                d.count += count;
+                d.bounds = union_bounds(d.bounds, ibounds);
+                d.max_extent = aabb_extent(d.bounds.0, d.bounds.1);
+                insts.push(index as u32);
+            } else {
+                active_chunk_key = (!blend).then_some(chunk_key);
+                draws.push(DrawItem {
                     first_index,
                     count,
                     material,
                     water,
-                }),
+                    bounds: ibounds,
+                    max_extent: span,
+                });
+                draw_sources.push(DrawSource::Instances(vec![index as u32]));
             }
         }
+        edit.draw_sources = draw_sources;
+
         let triangles = indices.len() / 3;
         if draws.is_empty() {
-            // Nothing cooked: a scene of props only. A placeholder keeps the buffers non-empty
-            // and the bounds finite.
             (min, max) = ([-1.0; 3], [1.0; 3]);
             vertices = vec![0.0; FLOATS_PER_VERTEX];
             indices = vec![0; 3];
@@ -312,8 +498,7 @@ impl GpuScene {
                 0.5 * (min[2] + max[2]),
             ]
         };
-        // Water last, so the opaque world is already in the depth buffer.
-        draws.sort_by_key(|d| d.water);
+
         let vb = device.create_buffer(&BufferDesc {
             size: (vertices.len() * 4) as u64,
             usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
@@ -329,7 +514,6 @@ impl GpuScene {
 
         let mut textures = Vec::with_capacity(world.textures.len());
         for (i, t) in world.textures.iter().enumerate() {
-            // Encoded PNGs are decoded here; other formats are the host's to decode first.
             let decoded;
             let levels: &[Vec<u8>] = match &t.encoded {
                 Some(e) if e.mime == "image/png" => {
@@ -353,7 +537,6 @@ impl GpuScene {
                 }
                 None => &t.levels,
             };
-            // A top level alone gets the rest of its chain made on the GPU.
             let full = crate::world::Texture::level_count(t.width, t.height) as u32;
             let generate = (levels.len() as u32) < full;
             let mut usage = TextureUsage::SAMPLED | TextureUsage::COPY_DST;
@@ -385,7 +568,6 @@ impl GpuScene {
             .lights
             .iter()
             .map(|l| {
-                // glTF: range 0 means unlimited; a very large range lights every tile.
                 let range = if l.range > 0.0 { l.range } else { 1.0e4 };
                 super::lights::lamp_record(
                     [l.position.0, l.position.1, l.position.2],
@@ -396,7 +578,6 @@ impl GpuScene {
             })
             .collect();
         let light_data: Vec<f32> = lights.iter().flatten().copied().collect();
-        // The lamps, then room for a game's own lights (`lights.rs`).
         let light_buffer = device.create_buffer(&BufferDesc {
             size: ((lights.len() + super::lights::MAX_GAME_LIGHTS) * 64) as u64,
             usage: BufferUsage::STORAGE | BufferUsage::COPY_DST,
@@ -427,7 +608,7 @@ impl GpuScene {
     }
 
     /// Moves world instance `index` to `transform` (column-major), or hides or shows it,
-    /// rewriting only its vertices. Bounds and the water level follow on `refresh_bounds`.
+    /// rewriting its vertices. World bounds, chunk bounds, and baked AO follow on `refresh_world`.
     pub fn set_instance(
         &mut self,
         device: &mut Device<'_>,
@@ -452,7 +633,7 @@ impl GpuScene {
         };
         let mesh = &self.edit.meshes[inst.mesh as usize];
         let mut data = Vec::with_capacity(mesh.positions.len() * FLOATS_PER_VERTEX);
-        write_vertices(mesh, &transform, visible, &mut data);
+        write_vertices(mesh, &transform, visible, None, &mut data);
         device.write_buffer(
             self.vertices,
             u64::from(first) * (FLOATS_PER_VERTEX as u64 * 4),
@@ -477,6 +658,73 @@ impl GpuScene {
         device.write_buffer(self.light_buffer, index as u64 * 64, &f32_bytes(&record))
     }
 
+    /// Recomputes world bounds, per-chunk bounds, water level, and baked vertex AO after one or
+    /// more world instances moved or changed visibility.
+    pub fn refresh_world(&mut self, device: &mut Device<'_>) -> Result<()> {
+        self.refresh_bounds();
+        for (d, src) in self.draws.iter_mut().zip(&self.edit.draw_sources) {
+            let mut lo = [f32::INFINITY; 3];
+            let mut hi = [f32::NEG_INFINITY; 3];
+            match src {
+                DrawSource::Instances(insts) => {
+                    for &idx in insts {
+                        let inst = &self.edit.instances[idx as usize];
+                        if !inst.visible || inst.first_vertex.is_none() {
+                            continue;
+                        }
+                        let b = instance_world_bounds(
+                            &self.edit.meshes[inst.mesh as usize],
+                            &inst.transform,
+                        );
+                        (lo, hi) = union_bounds((lo, hi), b);
+                    }
+                }
+                DrawSource::SubMesh {
+                    instance,
+                    local_indices,
+                } => {
+                    let inst = &self.edit.instances[*instance as usize];
+                    if inst.visible && inst.first_vertex.is_some() {
+                        let mesh = &self.edit.meshes[inst.mesh as usize];
+                        for &vi in local_indices {
+                            let w = transform_point(&inst.transform, mesh.positions[vi as usize]);
+                            for k in 0..3 {
+                                lo[k] = lo[k].min(w[k]);
+                                hi[k] = hi[k].max(w[k]);
+                            }
+                        }
+                    }
+                }
+            }
+            d.bounds = (lo, hi);
+            d.max_extent = aabb_extent(lo, hi);
+        }
+
+        if self.edit.vertex_count > 0 {
+            let baked_ao = bake_edit_ao(&self.edit, &AoConfig::default());
+            let mut vertices = vec![0.0f32; self.edit.vertex_count * FLOATS_PER_VERTEX];
+            let mut buf = Vec::new();
+            for (index, inst) in self.edit.instances.iter().enumerate() {
+                let Some(first) = inst.first_vertex else {
+                    continue;
+                };
+                let mesh = &self.edit.meshes[inst.mesh as usize];
+                buf.clear();
+                write_vertices(
+                    mesh,
+                    &inst.transform,
+                    inst.visible,
+                    baked_ao.get(index).map(Vec::as_slice),
+                    &mut buf,
+                );
+                let start = first as usize * FLOATS_PER_VERTEX;
+                vertices[start..start + buf.len()].copy_from_slice(&buf);
+            }
+            device.write_buffer(self.vertices, 0, &f32_bytes(&vertices))?;
+        }
+        Ok(())
+    }
+
     /// Recomputes the bounds, the land's centre and the water level from the instances as
     /// they are now placed.
     pub fn refresh_bounds(&mut self) {
@@ -493,7 +741,7 @@ impl GpuScene {
             let mesh = &self.edit.meshes[inst.mesh as usize];
             let water = self.instance_is_water(inst);
             for p in &mesh.positions {
-                let w = super::math::transform_point(&inst.transform, *p);
+                let w = transform_point(&inst.transform, *p);
                 for k in 0..3 {
                     min[k] = min[k].min(w[k]);
                     max[k] = max[k].max(w[k]);
@@ -554,8 +802,8 @@ impl GpuScene {
             let Some(inv) = super::math::invert(&inst.transform) else {
                 continue;
             };
-            let o = super::math::transform_point(&inv, origin);
-            let tip = super::math::transform_point(&inv, super::math::add(origin, dir));
+            let o = transform_point(&inv, origin);
+            let tip = transform_point(&inv, super::math::add(origin, dir));
             let d = super::math::sub(tip, o);
             let mesh = &self.edit.meshes[inst.mesh as usize];
             let Some(enter) = super::props::ray_box(o, d, mesh.bounds.0, mesh.bounds.1) else {
