@@ -42,7 +42,7 @@ impl Sha256 {
 
     pub fn update(&mut self, mut data: &[u8]) {
         self.length = self.length.wrapping_add(data.len() as u64);
-        while !data.is_empty() {
+        if self.filled > 0 {
             let take = (64 - self.filled).min(data.len());
             self.block[self.filled..self.filled + take].copy_from_slice(&data[..take]);
             self.filled += take;
@@ -53,13 +53,24 @@ impl Sha256 {
                 self.filled = 0;
             }
         }
+        let mut chunks = data.chunks_exact(64);
+        for chunk in &mut chunks {
+            self.compress(chunk.try_into().unwrap());
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            self.block[..rem.len()].copy_from_slice(rem);
+            self.filled = rem.len();
+        }
     }
 
     pub fn finish(mut self) -> [u8; 32] {
+        static ZEROS: [u8; 64] = [0; 64];
         let bits = self.length.wrapping_mul(8);
         self.update(&[0x80]);
-        while self.filled != 56 {
-            self.update(&[0]);
+        let pad = (56 + 64 - self.filled) & 63;
+        if pad > 0 {
+            self.update(&ZEROS[..pad]);
         }
         self.update(&bits.to_be_bytes());
         let mut out = [0; 32];
@@ -204,10 +215,7 @@ pub fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
             _ => None,
         }
     }
-    let clean: Vec<u8> = text
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
+    let clean: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if clean.len() % 4 != 0 {
         return Err("invalid base64 length".into());
     }

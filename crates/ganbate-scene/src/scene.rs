@@ -17,7 +17,7 @@
 //! derived from the instance's id and theirs (`ganbate_core::id::derived`), changed by the
 //! instance's `overrides`. Instances nest. Entities may be parented under those derived ids.
 //! Components are sparse: a missing field reads as the schema's default.
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use ganbate_core::id::{derived, is_asset_id, is_entity_id};
@@ -267,14 +267,20 @@ pub fn check(root: &Value, registry: &Registry) -> Vec<Issue> {
 /// (those in it and those beneath it). Each entity is walked once, so a long chain costs no
 /// more than a short one.
 fn in_parent_cycles(ents: &BTreeMap<String, Value>) -> Vec<&str> {
-    let mut loops: BTreeMap<&str, bool> = BTreeMap::new();
+    let mut loops: HashMap<&str, bool> = HashMap::with_capacity(ents.len());
+    let mut path = Vec::new();
+    let mut on_path = HashSet::new();
     for id in ents.keys() {
-        let mut path = vec![];
-        let mut on_path = BTreeSet::new();
-        let mut at = id.as_str();
+        let id = id.as_str();
+        if loops.contains_key(id) {
+            continue;
+        }
+        path.clear();
+        on_path.clear();
+        let mut at = id;
         let looped = loop {
-            if let Some(known) = loops.get(at) {
-                break *known;
+            if let Some(&known) = loops.get(at) {
+                break known;
             }
             if !on_path.insert(at) {
                 break true;
@@ -285,13 +291,13 @@ fn in_parent_cycles(ents: &BTreeMap<String, Value>) -> Vec<&str> {
                 _ => break false,
             }
         };
-        for x in path {
+        for &x in &path {
             loops.insert(x, looped);
         }
     }
-    loops
-        .into_iter()
-        .filter_map(|(id, looped)| looped.then_some(id))
+    ents.keys()
+        .map(String::as_str)
+        .filter(|&id| loops.get(id).copied().unwrap_or(false))
         .collect()
 }
 
@@ -698,7 +704,7 @@ impl<'l> Flattener<'l> {
         // instance shows goes right after that entity, and a parent cycle can run through it.
         let mut shown: BTreeMap<&str, Shown> = BTreeMap::new();
         // Every id the instances show.
-        let mut shown_ids: BTreeSet<String> = BTreeSet::new();
+        let mut shown_ids: HashSet<String> = HashSet::new();
         for (id, e) in own {
             let Some(link) = e.get("prefab") else {
                 continue;
@@ -715,7 +721,7 @@ impl<'l> Flattener<'l> {
                 }
             };
             // Derived ids are hashes: two entities can share one only by a forged collision.
-            let mut ids = BTreeSet::new();
+            let mut ids = HashSet::with_capacity(x.entities.len());
             if let Some(r) = x.entities.iter().find(|r| {
                 own.contains_key(&r.id) || shown_ids.contains(&r.id) || !ids.insert(&r.id)
             }) {
@@ -740,7 +746,7 @@ impl<'l> Flattener<'l> {
             tree: &tree,
             shown,
             out: Vec::with_capacity(total),
-            placed: BTreeSet::new(),
+            placed: HashSet::with_capacity(own.len()),
             queue: VecDeque::new(),
         };
         for r in &tree.roots {
@@ -892,7 +898,7 @@ struct Placer<'r> {
     /// What each instance not yet placed shows.
     shown: BTreeMap<&'r str, Shown>,
     out: Vec<Resolved>,
-    placed: BTreeSet<&'r str>,
+    placed: HashSet<&'r str>,
     /// Instances placed whose shown entities wait to be placed, in the order they came.
     queue: VecDeque<&'r str>,
 }
@@ -958,19 +964,31 @@ pub fn local_matrix(transform: Option<&Value>) -> [f32; 16] {
         .0
 }
 
-/// World matrices of resolved entities (parents must precede children, as `flatten` gives).
-pub fn world_matrices(resolved: &[Resolved]) -> BTreeMap<String, [f32; 16]> {
+/// World transforms of resolved entities in `resolved` order (parents must precede children,
+/// as `flatten` gives).
+pub fn world_transforms(resolved: &[Resolved]) -> Vec<ganbate_core::world::Transform> {
     use ganbate_core::world::Transform;
-    let mut out: BTreeMap<String, [f32; 16]> = BTreeMap::new();
-    for r in resolved {
+    let mut index_of: HashMap<&str, usize> = HashMap::with_capacity(resolved.len());
+    let mut out: Vec<Transform> = Vec::with_capacity(resolved.len());
+    for (i, r) in resolved.iter().enumerate() {
         let local = Transform(local_matrix(r.components.get("transform")));
-        let world = match r.parent.as_ref().and_then(|p| out.get(p)) {
-            Some(pm) => Transform(*pm).compose(local),
+        let world = match r.parent.as_deref().and_then(|p| index_of.get(p).copied()) {
+            Some(pi) => out[pi].compose(local),
             None => local,
         };
-        out.insert(r.id.clone(), world.0);
+        index_of.insert(&r.id, i);
+        out.push(world);
     }
     out
+}
+
+/// World matrices of resolved entities (parents must precede children, as `flatten` gives).
+pub fn world_matrices(resolved: &[Resolved]) -> BTreeMap<String, [f32; 16]> {
+    resolved
+        .iter()
+        .zip(world_transforms(resolved))
+        .map(|(r, t)| (r.id.clone(), t.0))
+        .collect()
 }
 
 #[cfg(test)]

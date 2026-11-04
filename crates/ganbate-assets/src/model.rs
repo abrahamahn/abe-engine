@@ -403,18 +403,298 @@ impl Doc<'_> {
     }
 
     fn vecs<const N: usize>(&self, id: usize, what: &str) -> R<Vec<[f32; N]>> {
-        let d = self.floats(id)?;
-        if d.width != N {
-            return Err(format!("{what}: expected {N} components, got {}", d.width));
+        let accessors = arr(self.json, "accessors")?;
+        let a = accessors
+            .get(id)
+            .ok_or_else(|| format!("accessor {id} outside {}", accessors.len()))?;
+        let count = need(a, "count")?.integer()?;
+        if count == 0 || count > MAX_VERTICES * 4 {
+            return Err(format!("accessor {id}: count {count} out of range"));
         }
-        Ok(d.values
-            .chunks_exact(N)
-            .map(|c| {
-                let mut out = [0.0; N];
-                out.copy_from_slice(c);
-                out
-            })
-            .collect())
+        let width = match need(a, "type")?.string()? {
+            "SCALAR" => 1,
+            "VEC2" => 2,
+            "VEC3" => 3,
+            "VEC4" => 4,
+            "MAT4" => 16,
+            t => return Err(format!("accessor {id}: unsupported type {t}")),
+        };
+        if width != N {
+            return Err(format!("{what}: expected {N} components, got {width}"));
+        }
+        let component = need(a, "componentType")?.integer()?;
+        let size = match component {
+            5120 | 5121 => 1,
+            5122 | 5123 => 2,
+            5125 | 5126 => 4,
+            c => return Err(format!("accessor {id}: unknown component type {c}")),
+        };
+        if width == 16 && size < 4 {
+            return Err(format!("accessor {id}: matrices must be floats"));
+        }
+        let normalized = matches!(a.get("normalized"), Some(Value::Bool(true)));
+        let decode = |b: &[u8]| -> f32 {
+            let v = match component {
+                5120 => f32::from(b[0] as i8),
+                5121 => f32::from(b[0]),
+                5122 => f32::from(i16::from_le_bytes([b[0], b[1]])),
+                5123 => f32::from(u16::from_le_bytes([b[0], b[1]])),
+                5125 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32,
+                _ => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            };
+            if !normalized {
+                return v;
+            }
+            match component {
+                5120 => (v / 127.0).max(-1.0),
+                5121 => v / 255.0,
+                5122 => (v / 32767.0).max(-1.0),
+                5123 => v / 65535.0,
+                _ => v,
+            }
+        };
+        let elem = N * size;
+        let mut out = vec![[0.0f32; N]; count];
+        if let Some(view) = a.get("bufferView") {
+            let (bytes, stride) = self.view(view.integer()?)?;
+            let stride = if stride == 0 { elem } else { stride };
+            let offset = a.get("byteOffset").map_or(Ok(0), Value::integer)?;
+            if stride < elem || offset % size != 0 || stride % size != 0 {
+                return Err(format!("accessor {id}: misaligned"));
+            }
+            let end = (count - 1)
+                .checked_mul(stride)
+                .and_then(|n| n.checked_add(offset + elem))
+                .ok_or("accessor overflow")?;
+            if end > bytes.len() {
+                return Err(format!("accessor {id}: outside its buffer view"));
+            }
+            if component == 5126 && stride == elem {
+                for (dst, chunk) in out
+                    .iter_mut()
+                    .zip(bytes[offset..offset + count * elem].chunks_exact(elem))
+                {
+                    for (slot, w) in dst.iter_mut().zip(chunk.chunks_exact(4)) {
+                        *slot = f32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                    }
+                }
+            } else {
+                for (i, dst) in out.iter_mut().enumerate() {
+                    let at = offset + i * stride;
+                    for (k, slot) in dst.iter_mut().enumerate() {
+                        *slot = decode(&bytes[at + k * size..]);
+                    }
+                }
+            }
+        }
+        if let Some(sparse) = a.get("sparse") {
+            let n = need(sparse, "count")?.integer()?;
+            if n > count {
+                return Err(format!("accessor {id}: sparse count {n} exceeds {count}"));
+            }
+            let ix = need(sparse, "indices")?;
+            let (ib, _) = self.view(need(ix, "bufferView")?.integer()?)?;
+            let io = ix.get("byteOffset").map_or(Ok(0), Value::integer)?;
+            let isize = match need(ix, "componentType")?.integer()? {
+                5121 => 1,
+                5123 => 2,
+                5125 => 4,
+                c => return Err(format!("accessor {id}: sparse index type {c}")),
+            };
+            let vx = need(sparse, "values")?;
+            let (vb, _) = self.view(need(vx, "bufferView")?.integer()?)?;
+            let vo = vx.get("byteOffset").map_or(Ok(0), Value::integer)?;
+            if io + n * isize > ib.len() || vo + n * elem > vb.len() {
+                return Err(format!("accessor {id}: sparse data outside its views"));
+            }
+            for j in 0..n {
+                let b = &ib[io + j * isize..];
+                let target = match isize {
+                    1 => usize::from(b[0]),
+                    2 => usize::from(u16::from_le_bytes([b[0], b[1]])),
+                    _ => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize,
+                };
+                if target >= count {
+                    return Err(format!("accessor {id}: sparse index {target} out of range"));
+                }
+                for k in 0..N {
+                    out[target][k] = decode(&vb[vo + j * elem + k * size..]);
+                }
+            }
+        }
+        if out.iter().flatten().any(|v| !v.is_finite()) {
+            return Err(format!("accessor {id}: values are not finite"));
+        }
+        Ok(out)
+    }
+
+    fn indices(&self, id: usize, mi: usize) -> R<Vec<u32>> {
+        let accessors = arr(self.json, "accessors")?;
+        let a = accessors
+            .get(id)
+            .ok_or_else(|| format!("accessor {id} outside {}", accessors.len()))?;
+        if need(a, "type")?.string()? != "SCALAR" {
+            return Err(format!("mesh {mi}: indices must be scalars"));
+        }
+        let component = need(a, "componentType")?.integer()?;
+        let normalized = matches!(a.get("normalized"), Some(Value::Bool(true)));
+        if normalized || !matches!(component, 5121 | 5123 | 5125) {
+            let d = self.floats(id)?;
+            return Ok(d.values.into_iter().map(|v| v as u32).collect());
+        }
+        let count = need(a, "count")?.integer()?;
+        if count == 0 || count > MAX_VERTICES * 4 {
+            return Err(format!("accessor {id}: count {count} out of range"));
+        }
+        let size = match component {
+            5121 => 1,
+            5123 => 2,
+            _ => 4,
+        };
+        let decode_u32 = |b: &[u8]| -> u32 {
+            match size {
+                1 => u32::from(b[0]),
+                2 => u32::from(u16::from_le_bytes([b[0], b[1]])),
+                _ => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            }
+        };
+        let mut values = vec![0u32; count];
+        if let Some(view) = a.get("bufferView") {
+            let (bytes, stride) = self.view(view.integer()?)?;
+            let stride = if stride == 0 { size } else { stride };
+            let offset = a.get("byteOffset").map_or(Ok(0), Value::integer)?;
+            if stride < size || offset % size != 0 || stride % size != 0 {
+                return Err(format!("accessor {id}: misaligned"));
+            }
+            let end = (count - 1)
+                .checked_mul(stride)
+                .and_then(|n| n.checked_add(offset + size))
+                .ok_or("accessor overflow")?;
+            if end > bytes.len() {
+                return Err(format!("accessor {id}: outside its buffer view"));
+            }
+            let slice = &bytes[offset..end];
+            match (size, stride) {
+                (1, 1) => {
+                    for (dst, &b) in values.iter_mut().zip(&slice[..count]) {
+                        *dst = u32::from(b);
+                    }
+                }
+                (2, 2) => {
+                    for (dst, c) in values.iter_mut().zip(slice.chunks_exact(2)) {
+                        *dst = u32::from(u16::from_le_bytes([c[0], c[1]]));
+                    }
+                }
+                (4, 4) => {
+                    for (dst, c) in values.iter_mut().zip(slice.chunks_exact(4)) {
+                        *dst = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    }
+                }
+                _ => {
+                    for (i, dst) in values.iter_mut().enumerate() {
+                        *dst = decode_u32(&bytes[offset + i * stride..]);
+                    }
+                }
+            }
+        }
+        if let Some(sparse) = a.get("sparse") {
+            let n = need(sparse, "count")?.integer()?;
+            if n > count {
+                return Err(format!("accessor {id}: sparse count {n} exceeds {count}"));
+            }
+            let ix = need(sparse, "indices")?;
+            let (ib, _) = self.view(need(ix, "bufferView")?.integer()?)?;
+            let io = ix.get("byteOffset").map_or(Ok(0), Value::integer)?;
+            let isize = match need(ix, "componentType")?.integer()? {
+                5121 => 1,
+                5123 => 2,
+                5125 => 4,
+                c => return Err(format!("accessor {id}: sparse index type {c}")),
+            };
+            let vx = need(sparse, "values")?;
+            let (vb, _) = self.view(need(vx, "bufferView")?.integer()?)?;
+            let vo = vx.get("byteOffset").map_or(Ok(0), Value::integer)?;
+            if io + n * isize > ib.len() || vo + n * size > vb.len() {
+                return Err(format!("accessor {id}: sparse data outside its views"));
+            }
+            for j in 0..n {
+                let b = &ib[io + j * isize..];
+                let target = match isize {
+                    1 => usize::from(b[0]),
+                    2 => usize::from(u16::from_le_bytes([b[0], b[1]])),
+                    _ => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize,
+                };
+                if target >= count {
+                    return Err(format!("accessor {id}: sparse index {target} out of range"));
+                }
+                values[target] = decode_u32(&vb[vo + j * size..]);
+            }
+        }
+        Ok(values)
+    }
+
+    fn joints(&self, id: usize, what: &str) -> R<Vec<[u16; 4]>> {
+        let accessors = arr(self.json, "accessors")?;
+        let a = accessors
+            .get(id)
+            .ok_or_else(|| format!("accessor {id} outside {}", accessors.len()))?;
+        let component = need(a, "componentType")?.integer()?;
+        let normalized = matches!(a.get("normalized"), Some(Value::Bool(true)));
+        if normalized
+            || !matches!(component, 5121 | 5123)
+            || need(a, "type")?.string()? != "VEC4"
+            || a.get("sparse").is_some()
+        {
+            return Ok(self
+                .vecs::<4>(id, what)?
+                .into_iter()
+                .map(|j| j.map(|v| v as u16))
+                .collect());
+        }
+        let count = need(a, "count")?.integer()?;
+        if count == 0 || count > MAX_VERTICES * 4 {
+            return Err(format!("accessor {id}: count {count} out of range"));
+        }
+        let size = if component == 5121 { 1 } else { 2 };
+        let elem = 4 * size;
+        let mut out = vec![[0u16; 4]; count];
+        if let Some(view) = a.get("bufferView") {
+            let (bytes, stride) = self.view(view.integer()?)?;
+            let stride = if stride == 0 { elem } else { stride };
+            let offset = a.get("byteOffset").map_or(Ok(0), Value::integer)?;
+            if stride < elem || offset % size != 0 || stride % size != 0 {
+                return Err(format!("accessor {id}: misaligned"));
+            }
+            let end = (count - 1)
+                .checked_mul(stride)
+                .and_then(|n| n.checked_add(offset + elem))
+                .ok_or("accessor overflow")?;
+            if end > bytes.len() {
+                return Err(format!("accessor {id}: outside its buffer view"));
+            }
+            if size == 1 {
+                for (i, dst) in out.iter_mut().enumerate() {
+                    let b = &bytes[offset + i * stride..];
+                    *dst = [
+                        u16::from(b[0]),
+                        u16::from(b[1]),
+                        u16::from(b[2]),
+                        u16::from(b[3]),
+                    ];
+                }
+            } else {
+                for (i, dst) in out.iter_mut().enumerate() {
+                    let b = &bytes[offset + i * stride..];
+                    *dst = [
+                        u16::from_le_bytes([b[0], b[1]]),
+                        u16::from_le_bytes([b[2], b[3]]),
+                        u16::from_le_bytes([b[4], b[5]]),
+                        u16::from_le_bytes([b[6], b[7]]),
+                    ];
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -650,11 +930,7 @@ pub fn load_glb(data: &[u8]) -> R<Model> {
                 None => vec![],
             };
             let joints: Vec<[u16; 4]> = match accessor("JOINTS_0")? {
-                Some(a) => doc
-                    .vecs::<4>(a, "JOINTS_0")?
-                    .into_iter()
-                    .map(|j| j.map(|v| v as u16))
-                    .collect(),
+                Some(a) => doc.joints(a, "JOINTS_0")?,
                 None => vec![],
             };
             let weights = match accessor("WEIGHTS_0")? {
@@ -675,13 +951,7 @@ pub fn load_glb(data: &[u8]) -> R<Model> {
                 return Err(format!("mesh {mi}: JOINTS_0 and WEIGHTS_0 come together"));
             }
             let indices: Vec<u32> = match p.get("indices") {
-                Some(i) => {
-                    let d = doc.floats(i.integer()?)?;
-                    if d.width != 1 {
-                        return Err(format!("mesh {mi}: indices must be scalars"));
-                    }
-                    d.values.into_iter().map(|v| v as u32).collect()
-                }
+                Some(i) => doc.indices(i.integer()?, mi)?,
                 None => (0..n as u32).collect(),
             };
             if indices.len() % 3 != 0 || indices.iter().any(|&i| i as usize >= n) {
@@ -778,7 +1048,9 @@ pub fn load_glb(data: &[u8]) -> R<Model> {
     }
     let node_count = model.nodes.len();
     for i in 0..node_count {
-        for c in model.nodes[i].children.clone() {
+        let n_children = model.nodes[i].children.len();
+        for k in 0..n_children {
+            let c = model.nodes[i].children[k];
             let child = model
                 .nodes
                 .get_mut(c)
@@ -789,14 +1061,29 @@ pub fn load_glb(data: &[u8]) -> R<Model> {
             child.parent = Some(i);
         }
     }
-    // No cycles: every node reaches a root within node_count steps.
-    for i in 0..node_count {
-        let (mut at, mut steps) = (i, 0);
-        while let Some(p) = model.nodes[at].parent {
-            at = p;
-            steps += 1;
-            if steps > node_count {
-                return Err("the node hierarchy has a cycle".into());
+    // No cycles: each node is visited in O(1) amortized time (0: unvisited, 1: active, 2: ok).
+    let mut state = vec![0u8; node_count];
+    for start in 0..node_count {
+        if state[start] == 2 {
+            continue;
+        }
+        let mut at = start;
+        while state[at] == 0 {
+            state[at] = 1;
+            match model.nodes[at].parent {
+                Some(p) => at = p,
+                None => break,
+            }
+        }
+        if state[at] == 1 && model.nodes[at].parent.is_some() {
+            return Err("the node hierarchy has a cycle".into());
+        }
+        let mut cur = start;
+        while state[cur] == 1 {
+            state[cur] = 2;
+            match model.nodes[cur].parent {
+                Some(p) => cur = p,
+                None => break,
             }
         }
     }

@@ -5,13 +5,19 @@ pub mod image;
 /// The JSON reader and writer now live in `ganbate-core`; this keeps `ganbate_assets::json` working.
 pub use ganbate_core::json;
 pub mod mip;
+pub mod mesh_opt;
 pub mod model;
 pub mod png;
 pub mod zlib;
+pub use mesh_opt::optimize_mesh;
 use std::io::Read;
 pub fn read_asset(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut bytes = vec![];
+    let cap = f
+        .metadata()
+        .map(|m| (m.len().min(cooked::MAX_BYTES as u64) as usize).saturating_add(32))
+        .unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
     f.take(cooked::MAX_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;

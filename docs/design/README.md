@@ -1,5 +1,7 @@
 # Ganbate design
 
+> **New to Ganbate Engine or Ganbate Studio?** Start with the practical **[Developer Onboarding Manual (`../ONBOARDING.md`)](../ONBOARDING.md)** for crate ownership, what runs today, Studio keyboard shortcuts, cooking commands, `createEngine()` code recipes, and the `ganbate` AI-agent CLI. Come back here when you want the architectural rationale behind each subsystem.
+
 **Ganbate is becoming a studio engine: one Rust runtime, one editor (Ganbate Studio) and one content pipeline that
 several games share.** A game keeps its rules, its server protocol and its art; the engine owns every mechanism a
 second game could use unchanged. People make and change content in the editor, not by asking for code: placement,
@@ -44,11 +46,13 @@ This folder is the design. It is written to be read in order; each page starts w
 
 ## Status
 
-Milestone 1 (scene and editor foundation) is implemented in this repository: `ganbate-core` (JSON writer, digests,
-ids), `ganbate-scene` (documents, schemas, prefabs, undo), `ganbate-pipeline` (project, asset database, import that keeps
-objects, scene cook to GBEW v4 with an entity table), renderer support for moving, hiding and picking world
-objects, `ganbate-studio` (host) and `editor/` (interface), checked end to end by `editor/test/run.cjs`. See the
-roadmap for what each later milestone adds.
+Milestone 1 (scene and editor foundation), deterministic rigid-body physics, and the structured agent CLI are
+implemented in this repository: `ganbate-core` (JSON writer, digests, ids), `ganbate-scene` (documents, schemas,
+prefabs, undo), `ganbate-pipeline` (project, asset database, import that keeps objects, scene cook to GBEW v4 with an
+entity table), renderer support for moving, hiding and picking world objects, `ganbate-physics` (60 Hz soft-step
+solver, joints, queries, character controller), `ganbate-studio` (host) plus `editor/` (interface + Asset Library),
+and `ganbate-agent` (`ganbate` JSON CLI), checked end to end by `editor/test/run.cjs` and `cargo test --workspace`.
+See the [roadmap](../roadmap.md) for what each later milestone adds.
 
 ## Words used here
 

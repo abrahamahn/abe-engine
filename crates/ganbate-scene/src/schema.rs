@@ -21,6 +21,7 @@
 //! Component kinds without a dot (`transform`) belong to the engine; a game's kinds carry its
 //! namespace (`arena.spawn`).
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use ganbate_core::id::{is_asset_id, is_entity_id};
 use ganbate_core::json::Value;
@@ -482,10 +483,15 @@ pub const ENGINE_SCHEMA: &str = include_str!("engine.schema.json");
 
 /// A registry holding the engine's component kinds.
 pub fn engine_registry() -> Registry {
-    let mut r = Registry::default();
-    let file = ganbate_core::json::parse(ENGINE_SCHEMA.as_bytes()).expect("engine schema parses");
-    r.add(&file, true).expect("engine schema is valid");
-    r
+    static BASE: OnceLock<Registry> = OnceLock::new();
+    BASE.get_or_init(|| {
+        let mut r = Registry::default();
+        let file =
+            ganbate_core::json::parse(ENGINE_SCHEMA.as_bytes()).expect("engine schema parses");
+        r.add(&file, true).expect("engine schema is valid");
+        r
+    })
+    .clone()
 }
 
 #[cfg(test)]

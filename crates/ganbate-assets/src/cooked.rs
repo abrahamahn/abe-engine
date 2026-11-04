@@ -169,28 +169,6 @@ fn put_varint(v: &mut Vec<u8>, mut n: u64) {
     v.push(n as u8);
 }
 
-/// Appends `values` byte plane by byte plane, `width` planes.
-fn put_planes(v: &mut Vec<u8>, values: &[u32], width: usize) {
-    for plane in 0..width {
-        v.extend(values.iter().map(|x| (x >> (8 * plane)) as u8));
-    }
-}
-
-/// Zigzag deltas of grid values, `components` per vertex.
-fn deltas(values: &[i64], components: usize) -> Vec<u32> {
-    let mut prev = vec![0i64; components];
-    values
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| {
-            let c = i % components;
-            let d = v - prev[c];
-            prev[c] = v;
-            zigzag(d)
-        })
-        .collect()
-}
-
 fn on_grid(c: f32, step: f32, what: &str) -> Result<i64, String> {
     let q = (f64::from(c) / f64::from(step)).round();
     if q.is_nan() || q.abs() > GRID_LIMIT {
@@ -203,9 +181,16 @@ fn on_grid(c: f32, step: f32, what: &str) -> Result<i64, String> {
 
 /// A mesh's coded stream (see the module notes) and its vertex count.
 fn code_mesh(m: &Mesh) -> Result<(usize, Vec<u8>), String> {
+    let has_normals = !m.normals.is_empty();
+    let has_uvs = !m.uvs.is_empty();
     let mut first = vec![u32::MAX; m.positions.len()];
-    let mut order = Vec::new();
-    let mut v = Vec::with_capacity(m.indices.len() * 2);
+    let mut order = Vec::with_capacity(m.positions.len());
+    let est_bytes = m
+        .indices
+        .len()
+        .saturating_mul(2)
+        .saturating_add(m.positions.len().saturating_mul(plane_bytes(has_normals, has_uvs) as usize));
+    let mut v = Vec::with_capacity(est_bytes);
     let mut next: u64 = 0;
     for &i in &m.indices {
         let i = i as usize;
@@ -221,35 +206,81 @@ fn code_mesh(m: &Mesh) -> Result<(usize, Vec<u8>), String> {
             put_varint(&mut v, next - k);
         }
     }
-    let mut grid = Vec::with_capacity(order.len() * 3);
-    for &i in &order {
-        let Vec3(x, y, z) = m.positions[i];
-        for c in [x, y, z] {
-            grid.push(on_grid(c, POSITION_GRID, "position")?);
-        }
-    }
-    put_planes(&mut v, &deltas(&grid, 3), 4);
-    if !m.normals.is_empty() {
-        let oct: Vec<i64> = order
-            .iter()
-            .flat_map(|&i| oct_encode(m.normals[i]))
-            .map(|c| (c * NORMAL_RANGE).round() as i64)
-            .collect();
-        put_planes(&mut v, &deltas(&oct, 2), 2);
-    }
-    if !m.uvs.is_empty() {
-        let mut uv = Vec::with_capacity(order.len() * 2);
-        for &i in &order {
-            for c in m.uvs[i] {
-                uv.push(on_grid(c, UV_GRID, "uv")?);
+    drop(first);
+
+    let n = order.len();
+    // Positions: 3 components, 4 byte planes.
+    {
+        let count = n * 3;
+        let start = v.len();
+        v.resize(start + count * 4, 0);
+        let (p0, rest) = v[start..].split_at_mut(count);
+        let (p1, rest) = rest.split_at_mut(count);
+        let (p2, p3) = rest.split_at_mut(count);
+        let mut prev = [0i64; 3];
+        for (vi, &orig) in order.iter().enumerate() {
+            let Vec3(x, y, z) = m.positions[orig];
+            let base = vi * 3;
+            for (c, val) in [x, y, z].into_iter().enumerate() {
+                let q = on_grid(val, POSITION_GRID, "position")?;
+                let bytes = zigzag(q - prev[c]).to_le_bytes();
+                prev[c] = q;
+                let idx = base + c;
+                p0[idx] = bytes[0];
+                p1[idx] = bytes[1];
+                p2[idx] = bytes[2];
+                p3[idx] = bytes[3];
             }
         }
-        put_planes(&mut v, &deltas(&uv, 2), 4);
     }
-    Ok((order.len(), crate::zlib::compress(&v)))
+    // Normals: 2 octahedral components, 2 byte planes.
+    if has_normals {
+        let count = n * 2;
+        let start = v.len();
+        v.resize(start + count * 2, 0);
+        let (n0, n1) = v[start..].split_at_mut(count);
+        let mut prev = [0i64; 2];
+        for (vi, &orig) in order.iter().enumerate() {
+            let oct = oct_encode(m.normals[orig]);
+            let base = vi * 2;
+            for (c, val) in oct.into_iter().enumerate() {
+                let q = (val * NORMAL_RANGE).round() as i64;
+                let bytes = zigzag(q - prev[c]).to_le_bytes();
+                prev[c] = q;
+                let idx = base + c;
+                n0[idx] = bytes[0];
+                n1[idx] = bytes[1];
+            }
+        }
+    }
+    // UVs: 2 components, 4 byte planes.
+    if has_uvs {
+        let count = n * 2;
+        let start = v.len();
+        v.resize(start + count * 4, 0);
+        let (u0, rest) = v[start..].split_at_mut(count);
+        let (u1, rest) = rest.split_at_mut(count);
+        let (u2, u3) = rest.split_at_mut(count);
+        let mut prev = [0i64; 2];
+        for (vi, &orig) in order.iter().enumerate() {
+            let uv = m.uvs[orig];
+            let base = vi * 2;
+            for (c, val) in uv.into_iter().enumerate() {
+                let q = on_grid(val, UV_GRID, "uv")?;
+                let bytes = zigzag(q - prev[c]).to_le_bytes();
+                prev[c] = q;
+                let idx = base + c;
+                u0[idx] = bytes[0];
+                u1[idx] = bytes[1];
+                u2[idx] = bytes[2];
+                u3[idx] = bytes[3];
+            }
+        }
+    }
+    Ok((n, crate::zlib::compress(&v)))
 }
 
-/// Reads a coded mesh's stream back into its arrays.
+/// Reads a coded mesh's stream back into its arrays without intermediate plane/delta buffers.
 #[allow(clippy::type_complexity)]
 fn decode_mesh(
     data: &[u8],
@@ -267,20 +298,27 @@ fn decode_mesh(
     let mut indices = Vec::with_capacity(k);
     let mut next: u64 = 0;
     for _ in 0..k {
-        let mut code: u64 = 0;
-        let mut shift = 0;
-        loop {
-            let b = *data.get(at).ok_or("truncated mesh indices")?;
-            at += 1;
-            if shift > 28 {
-                return Err("overlong index code".into());
+        let b0 = *data.get(at).ok_or("truncated mesh indices")?;
+        at += 1;
+        let code: u64 = if b0 < 0x80 {
+            u64::from(b0)
+        } else {
+            let mut c = u64::from(b0 & 0x7F);
+            let mut shift = 7;
+            loop {
+                let b = *data.get(at).ok_or("truncated mesh indices")?;
+                at += 1;
+                if shift > 28 {
+                    return Err("overlong index code".into());
+                }
+                c |= u64::from(b & 0x7F) << shift;
+                shift += 7;
+                if b & 0x80 == 0 {
+                    break;
+                }
             }
-            code |= u64::from(b & 0x7F) << shift;
-            shift += 7;
-            if b & 0x80 == 0 {
-                break;
-            }
-        }
+            c
+        };
         let index = if code == 0 {
             next += 1;
             next - 1
@@ -296,63 +334,87 @@ fn decode_mesh(
     if next != n as u64 {
         return Err("coded mesh has unused vertices".into());
     }
-    let mut planes = |count: usize, width: usize| -> Result<Vec<u32>, String> {
+
+    let take_planes = |at: &mut usize, count: usize, width: usize| -> Result<&[u8], String> {
         let end = count
             .checked_mul(width)
-            .and_then(|b| b.checked_add(at))
+            .and_then(|b| b.checked_add(*at))
             .ok_or("truncated mesh attributes")?;
-        let bytes = data.get(at..end).ok_or("truncated mesh attributes")?;
-        at = end;
-        Ok((0..count)
-            .map(|i| {
-                (0..width).fold(0u32, |acc, p| {
-                    acc | u32::from(bytes[p * count + i]) << (8 * p)
-                })
-            })
-            .collect())
+        let bytes = data.get(*at..end).ok_or("truncated mesh attributes")?;
+        *at = end;
+        Ok(bytes)
     };
-    let undelta = |codes: Vec<u32>, components: usize| -> Vec<i64> {
-        let mut prev = vec![0i64; components];
-        codes
-            .into_iter()
-            .enumerate()
-            .map(|(i, z)| {
-                let c = i % components;
-                prev[c] += unzigzag(z);
-                prev[c]
-            })
-            .collect()
-    };
-    let grid = undelta(planes(n * 3, 4)?, 3);
-    let positions = grid
-        .chunks_exact(3)
-        .map(|c| {
-            let f = |q: i64| (q as f64 * f64::from(POSITION_GRID)) as f32;
-            Vec3(f(c[0]), f(c[1]), f(c[2]))
-        })
-        .collect();
+
+    let pos_count = n.checked_mul(3).ok_or("truncated mesh attributes")?;
+    let p_bytes = take_planes(&mut at, pos_count, 4)?;
+    let (p0, rest) = p_bytes.split_at(pos_count);
+    let (p1, rest) = rest.split_at(pos_count);
+    let (p2, p3) = rest.split_at(pos_count);
+    let mut positions = Vec::with_capacity(n);
+    let mut prev_p = [0i64; 3];
+    let pos_step = f64::from(POSITION_GRID);
+    for vi in 0..n {
+        let base = vi * 3;
+        let z0 = u32::from_le_bytes([p0[base], p1[base], p2[base], p3[base]]);
+        let z1 = u32::from_le_bytes([p0[base + 1], p1[base + 1], p2[base + 1], p3[base + 1]]);
+        let z2 = u32::from_le_bytes([p0[base + 2], p1[base + 2], p2[base + 2], p3[base + 2]]);
+        prev_p[0] += unzigzag(z0);
+        prev_p[1] += unzigzag(z1);
+        prev_p[2] += unzigzag(z2);
+        positions.push(Vec3(
+            (prev_p[0] as f64 * pos_step) as f32,
+            (prev_p[1] as f64 * pos_step) as f32,
+            (prev_p[2] as f64 * pos_step) as f32,
+        ));
+    }
+
     let normals = if normals {
-        undelta(planes(n * 2, 2)?, 2)
-            .chunks_exact(2)
-            .map(|c| {
-                let f = |q: i64| (q as f32 / NORMAL_RANGE).clamp(-1.0, 1.0);
-                oct_decode([f(c[0]), f(c[1])])
-            })
-            .collect()
+        let norm_count = n.checked_mul(2).ok_or("truncated mesh attributes")?;
+        let n_bytes = take_planes(&mut at, norm_count, 2)?;
+        let (n0, n1) = n_bytes.split_at(norm_count);
+        let mut out_normals = Vec::with_capacity(n);
+        let mut prev_n = [0i64; 2];
+        for vi in 0..n {
+            let base = vi * 2;
+            let z0 = u32::from(u16::from_le_bytes([n0[base], n1[base]]));
+            let z1 = u32::from(u16::from_le_bytes([n0[base + 1], n1[base + 1]]));
+            prev_n[0] += unzigzag(z0);
+            prev_n[1] += unzigzag(z1);
+            out_normals.push(oct_decode([
+                (prev_n[0] as f32 / NORMAL_RANGE).clamp(-1.0, 1.0),
+                (prev_n[1] as f32 / NORMAL_RANGE).clamp(-1.0, 1.0),
+            ]));
+        }
+        out_normals
     } else {
         vec![]
     };
+
     let uvs = if uvs {
-        undelta(planes(n * 2, 4)?, 2)
-            .chunks_exact(2)
-            .map(|c| {
-                let f = |q: i64| (q as f64 * f64::from(UV_GRID)) as f32;
-                [f(c[0]), f(c[1])]
-            })
-            .collect()
+        let uv_count = n.checked_mul(2).ok_or("truncated mesh attributes")?;
+        let u_bytes = take_planes(&mut at, uv_count, 4)?;
+        let (u0, rest) = u_bytes.split_at(uv_count);
+        let (u1, rest) = rest.split_at(uv_count);
+        let (u2, u3) = rest.split_at(uv_count);
+        let mut out_uvs = Vec::with_capacity(n);
+        let mut prev_u = [0i64; 2];
+        let uv_step = f64::from(UV_GRID);
+        for vi in 0..n {
+            let base = vi * 2;
+            let z0 = u32::from_le_bytes([u0[base], u1[base], u2[base], u3[base]]);
+            let z1 = u32::from_le_bytes([u0[base + 1], u1[base + 1], u2[base + 1], u3[base + 1]]);
+            prev_u[0] += unzigzag(z0);
+            prev_u[1] += unzigzag(z1);
+            out_uvs.push([
+                (prev_u[0] as f64 * uv_step) as f32,
+                (prev_u[1] as f64 * uv_step) as f32,
+            ]);
+        }
+        out_uvs
     } else {
         vec![]
     };
+
     if at != data.len() {
         return Err("trailing bytes in a coded mesh".into());
     }
@@ -410,7 +472,34 @@ fn encode_with(w: &World, compact: bool) -> Result<Vec<u8>, String> {
     if w.meshes.len() > MAX_MESHES || w.instances.len() > MAX_INSTANCES {
         return Err("too many meshes or instances".into());
     }
-    let mut v = Vec::new();
+    let mesh_est: usize = w
+        .meshes
+        .iter()
+        .map(|m| {
+            let base = 28 + m.indices.len() * 2;
+            if compact {
+                base + m.positions.len() * 8
+            } else {
+                base + m.positions.len() * 12 + m.normals.len() * 12 + m.uvs.len() * 8
+            }
+        })
+        .sum();
+    let tex_est: usize = w
+        .textures
+        .iter()
+        .map(|t| match &t.encoded {
+            Some(e) => 28 + e.mime.len() + e.data.len(),
+            None => 20 + t.levels.iter().map(Vec::len).sum::<usize>(),
+        })
+        .sum();
+    let cap = (28usize)
+        .saturating_add(mesh_est)
+        .saturating_add(w.instances.len().saturating_mul(68))
+        .saturating_add(w.materials.len().saturating_mul(88))
+        .saturating_add(tex_est)
+        .saturating_add(w.lights.len().saturating_mul(32))
+        .min(MAX_BYTES);
+    let mut v = Vec::with_capacity(cap);
     v.extend_from_slice(MAGIC);
     put_u32(&mut v, VERSION as usize)?;
     for n in [
@@ -543,39 +632,74 @@ fn encode_with(w: &World, compact: bool) -> Result<Vec<u8>, String> {
 
 struct Read<'a>(&'a [u8]);
 impl<'a> Read<'a> {
+    #[inline]
     fn bytes(&mut self, n: u64) -> Result<&'a [u8], String> {
         let n = usize::try_from(n).map_err(|_| "truncated cooked scene")?;
         let (b, left) = self.0.split_at_checked(n).ok_or("truncated cooked scene")?;
         self.0 = left;
         Ok(b)
     }
+    #[inline]
     fn word(&mut self) -> Result<[u8; 4], String> {
         Ok(self.bytes(4)?.try_into().expect("four bytes"))
     }
+    #[inline]
     fn uint(&mut self) -> Result<u32, String> {
         Ok(u32::from_le_bytes(self.word()?))
     }
+    #[inline]
     fn floats<const N: usize>(&mut self) -> Result<[f32; N], String> {
+        let raw = self.bytes(4 * N as u64)?;
         let mut v = [0.0; N];
-        for f in &mut v {
-            *f = f32::from_le_bytes(self.word()?)
+        for (f, c) in v.iter_mut().zip(raw.chunks_exact(4)) {
+            *f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
         }
         Ok(v)
     }
     fn vec3s(&mut self, n: usize) -> Result<Vec<Vec3>, String> {
-        (0..n)
-            .map(|_| self.floats().map(|[x, y, z]| Vec3(x, y, z)))
-            .collect()
+        let raw = self.bytes(12 * n as u64)?;
+        Ok(raw
+            .chunks_exact(12)
+            .map(|c| {
+                Vec3(
+                    f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                    f32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+                    f32::from_le_bytes([c[8], c[9], c[10], c[11]]),
+                )
+            })
+            .collect())
     }
+    fn pairs(&mut self, n: usize) -> Result<Vec<[f32; 2]>, String> {
+        let raw = self.bytes(8 * n as u64)?;
+        Ok(raw
+            .chunks_exact(8)
+            .map(|c| {
+                [
+                    f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                    f32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+                ]
+            })
+            .collect())
+    }
+    fn u32s(&mut self, n: usize) -> Result<Vec<u32>, String> {
+        let raw = self.bytes(4 * n as u64)?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+    #[inline]
     fn index(&mut self) -> Result<Option<u32>, String> {
         Ok(Some(self.uint()?).filter(|&i| i != NONE))
     }
+    #[inline]
     fn choice(&mut self, options: u32) -> Result<u32, String> {
         Some(self.uint()?)
             .filter(|&v| v < options)
             .ok_or_else(|| "invalid enumeration in cooked scene".into())
     }
     /// Fail before allocating `bytes` that the input cannot hold.
+    #[inline]
     fn holds(&self, bytes: u64) -> Result<(), String> {
         if bytes > self.0.len() as u64 {
             return Err("cooked counts exceed file size".into());
@@ -585,14 +709,21 @@ impl<'a> Read<'a> {
 }
 
 fn instances(r: &mut Read, count: usize) -> Result<Vec<Instance>, String> {
-    (0..count)
-        .map(|_| {
-            Ok(Instance {
-                mesh: r.uint()?,
-                transform: Transform(r.floats()?),
-            })
+    let raw = r.bytes(INSTANCE_BYTES * count as u64)?;
+    Ok(raw
+        .chunks_exact(INSTANCE_BYTES as usize)
+        .map(|c| {
+            let mesh = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let mut m = [0.0f32; 16];
+            for (dst, w) in m.iter_mut().zip(c[4..].chunks_exact(4)) {
+                *dst = f32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            }
+            Instance {
+                mesh,
+                transform: Transform(m),
+            }
         })
-        .collect()
+        .collect())
 }
 
 fn decode_v1(r: &mut Read) -> Result<World, String> {
@@ -615,7 +746,7 @@ fn decode_v1(r: &mut Read) -> Result<World, String> {
         }
         r.holds(n as u64 * 12 + k as u64 * 4)?;
         let positions = r.vec3s(n)?;
-        let indices = (0..k).map(|_| r.uint()).collect::<Result<_, _>>()?;
+        let indices = r.u32s(k)?;
         world.meshes.push(Mesh {
             positions,
             indices,
@@ -690,7 +821,11 @@ fn decode_v2(r: &mut Read, version: u32) -> Result<World, String> {
                 .ok_or("coded meshes decode to more than a file may hold")?;
             let limit = usize::try_from(stream_bytes(n, k, normals, uvs))
                 .map_err(|_| "invalid coded mesh counts")?;
-            let data = crate::zlib::decompress(&raw[..len], limit)?;
+            let expect = k
+                .saturating_mul(2)
+                .saturating_add(n.saturating_mul(plane_bytes(normals, uvs) as usize))
+                .min(limit);
+            let data = crate::zlib::decompress_with_capacity(&raw[..len], limit, expect)?;
             decode_mesh(&data, n, k, normals, uvs)?
         } else {
             let n64 = n as u64;
@@ -703,11 +838,7 @@ fn decode_v2(r: &mut Read, version: u32) -> Result<World, String> {
             r.holds(n64 * per_vertex + index_bytes)?;
             let positions = r.vec3s(n)?;
             let normals = if normals { r.vec3s(n)? } else { vec![] };
-            let uvs = if uvs {
-                (0..n).map(|_| r.floats()).collect::<Result<_, _>>()?
-            } else {
-                vec![]
-            };
+            let uvs = if uvs { r.pairs(n)? } else { vec![] };
             let indices = if flags & SHORT_INDICES != 0 {
                 let raw = r.bytes(short_index_bytes(k))?;
                 raw.chunks_exact(2)
@@ -715,7 +846,7 @@ fn decode_v2(r: &mut Read, version: u32) -> Result<World, String> {
                     .map(|c| u32::from(u16::from_le_bytes([c[0], c[1]])))
                     .collect()
             } else {
-                (0..k).map(|_| r.uint()).collect::<Result<_, _>>()?
+                r.u32s(k)?
             };
             (positions, normals, uvs, indices)
         };

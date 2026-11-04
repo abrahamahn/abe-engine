@@ -246,7 +246,13 @@ function onMessage(msg) {
     case 'assets':
       state.assets = msg.assets;
       watchLook(state.inspectedLook);
-      drawAssets();
+      if (state.pendingRevealAsset && state.assets.some((a) => a.id === state.pendingRevealAsset)) {
+        const revealId = state.pendingRevealAsset;
+        state.pendingRevealAsset = null;
+        assetLibrary.revealAsset(revealId);
+      } else {
+        drawAssets();
+      }
       scheduleUsageRefresh(40);
       break;
     case 'asset-usage':
@@ -261,7 +267,12 @@ function onMessage(msg) {
     case 'asset-imported':
       log(0, t('importedCount', msg.path));
       assetLibrary.recordRecent(msg.id);
-      assetLibrary.revealAsset(msg.id);
+      if (state.assets.some((a) => a.id === msg.id)) {
+        state.pendingRevealAsset = null;
+        assetLibrary.revealAsset(msg.id);
+      } else {
+        state.pendingRevealAsset = msg.id;
+      }
       scheduleUsageRefresh(40);
       break;
     case 'doc': {

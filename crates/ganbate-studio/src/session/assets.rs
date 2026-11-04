@@ -65,12 +65,8 @@ impl Studio {
                 self.visit_project_references(|r| {
                     *counts.entry(r.target).or_insert(0) += 1;
                 });
-                let counts_obj = Value::Object(
-                    counts
-                        .into_iter()
-                        .map(|(k, v)| (k, n(v)))
-                        .collect(),
-                );
+                let counts_obj =
+                    Value::Object(counts.into_iter().map(|(k, v)| (k, n(v))).collect());
                 Ok(vec![(
                     from,
                     obj(vec![
@@ -94,7 +90,10 @@ impl Studio {
                             ("docPath", s(&r.doc_path)),
                             ("docKind", s(r.doc_kind)),
                             ("entity", r.entity.as_deref().map_or(Value::Null, s)),
-                            ("entityName", r.entity_name.as_deref().map_or(Value::Null, s)),
+                            (
+                                "entityName",
+                                r.entity_name.as_deref().map_or(Value::Null, s),
+                            ),
                             ("field", s(&r.field)),
                         ]));
                     }
@@ -225,8 +224,7 @@ impl Studio {
         }
 
         if let Some(parent) = to_file.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("{}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
         self.inside(&to)?;
         if !entry.kind.self_identified() {
@@ -247,7 +245,9 @@ impl Studio {
             open.path = to.clone();
         }
 
-        let mut out = vec![(
+        let assets = obj(vec![("type", s("assets")), ("assets", self.assets())]);
+        let mut out: Outbox = self.clients.keys().map(|c| (*c, assets.clone())).collect();
+        out.push((
             from,
             obj(vec![
                 ("type", s("asset-moved")),
@@ -257,9 +257,7 @@ impl Studio {
                 ("to", s(&to)),
                 ("req", req),
             ]),
-        )];
-        let assets = obj(vec![("type", s("assets")), ("assets", self.assets())]);
-        out.extend(self.clients.keys().map(|c| (*c, assets.clone())));
+        ));
         if let Some(open) = self.open.get(&id)
             && !open.watchers.is_empty()
         {
@@ -347,7 +345,9 @@ impl Studio {
             }
         };
 
-        let mut out = vec![(
+        let assets = obj(vec![("type", s("assets")), ("assets", self.assets())]);
+        let mut out: Outbox = self.clients.keys().map(|c| (*c, assets.clone())).collect();
+        out.push((
             from,
             obj(vec![
                 ("type", s("asset-imported")),
@@ -356,9 +356,7 @@ impl Studio {
                 ("path", s(&path)),
                 ("req", req),
             ]),
-        )];
-        let assets = obj(vec![("type", s("assets")), ("assets", self.assets())]);
-        out.extend(self.clients.keys().map(|c| (*c, assets.clone())));
+        ));
         Ok(out)
     }
 
@@ -407,8 +405,7 @@ impl Studio {
     ) -> Result<String, String> {
         let dest = self.project.root.join(rel);
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("{}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
         self.inside(rel)?;
         self.inside(&format!("{rel}.meta.json"))?;
@@ -421,7 +418,10 @@ impl Studio {
             let _ = std::fs::remove_file(&meta_path);
             return Err(format!("{rel}: {e}"));
         }
-        if let Err(e) = self.project.register_sidecar_asset(id.clone(), kind, rel.to_string()) {
+        if let Err(e) = self
+            .project
+            .register_sidecar_asset(id.clone(), kind, rel.to_string())
+        {
             let _ = std::fs::remove_file(&dest);
             let _ = std::fs::remove_file(&meta_path);
             return Err(e);
@@ -462,12 +462,7 @@ fn validate_sound_header(path: &str, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn visit_field_refs(
-    field: &Field,
-    value: &Value,
-    path: &str,
-    emit: &mut dyn FnMut(&str, &str),
-) {
+fn visit_field_refs(field: &Field, value: &Value, path: &str, emit: &mut dyn FnMut(&str, &str)) {
     match (&field.ty, value) {
         (FieldType::Asset { .. }, Value::String(id)) if is_asset_id(id) => {
             emit(id, path);

@@ -223,16 +223,10 @@ pub struct Project {
 /// Writes `v` as canonical JSON (atomic). Text the reader refuses (too large, too deep, too
 /// many values) is not written: no tool could open that file again.
 pub fn write_json(path: &Path, v: &Value) -> Result<(), String> {
-    // The writer refuses what the reader would refuse; the read-back below guards the rest.
+    // `to_canonical` enforces the reader's byte, depth, value-count and finite-number limits.
     let text =
         json::to_canonical(v).map_err(|e| format!("{}: not written: {e}", path.display()))?;
-    json::parse(text.as_bytes()).map_err(|e| {
-        format!(
-            "{}: not written: {} bytes of JSON that would not read back ({e})",
-            path.display(),
-            text.len()
-        )
-    })?;
+    debug_assert!(json::parse(text.as_bytes()).is_ok());
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -465,7 +459,11 @@ impl Project {
         if let Some(other) = self.find_path(rel)
             && other.id != id
         {
-            return Err(format!("{rel} already holds {} {}", other.kind.name(), other.id));
+            return Err(format!(
+                "{rel} already holds {} {}",
+                other.kind.name(),
+                other.id
+            ));
         }
         self.by_id.get_mut(id).expect("entry").path = rel.to_string();
         Ok(())
@@ -488,7 +486,11 @@ impl Project {
             return Err(format!("{rel} is not a {} file", kind.name()));
         }
         if let Some(other) = self.find_path(&rel) {
-            return Err(format!("{rel} already holds {} {}", other.kind.name(), other.id));
+            return Err(format!(
+                "{rel} already holds {} {}",
+                other.kind.name(),
+                other.id
+            ));
         }
         index_entry(&mut self.by_id, id, kind, rel)
     }

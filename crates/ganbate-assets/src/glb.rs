@@ -114,29 +114,89 @@ struct Access<'a> {
     component: usize,
 }
 impl Access<'_> {
+    #[inline]
     fn at(&self, i: usize) -> &[u8] {
         &self.bytes[i * self.stride..]
     }
-    fn float(&self, i: usize, k: usize) -> f32 {
-        f32::from_bits(word(self.at(i), 4 * k).expect("validated accessor range"))
+    #[inline]
+    fn read_f32(b: &[u8], off: usize) -> f32 {
+        f32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
     }
-    fn vec3(&self, i: usize) -> Vec3 {
-        Vec3(self.float(i, 0), self.float(i, 1), self.float(i, 2))
-    }
-    fn uv(&self, i: usize) -> [f32; 2] {
-        let b = self.at(i);
-        match self.component {
-            5121 => [f32::from(b[0]) / 255., f32::from(b[1]) / 255.],
-            5123 => [0, 2].map(|k| f32::from(u16::from_le_bytes([b[k], b[k + 1]])) / 65535.),
-            _ => [self.float(i, 0), self.float(i, 1)],
+    fn vec3s(&self) -> Vec<Vec3> {
+        if self.stride == 12 {
+            self.bytes
+                .chunks_exact(12)
+                .take(self.count)
+                .map(|b| Vec3(Self::read_f32(b, 0), Self::read_f32(b, 4), Self::read_f32(b, 8)))
+                .collect()
+        } else {
+            (0..self.count)
+                .map(|i| {
+                    let b = self.at(i);
+                    Vec3(Self::read_f32(b, 0), Self::read_f32(b, 4), Self::read_f32(b, 8))
+                })
+                .collect()
         }
     }
-    fn index(&self, i: usize) -> u32 {
-        let b = self.at(i);
+    fn uvs(&self) -> Vec<[f32; 2]> {
         match self.component {
-            5121 => u32::from(b[0]),
-            5123 => u32::from(u16::from_le_bytes([b[0], b[1]])),
-            _ => word(b, 0).expect("validated index range"),
+            5121 => (0..self.count)
+                .map(|i| {
+                    let b = self.at(i);
+                    [f32::from(b[0]) / 255., f32::from(b[1]) / 255.]
+                })
+                .collect(),
+            5123 => (0..self.count)
+                .map(|i| {
+                    let b = self.at(i);
+                    [
+                        f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.,
+                        f32::from(u16::from_le_bytes([b[2], b[3]])) / 65535.,
+                    ]
+                })
+                .collect(),
+            _ if self.stride == 8 => self
+                .bytes
+                .chunks_exact(8)
+                .take(self.count)
+                .map(|b| [Self::read_f32(b, 0), Self::read_f32(b, 4)])
+                .collect(),
+            _ => (0..self.count)
+                .map(|i| {
+                    let b = self.at(i);
+                    [Self::read_f32(b, 0), Self::read_f32(b, 4)]
+                })
+                .collect(),
+        }
+    }
+    fn indices(&self) -> Vec<u32> {
+        match (self.component, self.stride) {
+            (5121, 1) => self.bytes[..self.count].iter().map(|&b| u32::from(b)).collect(),
+            (5121, _) => (0..self.count).map(|i| u32::from(self.at(i)[0])).collect(),
+            (5123, 2) => self
+                .bytes
+                .chunks_exact(2)
+                .take(self.count)
+                .map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])))
+                .collect(),
+            (5123, _) => (0..self.count)
+                .map(|i| {
+                    let b = self.at(i);
+                    u32::from(u16::from_le_bytes([b[0], b[1]]))
+                })
+                .collect(),
+            (_, 4) => self
+                .bytes
+                .chunks_exact(4)
+                .take(self.count)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+            _ => (0..self.count)
+                .map(|i| {
+                    let b = self.at(i);
+                    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                })
+                .collect(),
         }
     }
 }
@@ -572,11 +632,11 @@ impl Importer<'_> {
         }
         let per_vertex = 12 + an.as_ref().map_or(0, |_| 12) + at.as_ref().map_or(0, |_| 8);
         self.spend(per_vertex * n as u64 + 4 * num as u64)?;
-        let positions = (0..n).map(|i| ap.vec3(i)).collect();
-        let normals = an.map_or_else(Vec::new, |a| (0..n).map(|i| a.vec3(i)).collect());
-        let uvs: Vec<[f32; 2]> = at.map_or_else(Vec::new, |a| (0..n).map(|i| a.uv(i)).collect());
+        let positions = ap.vec3s();
+        let normals = an.map_or_else(Vec::new, |a| a.vec3s());
+        let uvs: Vec<[f32; 2]> = at.map_or_else(Vec::new, |a| a.uvs());
         let indices = match ai {
-            Some(a) => (0..a.count).map(|i| a.index(i)).collect(),
+            Some(a) => a.indices(),
             None => (0..n as u32).collect(),
         };
         let (mut color, mut material) = ([1.; 3], None);
@@ -722,7 +782,7 @@ pub fn import_nodes(data: &[u8], keep_images: bool) -> Result<NodeWorld, String>
     let nodes = arr(&doc, "nodes")?;
     let selected = index(arr(&doc, "scenes")?, opt_u(&doc, "scene", 0)?)?;
     let mut seen = vec![false; nodes.len()];
-    let mut out: Vec<SourceNode> = vec![];
+    let mut out: Vec<SourceNode> = Vec::with_capacity(nodes.len());
     // Depth-first, parents first: (glTF node, parent's index in `out`, depth).
     let mut todo: Vec<(usize, Option<usize>, usize)> = arr(selected, "nodes")?
         .iter()

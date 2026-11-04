@@ -309,33 +309,38 @@ pub struct Cooked {
     pub warnings: Vec<String>,
 }
 
+/// Cached model metadata after its textures, materials and meshes have been moved into the
+/// cooked [`World`].
+struct CachedModel {
+    nodes: Vec<SourceNode>,
+    path_to_idx: HashMap<String, usize>,
+    model_space: Vec<Transform>,
+    mesh0: u32,
+}
+
 /// Models already imported, with their meshes appended to the world being built.
-struct Library<'p> {
-    project: &'p Project,
+struct Library<'l> {
+    load_model: &'l dyn Fn(&str) -> Result<(String, Vec<u8>), String>,
     keep_images: bool,
-    models: HashMap<String, (NodeWorld, Vec<String>, u32)>,
+    models: HashMap<String, CachedModel>,
 }
 
 impl Library<'_> {
-    /// The model's nodes and paths, importing it (and appending its meshes, materials and
-    /// textures to `w`) the first time; returns the mesh index offset into `w`.
-    fn model(&mut self, w: &mut World, id: &str) -> Result<(&NodeWorld, &[String], u32), String> {
+    /// The model's nodes, path index and model-space transforms, importing it (and moving its
+    /// optimized meshes, materials and textures into `w`) the first time.
+    fn model(&mut self, w: &mut World, id: &str) -> Result<&CachedModel, String> {
         if !self.models.contains_key(id) {
-            let path = self
-                .project
-                .path_of(id)
-                .ok_or_else(|| format!("missing model {id}"))?;
-            let bytes = ganbate_assets::read_asset(&path)?;
-            let nw = glb::import_nodes(&bytes, self.keep_images)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let (label, bytes) = (self.load_model)(id)?;
+            let nw =
+                glb::import_nodes(&bytes, self.keep_images).map_err(|e| format!("{label}: {e}"))?;
             let (mesh0, mat0, tex0) = (
                 w.meshes.len() as u32,
                 w.materials.len() as u32,
                 w.textures.len() as u32,
             );
-            w.textures.extend(nw.world.textures.iter().cloned());
-            for m in &nw.world.materials {
-                let mut m = m.clone();
+            w.textures.extend(nw.world.textures);
+            w.materials.reserve(nw.world.materials.len());
+            for mut m in nw.world.materials {
                 for t in [
                     &mut m.base_color_texture,
                     &mut m.normal_texture,
@@ -345,16 +350,36 @@ impl Library<'_> {
                 }
                 w.materials.push(m);
             }
-            for mesh in &nw.world.meshes {
-                let mut mesh = mesh.clone();
+            w.meshes.reserve(nw.world.meshes.len());
+            for mut mesh in nw.world.meshes {
                 mesh.material = mesh.material.map(|i| i + mat0);
+                ganbate_assets::optimize_mesh(&mut mesh);
                 w.meshes.push(mesh);
             }
             let paths = node_paths(&nw.nodes);
-            self.models.insert(id.to_string(), (nw, paths, mesh0));
+            let mut path_to_idx = HashMap::with_capacity(paths.len());
+            for (i, p) in paths.into_iter().enumerate() {
+                path_to_idx.insert(p, i);
+            }
+            let mut model_space: Vec<Transform> = Vec::with_capacity(nw.nodes.len());
+            for n in &nw.nodes {
+                let m = match n.parent {
+                    Some(p) => model_space[p].compose(n.local),
+                    None => n.local,
+                };
+                model_space.push(m);
+            }
+            self.models.insert(
+                id.to_string(),
+                CachedModel {
+                    nodes: nw.nodes,
+                    path_to_idx,
+                    model_space,
+                    mesh0,
+                },
+            );
         }
-        let (nw, paths, offset) = &self.models[id];
-        Ok((nw, paths, *offset))
+        Ok(&self.models[id])
     }
 }
 
@@ -472,22 +497,39 @@ pub fn cook_resolved(
     resolved: &[Resolved],
     keep_images: bool,
 ) -> Result<Cooked, String> {
-    let matrices = scene::world_matrices(resolved);
+    cook_resolved_with(registry, doc, resolved, keep_images, &|id| {
+        let path = project
+            .path_of(id)
+            .ok_or_else(|| format!("missing model {id}"))?;
+        let bytes = ganbate_assets::read_asset(&path)?;
+        Ok((path.display().to_string(), bytes))
+    })
+}
+
+/// Cooks already-resolved entities using `load_model` to fetch each referenced model's `(label, bytes)`.
+/// Used by both disk-backed hosts (`cook_resolved`) and the pure-web Wasm Studio host.
+pub fn cook_resolved_with(
+    registry: &Registry,
+    doc: &Value,
+    resolved: &[Resolved],
+    keep_images: bool,
+    load_model: &dyn Fn(&str) -> Result<(String, Vec<u8>), String>,
+) -> Result<Cooked, String> {
+    let transforms = scene::world_transforms(resolved);
     let mut w = World::default();
     let mut lib = Library {
-        project,
+        load_model,
         keep_images,
         models: HashMap::new(),
     };
     let mut warnings = vec![];
-    let mut index_of: HashMap<&str, u32> = HashMap::new();
-    let mut records = vec![];
+    let mut index_of: HashMap<&str, u32> = HashMap::with_capacity(resolved.len());
+    let mut records = Vec::with_capacity(resolved.len());
     let mut data = BTreeMap::new();
-    for r in resolved {
+    for (r, &world_m) in resolved.iter().zip(&transforms) {
         if !is_entity_id(&r.id) {
             return Err(format!("{}: invalid entity id", r.id));
         }
-        let world_m = Transform(matrices[&r.id]);
         let first = w.instances.len() as u32;
         let first_light = w.lights.len() as u32;
         let mut rest = BTreeMap::new();
@@ -505,68 +547,62 @@ pub fn cook_resolved(
                         continue;
                     };
                     let node = field(c, "node").and_then(|v| v.string().ok()).unwrap_or("");
-                    let (nw, paths, offset) = lib.model(&mut w, model)?;
-                    let picks: Vec<(usize, Transform)> = if node.is_empty() {
+                    let cached = lib.model(&mut w, model)?;
+                    let offset = cached.mesh0;
+                    if node.is_empty() {
                         // The whole model under the entity, its node tree intact.
-                        let mut model_space: Vec<Transform> = Vec::with_capacity(nw.nodes.len());
-                        for n in &nw.nodes {
-                            let m = match n.parent {
-                                Some(p) => model_space[p].compose(n.local),
-                                None => n.local,
-                            };
-                            model_space.push(m);
-                        }
-                        (0..nw.nodes.len())
-                            .map(|i| (i, world_m.compose(model_space[i])))
-                            .collect()
-                    } else {
-                        match paths.iter().position(|p| p == node) {
-                            Some(i) => vec![(i, world_m)],
-                            None => {
-                                warnings.push(format!(
-                                    "{} ({}): model {model} has no node {node:?}",
+                        for (n, &ms) in cached.nodes.iter().zip(&cached.model_space) {
+                            // The world's limits, checked as it grows: a large model placed many
+                            // times fails here instead of exhausting memory.
+                            if w.instances.len() + n.meshes.len() > MAX_INSTANCES {
+                                return Err(format!(
+                                    "{} ({}): the scene places more than {MAX_INSTANCES} mesh instances",
                                     r.name, r.id
                                 ));
-                                vec![]
+                            }
+                            if n.light.is_some() && w.lights.len() >= MAX_LIGHTS {
+                                return Err(format!(
+                                    "{} ({}): the scene has more than {MAX_LIGHTS} lamps",
+                                    r.name, r.id
+                                ));
+                            }
+                            if n.meshes.is_empty() && n.light.is_none() {
+                                continue;
+                            }
+                            let m = world_m.compose(ms);
+                            for mesh in n.meshes.clone() {
+                                w.instances.push(Instance {
+                                    mesh: mesh + offset,
+                                    transform: m,
+                                });
+                            }
+                            if let Some(l) = n.light {
+                                w.lights.push(PointLight {
+                                    position: m.point(Vec3(0.0, 0.0, 0.0)),
+                                    ..l
+                                });
                             }
                         }
-                    };
-                    let mut lights = vec![];
-                    for (i, m) in picks {
-                        let n = &nw.nodes[i];
-                        // The world's limits, checked as it grows: a large model placed many
-                        // times fails here instead of exhausting memory.
+                    } else if let Some(&i) = cached.path_to_idx.get(node) {
+                        let n = &cached.nodes[i];
                         if w.instances.len() + n.meshes.len() > MAX_INSTANCES {
                             return Err(format!(
                                 "{} ({}): the scene places more than {MAX_INSTANCES} mesh instances",
                                 r.name, r.id
                             ));
                         }
-                        if node.is_empty()
-                            && n.light.is_some()
-                            && w.lights.len() + lights.len() >= MAX_LIGHTS
-                        {
-                            return Err(format!(
-                                "{} ({}): the scene has more than {MAX_LIGHTS} lamps",
-                                r.name, r.id
-                            ));
-                        }
                         for mesh in n.meshes.clone() {
                             w.instances.push(Instance {
                                 mesh: mesh + offset,
-                                transform: m,
+                                transform: world_m,
                             });
                         }
-                        if node.is_empty() {
-                            if let Some(l) = n.light {
-                                lights.push(PointLight {
-                                    position: m.point(Vec3(0.0, 0.0, 0.0)),
-                                    ..l
-                                });
-                            }
-                        }
+                    } else {
+                        warnings.push(format!(
+                            "{} ({}): model {model} has no node {node:?}",
+                            r.name, r.id
+                        ));
                     }
-                    w.lights.extend(lights);
                 }
                 "light"
                     if registry

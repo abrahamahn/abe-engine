@@ -637,7 +637,7 @@ async function main() {
     check('the browser simulation matches a native run bit for bit', !!wasmHash && wasmHash === nativeHash,
       { wasmHash, nativeHash, native: simulated.trim().split('\n').slice(1, 4) });
     await require('./camera-authoring.cjs')(page, check);
-    await require('./assets.cjs')(page, project, check);
+    await require('./assets.cjs')(page, project, check, o.out);
     await require('./framing.cjs')(page, check);
   } catch (e) {
     failed = e.message;

@@ -1918,9 +1918,20 @@ mod tests {
             .string()
             .unwrap()
             .to_string();
+        let a_imp_types: Vec<&str> = mat_imp
+            .iter()
+            .filter(|(c, _)| *c == a)
+            .map(|(_, v)| v.get("type").unwrap().string().unwrap())
+            .collect();
+        assert_eq!(a_imp_types, vec!["assets", "asset-imported"]);
 
         let look_id = created_doc(&create(&mut st, a, "look", "content/looks/day.look.json"));
-        let scene_id = created_doc(&create(&mut st, a, "scene", "content/scenes/main.scene.json"));
+        let scene_id = created_doc(&create(
+            &mut st,
+            a,
+            "scene",
+            "content/scenes/main.scene.json",
+        ));
         st.handle(a, &msg(&format!(r#"{{"type":"open","doc":"{scene_id}"}}"#)));
         st.handle(b, &msg(&format!(r#"{{"type":"open","doc":"{look_id}"}}"#)));
         st.handle(
@@ -1939,7 +1950,9 @@ mod tests {
 
         let look_uses = st.handle(
             a,
-            &msg(&format!(r#"{{"type":"asset-usage","id":"{look_id}","req":"u1"}}"#)),
+            &msg(&format!(
+                r#"{{"type":"asset-usage","id":"{look_id}","req":"u1"}}"#
+            )),
         );
         let uses_arr = of_type(&look_uses, "asset-usage")[0]
             .1
@@ -1962,6 +1975,12 @@ mod tests {
         );
         assert_eq!(of_type(&moved_look, "asset-moved").len(), 1);
         assert_eq!(of_type(&moved_look, "assets").len(), 2);
+        let a_move_types: Vec<&str> = moved_look
+            .iter()
+            .filter(|(c, _)| *c == a)
+            .map(|(_, v)| v.get("type").unwrap().string().unwrap())
+            .collect();
+        assert_eq!(a_move_types, vec!["assets", "asset-moved"]);
         let watcher_docs = of_type(&moved_look, "doc");
         assert_eq!(watcher_docs.len(), 1);
         assert_eq!(
@@ -1971,7 +1990,10 @@ mod tests {
         assert!(!t.0.join("content/looks/day.look.json").exists());
         assert!(!t.0.join("content/looks/day.look.json.meta.json").exists());
         assert!(t.0.join("content/looks/sunset.look.json").is_file());
-        assert!(t.0.join("content/looks/sunset.look.json.meta.json").is_file());
+        assert!(
+            t.0.join("content/looks/sunset.look.json.meta.json")
+                .is_file()
+        );
 
         // Changing kind via rename is refused.
         let wrong_ext = st.handle(
