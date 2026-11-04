@@ -418,7 +418,9 @@ test('KPIs, filters, dependency graph, and SHA-256 glTF fork vs copy comparison 
   assert.ok(OFFICIAL_STATUSES.includes('canonical'));
   assert.ok(SURFACE_BUCKETS.includes('dev-studio-migration'));
   assert.ok(RUNTIME_EXPOSURES.includes('worktree_only'));
-  assert.deepEqual(TRIAGE_ACTIONS, ['Keep', 'Merge', 'Wire', 'Refactor', 'Archive', 'Delete']);
+  assert.deepEqual(TRIAGE_ACTIONS, ['Keep', 'Update', 'Merge', 'Wire', 'Refactor', 'Archive', 'Delete']);
+  assert.equal(normalizeTriageAction('update-algo-comments'), 'Update');
+  assert.equal(normalizeTriageAction('Update'), 'Update');
 
   const kpis = computeCatalogKpis(catalog, {});
   assert.equal(kpis.totalItems, catalog.items.length);
@@ -533,6 +535,83 @@ test('mountCodeXray renders workbench UI, dependency graph, live sandbox preview
 
   const exportedMd = api.exportMarkdown();
   assert.match(exportedMd, /Migrate to Studio audio-daw/);
+
+  api.destroy();
+});
+
+test('mountCodeXray supports Code Tree & Backend explorer, File-by-File Audit Queue, and live Source Code reader', async () => {
+  const doc = createMiniDom();
+  const container = doc.createElement('div');
+  const storage = createMemoryStorage();
+  const catalog = createSampleCatalog();
+  catalog.items.push({
+    id: 'backend-source:server-router',
+    title: 'server_router.rs',
+    category: 'backend-rust-source',
+    status: 'canonical',
+    surfaceBucket: 'live',
+    runtimeExposure: 'live_route',
+    owningSubsystem: 'backend:http-api',
+    repo: 'ganbate-main',
+    repoPath: 'main/backend/src/server_router.rs',
+    fileSize: 8192,
+    loc: 1120,
+    referenceCount: 4,
+    implementationPct: 85,
+    integrationPct: 90,
+    authoritySource: { kind: 'backend-db-api', ref: 'axum-router' },
+    preview: { kind: 'source-code' },
+    codeIntel: {
+      layer: 'backend-rust',
+      lang: 'rust',
+      riskSignals: ['over-1000-loc', 'missing-module-docs'],
+      httpRoutes: ['GET /api/v1/health'],
+      symbols: ['build_router'],
+    },
+  });
+
+  const api = mountCodeXray(container, {
+    initialCatalog: catalog,
+    storage,
+    fetch: async (url) => {
+      if (String(url).includes('/api/project/file')) {
+        return {
+          ok: true,
+          text: async () => '// live workspace rust preview\npub fn build_router() {}\n',
+        };
+      }
+      return { ok: false, status: 404 };
+    },
+  });
+
+  // Switch to Code Tree & Backend mode
+  const codeTreeTab = container.findAll((el) => el.getAttribute('data-testid') === 'mode-codetree-btn')[0];
+  assert.ok(codeTreeTab);
+  codeTreeTab.dispatch('click');
+  assert.match(container.textContentDeep(), /Full Repository Code Explorer/);
+
+  // Filter by riskSignal
+  const risked = filterCatalogItems(catalog.items, { layer: 'backend-rust', riskSignal: 'over-1000-loc' });
+  assert.equal(risked.length, 1);
+  assert.equal(risked[0].id, 'backend-source:server-router');
+
+  // Select backend source file and verify live source viewer renders
+  api.selectItem('backend-source:server-router');
+  await new Promise((r) => setTimeout(r, 10));
+  const deepText = container.textContentDeep();
+  assert.match(deepText, /Source Code & Static Audit Intelligence/);
+  assert.match(deepText, /pub fn build_router/);
+
+  // Switch to File-by-File Audit Queue and set Update triage
+  const auditTab = container.findAll((el) => el.getAttribute('data-testid') === 'mode-audit-btn')[0];
+  assert.ok(auditTab);
+  auditTab.dispatch('click');
+  assert.match(container.textContentDeep(), /File-by-File AI & Founder Audit Queue/);
+
+  await api.setItemTriage('backend-source:server-router', 'Update', 'Split monolith & add rustdoc');
+  const md = api.exportMarkdown();
+  assert.match(md, /## ✨ Update \(1\)/);
+  assert.match(md, /Split monolith & add rustdoc/);
 
   api.destroy();
 });

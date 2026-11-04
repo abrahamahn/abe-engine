@@ -242,7 +242,12 @@ pub fn content_type(path: &Path) -> &'static str {
         Some("wav") => "audio/wav",
         Some("ogg") => "audio/ogg",
         Some("glb") => "model/gltf-binary",
-        Some("txt" | "md") => "text/plain; charset=utf-8",
+        Some("mp3") => "audio/mpeg",
+        Some("avif") => "image/avif",
+        Some(
+            "txt" | "md" | "rs" | "ts" | "tsx" | "jsx" | "sql" | "wgsl" | "toml" | "yaml" | "yml"
+            | "sh",
+        ) => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
 }

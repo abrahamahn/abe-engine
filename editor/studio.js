@@ -2970,6 +2970,35 @@ function commands() {
   $('#frame').onclick = () => frameBounds(state.selection ? boundsOf(state.selection) : null);
   $('#recook').onclick = () => requestCook(0);
   $('#simulate').onclick = toggleSimulation;
+  const guideDialog = $('#studio-guide-dialog');
+  const openStudioGuide = () => {
+    if (guideDialog && !guideDialog.open) guideDialog.showModal();
+  };
+  $('#studio-help-btn')?.addEventListener('click', openStudioGuide);
+  $('#viewport-controls-guide')?.addEventListener('click', openStudioGuide);
+  $('#studio-guide-close')?.addEventListener('click', () => guideDialog?.close());
+  guideDialog?.addEventListener('click', (ev) => {
+    if (ev.target === guideDialog) guideDialog.close();
+  });
+  for (const btn of document.querySelectorAll('[data-guide-action]')) {
+    btn.addEventListener('click', () => {
+      const act = btn.getAttribute('data-guide-action');
+      guideDialog?.close();
+      if (act === 'xray') {
+        void activateWorkbench('code-xray');
+      } else if (act === 'model') {
+        void activateWorkbench('model');
+      } else if (act === 'pie') {
+        void activateWorkbench('world').then(() => pieViewport.setMode('pie'));
+      } else if (act === 'matrix') {
+        void activateWorkbench('world').then(() => pieViewport.setMode('matrix'));
+      } else if (act === 'frame') {
+        void activateWorkbench('world').then(() => {
+          frameBounds(state.selection ? boundsOf(state.selection) : null);
+        });
+      }
+    });
+  }
   $('#rescan-assets').onclick = () => {
     if (!state.host.open || state.scanning) return;
     state.scanning = true;
@@ -3129,7 +3158,7 @@ function commands() {
   $('#outliner-filter').oninput = drawOutliner;
   $('#time').oninput = (e) => setTime(Number(e.target.value));
   window.addEventListener('keydown', (e) => {
-    if ($('#project-tool-panel').open || $('#new-data-dialog')?.open) return;
+    if ($('#project-tool-panel').open || $('#new-data-dialog')?.open || $('#studio-guide-dialog')?.open) return;
     const typing = ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName);
     const mod = e.ctrlKey || e.metaKey;
     // A letter shortcut matches the key's position (so Caps Lock and a Korean input method do not
@@ -3141,6 +3170,11 @@ function commands() {
       return;
     }
     if (typing) return;
+    if (e.key === '?') {
+      e.preventDefault();
+      $('#studio-guide-dialog')?.showModal();
+      return;
+    }
     if (mod && letter('z')) {
       e.preventDefault();
       undoRedo(e.shiftKey ? 'redo' : 'undo');

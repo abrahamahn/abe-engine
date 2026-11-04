@@ -2,8 +2,8 @@
 // Pure binary parsers (`parseGlbPreview`, `extractWavPeaks`) avoid DOM globals so Node tests
 // can exercise them directly.
 
-const MAX_PREVIEW_TRIS = 1800;
-const MAX_FULL_MESH_TRIS = 250000;
+const MAX_PREVIEW_TRIS = 9000;
+const MAX_FULL_MESH_TRIS = 500000;
 
 function mulMat4(a, b) {
   const out = new Float32Array(16);
@@ -183,16 +183,45 @@ export function parseGlbPreview(input) {
   }
   const bones = jointSet.size;
 
-  const matColors = materials.map((mat) => {
-    const f = mat?.pbrMetallicRoughness?.baseColorFactor;
-    if (Array.isArray(f) && f.length >= 3) {
-      return [
-        Math.max(0, Math.min(1, Number(f[0]) || 0)),
-        Math.max(0, Math.min(1, Number(f[1]) || 0)),
-        Math.max(0, Math.min(1, Number(f[2]) || 0)),
-      ];
-    }
-    return [0.64, 0.73, 0.9];
+  const matInfos = materials.map((mat, index) => {
+    const pbr = mat?.pbrMetallicRoughness || {};
+    const f = pbr.baseColorFactor;
+    const color = Array.isArray(f) && f.length >= 3
+      ? [
+          Math.max(0, Math.min(1, Number(f[0]) || 0)),
+          Math.max(0, Math.min(1, Number(f[1]) || 0)),
+          Math.max(0, Math.min(1, Number(f[2]) || 0)),
+        ]
+      : [0.76, 0.8, 0.88];
+    const texIdx = typeof pbr.baseColorTexture?.index === 'number' ? pbr.baseColorTexture.index : null;
+    const imgIdx = texIdx !== null && typeof textures[texIdx]?.source === 'number'
+      ? textures[texIdx].source
+      : null;
+    return {
+      index,
+      name: typeof mat?.name === 'string' && mat.name ? mat.name : `Material_${index}`,
+      color,
+      imageIndex: imgIdx,
+      doubleSided: Boolean(mat?.doubleSided),
+    };
+  });
+  const matColors = matInfos.map((m) => m.color);
+
+  const embeddedImages = images.map((img, index) => {
+    if (!bin || typeof img?.bufferView !== 'number' || !views[img.bufferView]) return null;
+    const bv = views[img.bufferView];
+    const start = bv.byteOffset || 0;
+    const len = bv.byteLength || 0;
+    if (len <= 0 || start + len > bin.byteLength) return null;
+    const slice = bin.slice(start, start + len);
+    const mimeType = typeof img.mimeType === 'string' && img.mimeType
+      ? img.mimeType
+      : slice[0] === 0x89
+        ? 'image/png'
+        : slice[0] === 0xff
+          ? 'image/jpeg'
+          : 'image/webp';
+    return { index, mimeType, bytes: slice };
   });
 
   // Determine root nodes from the default scene (or parentless nodes).
@@ -262,12 +291,13 @@ export function parseGlbPreview(input) {
     const start = (bv.byteOffset || 0) + (acc.byteOffset || 0);
     if (start + (count > 0 ? (count - 1) * stride + elemBytes : 0) > bin.byteLength) return null;
     const viewDv = new DataView(bin.buffer, bin.byteOffset + start, bin.byteLength - start);
+    const norm = acc.normalized !== false;
     const readComp = (byteOff) => {
       if (ct === 5126) return viewDv.getFloat32(byteOff, true);
-      if (ct === 5121) return viewDv.getUint8(byteOff) / 255;
-      if (ct === 5123) return viewDv.getUint16(byteOff, true) / 65535;
-      if (ct === 5120) return Math.max(-1, viewDv.getInt8(byteOff) / 127);
-      return Math.max(-1, viewDv.getInt16(byteOff, true) / 32767);
+      if (ct === 5121) return norm ? viewDv.getUint8(byteOff) / 255 : viewDv.getUint8(byteOff);
+      if (ct === 5123) return norm ? viewDv.getUint16(byteOff, true) / 65535 : viewDv.getUint16(byteOff, true);
+      if (ct === 5120) return norm ? Math.max(-1, viewDv.getInt8(byteOff) / 127) : viewDv.getInt8(byteOff);
+      return norm ? Math.max(-1, viewDv.getInt16(byteOff, true) / 32767) : viewDv.getInt16(byteOff, true);
     };
     return {
       count,
@@ -282,8 +312,13 @@ export function parseGlbPreview(input) {
 
   const readPositions = (accIdx) => {
     const acc = accessors[accIdx];
-    if (!acc || acc.componentType !== 5126) return null;
-    return readFloatAccessor(accIdx, 3);
+    if (!acc) return null;
+    if (acc.componentType === 5126) return readFloatAccessor(accIdx, 3);
+    // Support KHR_mesh_quantization (BYTE/UBYTE/SHORT/USHORT positions)
+    if ([5120, 5121, 5122, 5123].includes(acc.componentType)) {
+      return readFloatAccessor(accIdx, 3);
+    }
+    return null;
   };
 
   const readIndices = (accIdx) => {
@@ -315,10 +350,31 @@ export function parseGlbPreview(input) {
   let hasTangents = false;
   let hasUvs = false;
   const rawPrims = [];
+  const dracoPrimitives = [];
   for (const inst of instances) {
     const mesh = meshes[inst.meshIndex];
+    const meshName = typeof mesh?.name === 'string' && mesh.name ? mesh.name : `Mesh_${inst.meshIndex}`;
     for (const prim of mesh?.primitives || []) {
       if (prim.mode !== undefined && prim.mode !== 4) continue;
+      const matInfo = typeof prim.material === 'number' && matInfos[prim.material]
+        ? matInfos[prim.material]
+        : { index: -1, name: 'Default', color: [0.76, 0.8, 0.88], imageIndex: null, doubleSided: false };
+      const dracoExt = prim.extensions?.KHR_draco_mesh_compression;
+      if (dracoExt && typeof dracoExt.bufferView === 'number' && views[dracoExt.bufferView] && bin) {
+        const bv = views[dracoExt.bufferView];
+        const start = bv.byteOffset || 0;
+        const len = bv.byteLength || 0;
+        if (len > 0 && start + len <= bin.byteLength) {
+          dracoPrimitives.push({
+            meshName,
+            slice: bin.subarray(start, start + len),
+            attributes: dracoExt.attributes || {},
+            world: inst.world,
+            nMat: inst.nMat,
+            matInfo,
+          });
+        }
+      }
       const posIdx = prim.attributes?.POSITION;
       if (typeof posIdx !== 'number') continue;
       const pos = readPositions(posIdx);
@@ -335,10 +391,8 @@ export function parseGlbPreview(input) {
       if (uv && uv.count === pos.count) hasUvs = true;
       totalVerts += pos.count;
       totalTris += triCount;
-      const color = typeof prim.material === 'number' && matColors[prim.material]
-        ? matColors[prim.material]
-        : [0.64, 0.73, 0.9];
       rawPrims.push({
+        meshName,
         pos,
         norm: norm && norm.count === pos.count ? norm : null,
         tan: tan && tan.count === pos.count ? tan : null,
@@ -348,11 +402,52 @@ export function parseGlbPreview(input) {
         triCount,
         world: inst.world,
         nMat: inst.nMat,
-        color,
+        color: matInfo.color,
+        matInfo,
       });
     }
   }
 
+  return assembleParsedGlbResult({
+    rawPrims,
+    dracoPrimitives,
+    totalVerts,
+    totalTris,
+    hasNormals,
+    hasTangents,
+    hasUvs,
+    meshesCount: meshes.length,
+    nodesCount: nodes.length,
+    materialsCount: materials.length,
+    bones,
+    texturesCount: textures.length,
+    images,
+    views,
+    bin,
+    nodeHierarchy,
+    embeddedImages,
+  });
+}
+
+function assembleParsedGlbResult({
+  rawPrims,
+  dracoPrimitives = [],
+  totalVerts,
+  totalTris,
+  hasNormals,
+  hasTangents,
+  hasUvs,
+  meshesCount,
+  nodesCount,
+  materialsCount,
+  bones,
+  texturesCount,
+  images,
+  views,
+  bin,
+  nodeHierarchy,
+  embeddedImages = [],
+}) {
   const min = [Infinity, Infinity, Infinity];
   const max = [-Infinity, -Infinity, -Infinity];
   const sampleTris = [];
@@ -366,10 +461,14 @@ export function parseGlbPreview(input) {
   const fullUv = buildFull ? new Float32Array(totalVerts * 2) : new Float32Array(0);
   const fullCol = buildFull ? new Float32Array(totalVerts * 3) : new Float32Array(0);
   const fullIdx = buildFull ? new Uint32Array(totalTris * 3) : new Uint32Array(0);
+  const submeshes = [];
   let vertBase = 0;
   let idxWrite = 0;
 
   for (const p of rawPrims) {
+    const pMin = [Infinity, Infinity, Infinity];
+    const pMax = [-Infinity, -Infinity, -Infinity];
+    const subIdxStart = idxWrite;
     for (let v = 0; v < p.pos.count; v++) {
       const [lx, ly, lz] = p.pos.at(v);
       const [wx, wy, wz] = transformVec3(p.world, lx, ly, lz);
@@ -379,6 +478,12 @@ export function parseGlbPreview(input) {
       if (wx > max[0]) max[0] = wx;
       if (wy > max[1]) max[1] = wy;
       if (wz > max[2]) max[2] = wz;
+      if (wx < pMin[0]) pMin[0] = wx;
+      if (wy < pMin[1]) pMin[1] = wy;
+      if (wz < pMin[2]) pMin[2] = wz;
+      if (wx > pMax[0]) pMax[0] = wx;
+      if (wy > pMax[1]) pMax[1] = wy;
+      if (wz > pMax[2]) pMax[2] = wz;
 
       if (buildFull) {
         const gv = vertBase + v;
@@ -534,6 +639,33 @@ export function parseGlbPreview(input) {
         }
       }
       vertBase += p.pos.count;
+      submeshes.push({
+        name: p.meshName || 'Submesh',
+        materialIndex: p.matInfo?.index ?? -1,
+        materialName: p.matInfo?.name || 'Default',
+        baseColor: p.color,
+        imageIndex: typeof p.matInfo?.imageIndex === 'number' ? p.matInfo.imageIndex : null,
+        doubleSided: Boolean(p.matInfo?.doubleSided),
+        indexOffset: subIdxStart,
+        indexCount: idxWrite - subIdxStart,
+        triCount: Math.floor((idxWrite - subIdxStart) / 3),
+        vertCount: p.pos.count,
+        bounds: pMin[0] <= pMax[0] ? [pMin, pMax] : [[0, 0, 0], [0, 0, 0]],
+      });
+    } else if (pMin[0] <= pMax[0]) {
+      submeshes.push({
+        name: p.meshName || 'Submesh',
+        materialIndex: p.matInfo?.index ?? -1,
+        materialName: p.matInfo?.name || 'Default',
+        baseColor: p.color,
+        imageIndex: typeof p.matInfo?.imageIndex === 'number' ? p.matInfo.imageIndex : null,
+        doubleSided: Boolean(p.matInfo?.doubleSided),
+        indexOffset: 0,
+        indexCount: 0,
+        triCount: p.triCount,
+        vertCount: p.pos.count,
+        bounds: [pMin, pMax],
+      });
     }
   }
 
@@ -564,20 +696,48 @@ export function parseGlbPreview(input) {
     ? [max[0] - min[0], max[1] - min[1], max[2] - min[2]]
     : [0, 0, 0];
 
+  // Smart focus bounds: ignore tiny flat ground/shadow decal quads when framing characters/props
+  let focusBounds = bounds;
+  if (hasBounds && totalTris > 120 && submeshes.length > 1) {
+    const overallSpan = Math.max(size[0], size[1], size[2], 1e-4);
+    const fMin = [Infinity, Infinity, Infinity];
+    const fMax = [-Infinity, -Infinity, -Infinity];
+    for (const sm of submeshes) {
+      const [sMin, sMax] = sm.bounds;
+      const dy = sMax[1] - sMin[1];
+      const isFlatDecal =
+        (sm.vertCount <= 16 && sm.triCount <= 12) ||
+        (dy < overallSpan * 0.012 && sm.triCount < totalTris * 0.04);
+      if (isFlatDecal) continue;
+      for (let k = 0; k < 3; k++) {
+        if (sMin[k] < fMin[k]) fMin[k] = sMin[k];
+        if (sMax[k] > fMax[k]) fMax[k] = sMax[k];
+      }
+    }
+    if (fMin[0] <= fMax[0]) {
+      focusBounds = [fMin, fMax];
+    }
+  }
+
   return {
     vertices: totalVerts,
     triangles: totalTris,
-    meshes: meshes.length,
-    nodes: nodes.length,
-    materials: materials.length,
+    meshes: meshesCount,
+    nodes: nodesCount,
+    materials: materialsCount,
     bones,
-    textures: textures.length,
+    textures: texturesCount,
     estimatedVramBytes,
     hasNormals,
     hasTangents,
     hasUvs,
+    usesDraco: dracoPrimitives.length > 0,
+    dracoPrimitives,
+    embeddedImages,
+    submeshes,
     nodeHierarchy,
     bounds,
+    focusBounds,
     size,
     sampleTris,
     fullMesh: {
@@ -589,6 +749,157 @@ export function parseGlbPreview(input) {
       indices: idxWrite === fullIdx.length ? fullIdx : fullIdx.subarray(0, idxWrite),
     },
   };
+}
+
+let dracoDecoderPromise = null;
+
+async function getDracoDecoderModule({
+  scriptUrl = '/vendor/draco/draco_decoder_nodejs.js',
+  wasmUrl = '/vendor/draco/draco_decoder.wasm',
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  if (dracoDecoderPromise) return dracoDecoderPromise;
+  dracoDecoderPromise = (async () => {
+    try {
+      if (typeof fetchImpl !== 'function') return null;
+      const [jsRes, wasmRes] = await Promise.all([fetchImpl(scriptUrl), fetchImpl(wasmUrl)]);
+      if (!jsRes?.ok || !wasmRes?.ok) return null;
+      const [jsCode, wasmBinary] = await Promise.all([jsRes.text(), wasmRes.arrayBuffer()]);
+      // Instantiate Emscripten factory without polluting globals
+      const factory = new Function(`${jsCode}\nreturn typeof DracoDecoderModule === 'function' ? DracoDecoderModule : null;`)();
+      if (typeof factory !== 'function') return null;
+      return await factory({ wasmBinary });
+    } catch {
+      return null;
+    }
+  })();
+  const mod = await dracoDecoderPromise;
+  if (!mod) dracoDecoderPromise = null;
+  return mod;
+}
+
+/**
+ * Async `.glb` parser that automatically decodes `KHR_draco_mesh_compression` primitives via
+ * `/vendor/draco/draco_decoder.wasm` when raw uncompressed accessors are absent.
+ */
+export async function parseGlbPreviewAsync(input, options = {}) {
+  const syncResult = parseGlbPreview(input);
+  if (!syncResult || !syncResult.usesDraco || syncResult.triangles > 0) {
+    return syncResult;
+  }
+  const draco = await getDracoDecoderModule(options);
+  if (!draco) return syncResult;
+
+  const decodedPrims = [];
+  let totalVerts = 0;
+  let totalTris = 0;
+  let hasNormals = false;
+  let hasUvs = false;
+
+  for (const dp of syncResult.dracoPrimitives || []) {
+    const decoder = new draco.Decoder();
+    const buffer = new draco.DecoderBuffer();
+    let mesh = null;
+    try {
+      buffer.Init(new Int8Array(dp.slice.buffer, dp.slice.byteOffset, dp.slice.byteLength), dp.slice.byteLength);
+      const geomType = decoder.GetEncodedGeometryType(buffer);
+      if (geomType !== draco.TRIANGULAR_MESH) continue;
+      mesh = new draco.Mesh();
+      const status = decoder.DecodeBufferToMesh(buffer, mesh);
+      if (!status || !status.ok()) continue;
+      const numPoints = mesh.num_points();
+      const numFaces = mesh.num_faces();
+      if (numPoints < 3 || numFaces < 1) continue;
+
+      const readDracoAttr = (attrName, fallbackEnum, arity) => {
+        let attr = null;
+        if (typeof dp.attributes?.[attrName] === 'number') {
+          attr = decoder.GetAttributeByUniqueId(mesh, dp.attributes[attrName]);
+        } else if (fallbackEnum !== null) {
+          const id = decoder.GetAttributeId(mesh, fallbackEnum);
+          if (id >= 0) attr = decoder.GetAttribute(mesh, id);
+        }
+        if (!attr) return null;
+        const arr = new draco.DracoFloat32Array();
+        const ok = decoder.GetAttributeFloatForAllPoints(mesh, attr, arr);
+        if (!ok) {
+          draco.destroy(arr);
+          return null;
+        }
+        const out = new Float32Array(numPoints * arity);
+        for (let i = 0; i < out.length; i++) out[i] = arr.GetValue(i);
+        draco.destroy(arr);
+        return {
+          count: numPoints,
+          at(i) {
+            const o = i * arity;
+            if (arity === 2) return [out[o], out[o + 1]];
+            if (arity === 3) return [out[o], out[o + 1], out[o + 2]];
+            return [out[o], out[o + 1], out[o + 2], out[o + 3]];
+          },
+        };
+      };
+
+      const pos = readDracoAttr('POSITION', draco.POSITION, 3);
+      if (!pos) continue;
+      const norm = readDracoAttr('NORMAL', draco.NORMAL, 3);
+      const uv = readDracoAttr('TEXCOORD_0', draco.TEX_COORD, 2);
+      if (norm) hasNormals = true;
+      if (uv) hasUvs = true;
+
+      const ia = new draco.DracoInt32Array();
+      const indices = new Uint32Array(numFaces * 3);
+      for (let f = 0; f < numFaces; f++) {
+        decoder.GetFaceFromMesh(mesh, f, ia);
+        indices[f * 3] = ia.GetValue(0);
+        indices[f * 3 + 1] = ia.GetValue(1);
+        indices[f * 3 + 2] = ia.GetValue(2);
+      }
+      draco.destroy(ia);
+
+      totalVerts += numPoints;
+      totalTris += numFaces;
+      decodedPrims.push({
+        meshName: dp.meshName,
+        pos,
+        norm,
+        tan: null,
+        uv,
+        vcol: null,
+        idx: { count: indices.length, at: (k) => indices[k] },
+        triCount: numFaces,
+        world: dp.world,
+        nMat: dp.nMat,
+        color: dp.matInfo.color,
+        matInfo: dp.matInfo,
+      });
+    } finally {
+      if (mesh) draco.destroy(mesh);
+      draco.destroy(buffer);
+      draco.destroy(decoder);
+    }
+  }
+
+  if (!decodedPrims.length) return syncResult;
+  return assembleParsedGlbResult({
+    rawPrims: decodedPrims,
+    dracoPrimitives: syncResult.dracoPrimitives,
+    totalVerts,
+    totalTris,
+    hasNormals,
+    hasTangents: false,
+    hasUvs,
+    meshesCount: syncResult.meshes,
+    nodesCount: syncResult.nodes,
+    materialsCount: syncResult.materials,
+    bones: syncResult.bones,
+    texturesCount: syncResult.textures,
+    images: [],
+    views: [],
+    bin: null,
+    nodeHierarchy: syncResult.nodeHierarchy,
+    embeddedImages: syncResult.embeddedImages,
+  });
 }
 
 /** Extracts duration and normalized amplitude peaks from an uncompressed PCM/float RIFF `.wav`. */
@@ -666,6 +977,9 @@ export function extractWavPeaks(input, bucketCount = 44) {
 // ---- Canvas Renderers -------------------------------------------------------------------------
 
 function prepCanvas(canvas, cssWidth, cssHeight) {
+  if (!canvas || typeof canvas.getContext !== 'function') {
+    return { ctx: null, w: cssWidth, h: cssHeight };
+  }
   const dpr = typeof window !== 'undefined' ? Math.min(2, window.devicePixelRatio || 1) : 1;
   const w = Math.max(16, Math.round(cssWidth * dpr));
   const h = Math.max(16, Math.round(cssHeight * dpr));
@@ -678,7 +992,492 @@ function prepCanvas(canvas, cssWidth, cssHeight) {
   return { ctx, w: cssWidth, h: cssHeight };
 }
 
-export function drawGlbPreviewCanvas(canvas, info, { width = 180, height = 100, yaw = 0.68, pitch = 0.42 } = {}) {
+const GLB_VS_300 = `#version 300 es
+precision highp float;
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNorm;
+layout(location = 2) in vec2 aUv;
+layout(location = 3) in vec3 aCol;
+
+uniform mat4 uViewProj;
+out vec3 vWorldPos;
+out vec3 vNorm;
+out vec2 vUv;
+out vec3 vCol;
+
+void main() {
+  vWorldPos = aPos;
+  vNorm = aNorm;
+  vUv = aUv;
+  vCol = aCol;
+  gl_Position = uViewProj * vec4(aPos, 1.0);
+}
+`;
+
+const GLB_FS_300 = `#version 300 es
+precision highp float;
+in vec3 vWorldPos;
+in vec3 vNorm;
+in vec2 vUv;
+in vec3 vCol;
+
+uniform vec3 uEye;
+uniform int uMode; // 0=textured/shaded, 1=clay, 2=normals, 3=wireline
+uniform int uHasTex;
+uniform sampler2D uTex;
+uniform vec3 uSubColor;
+
+out vec4 fragColor;
+
+void main() {
+  if (uMode == 3) {
+    fragColor = vec4(0.38, 0.78, 1.0, 0.72);
+    return;
+  }
+  vec3 N = normalize(vNorm);
+  if (length(vNorm) < 0.001) {
+    vec3 dx = dFdx(vWorldPos);
+    vec3 dy = dFdy(vWorldPos);
+    N = normalize(cross(dx, dy));
+  }
+  vec3 V = normalize(uEye - vWorldPos);
+  if (dot(N, V) < 0.0) N = -N;
+
+  if (uMode == 2) {
+    fragColor = vec4(N * 0.5 + 0.5, 1.0);
+    return;
+  }
+
+  vec3 base = vCol;
+  if (uMode == 1) {
+    base = vec3(0.76, 0.74, 0.72);
+  } else if (uHasTex == 1) {
+    vec4 texel = texture(uTex, vUv);
+    // Approximate sRGB -> linear
+    vec3 texLin = pow(max(texel.rgb, vec3(0.0)), vec3(2.2));
+    base = texLin * max(uSubColor, vec3(0.08));
+  }
+
+  // Studio 3-point lighting (Key + Cool Fill + Rim + Hemisphere)
+  vec3 keyDir = normalize(vec3(0.48, 0.68, 0.55));
+  vec3 fillDir = normalize(vec3(-0.65, 0.28, -0.45));
+  float ndlKey = max(0.0, dot(N, keyDir));
+  float ndlFill = max(0.0, dot(N, fillDir));
+  float hemi = 0.28 + 0.22 * (N.y * 0.5 + 0.5);
+  float rim = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 2.6) * 0.32;
+
+  vec3 H = normalize(keyDir + V);
+  float spec = pow(max(0.0, dot(N, H)), 28.0) * (uMode == 1 ? 0.18 : 0.12);
+
+  vec3 lit = base * (
+    vec3(hemi) +
+    vec3(1.06, 1.01, 0.96) * (ndlKey * 0.82) +
+    vec3(0.52, 0.66, 0.92) * (ndlFill * 0.34)
+  ) + vec3(0.55, 0.72, 0.98) * rim + vec3(spec);
+
+  // Subtle filmic tone curve + gamma 2.2
+  lit = lit / (lit + vec3(0.85)) * 1.62;
+  vec3 srgb = pow(clamp(lit, 0.0, 1.0), vec3(1.0 / 2.2));
+  fragColor = vec4(srgb, 1.0);
+}
+`;
+
+const BG_VS_300 = `#version 300 es
+precision mediump float;
+out vec2 vUv;
+void main() {
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  vUv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.9999, 1.0);
+}
+`;
+
+const BG_FS_300 = `#version 300 es
+precision mediump float;
+in vec2 vUv;
+out vec4 fragColor;
+void main() {
+  vec3 top = vec3(0.13, 0.16, 0.23);
+  vec3 mid = vec3(0.09, 0.11, 0.16);
+  vec3 bot = vec3(0.06, 0.07, 0.10);
+  float t = clamp(vUv.y, 0.0, 1.0);
+  vec3 col = t > 0.45 ? mix(mid, top, (t - 0.45) / 0.55) : mix(bot, mid, t / 0.45);
+  float radial = 1.0 - smoothstep(0.0, 0.85, length(vUv - vec2(0.5, 0.48)));
+  col += vec3(0.035, 0.05, 0.085) * radial;
+  fragColor = vec4(col, 1.0);
+}
+`;
+
+function compileGlProgram(gl, vsSrc, fsSrc) {
+  const compile = (type, src) => {
+    const sh = gl.createShader(type);
+    if (!sh) return null;
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      gl.deleteShader(sh);
+      return null;
+    }
+    return sh;
+  };
+  const vs = compile(gl.VERTEX_SHADER, vsSrc);
+  const fs = compile(gl.FRAGMENT_SHADER, fsSrc);
+  if (!vs || !fs) return null;
+  const prog = gl.createProgram();
+  if (!prog) return null;
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    gl.deleteProgram(prog);
+    return null;
+  }
+  return prog;
+}
+
+function buildPerspectiveViewProj(eye, target, upVec, fovRad, aspect, near, far) {
+  let zx = eye[0] - target[0], zy = eye[1] - target[1], zz = eye[2] - target[2];
+  const zl = Math.hypot(zx, zy, zz) || 1;
+  zx /= zl; zy /= zl; zz /= zl;
+
+  let xx = upVec[1] * zz - upVec[2] * zy;
+  let xy = upVec[2] * zx - upVec[0] * zz;
+  let xz = upVec[0] * zy - upVec[1] * zx;
+  const xl = Math.hypot(xx, xy, xz) || 1;
+  xx /= xl; xy /= xl; xz /= xl;
+
+  const yx = zy * xz - zz * xy;
+  const yy = zz * xx - zx * xz;
+  const yz = zx * xy - zy * xx;
+
+  const view = new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+
+  const f = 1 / Math.tan(fovRad * 0.5);
+  const nf = 1 / (near - far);
+  const proj = new Float32Array([
+    f / Math.max(0.1, aspect), 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+  return mulMat4(proj, view);
+}
+
+function getOrInitCanvasGl(canvas) {
+  if (!canvas || typeof canvas.getContext !== 'function' || canvas.__ganbate2dLocked) return null;
+  if (canvas.__ganbateGlState) return canvas.__ganbateGlState;
+  let gl = null;
+  try {
+    gl = canvas.getContext('webgl2', {
+      antialias: true,
+      alpha: false,
+      depth: true,
+      premultipliedAlpha: false,
+      preserveDrawingBuffer: false,
+    });
+  } catch {
+    gl = null;
+  }
+  if (!gl) {
+    canvas.__ganbate2dLocked = true;
+    return null;
+  }
+  const meshProg = compileGlProgram(gl, GLB_VS_300, GLB_FS_300);
+  const bgProg = compileGlProgram(gl, BG_VS_300, BG_FS_300);
+  if (!meshProg || !bgProg) {
+    canvas.__ganbate2dLocked = true;
+    return null;
+  }
+  const bgVao = gl.createVertexArray();
+  const state = {
+    gl,
+    meshProg,
+    bgProg,
+    bgVao,
+    locs: {
+      uViewProj: gl.getUniformLocation(meshProg, 'uViewProj'),
+      uEye: gl.getUniformLocation(meshProg, 'uEye'),
+      uMode: gl.getUniformLocation(meshProg, 'uMode'),
+      uHasTex: gl.getUniformLocation(meshProg, 'uHasTex'),
+      uTex: gl.getUniformLocation(meshProg, 'uTex'),
+      uSubColor: gl.getUniformLocation(meshProg, 'uSubColor'),
+    },
+    uploadedInfo: null,
+    vao: null,
+    wireVao: null,
+    wireCount: 0,
+    texturesByImage: new Map(),
+    lastDrawOpts: null,
+  };
+  canvas.__ganbateGlState = state;
+  return state;
+}
+
+function uploadMeshToGl(glState, info, canvas) {
+  const { gl } = glState;
+  if (glState.uploadedInfo === info && glState.vao) return;
+  if (glState.vao) gl.deleteVertexArray(glState.vao);
+  if (glState.wireVao) gl.deleteVertexArray(glState.wireVao);
+  for (const tex of glState.texturesByImage.values()) {
+    if (tex) gl.deleteTexture(tex);
+  }
+  glState.texturesByImage.clear();
+  glState.wireVao = null;
+  glState.wireCount = 0;
+
+  const fm = info?.fullMesh;
+  if (!fm || !fm.indices?.length || !fm.positions?.length) {
+    glState.uploadedInfo = info;
+    glState.vao = null;
+    return;
+  }
+
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+
+  const makeBuf = (loc, arr, size) => {
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, arr, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+  };
+  makeBuf(0, fm.positions, 3);
+  makeBuf(1, fm.normals, 3);
+  makeBuf(2, fm.uvs, 2);
+  makeBuf(3, fm.colors, 3);
+
+  const ebo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, fm.indices, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+
+  glState.vao = vao;
+  glState.posBuf = fm.positions;
+  glState.uploadedInfo = info;
+
+  // Decode embedded diffuse images asynchronously using browser ImageBitmap
+  if (typeof createImageBitmap === 'function' && typeof Blob === 'function' && Array.isArray(info.embeddedImages)) {
+    const needed = new Set(
+      (info.submeshes || [])
+        .map((sm) => sm.imageIndex)
+        .filter((idx) => typeof idx === 'number' && idx >= 0),
+    );
+    for (const imgIdx of needed) {
+      const entry = info.embeddedImages[imgIdx];
+      if (!entry?.bytes) continue;
+      glState.texturesByImage.set(imgIdx, null);
+      const blob = new Blob([entry.bytes], { type: entry.mimeType || 'image/webp' });
+      createImageBitmap(blob)
+        .then((bmp) => {
+          if (glState.uploadedInfo !== info) {
+            bmp.close?.();
+            return;
+          }
+          const tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
+          gl.generateMipmap(gl.TEXTURE_2D);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+          bmp.close?.();
+          glState.texturesByImage.set(imgIdx, tex);
+          if (glState.lastDrawOpts) {
+            drawGlbPreviewCanvas(canvas, info, glState.lastDrawOpts);
+          }
+        })
+        .catch(() => {});
+    }
+  }
+}
+
+function ensureWireframeVao(glState, info) {
+  if (glState.wireVao) return;
+  const { gl } = glState;
+  const fm = info?.fullMesh;
+  if (!fm?.indices?.length) return;
+  const triCount = Math.floor(fm.indices.length / 3);
+  const stride = Math.max(1, Math.ceil(triCount / 45000));
+  const sampled = Math.ceil(triCount / stride);
+  const lineIdx = new Uint32Array(sampled * 6);
+  let w = 0;
+  for (let t = 0; t < triCount; t += stride) {
+    const a = fm.indices[t * 3];
+    const b = fm.indices[t * 3 + 1];
+    const c = fm.indices[t * 3 + 2];
+    lineIdx[w++] = a; lineIdx[w++] = b;
+    lineIdx[w++] = b; lineIdx[w++] = c;
+    lineIdx[w++] = c; lineIdx[w++] = a;
+  }
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const posB = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posB);
+  gl.bufferData(gl.ARRAY_BUFFER, fm.positions, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  const ebo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, lineIdx.subarray(0, w), gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  glState.wireVao = vao;
+  glState.wireCount = w;
+}
+
+export function drawGlbPreviewCanvas(
+  canvas,
+  info,
+  {
+    width = 180,
+    height = 100,
+    yaw = 0.52,
+    pitch = 0.22,
+    zoom = 1.0,
+    panX = 0,
+    panY = 0,
+    shading = 'textured',
+    focus = 'body',
+  } = {},
+) {
+  const glState = getOrInitCanvasGl(canvas);
+  if (glState) {
+    const { gl, meshProg, bgProg, bgVao, locs } = glState;
+    glState.lastDrawOpts = { width, height, yaw, pitch, zoom, panX, panY, shading, focus };
+    const dpr = typeof window !== 'undefined' ? Math.min(2, window.devicePixelRatio || 1) : 1;
+    const pxW = Math.max(16, Math.round(width * dpr));
+    const pxH = Math.max(16, Math.round(height * dpr));
+    if (canvas.width !== pxW || canvas.height !== pxH) {
+      canvas.width = pxW;
+      canvas.height = pxH;
+    }
+    gl.viewport(0, 0, pxW, pxH);
+    gl.clearDepth(1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    // Draw studio gradient background
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(bgProg);
+    gl.bindVertexArray(bgVao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindVertexArray(null);
+
+    if (!info || !info.fullMesh?.indices?.length) return;
+    uploadMeshToGl(glState, info, canvas);
+    if (!glState.vao) return;
+
+    const [bMin, bMax] = info.focusBounds || info.bounds;
+    const spanX = Math.max(1e-4, bMax[0] - bMin[0]);
+    const spanY = Math.max(1e-4, bMax[1] - bMin[1]);
+    const spanZ = Math.max(1e-4, bMax[2] - bMin[2]);
+    const maxSpan = Math.max(spanX, spanY, spanZ, 1e-4);
+
+    let cx = (bMin[0] + bMax[0]) * 0.5;
+    let cy = focus === 'bust' ? bMin[1] + spanY * 0.82 : bMin[1] + spanY * 0.5;
+    let cz = (bMin[2] + bMax[2]) * 0.5;
+    const fitSpan = focus === 'bust' ? Math.max(spanY * 0.34, spanX * 0.45, 1e-4) : Math.max(spanY * 1.08, Math.max(spanX, spanZ) * 0.95);
+
+    const fovRad = (36 * Math.PI) / 180;
+    const aspect = Math.max(0.2, width / Math.max(1, height));
+    const vHalf = Math.tan(fovRad * 0.5);
+    const hHalf = vHalf * aspect;
+    const baseDist = Math.max(
+      (fitSpan * 0.54) / vHalf,
+      (Math.max(spanX, spanZ) * (focus === 'bust' ? 0.28 : 0.56)) / Math.max(0.15, hHalf),
+    );
+    const dist = Math.max(maxSpan * 0.08, baseDist / Math.max(0.15, Math.min(12, zoom)));
+
+    const cyaw = Math.cos(yaw), syaw = Math.sin(yaw);
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const right = [cyaw, 0, -syaw];
+    const up = [-syaw * sp, cp, -cyaw * sp];
+    const fwd = [syaw * cp, sp, cyaw * cp];
+
+    const panScale = dist * 0.0024;
+    cx -= (right[0] * panX - up[0] * panY) * panScale;
+    cy -= (right[1] * panX - up[1] * panY) * panScale;
+    cz -= (right[2] * panX - up[2] * panY) * panScale;
+
+    const eye = [cx + fwd[0] * dist, cy + fwd[1] * dist, cz + fwd[2] * dist];
+    const vp = buildPerspectiveViewProj(
+      eye,
+      [cx, cy, cz],
+      [0, 1, 0],
+      fovRad,
+      aspect,
+      Math.max(1e-4, dist * 0.02),
+      Math.max(10, dist * 16 + maxSpan * 8),
+    );
+
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.disable(gl.CULL_FACE);
+    if (shading === 'wireframe') {
+      gl.enable(gl.POLYGON_OFFSET_FILL);
+      gl.polygonOffset(1.0, 1.0);
+    } else {
+      gl.disable(gl.POLYGON_OFFSET_FILL);
+    }
+
+    gl.useProgram(meshProg);
+    gl.uniformMatrix4fv(locs.uViewProj, false, vp);
+    gl.uniform3fv(locs.uEye, eye);
+    const modeInt = shading === 'clay' ? 1 : shading === 'normals' ? 2 : 0;
+    gl.uniform1i(locs.uMode, modeInt);
+    gl.uniform1i(locs.uTex, 0);
+
+    gl.bindVertexArray(glState.vao);
+    const subs = info.submeshes?.length
+      ? info.submeshes
+      : [{ indexOffset: 0, indexCount: info.fullMesh.indices.length, imageIndex: null, baseColor: [0.85, 0.88, 0.94] }];
+    for (const sm of subs) {
+      if (!sm.indexCount) continue;
+      const tex = shading === 'textured' && typeof sm.imageIndex === 'number'
+        ? glState.texturesByImage.get(sm.imageIndex) || null
+        : null;
+      if (tex) {
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.uniform1i(locs.uHasTex, 1);
+      } else {
+        gl.uniform1i(locs.uHasTex, 0);
+      }
+      const c = sm.baseColor || [0.85, 0.88, 0.94];
+      gl.uniform3f(locs.uSubColor, c[0], c[1], c[2]);
+      gl.drawElements(gl.TRIANGLES, sm.indexCount, gl.UNSIGNED_INT, sm.indexOffset * 4);
+    }
+    gl.bindVertexArray(null);
+    gl.disable(gl.POLYGON_OFFSET_FILL);
+
+    if (shading === 'wireframe') {
+      ensureWireframeVao(glState, info);
+      if (glState.wireVao && glState.wireCount > 0) {
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        gl.uniform1i(locs.uMode, 3);
+        gl.uniform1i(locs.uHasTex, 0);
+        gl.bindVertexArray(glState.wireVao);
+        gl.drawElements(gl.LINES, glState.wireCount, gl.UNSIGNED_INT, 0);
+        gl.bindVertexArray(null);
+        gl.disable(gl.BLEND);
+      }
+    }
+    return;
+  }
+
+  // Fallback 2D software painter's renderer (used in headless Node / jsdom unit tests)
   const { ctx, w, h } = prepCanvas(canvas, width, height);
   if (!ctx) return;
 
@@ -688,7 +1487,6 @@ export function drawGlbPreviewCanvas(canvas, info, { width = 180, height = 100, 
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, w, h);
 
-  // Subtle floor shadow disc
   ctx.save();
   ctx.fillStyle = 'rgba(0, 0, 0, 0.34)';
   ctx.beginPath();
@@ -698,7 +1496,7 @@ export function drawGlbPreviewCanvas(canvas, info, { width = 180, height = 100, 
 
   if (!info || !info.sampleTris?.length) return;
 
-  const [min, max] = info.bounds;
+  const [min, max] = info.focusBounds || info.bounds;
   const cx = (min[0] + max[0]) * 0.5;
   const cy = (min[1] + max[1]) * 0.5;
   const cz = (min[2] + max[2]) * 0.5;
@@ -958,7 +1756,7 @@ export function createPreviewManager({ urlForAsset, onMetadata }) {
         if (!res.ok) return null;
         if (asset.kind === 'model') {
           const buf = await res.arrayBuffer();
-          const parsed = parseGlbPreview(buf);
+          const parsed = await parseGlbPreviewAsync(buf);
           if (parsed) {
             cache.set(key, parsed);
             onMetadata?.(asset.id, parsed);

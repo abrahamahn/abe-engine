@@ -68,6 +68,7 @@
   <select id="project-tools" aria-label="Project tools" hidden><option value="" data-i18n="projectTools">Project tools</option></select>
   <span id="fps"></span>
   <span id="project-tab-tools"></span>
+  <button id="studio-help-btn" type="button" class="mini" data-i18n="quickGuide" data-i18n-title="quickGuideTip">? Guide</button>
   <button id="language" class="mini" data-i18n="language">한국어</button>
   <span id="connection" data-i18n="connecting">connecting</span>
 </header>
@@ -119,6 +120,10 @@
     <canvas id="overlay"></canvas>
     <div id="frame-guide" hidden aria-hidden="true"></div>
     <div id="viewport-drop-hint" hidden aria-hidden="true"></div>
+    <div id="viewport-controls-hint" class="viewport-controls-hint" role="note">
+      <span data-i18n="viewportControlsHint">Right-Drag: Orbit · Middle/Shift+Right: Pan · Scroll: Zoom · Click: Select · W/E/R: Move/Rot/Scale · F: Frame</span>
+      <button type="button" id="viewport-controls-guide" class="mini">?</button>
+    </div>
   </section><section id="pie-stage" hidden></section><section id="pie-matrix" hidden></section><div id="layout-rig-overlay" hidden></div></div>
   <section id="right" class="panel">
     <h2 data-i18n="inspector">Inspector</h2>
@@ -203,6 +208,63 @@
     <button type="button" id="project-tool-close" data-i18n="backToScene">Back to scene</button>
   </header>
   <iframe id="project-tool-frame" referrerpolicy="no-referrer" sandbox="allow-forms allow-scripts allow-same-origin allow-downloads allow-popups"></iframe>
+</dialog>
+<dialog id="studio-guide-dialog" aria-labelledby="studio-guide-title">
+  <div class="studio-guide-shell">
+    <header class="studio-guide-header">
+      <div>
+        <h3 id="studio-guide-title">Ganbate Studio — Quick-Start &amp; Architecture Guide</h3>
+        <p class="studio-guide-sub">Unified 3D World Authoring, Live Game Output Verification (PIE), and Full-Repository Project X-Ray</p>
+      </div>
+      <button type="button" id="studio-guide-close" class="mini">✕ Close</button>
+    </header>
+    <div class="studio-guide-actions">
+      <button type="button" class="on" data-guide-action="xray">🔍 Open Project X-Ray (Assets + Code)</button>
+      <button type="button" data-guide-action="model">🧊 Open Model &amp; Mesh Studio (.glb)</button>
+      <button type="button" data-guide-action="pie">▶ Switch to Live Game Output (PIE)</button>
+      <button type="button" data-guide-action="matrix">📱 Open 4-Device Matrix (Portrait / Landscape)</button>
+      <button type="button" data-guide-action="frame">🎯 Frame Active 3D Scene (F)</button>
+    </div>
+    <div class="studio-guide-grid">
+      <section class="studio-guide-card">
+        <h4>1. 3D Viewport &amp; Gizmo Controls</h4>
+        <ul>
+          <li><strong>Right-Click + Drag:</strong> Orbit 3D camera around target</li>
+          <li><strong>Middle-Drag or Shift + Right-Drag:</strong> Pan camera</li>
+          <li><strong>Mouse Scroll Wheel:</strong> Zoom in / out smoothly</li>
+          <li><strong>Left-Click:</strong> Select 3D entity or drag gizmo axis</li>
+          <li><strong>W / E / R:</strong> Move / Rotate / Scale gizmo (hold <strong>Ctrl/Cmd</strong> to snap)</li>
+          <li><strong>F:</strong> Frame selected entity (or entire scene)</li>
+          <li><strong>Ctrl+S / Ctrl+Z / Ctrl+Shift+Z:</strong> Save / Undo / Redo</li>
+        </ul>
+      </section>
+      <section class="studio-guide-card">
+        <h4>2. Matching Edit-to-Real Game Output (WYSIWYG)</h4>
+        <ul>
+          <li><strong>Scene:</strong> Direct 3D engine authoring viewport (`3D World &amp; Look`).</li>
+          <li><strong>Game (PIE):</strong> Runs the real live web runtime inside exact device dimensions (`390×844` iPhone Portrait, `844×390` Landscape, `1440×900` Desktop).</li>
+          <li><strong>Device Matrix:</strong> Shows 4 real aspect ratios simultaneously so portrait/landscape camera &amp; HUD mismatches are caught immediately.</li>
+          <li><strong>Preset Selector:</strong> Compare Engine Runtime vs Legacy Default side-by-side.</li>
+        </ul>
+      </section>
+      <section class="studio-guide-card">
+        <h4>3. Project X-Ray (Assets + Backend/Frontend Code)</h4>
+        <ul>
+          <li><strong>Overlap Clusters:</strong> Side-by-side comparison of duplicate `.glb` models (full WebGL2 textured + Clay + Wireframe + Bust zoom), environments, and editor tools.</li>
+          <li><strong>Code Tree &amp; Backend:</strong> Browse every Rust, SQL, Protocol, Shared, Frontend, and Engine source file with static risk flags (`&gt;1,000 LOC`, `0 callers`, uncalled routes).</li>
+          <li><strong>File-by-File Audit Queue:</strong> Step file-by-file (`← Prev / Next →`) and mark <code>Keep</code>, <code>Update</code>, <code>Merge</code>, or <code>Delete</code> with live source inspection.</li>
+        </ul>
+      </section>
+      <section class="studio-guide-card">
+        <h4>4. Bottom Asset Browser &amp; Workbenches</h4>
+        <ul>
+          <li><strong>Assets Dock (Bottom):</strong> Double-click `.scene.json` to open a 3D scene, `.glb` to inspect in Model Studio, or drag any `.glb` / `.prefab.json` directly into the 3D viewport.</li>
+          <li><strong>Inspector (Right):</strong> Edit transforms, lights, cameras (`Look through` / `Align camera`), materials, and schema-validated `.data.json` documents.</li>
+          <li><strong>SceneScript (`.gbs` Bar):</strong> Type deterministic scene commands (`spawn`, `move`, `snap`) and run <code>Verify</code>.</li>
+        </ul>
+      </section>
+    </div>
+  </div>
 </dialog>
 <div id="asset-context-menu" class="context-menu" role="menu" hidden></div>
 </body>

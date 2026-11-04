@@ -9,6 +9,7 @@ import {
   drawWaveformCanvas,
   extractWavPeaks,
   parseGlbPreview,
+  parseGlbPreviewAsync,
 } from './asset-previews.js';
 
 export const DEFAULT_CATALOG_URLS = Object.freeze([
@@ -49,6 +50,7 @@ export const RUNTIME_EXPOSURES = Object.freeze([
 
 export const TRIAGE_ACTIONS = Object.freeze([
   'Keep',
+  'Update',
   'Merge',
   'Wire',
   'Refactor',
@@ -58,6 +60,7 @@ export const TRIAGE_ACTIONS = Object.freeze([
 
 const TRIAGE_ACTION_META = Object.freeze({
   Keep: { icon: '✓', label: 'Keep' },
+  Update: { icon: '✨', label: 'Update (Algo/Bug/Docs)' },
   Merge: { icon: '⇄', label: 'Merge' },
   Wire: { icon: '⚡', label: 'Wire' },
   Refactor: { icon: '🛠', label: 'Refactor' },
@@ -79,6 +82,7 @@ export function normalizeTriageAction(raw) {
   if (TRIAGE_ACTIONS.includes(trimmed)) return trimmed;
   const lower = trimmed.toLowerCase();
   if (lower === 'keep' || lower === 'keep-canonical') return 'Keep';
+  if (lower === 'update' || lower.startsWith('update-') || lower === 'improve' || lower === 'fix') return 'Update';
   if (lower === 'merge' || lower === 'merge-into-studio') return 'Merge';
   if (lower === 'wire' || lower === 'wire-to-frontend') return 'Wire';
   if (lower === 'refactor' || lower === 're-architect') return 'Refactor';
@@ -330,6 +334,8 @@ export function filterCatalogItems(items = [], filters = {}, decisions = {}) {
     category = 'all',
     subsystem = 'all',
     clusterId = 'all',
+    layer = 'all',
+    riskSignal = 'all',
     triage = 'all',
     query = '',
   } = filters;
@@ -343,6 +349,22 @@ export function filterCatalogItems(items = [], filters = {}, decisions = {}) {
     if (category !== 'all' && item.category !== category) return false;
     if (subsystem !== 'all' && item.owningSubsystem !== subsystem) return false;
     if (clusterId !== 'all' && !(item.clusterIds || []).includes(clusterId)) return false;
+    if (layer !== 'all') {
+      const itemLayer = item.codeIntel?.layer || null;
+      if (layer === 'any-code') {
+        if (!itemLayer && !isSourceCodePath(item.repoPath)) return false;
+      } else if (itemLayer !== layer) {
+        return false;
+      }
+    }
+    if (riskSignal !== 'all') {
+      const risks = item.codeIntel?.riskSignals || [];
+      if (riskSignal === 'any-risk') {
+        if (!risks.length) return false;
+      } else if (!risks.includes(riskSignal)) {
+        return false;
+      }
+    }
 
     if (triage !== 'all') {
       const itemTriage = normalizeTriageAction(decisions?.[item.id]?.action);
@@ -368,6 +390,12 @@ export function filterCatalogItems(items = [], filters = {}, decisions = {}) {
         item.authoritySource?.kind || '',
         item.authoritySource?.ref || '',
         item.statusReason || '',
+        item.codeIntel?.layer || '',
+        item.codeIntel?.lang || '',
+        ...(item.codeIntel?.symbols || []),
+        ...(item.codeIntel?.httpRoutes || []),
+        ...(item.codeIntel?.sqlTables || []),
+        ...(item.codeIntel?.riskSignals || []),
       ]
         .join(' ')
         .toLowerCase();
@@ -376,6 +404,10 @@ export function filterCatalogItems(items = [], filters = {}, decisions = {}) {
 
     return true;
   });
+}
+
+export function isSourceCodePath(repoPath = '') {
+  return /\.(?:rs|sql|ts|tsx|js|mjs|cjs|wgsl|toml|sh|py|css|html)$/i.test(String(repoPath || ''));
 }
 
 /**
@@ -731,24 +763,36 @@ export function mountCodeXray(container, studioApi = {}) {
     catalog: studioApi.initialCatalog || studioApi.catalog || null,
     sourceUrl: studioApi.initialCatalog ? 'injected' : null,
     loading: !studioApi.initialCatalog && !studioApi.catalog,
-    viewMode: 'clusters', // 'clusters' | 'bookshelf'
+    viewMode: 'clusters', // 'clusters' | 'bookshelf' | 'codetree' | 'audit'
     selectedClusterId: null,
     selectedItemId: null,
     sandboxLiveMounted: false,
     imageZoomed: false,
-    orbitYaw: 0.68,
-    orbitPitch: 0.36,
+    orbitYaw: 0.42,
+    orbitPitch: 0.18,
+    orbitZoom: 1.0,
+    orbitPanX: 0,
+    orbitPanY: 0,
+    glbShading: 'textured', // 'textured' | 'clay' | 'wireframe' | 'normals'
+    glbFocus: 'body', // 'body' | 'bust'
+    expandedDirs: new Set(['ganbate-main', 'ganbate-engine', 'ganbate-main/main', 'ganbate-main/main/backend', 'ganbate-main/main/database', 'ganbate-main/main/apps', 'ganbate-engine/src', 'ganbate-engine/crates']),
+    auditSort: 'priority', // 'priority' | 'loc' | 'callers' | 'path'
+    auditOnlyUndecided: false,
     filters: {
       status: 'all',
       surfaceBucket: 'all',
       runtimeExposure: 'all',
       category: 'all',
       subsystem: 'all',
+      layer: 'all',
+      riskSignal: 'all',
       triage: 'all',
       query: '',
     },
     decisions: loadTriageDecisionsFromStorage(storage),
     glbCache: new Map(),
+    sourceCache: new Map(),
+    sourceInflight: new Set(),
     saveNotice: '',
     disposed: false,
   };
@@ -773,47 +817,61 @@ export function mountCodeXray(container, studioApi = {}) {
     }
   }
 
-  async function loadGlbGeometryForCanvas(item, canvas, width, height) {
+  function currentGlbDrawOpts(width, height, isMini = false) {
+    return {
+      width,
+      height,
+      yaw: state.orbitYaw,
+      pitch: state.orbitPitch,
+      zoom: isMini ? 1.0 : state.orbitZoom,
+      panX: isMini ? 0 : state.orbitPanX,
+      panY: isMini ? 0 : state.orbitPanY,
+      shading: state.glbShading,
+      focus: isMini ? 'body' : state.glbFocus,
+    };
+  }
+
+  async function loadGlbGeometryForCanvas(item, canvas, width, height, isMini = false) {
     if (!item || !canvas || typeof fetchImpl !== 'function') return;
     const cacheKey = item.id;
     if (state.glbCache.has(cacheKey)) {
-      drawGlbPreviewCanvas(canvas, state.glbCache.get(cacheKey), {
-        width,
-        height,
-        yaw: state.orbitYaw,
-        pitch: state.orbitPitch,
-      });
+      drawGlbPreviewCanvas(canvas, state.glbCache.get(cacheKey), currentGlbDrawOpts(width, height, isMini));
       return;
     }
+    // Paint empty studio background immediately using WebGL2 so canvas context stays WebGL2
+    drawGlbPreviewCanvas(canvas, null, currentGlbDrawOpts(width, height, isMini));
     try {
-      const url = resolveAssetPreviewUrl(item, studioApi);
-      const res = await fetchImpl(url);
+      const primaryUrl = resolveAssetPreviewUrl(item, studioApi);
+      const fallbackUrl = `/api/project/file?repo=${encodeURIComponent(item?.repo || 'ganbate-main')}&path=${encodeURIComponent(item?.repoPath || '')}`;
+      let res = await fetchImpl(primaryUrl);
+      if ((!res || !res.ok) && primaryUrl !== fallbackUrl) {
+        res = await fetchImpl(fallbackUrl);
+      }
       if (!res?.ok) return;
       const buf = await res.arrayBuffer();
-      const parsed = parseGlbPreview(buf);
+      const parsed = (await parseGlbPreviewAsync(buf, { fetchImpl })) || parseGlbPreview(buf);
       if (parsed && !state.disposed) {
         state.glbCache.set(cacheKey, parsed);
-        drawGlbPreviewCanvas(canvas, parsed, {
-          width,
-          height,
-          yaw: state.orbitYaw,
-          pitch: state.orbitPitch,
-        });
+        drawGlbPreviewCanvas(canvas, parsed, currentGlbDrawOpts(width, height, isMini));
       }
     } catch {
       // ignore offline preview fetch
     }
   }
 
-  function bindOrbitDrag(canvas, item, width, height) {
+  function bindOrbitDrag(canvas, item, width, height, isMini = false) {
     let dragging = false;
+    let panMode = false;
     let lastX = 0;
     let lastY = 0;
+    canvas.addEventListener('contextmenu', (ev) => ev.preventDefault?.());
     canvas.addEventListener('pointerdown', (ev) => {
       dragging = true;
+      panMode = !isMini && (ev.button === 2 || ev.button === 1 || Boolean(ev.shiftKey));
       lastX = ev.clientX || 0;
       lastY = ev.clientY || 0;
       canvas.setPointerCapture?.(ev.pointerId);
+      ev.stopPropagation?.();
     });
     canvas.addEventListener('pointermove', (ev) => {
       if (!dragging) return;
@@ -821,21 +879,62 @@ export function mountCodeXray(container, studioApi = {}) {
       const dy = (ev.clientY || 0) - lastY;
       lastX = ev.clientX || 0;
       lastY = ev.clientY || 0;
-      state.orbitYaw += dx * 0.012;
-      state.orbitPitch = Math.max(-1.1, Math.min(1.1, state.orbitPitch + dy * 0.01));
+      if (panMode) {
+        state.orbitPanX += dx;
+        state.orbitPanY += dy;
+      } else {
+        state.orbitYaw += dx * 0.012;
+        state.orbitPitch = Math.max(-1.35, Math.min(1.35, state.orbitPitch + dy * 0.01));
+      }
       const info = state.glbCache.get(item.id);
       if (info) {
-        drawGlbPreviewCanvas(canvas, info, {
-          width,
-          height,
-          yaw: state.orbitYaw,
-          pitch: state.orbitPitch,
-        });
+        drawGlbPreviewCanvas(canvas, info, currentGlbDrawOpts(width, height, isMini));
       }
     });
     canvas.addEventListener('pointerup', () => {
       dragging = false;
     });
+    if (!isMini) {
+      canvas.addEventListener(
+        'wheel',
+        (ev) => {
+          ev.preventDefault?.();
+          const factor = (ev.deltaY || 0) < 0 ? 1.14 : 1 / 1.14;
+          state.orbitZoom = Math.max(0.25, Math.min(10, state.orbitZoom * factor));
+          const info = state.glbCache.get(item.id);
+          if (info) {
+            drawGlbPreviewCanvas(canvas, info, currentGlbDrawOpts(width, height, false));
+          }
+        },
+        { passive: false },
+      );
+    }
+  }
+
+  function ensureSourceLoaded(item) {
+    if (!item || typeof fetchImpl !== 'function') return;
+    if (!isSourceCodePath(item.repoPath) && item.preview?.kind !== 'source-code' && !item.codeIntel) return;
+    if (state.sourceCache.has(item.id) || state.sourceInflight.has(item.id)) return;
+    state.sourceInflight.add(item.id);
+    const url = `/api/project/file?repo=${encodeURIComponent(item.repo || 'ganbate-main')}&path=${encodeURIComponent(item.repoPath || '')}`;
+    fetchImpl(url)
+      .then(async (res) => {
+        if (!res?.ok) throw new Error(`HTTP ${res?.status || 'err'}`);
+        const text = await res.text();
+        if (!state.disposed) {
+          state.sourceCache.set(item.id, { ok: true, text });
+          if (state.selectedItemId === item.id) render();
+        }
+      })
+      .catch((err) => {
+        if (!state.disposed) {
+          state.sourceCache.set(item.id, { ok: false, text: `Unable to load live file preview (${err?.message || 'offline'}).` });
+          if (state.selectedItemId === item.id) render();
+        }
+      })
+      .finally(() => {
+        state.sourceInflight.delete(item.id);
+      });
   }
 
   async function setItemTriage(itemId, action, notesInput) {
@@ -894,9 +993,9 @@ export function mountCodeXray(container, studioApi = {}) {
 
     let turntableEl = null;
     if (showTurntable && (item.glbStats || String(item.repoPath || '').endsWith('.glb'))) {
-      turntableEl = h('canvas', { class: 'cxr-mini-turntable', width: 220, height: 112 });
-      bindOrbitDrag(turntableEl, item, 220, 112);
-      void loadGlbGeometryForCanvas(item, turntableEl, 220, 112);
+      turntableEl = h('canvas', { class: 'cxr-mini-turntable', width: 256, height: 164 });
+      bindOrbitDrag(turntableEl, item, 256, 164, true);
+      void loadGlbGeometryForCanvas(item, turntableEl, 256, 164, true);
     }
 
     return h(
@@ -1102,17 +1201,104 @@ export function mountCodeXray(container, studioApi = {}) {
     let previewContent = null;
     const pKind = item.preview?.kind || 'code-summary';
     if (pKind === 'glb' || item.glbStats) {
-      const canvas = h('canvas', { class: 'cxr-preview-canvas', width: 380, height: 220 });
-      bindOrbitDrag(canvas, item, 380, 220);
-      void loadGlbGeometryForCanvas(item, canvas, 380, 220);
+      const stageW = 480;
+      const stageH = 310;
+      const canvas = h('canvas', { class: 'cxr-preview-canvas', width: stageW, height: stageH });
+      bindOrbitDrag(canvas, item, stageW, stageH, false);
+      void loadGlbGeometryForCanvas(item, canvas, stageW, stageH, false);
+      const cachedGlb = state.glbCache.get(item.id);
+      const submeshList = cachedGlb?.submeshes?.length
+        ? h(
+            'details',
+            { class: 'cxr-submesh-details' },
+            h(
+              'summary',
+              {},
+              `Mesh Parts & Materials (${cachedGlb.submeshes.length} submeshes · ${cachedGlb.triangles.toLocaleString('en-US')} tris${cachedGlb.usesDraco ? ' · Draco decoded' : ''})`,
+            ),
+            h(
+              'div',
+              { class: 'cxr-submesh-list' },
+              cachedGlb.submeshes.slice(0, 48).map((sm) =>
+                h(
+                  'div',
+                  { class: 'cxr-submesh-row' },
+                  h('span', { class: 'cxr-submesh-name' }, sm.name),
+                  h('span', { class: 'cxr-subtitle' }, `${sm.materialName} · ${sm.triCount.toLocaleString('en-US')} tris`),
+                ),
+              ),
+            ),
+          )
+        : null;
       previewContent = h(
         'div',
         { class: 'cxr-preview-stage' },
+        h(
+          'div',
+          { class: 'cxr-glb-toolbar' },
+          ['textured', 'clay', 'wireframe', 'normals'].map((mode) =>
+            h(
+              'button',
+              {
+                type: 'button',
+                class: `cxr-pill${state.glbShading === mode ? ' is-active' : ''}`,
+                onClick: () => {
+                  state.glbShading = mode;
+                  render();
+                },
+              },
+              mode === 'textured'
+                ? 'Textured'
+                : mode === 'clay'
+                  ? 'Clay Sculpt'
+                  : mode === 'wireframe'
+                    ? 'Wire + Shaded'
+                    : 'Normals',
+            ),
+          ),
+          h('span', { style: 'width:6px;' }),
+          ['body', 'bust'].map((foc) =>
+            h(
+              'button',
+              {
+                type: 'button',
+                class: `cxr-pill${state.glbFocus === foc ? ' is-active' : ''}`,
+                onClick: () => {
+                  state.glbFocus = foc;
+                  state.orbitPanX = 0;
+                  state.orbitPanY = 0;
+                  render();
+                },
+              },
+              foc === 'body' ? 'Full Frame' : 'Bust / Detail',
+            ),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              class: 'cxr-pill',
+              onClick: () => {
+                state.orbitYaw = 0.42;
+                state.orbitPitch = 0.18;
+                state.orbitZoom = 1.0;
+                state.orbitPanX = 0;
+                state.orbitPanY = 0;
+                render();
+              },
+            },
+            'Reset View',
+          ),
+        ),
         canvas,
         h(
           'div',
           { class: 'cxr-header-actions' },
-          h('span', { class: 'cxr-subtitle' }, 'Drag 3D canvas to orbit · Real glTF 2.0 geometry'),
+          h(
+            'span',
+            { class: 'cxr-subtitle' },
+            'Left-drag: Orbit · Right/Shift-drag: Pan · Scroll: Zoom · WebGL2 full-mesh + diffuse textures',
+          ),
           studioApi.activateWorkbench
             ? h(
                 'button',
@@ -1125,6 +1311,7 @@ export function mountCodeXray(container, studioApi = {}) {
               )
             : null,
         ),
+        submeshList,
       );
     } else if (pKind === 'image') {
       const img = h('img', {
@@ -1396,6 +1583,71 @@ export function mountCodeXray(container, studioApi = {}) {
       notesBox,
     );
 
+    // Live Source Code & Code Intelligence Section (Backend Rust / SQL / Protocol / Frontend / Engine)
+    const isCodeItem = Boolean(item.codeIntel || isSourceCodePath(item.repoPath) || pKind === 'source-code');
+    let codeIntelSection = null;
+    if (isCodeItem) {
+      ensureSourceLoaded(item);
+      const cachedSource = state.sourceCache.get(item.id);
+      const ci = item.codeIntel || {};
+      const lines = cachedSource?.ok && typeof cachedSource.text === 'string'
+        ? cachedSource.text.split('\n')
+        : null;
+      const maxPreviewLines = 260;
+
+      codeIntelSection = h(
+        'section',
+        { class: 'cxr-section', 'data-testid': 'source-code-inspector' },
+        h(
+          'div',
+          { class: 'cxr-card-top' },
+          h('h3', { class: 'cxr-section-title' }, 'Source Code & Static Audit Intelligence'),
+          ci.layer ? h('span', { class: 'cxr-badge cxr-status-active_alternative' }, `${ci.layer} · ${ci.lang || 'code'}`) : null,
+        ),
+        (ci.riskSignals || []).length > 0
+          ? h(
+              'div',
+              { class: 'cxr-pill-bar' },
+              ci.riskSignals.map((sig) =>
+                h('span', { class: 'cxr-badge cxr-status-deprecated' }, `⚠ ${sig}`),
+              ),
+            )
+          : h('div', { class: 'cxr-subtitle' }, 'No static risk flags triggered on this file.'),
+        (ci.httpRoutes?.length || ci.sqlTables?.length || ci.symbols?.length)
+          ? h(
+              'div',
+              { class: 'cxr-kv-grid' },
+              ci.httpRoutes?.length
+                ? h('div', { class: 'cxr-kv-item' }, h('div', { class: 'cxr-kv-key' }, 'HTTP Endpoints'), h('div', { class: 'cxr-kv-val' }, ci.httpRoutes.slice(0, 6).join(', ')))
+                : null,
+              ci.sqlTables?.length
+                ? h('div', { class: 'cxr-kv-item' }, h('div', { class: 'cxr-kv-key' }, 'SQL Tables'), h('div', { class: 'cxr-kv-val' }, ci.sqlTables.slice(0, 6).join(', ')))
+                : null,
+              ci.symbols?.length
+                ? h('div', { class: 'cxr-kv-item' }, h('div', { class: 'cxr-kv-key' }, 'Key Symbols'), h('div', { class: 'cxr-kv-val' }, ci.symbols.slice(0, 10).join(', ')))
+                : null,
+            )
+          : null,
+        lines
+          ? h(
+              'pre',
+              { class: 'cxr-code-viewer' },
+              lines
+                .slice(0, maxPreviewLines)
+                .map((ln, idx) => `${String(idx + 1).padStart(4, ' ')} │ ${ln}`)
+                .join('\n') +
+                (lines.length > maxPreviewLines
+                  ? `\n... (${lines.length - maxPreviewLines} more lines — ${lines.length} total lines)`
+                  : ''),
+            )
+          : h(
+              'div',
+              { class: 'cxr-subtitle' },
+              cachedSource ? cachedSource.text : 'Loading source file from workspace...',
+            ),
+      );
+    }
+
     return h(
       'div',
       { style: 'display:flex;flex-direction:column;gap:10px;' },
@@ -1407,9 +1659,261 @@ export function mountCodeXray(container, studioApi = {}) {
         previewContent,
       ),
       triageSection,
+      codeIntelSection,
       provenanceSection,
       completenessSection,
       graphSection,
+    );
+  }
+
+  function renderCodeTreeShelf(filteredItems) {
+    const codeItems = filteredItems.filter((i) => i.codeIntel || isSourceCodePath(i.repoPath));
+    const layers = ['all', ...new Set(codeItems.map((i) => i.codeIntel?.layer).filter(Boolean))];
+    const riskOptions = [
+      ['all', 'All Code Files'],
+      ['any-risk', '⚠ Any Risk Signal'],
+      ['over-1000-loc', '> 1,000 LOC Monoliths'],
+      ['zero-inbound-imports', '0 Inbound Callers'],
+      ['uncalled-http-route', 'Uncalled Backend Route'],
+      ['unused-sql-table', 'Unused SQL Table'],
+      ['high-unwrap-or-any', 'High unwrap / any'],
+      ['missing-module-docs', 'Missing Module Docs'],
+    ];
+
+    // Group into folder hierarchy (repo/top1/top2)
+    const groups = new Map();
+    for (const item of codeItems) {
+      const parts = String(item.repoPath || '').split('/').filter(Boolean);
+      const groupKey = `${item.repo}/${parts.slice(0, Math.min(3, Math.max(1, parts.length - 1))).join('/')}`;
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, { key: groupKey, items: [], totalLoc: 0 });
+      }
+      const g = groups.get(groupKey);
+      g.items.push(item);
+      g.totalLoc += Number(item.loc || 0);
+    }
+    const sortedGroups = [...groups.values()].sort((a, b) => b.items.length - a.items.length || a.key.localeCompare(b.key));
+
+    return h(
+      'div',
+      { style: 'display:flex;flex-direction:column;gap:10px;', 'data-testid': 'code-tree-shelf' },
+      h(
+        'div',
+        { class: 'cxr-cluster-banner' },
+        h(
+          'div',
+          { class: 'cxr-card-top' },
+          h('strong', { style: 'color:#fff;font-size:13px;' }, `Full Repository Code Explorer (${codeItems.length.toLocaleString('en-US')} files)`),
+          h(
+            'select',
+            {
+              class: 'cxr-select',
+              value: state.filters.riskSignal,
+              onChange: (ev) => {
+                state.filters.riskSignal = ev.target?.value || 'all';
+                render();
+              },
+            },
+            riskOptions.map(([val, lbl]) => h('option', { value: val }, lbl)),
+          ),
+        ),
+        h(
+          'div',
+          { class: 'cxr-pill-bar' },
+          layers.map((lyr) =>
+            h(
+              'button',
+              {
+                type: 'button',
+                class: `cxr-pill${state.filters.layer === lyr ? ' is-active' : ''}`,
+                onClick: () => {
+                  state.filters.layer = lyr;
+                  render();
+                },
+              },
+              lyr === 'all' ? 'All Architecture Layers' : lyr,
+            ),
+          ),
+        ),
+      ),
+      sortedGroups.slice(0, 60).map((grp) => {
+        const open = state.expandedDirs.has(grp.key) || sortedGroups.length <= 8 || Boolean(state.filters.query.trim());
+        return h(
+          'div',
+          { class: 'cxr-tree-group' },
+          h(
+            'button',
+            {
+              type: 'button',
+              class: 'cxr-tree-folder',
+              onClick: () => {
+                if (state.expandedDirs.has(grp.key)) state.expandedDirs.delete(grp.key);
+                else state.expandedDirs.add(grp.key);
+                render();
+              },
+            },
+            h('span', {}, `${open ? '▾' : '▸'} 📁 ${grp.key}`),
+            h('span', { class: 'cxr-subtitle' }, `${grp.items.length} files · ${grp.totalLoc.toLocaleString('en-US')} LOC`),
+          ),
+          open
+            ? h(
+                'div',
+                { class: 'cxr-tree-files' },
+                grp.items.slice(0, 120).map((it) => {
+                  const tri = normalizeTriageAction(state.decisions[it.id]?.action);
+                  const risks = it.codeIntel?.riskSignals || [];
+                  return h(
+                    'button',
+                    {
+                      type: 'button',
+                      class: `cxr-tree-file${state.selectedItemId === it.id ? ' is-selected' : ''}`,
+                      onClick: () => selectItem(it.id),
+                    },
+                    h('span', { class: 'cxr-tree-filename' }, it.repoPath.split('/').slice(3).join('/') || it.title),
+                    h(
+                      'span',
+                      { class: 'cxr-cluster-tab-meta' },
+                      risks.length > 0 ? h('span', { class: 'cxr-badge cxr-status-deprecated' }, `⚠ ${risks.length}`) : null,
+                      tri ? h('span', { class: 'cxr-badge cxr-status-active_alternative' }, `${TRIAGE_ACTION_META[tri].icon} ${tri}`) : null,
+                      h('span', {}, `${it.loc} LOC`),
+                      h('span', {}, `${it.referenceCount} refs`),
+                    ),
+                  );
+                }),
+              )
+            : null,
+        );
+      }),
+    );
+  }
+
+  function renderAuditQueueShelf(filteredItems) {
+    let queue = filteredItems.filter((i) => {
+      if (!state.auditOnlyUndecided) return true;
+      return !normalizeTriageAction(state.decisions[i.id]?.action);
+    });
+
+    const riskScore = (it) => {
+      const risks = it.codeIntel?.riskSignals || [];
+      let s = risks.length * 25;
+      if (it.surfaceBucket === 'orphan') s += 40;
+      if (it.surfaceBucket === 'duplicate') s += 30;
+      if (Number(it.loc || 0) > 1000) s += 35;
+      return s + Math.min(20, Math.floor(Number(it.loc || 0) / 100));
+    };
+
+    queue = [...queue].sort((a, b) => {
+      if (state.auditSort === 'loc') return Number(b.loc || 0) - Number(a.loc || 0);
+      if (state.auditSort === 'callers') return Number(a.referenceCount || 0) - Number(b.referenceCount || 0);
+      if (state.auditSort === 'path') return String(a.repoPath).localeCompare(String(b.repoPath));
+      return riskScore(b) - riskScore(a);
+    });
+
+    const curIdx = queue.findIndex((i) => i.id === state.selectedItemId);
+    const stepBy = (delta) => {
+      if (!queue.length) return;
+      const nextIdx = Math.max(0, Math.min(queue.length - 1, (curIdx < 0 ? 0 : curIdx) + delta));
+      selectItem(queue[nextIdx].id);
+    };
+
+    return h(
+      'div',
+      { style: 'display:flex;flex-direction:column;gap:10px;', 'data-testid': 'audit-queue-shelf' },
+      h(
+        'div',
+        { class: 'cxr-cluster-banner' },
+        h(
+          'div',
+          { class: 'cxr-card-top' },
+          h('strong', { style: 'color:#fff;font-size:13px;' }, `File-by-File AI & Founder Audit Queue (${queue.length.toLocaleString('en-US')} items)`),
+          h(
+            'div',
+            { class: 'cxr-header-actions' },
+            h('button', { type: 'button', class: 'cxr-btn', onClick: () => stepBy(-1) }, '← Prev File'),
+            h('span', { class: 'cxr-subtitle' }, curIdx >= 0 ? `${curIdx + 1} / ${queue.length}` : `0 / ${queue.length}`),
+            h('button', { type: 'button', class: 'cxr-btn cxr-btn-primary', onClick: () => stepBy(1) }, 'Next File →'),
+          ),
+        ),
+        h(
+          'div',
+          { class: 'cxr-card-top' },
+          h(
+            'label',
+            { class: 'cxr-subtitle', style: 'display:inline-flex;align-items:center;gap:5px;cursor:pointer;' },
+            h('input', {
+              type: 'checkbox',
+              checked: state.auditOnlyUndecided ? 'checked' : null,
+              onChange: (ev) => {
+                state.auditOnlyUndecided = Boolean(ev.target?.checked);
+                render();
+              },
+            }),
+            'Show undecided files only',
+          ),
+          h(
+            'select',
+            {
+              class: 'cxr-select',
+              value: state.auditSort,
+              onChange: (ev) => {
+                state.auditSort = ev.target?.value || 'priority';
+                render();
+              },
+            },
+            h('option', { value: 'priority' }, 'Sort: Highest Audit Priority First'),
+            h('option', { value: 'loc' }, 'Sort: Largest LOC First (>1,000 LOC Monoliths)'),
+            h('option', { value: 'callers' }, 'Sort: 0 Inbound Callers First'),
+            h('option', { value: 'path' }, 'Sort: Alphabetical Path'),
+          ),
+        ),
+      ),
+      h(
+        'div',
+        { class: 'cxr-audit-list' },
+        queue.slice(0, 160).map((it) => {
+          const curAct = normalizeTriageAction(state.decisions[it.id]?.action);
+          const risks = it.codeIntel?.riskSignals || [];
+          return h(
+            'div',
+            {
+              class: `cxr-audit-row${state.selectedItemId === it.id ? ' is-selected' : ''}`,
+              onClick: () => selectItem(it.id),
+            },
+            h(
+              'div',
+              { class: 'cxr-audit-main' },
+              h('div', { class: 'cxr-card-title' }, it.title),
+              h('div', { class: 'cxr-card-path' }, `${it.repo}:${it.repoPath}`),
+              h(
+                'div',
+                { class: 'cxr-cluster-tab-meta' },
+                it.codeIntel?.layer ? h('span', { class: 'cxr-hash-badge' }, it.codeIntel.layer) : null,
+                h('span', {}, `${it.loc || 0} LOC`),
+                h('span', {}, `${it.referenceCount || 0} callers`),
+                ...risks.slice(0, 3).map((r) => h('span', { class: 'cxr-badge cxr-status-deprecated' }, r)),
+              ),
+            ),
+            h(
+              'div',
+              { class: 'cxr-audit-quick-actions' },
+              ['Keep', 'Update', 'Merge', 'Delete'].map((act) =>
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    class: `cxr-pill${curAct === act ? ' is-active' : ''}`,
+                    onClick: (ev) => {
+                      ev.stopPropagation?.();
+                      void setItemTriage(it.id, curAct === act ? null : act);
+                    },
+                  },
+                  `${TRIAGE_ACTION_META[act].icon} ${act}`,
+                ),
+              ),
+            ),
+          );
+        }),
+      ),
     );
   }
 
@@ -1518,13 +2022,39 @@ export function mountCodeXray(container, studioApi = {}) {
           'button',
           {
             type: 'button',
+            class: `cxr-mode-tab${state.viewMode === 'codetree' ? ' is-active' : ''}`,
+            'data-testid': 'mode-codetree-btn',
+            onClick: () => {
+              state.viewMode = 'codetree';
+              render();
+            },
+          },
+          'Code Tree & Backend',
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
+            class: `cxr-mode-tab${state.viewMode === 'audit' ? ' is-active' : ''}`,
+            'data-testid': 'mode-audit-btn',
+            onClick: () => {
+              state.viewMode = 'audit';
+              render();
+            },
+          },
+          'File-by-File Audit Queue',
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
             class: `cxr-mode-tab${state.viewMode === 'bookshelf' ? ' is-active' : ''}`,
             onClick: () => {
               state.viewMode = 'bookshelf';
               render();
             },
           },
-          `Every Book Shelf (${filteredItems.length})`,
+          `Every Surface (${filteredItems.length})`,
         ),
       ),
       h('input', {
@@ -1591,11 +2121,15 @@ export function mountCodeXray(container, studioApi = {}) {
       { class: 'cxr-shelf-pane' },
       state.viewMode === 'clusters'
         ? renderClusterShelf()
-        : h(
-            'div',
-            { class: 'cxr-card-grid' },
-            filteredItems.slice(0, 180).map((it) => renderBookCard(it, { showTurntable: Boolean(it.glbStats) })),
-          ),
+        : state.viewMode === 'codetree'
+          ? renderCodeTreeShelf(filteredItems)
+          : state.viewMode === 'audit'
+            ? renderAuditQueueShelf(filteredItems)
+            : h(
+                'div',
+                { class: 'cxr-card-grid' },
+                filteredItems.slice(0, 180).map((it) => renderBookCard(it, { showTurntable: Boolean(it.glbStats) })),
+              ),
     );
 
     const inspectorPane = h('aside', { class: 'cxr-inspector-pane' }, renderInspector(selectedItem));

@@ -611,7 +611,22 @@ export function createPieViewport({
         const res = await fetch(projectAssetUrl(relPath));
         if (res.status === 404) continue;
         if (!res.ok) throw new Error(`Could not load ${relPath}`);
-        resolved = resolveGameWorkspace(await res.json(), location.origin, override, { allowSameOrigin });
+        const rawManifest = await res.json();
+        let effectiveOverride = override;
+        if (!effectiveOverride && !allowSameOrigin && typeof rawManifest?.origin === 'string') {
+          try {
+            const mUrl = new URL(rawManifest.origin);
+            const sHost = new URL(location.origin).hostname.replace(/\.$/, '');
+            const mHost = mUrl.hostname.replace(/\.$/, '');
+            if (sHost === mHost && (mHost === 'localhost' || mHost === '127.0.0.1')) {
+              mUrl.hostname = mHost === 'localhost' ? '127.0.0.1' : 'localhost';
+              effectiveOverride = mUrl.origin;
+            }
+          } catch {
+            /* let resolveGameWorkspace validate */
+          }
+        }
+        resolved = resolveGameWorkspace(rawManifest, location.origin, effectiveOverride, { allowSameOrigin });
         break;
       }
       if (gen !== loadGeneration) return;

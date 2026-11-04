@@ -518,6 +518,9 @@ impl Host {
             }
             return resp;
         }
+        if p == "/api/project/file" {
+            return self.serve_workspace_file(req);
+        }
         if let Some(rest) = p.strip_prefix("/editor/") {
             return http::serve_file(&self.config.editor, rest);
         }
@@ -526,6 +529,9 @@ impl Host {
         }
         if let Some(rest) = p.strip_prefix("/web/") {
             return http::serve_file(&self.config.engine, rest);
+        }
+        if let Some(rest) = p.strip_prefix("/vendor/") {
+            return http::serve_inside(&self.root.join("public/vendor"), rest, &self.real_root);
         }
         if let Some(rest) = p.strip_prefix("/cooked/") {
             return http::serve_inside(&self.cooked, rest, &self.real_root);
@@ -555,6 +561,95 @@ impl Host {
         }
         Response::text(404, "not found")
     }
+
+    /// Serves a read-only workspace source or binary asset file (`GET /api/project/file?repo=...&path=...`)
+    /// strictly confined to either the engine repository root or the enclosing project repository root.
+    fn serve_workspace_file(&self, req: &Request) -> Response {
+        let Some(rel_path) = req.param("path") else {
+            return Response::text(400, "missing path query parameter");
+        };
+        if rel_path.is_empty() || is_forbidden_workspace_path(&rel_path) {
+            return Response::text(403, "forbidden workspace path");
+        }
+        let repo = req.param("repo").unwrap_or_default();
+        let base_root = if repo == "ganbate-engine" || repo == "engine" {
+            self.config
+                .editor
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| self.config.editor.clone())
+        } else {
+            find_workspace_repo_root(&self.real_root)
+        };
+        let Ok(real_repo_root) = std::fs::canonicalize(&base_root) else {
+            return Response::text(404, "workspace root not found");
+        };
+        let Some(candidate) = http::safe_join(&real_repo_root, &rel_path) else {
+            return Response::text(403, "forbidden");
+        };
+        let Ok(real_file) = std::fs::canonicalize(&candidate) else {
+            return Response::text(404, "not found");
+        };
+        let Ok(stripped) = real_file.strip_prefix(&real_repo_root) else {
+            return Response::text(403, "forbidden: outside workspace root");
+        };
+        if http::hidden(stripped) || !real_file.is_file() {
+            return Response::text(403, "forbidden");
+        }
+        const MAX_WORKSPACE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+        if std::fs::metadata(&real_file)
+            .map(|m| m.len() > MAX_WORKSPACE_FILE_BYTES)
+            .unwrap_or(true)
+        {
+            return Response::text(413, "file exceeds 64 MiB preview cap");
+        }
+        match std::fs::read(&real_file) {
+            Ok(bytes) => Response::new(200, http::content_type(&real_file), bytes),
+            Err(_) => Response::text(404, "not found"),
+        }
+    }
+}
+
+/// Walks up at most 4 ancestor levels from `project_root` to find the enclosing git/monorepo root.
+fn find_workspace_repo_root(project_root: & std::path::Path) -> PathBuf {
+    let mut best = project_root.to_path_buf();
+    let mut cur = project_root;
+    for _ in 0..4 {
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        if parent.join(".git").exists()
+            || parent.join("pnpm-workspace.yaml").exists()
+            || parent.join("Cargo.toml").exists()
+        {
+            best = parent.to_path_buf();
+        }
+        if parent.join(".git").exists() {
+            break;
+        }
+        cur = parent;
+    }
+    best
+}
+
+fn is_forbidden_workspace_path(rel_path: &str) -> bool {
+    let lower = rel_path.to_ascii_lowercase();
+    for ext in [".pem", ".key", ".p12", ".pfx", ".env"] {
+        if lower.ends_with(ext) {
+            return true;
+        }
+    }
+    rel_path
+        .trim_start_matches('/')
+        .split('/')
+        .any(|seg| {
+            let s = seg.to_ascii_lowercase();
+            s.starts_with('.')
+                || matches!(
+                    s.as_str(),
+                    "private" | "secrets" | "credentials" | "node_modules" | "target"
+                )
+        })
 }
 
 /// Wrong pairing tokens by peer address: how many, since when (the window's start).
@@ -810,5 +905,28 @@ mod tests {
             f.count(IpAddr::from(i.to_be_bytes()), t0, &limits);
         }
         assert!(f.0.len() <= MAX_PEERS);
+    }
+
+    #[test]
+    fn workspace_file_guard_blocks_secrets_and_dot_segments() {
+        for blocked in [
+            ".env",
+            "config/env/.env.local",
+            "private/key.txt",
+            "secrets/token.json",
+            "node_modules/pkg/index.js",
+            "target/debug/app",
+            "certs/server.pem",
+            "certs/id.key",
+        ] {
+            assert!(is_forbidden_workspace_path(blocked), "{blocked}");
+        }
+        for allowed in [
+            "main/backend/crates/server/src/main.rs",
+            "main/tools/scripts/art/sources/hero.glb",
+            "src/render/world.rs",
+        ] {
+            assert!(!is_forbidden_workspace_path(allowed), "{allowed}");
+        }
     }
 }
