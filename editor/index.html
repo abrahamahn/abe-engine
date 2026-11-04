@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ganbate Studio</title>
 <link rel="stylesheet" href="/editor/studio.css">
+<link rel="stylesheet" href="/editor/ai-copilot.css">
 </head>
 <body>
 <header id="toolbar">
@@ -73,11 +74,17 @@
   <span id="connection" data-i18n="connecting">connecting</span>
 </header>
 <nav id="workspace-bar" aria-label="Studio Workbenches and AI IDE">
+  <div id="ux-tier-bar" class="ux-tier-switch" role="group" aria-label="Studio Experience Mode">
+    <button type="button" class="ux-tier-btn" data-ux-tier="creator" data-i18n="uxCreator" data-i18n-title="uxCreatorTip">Creator</button>
+    <button type="button" class="ux-tier-btn" data-ux-tier="studio" data-i18n="uxStudio" data-i18n-title="uxStudioTip">Studio</button>
+    <button type="button" class="ux-tier-btn on" data-ux-tier="engineer" data-i18n="uxEngineer" data-i18n-title="uxEngineerTip">Engineer</button>
+  </div>
   <div id="workspace-tabs" role="tablist">
     <button type="button" role="tab" class="workspace-tab on" aria-selected="true" data-workbench="world" data-i18n="wb_world">3D World &amp; Look</button>
     <button type="button" role="tab" class="workspace-tab" aria-selected="false" data-workbench="code-xray" data-i18n="wb_code_xray">Project X-Ray</button>
   </div>
   <div id="ai-ide-bar">
+    <button type="button" id="ai-copilot-toggle" class="mini" data-i18n="aiCopilot" data-i18n-title="aiCopilotTip">✨ AI Copilot</button>
     <span id="ai-selection-pill" class="ai-selection-pill" data-i18n="aiSelectionNone">@selection: scene</span>
     <input id="ai-gbs-input" type="text" autocomplete="off" spellcheck="false" data-i18n-placeholder="aiGbsPlaceholder" placeholder=".gbs command (e.g. spawn Beacon at 0 1 0; snap Beacon ground)…">
     <button type="button" id="ai-gbs-apply" class="mini" data-i18n="aiApply" data-i18n-title="aiApplyTip">Apply .gbs</button>

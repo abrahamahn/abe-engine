@@ -84,6 +84,12 @@ fn prop_arr_str(desc: &'static str) -> Value {
 pub fn tools_list() -> Value {
     Value::Array(vec![
         tool_def(
+            "project_context",
+            "Read the <800-token L0/L1 AI Context Digest of the entire open game project (scenes, schemas, workspaces, @selection, top bricks, and .gbs grammar).",
+            obj([("limit", prop_num("Max top brick signatures to include (default 24)"))]),
+            &[],
+        ),
+        tool_def(
             "studio_status",
             "Inspect the open Ganbate project, open documents, dirty flags, and connected Studio clients.",
             obj([]),
@@ -312,6 +318,11 @@ pub fn handle_rpc_value(studio: &mut Studio, req: &Value) -> (Option<Value>, Out
         "resources/list" => {
             let resources = Value::Array(vec![
                 obj([
+                    ("uri", s("ganbate://context")),
+                    ("name", s("Token-Compact L0/L1 Project Context Digest")),
+                    ("mimeType", s("text/markdown")),
+                ]),
+                obj([
                     ("uri", s("ganbate://selection")),
                     ("name", s("Live Studio @selection")),
                     ("mimeType", s("application/json")),
@@ -333,6 +344,25 @@ pub fn handle_rpc_value(studio: &mut Studio, req: &Value) -> (Option<Value>, Out
                 .and_then(|v| v.string().ok())
                 .unwrap_or("");
             match uri {
+                "ganbate://context" => match studio.mcp_project_context(24) {
+                    Ok(ctx) => {
+                        let text = ctx
+                            .get("digestText")
+                            .and_then(|v| v.string().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let res = obj([(
+                            "contents",
+                            Value::Array(vec![obj([
+                                ("uri", s(uri)),
+                                ("mimeType", s("text/markdown")),
+                                ("text", Value::String(text)),
+                            ])]),
+                        )]);
+                        (Some(rpc_ok(id, res)), Vec::new())
+                    }
+                    Err(e) => (Some(rpc_err(id, -32603, &e)), Vec::new()),
+                },
                 "ganbate://selection" => {
                     let sel = studio.mcp_selection_details();
                     let text = json::to_compact(&sel).unwrap_or_default();

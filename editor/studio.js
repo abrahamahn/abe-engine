@@ -25,6 +25,7 @@ import {
 import { t, label, lang, setLang, translate } from './i18n.js';
 
 import { projectToolsPanel } from './project-tools.js';
+import { mountAiCopilot, UX_TIERS } from './ai-copilot.js';
 
 const $ = (sel) => document.querySelector(sel);
 function el(tag, attrs = {}, ...children) {
@@ -2194,14 +2195,19 @@ function allWorkbenchDescriptors() {
 function drawWorkspaceTabs() {
   const bar = $('#workspace-tabs');
   if (!bar) return;
+  const tierId = document.body.dataset.uxTier || 'engineer';
+  const tierRule = UX_TIERS[tierId] || UX_TIERS.engineer;
   bar.replaceChildren();
   for (const wb of allWorkbenchDescriptors()) {
     const active = state.activeWorkbench === wb.id;
+    const hiddenByTier = Boolean(
+      tierRule.visibleEngineTabs && !tierRule.visibleEngineTabs.has(wb.id) && !active,
+    );
     const text = wb.label || (wb.labelKey ? t(wb.labelKey) : wb.id);
     bar.append(el('button', {
       type: 'button',
       role: 'tab',
-      class: `workspace-tab${active ? ' on' : ''}`,
+      class: `workspace-tab${active ? ' on' : ''}${hiddenByTier ? ' ux-tier-hidden' : ''}`,
       'aria-selected': String(active),
       'data-workbench': wb.id,
       onclick: () => { void activateWorkbench(wb.id); },
@@ -2545,7 +2551,89 @@ async function runAiCrystallize(explicitId = null) {
   return reply?.brick || null;
 }
 
+function setUxTier(tierId, persist = true) {
+  const valid = UX_TIERS[tierId] ? tierId : 'engineer';
+  document.body.dataset.uxTier = valid;
+  for (const btn of document.querySelectorAll('#ux-tier-bar .ux-tier-btn')) {
+    btn.classList.toggle('on', btn.dataset.uxTier === valid);
+  }
+  if (persist) {
+    try { localStorage.setItem('ganbate.studio.uxTier', valid); } catch { /* ignore */ }
+  }
+  drawWorkspaceTabs();
+}
+
 function setupAiIdeBar() {
+  // Restore 3-Tier Single-Application UX Mode (defaults to 'engineer' in automated webdriver runs)
+  let savedTier = 'engineer';
+  try {
+    if (!navigator.webdriver) {
+      savedTier = localStorage.getItem('ganbate.studio.uxTier') || 'studio';
+    }
+  } catch { /* ignore */ }
+  setUxTier(savedTier, false);
+  for (const btn of document.querySelectorAll('#ux-tier-bar .ux-tier-btn')) {
+    btn.addEventListener('click', () => setUxTier(btn.dataset.uxTier));
+  }
+
+  const aiCopilot = mountAiCopilot(document.body, {
+    getProjectName: () => $('#project-name')?.textContent || 'Ganbate Project',
+    listAssets: () => studioApi.listAssets(),
+    getSchemas: () => studioApi.getSchemas(),
+    getProjectWorkbenches: () => state.projectWorkbenches,
+    getSelection: () => ({
+      ...(studioApi.getSelection() || {}),
+      cursorWorld: state.view.target.map((v) => M.tidy(v, 2)),
+    }),
+    getActiveWorkbench: () => state.activeWorkbench,
+    hasOpenScene: () => Boolean(state.doc?.id),
+    openDocument: (id) => studioApi.openDocument(id),
+    createScene: async (scenePath, sceneName) => {
+      await studioApi.createDocument({ kind: 'scene', path: scenePath, name: sceneName });
+    },
+    queryCatalog: (q) => runAiCatalogQuery(q),
+    fetchProjectContext: async () => {
+      if (!state.host?.open || state.host.kind === 'cloud') return null;
+      const reply = await state.host.request({ type: 'project-context', limit: 24 });
+      return reply?.context || null;
+    },
+    applyGbs: async (script) => {
+      if (!state.host?.open || !state.doc?.id) {
+        return { ok: false, error: t('openHint') };
+      }
+      const reply = await state.host.request({
+        type: 'gbs-apply',
+        doc: state.doc.id,
+        script,
+      });
+      if (reply?.type === 'error') {
+        log(2, `.gbs: ${reply.message}`);
+        return { ok: false, error: reply.message };
+      }
+      log(0, t('aiGbsApplied', reply?.statements ?? 1));
+      markViewportDirty(8, 350);
+      return { ok: true, statements: reply?.statements ?? 1 };
+    },
+    verifyScene: () => runAiSceneVerify(),
+    undo: () => studioApi.undo(),
+    setTimeOfDay: (h, preset) => {
+      state.time = Number(h);
+      const timeEl = $('#time');
+      const timeLbl = $('#time-label');
+      if (timeEl) timeEl.value = String(state.time);
+      if (timeLbl) timeLbl.textContent = `${state.time.toFixed(1)} h`;
+      if (preset) studioApi.setLightingPreset?.(preset);
+      markViewportDirty(6, 300);
+    },
+    activateWorkbench: (id) => { void activateWorkbench(id); },
+    openNewDataDialog: () => { $('#new-data')?.click(); },
+    onToggle: (open) => {
+      $('#ai-copilot-toggle')?.classList.toggle('on', Boolean(open));
+    },
+  });
+  state.aiCopilot = aiCopilot;
+  $('#ai-copilot-toggle')?.addEventListener('click', () => aiCopilot.toggle());
+
   $('#ai-gbs-apply')?.addEventListener('click', () => { void runAiGbsApply(); });
   $('#ai-gbs-input')?.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter') {

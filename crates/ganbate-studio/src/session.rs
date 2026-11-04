@@ -1299,6 +1299,18 @@ impl Studio {
                     Ok(vec![])
                 }
             }
+            "project-context" => {
+                let limit = msg
+                    .get("limit")
+                    .and_then(|v| v.unsigned().ok())
+                    .unwrap_or(24) as usize;
+                let ctx = self.mcp_project_context(limit)?;
+                let mut resp = vec![("type", s("project-context-result")), ("context", ctx)];
+                if let Some(r) = msg.get("req") {
+                    resp.push(("req", r.clone()));
+                }
+                Ok(vec![(from, obj(resp))])
+            }
             "catalog-query" => {
                 let cat = crate::ai::catalog::build_catalog(&self.project, &self.registry, true)?;
                 let query = msg.get("query").and_then(|v| v.string().ok());
@@ -2146,6 +2158,120 @@ impl Studio {
         Value::Object(base)
     }
 
+    /// Builds a token-compact L0/L1 AI Project Context digest (`<800 tokens`) for any game project
+    /// opened in Ganbate Studio so LLMs and external MCP agents understand scenes, schemas,
+    /// reusable bricks, workspaces, and `@selection` without reading raw multi-MB files.
+    pub fn mcp_project_context(&self, brick_limit: usize) -> Result<Value, String> {
+        let cat = crate::ai::catalog::build_catalog(&self.project, &self.registry, true)?;
+        let assets_val = self.assets();
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        let mut scenes = Vec::new();
+        if let Ok(arr) = assets_val.array() {
+            for item in arr {
+                let k = item
+                    .get("kind")
+                    .and_then(|v| v.string().ok())
+                    .unwrap_or("unknown");
+                *counts.entry(k.to_string()).or_insert(0) += 1;
+                if k == "scene" {
+                    let pid = item.get("id").and_then(|v| v.string().ok()).unwrap_or("");
+                    let ppath = item.get("path").and_then(|v| v.string().ok()).unwrap_or("");
+                    scenes.push(obj(vec![("id", s(pid)), ("path", s(ppath))]));
+                }
+            }
+        }
+
+        let mut schema_ids = Vec::new();
+        for src in self.registry.sources() {
+            if let Some(kind_id) = src.get("kind").and_then(|v| v.string().ok()) {
+                schema_ids.push(kind_id.to_string());
+            } else if let Some(sid) = src.get("id").and_then(|v| v.string().ok()) {
+                schema_ids.push(sid.to_string());
+            }
+        }
+
+        let top_hits = cat.search(None, None, brick_limit.clamp(1, 64));
+        let top_sigs: Vec<String> = top_hits.iter().map(|it| it.signature.clone()).collect();
+        let sel = self.mcp_selection_details();
+        let active_doc_path = sel
+            .get("docPath")
+            .and_then(|v| v.string().ok())
+            .unwrap_or("none");
+        let active_wb = sel
+            .get("workbench")
+            .and_then(|v| v.string().ok())
+            .unwrap_or("world");
+
+        let counts_line = counts
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let scenes_line = scenes
+            .iter()
+            .filter_map(|sc| sc.get("path").and_then(|v| v.string().ok()))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let gbs_grammar = "tx \"Label\" | spawn <alias> <brick|prefab|model|empty> [name=\"...\"] | \
+place <target> at [x,y,z] | place <target> snap onto <ground|entity> [at [x,z]] | \
+place <target> socket <sock> on <host> | place <target> beside <peer> <left|right|front|back|above> [gap=0.1] | \
+ring <N> <source> around <center|[x,y,z]> [radius=2.0] [face=in|out] [snap=ground] | \
+attach <target> <schema_kind> [field=val] | rotate <target> yaw=<deg> | look_at <target> <focus> | \
+cam frame <subject|@selection|all> [azimuth=<deg>] [elevation=<deg>]";
+
+        let mut digest = String::new();
+        digest.push_str(&format!(
+            "# Ganbate AI Context Digest: {}\n",
+            self.project.manifest.name
+        ));
+        digest.push_str(&format!(
+            "ActiveDoc: {active_doc_path} | Workbench: {active_wb}\n"
+        ));
+        digest.push_str(&format!("Inventory: {counts_line}\n"));
+        digest.push_str(&format!(
+            "Scenes: {}\n",
+            if scenes_line.is_empty() {
+                "none"
+            } else {
+                &scenes_line
+            }
+        ));
+        digest.push_str(&format!("Schemas: {}\n", schema_ids.join(", ")));
+        digest.push_str(&format!("GBS_DSL: {gbs_grammar}\n"));
+        if !top_sigs.is_empty() {
+            digest.push_str("Catalog_Top:\n");
+            for sig in &top_sigs {
+                digest.push_str("  ");
+                digest.push_str(sig);
+                digest.push('\n');
+            }
+        }
+
+        let est_tokens = ((digest.len() + 3) / 4) as u64;
+        let counts_obj = Value::Object(counts.into_iter().map(|(k, v)| (k, n(v))).collect());
+
+        Ok(obj(vec![
+            ("ok", Value::Bool(true)),
+            ("projectName", s(&self.project.manifest.name)),
+            ("estimatedTokens", n(est_tokens)),
+            ("digestText", s(&digest)),
+            ("countsByKind", counts_obj),
+            ("scenes", Value::Array(scenes)),
+            (
+                "schemas",
+                Value::Array(schema_ids.into_iter().map(|x| s(&x)).collect()),
+            ),
+            ("gameWorkspaces", self.game_workspaces()),
+            ("selection", sel),
+            (
+                "topSignatures",
+                Value::Array(top_sigs.into_iter().map(|x| s(&x)).collect()),
+            ),
+            ("gbsGrammar", s(gbs_grammar)),
+        ]))
+    }
+
     /// Dispatches an MCP `tools/call` invocation against this `Studio` session (`M-AI.1`).
     pub fn call_mcp_tool(
         &mut self,
@@ -2155,6 +2281,13 @@ impl Studio {
     ) -> Result<Value, String> {
         const MCP_CLIENT: ClientId = 0;
         match name {
+            "project_context" => {
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.unsigned().ok())
+                    .unwrap_or(24) as usize;
+                self.mcp_project_context(limit)
+            }
             "studio_status" => {
                 let mut open_docs = Vec::new();
                 for (id, o) in &self.open {
