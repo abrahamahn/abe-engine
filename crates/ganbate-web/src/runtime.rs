@@ -12,7 +12,10 @@
 //! [`ganbate_rt_start`] comes from `ganbate_alloc` and becomes the engine's.
 
 use crate::{give, install_panic_hook, say};
-use ganbate_engine::anim::normalize_q;
+use ganbate_engine::anim::{
+    BoneOffset, ClipLayer, LookAtChain, MorphOverride, Pose, PoseSpec, TwoBoneIk, normalize_q,
+    pose_model_clip,
+};
 use ganbate_engine::assets::model::{self, Model};
 use ganbate_engine::gpu::Device;
 use ganbate_engine::render::{
@@ -22,6 +25,7 @@ use ganbate_engine::render::{
 use ganbate_engine::render::{GameLight, LightDesc, ModelId, ModelInstance, SpotCone};
 use ganbate_engine::world::World;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 struct Runtime {
     device: Device<'static>,
@@ -35,6 +39,8 @@ struct Runtime {
     frames: u32,
     /// Parsed models waiting for their textures (handle = index + 1).
     pending: Vec<Option<Model>>,
+    /// Snapshotted poses per model instance for zero-copy in-Rust cross-fading.
+    crossfade_from: HashMap<u32, Pose>,
 }
 
 thread_local! {
@@ -196,6 +202,7 @@ fn start(world: &World, look: &[u8], quality: u32) -> Result<Runtime, String> {
         lamp_boost: 1.0,
         frames: 0,
         pending: vec![],
+        crossfade_from: HashMap::new(),
     })
 }
 
@@ -1181,8 +1188,181 @@ pub unsafe extern "C" fn ganbate_rt_model_instance_set(
 #[unsafe(no_mangle)]
 pub extern "C" fn ganbate_rt_model_instance_destroy(instance: u32) -> u32 {
     with(0, |rt| {
+        rt.crossfade_from.remove(&instance);
         rt.renderer
             .destroy_model_instance(&mut rt.device, ModelInstance::from_raw(instance));
+        Ok(1)
+    })
+}
+
+/// Snapshots `instance`'s current pose inside Rust WASM memory so subsequent calls to
+/// [`ganbate_rt_pose_model_clip`] can Hermite cross-fade from it without JS joint copies.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_model_snapshot_pose(instance: u32) -> u32 {
+    with(0, |rt| {
+        let (pose, _) = rt
+            .renderer
+            .model_pose_and_model(ModelInstance::from_raw(instance))?;
+        let snap = pose.clone();
+        rt.crossfade_from.insert(instance, snap);
+        Ok(1)
+    })
+}
+
+/// Evaluates skeletal clip layers, Hermite cross-fade from [`ganbate_rt_model_snapshot_pose`],
+/// Look-At chains, analytical Two-Bone IK, additive bone offsets, morph overrides, and optional
+/// GPU skinning/morph commit in a single WASM call.
+///
+/// Packet layout (`float_count` little-endian `f32` values at `cmd_ptr`):
+/// - Header (`9` floats): `[flags, clip_count, fade_elapsed_s, fade_duration_s, fade_mask_count,
+///   look_at_count, ik_count, offset_count, morph_count]`
+///   where `flags` bits are `1` (`reset_to_rest`), `2` (`commit_update`), `4` (`use_crossfade`).
+/// - `clip_count * 3`: `[clip_idx, time_s, weight]`
+/// - `fade_mask_count`: `[node_idx]`
+/// - `look_at_count`: `[joint_count, tx, ty, tz, fx, fy, fz, ux, uy, uz, max_yaw, max_pitch,
+///   weight, (node_idx, share) * joint_count]`
+/// - `ik_count * 10`: `[root, mid, end, tx, ty, tz, px, py, pz, weight]`
+/// - `offset_count * 11`: `[node, tx, ty, tz, qx, qy, qz, qw, sx, sy, sz]`
+/// - `morph_count * 3`: `[node, target, weight]`
+///
+/// # Safety
+/// `cmd_ptr` must address `float_count * 4` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ganbate_rt_pose_model_clip(
+    instance: u32,
+    cmd_ptr: *const u8,
+    float_count: usize,
+) -> u32 {
+    if float_count < 9 {
+        say(2, "pose_model_clip: packet needs at least 9 header floats");
+        return 0;
+    }
+    // SAFETY: forwarded from caller.
+    let f = unsafe { floats(cmd_ptr, float_count) };
+    with(0, |rt| {
+        if f.iter().any(|x| !x.is_finite()) {
+            return Err("pose_model_clip: non-finite packet value".into());
+        }
+        let flags = f[0] as u32;
+        let clip_count = f[1] as usize;
+        let fade_elapsed = f[2];
+        let fade_duration = f[3];
+        let mask_count = f[4] as usize;
+        let look_at_count = f[5] as usize;
+        let ik_count = f[6] as usize;
+        let offset_count = f[7] as usize;
+        let morph_count = f[8] as usize;
+
+        let mut cursor = 9usize;
+        let take = |cur: &mut usize, n: usize| -> Result<&[f32], String> {
+            let end = cur
+                .checked_add(n)
+                .filter(|&e| e <= f.len())
+                .ok_or_else(|| "pose_model_clip: truncated command packet".to_string())?;
+            let slice = &f[*cur..end];
+            *cur = end;
+            Ok(slice)
+        };
+
+        let raw_clips = take(&mut cursor, clip_count * 3)?;
+        let clips: Vec<ClipLayer> = raw_clips
+            .chunks_exact(3)
+            .map(|c| ClipLayer {
+                clip: c[0] as usize,
+                time: c[1],
+                weight: c[2],
+            })
+            .collect();
+
+        let raw_mask = take(&mut cursor, mask_count)?;
+        let mask: Vec<usize> = raw_mask.iter().map(|&n| n as usize).collect();
+
+        let mut look_at = Vec::with_capacity(look_at_count);
+        for _ in 0..look_at_count {
+            let hdr = take(&mut cursor, 13)?;
+            let joints_n = hdr[0] as usize;
+            let raw_joints = take(&mut cursor, joints_n * 2)?;
+            let nodes = raw_joints
+                .chunks_exact(2)
+                .map(|j| (j[0] as usize, j[1]))
+                .collect();
+            look_at.push(LookAtChain {
+                nodes,
+                target_model: [hdr[1], hdr[2], hdr[3]],
+                forward: [hdr[4], hdr[5], hdr[6]],
+                up: [hdr[7], hdr[8], hdr[9]],
+                max_yaw: hdr[10],
+                max_pitch: hdr[11],
+                weight: hdr[12],
+            });
+        }
+
+        let raw_ik = take(&mut cursor, ik_count * 10)?;
+        let two_bone_ik: Vec<TwoBoneIk> = raw_ik
+            .chunks_exact(10)
+            .map(|k| TwoBoneIk {
+                root: k[0] as usize,
+                mid: k[1] as usize,
+                end: k[2] as usize,
+                target_model: [k[3], k[4], k[5]],
+                pole_model: [k[6], k[7], k[8]],
+                weight: k[9],
+            })
+            .collect();
+
+        let raw_offsets = take(&mut cursor, offset_count * 11)?;
+        let bone_offsets: Vec<BoneOffset> = raw_offsets
+            .chunks_exact(11)
+            .map(|o| BoneOffset {
+                node: o[0] as usize,
+                translation: [o[1], o[2], o[3]],
+                rotation: [o[4], o[5], o[6], o[7]],
+                scale: [o[8], o[9], o[10]],
+            })
+            .collect();
+
+        let raw_morphs = take(&mut cursor, morph_count * 3)?;
+        let morph_overrides: Vec<MorphOverride> = raw_morphs
+            .chunks_exact(3)
+            .map(|m| MorphOverride {
+                node: m[0] as usize,
+                target: m[1] as usize,
+                weight: m[2],
+            })
+            .collect();
+
+        let snap = if (flags & 4) != 0 {
+            rt.crossfade_from.get(&instance).cloned()
+        } else {
+            None
+        };
+        let crossfade = ((flags & 4) != 0).then_some((
+            fade_elapsed,
+            fade_duration,
+            (!mask.is_empty()).then_some(mask.as_slice()),
+        ));
+
+        let handle = ModelInstance::from_raw(instance);
+        {
+            let (pose, model) = rt.renderer.model_pose_and_model(handle)?;
+            pose_model_clip(
+                pose,
+                snap.as_ref(),
+                model,
+                &PoseSpec {
+                    reset_to_rest: (flags & 1) != 0,
+                    clips: &clips,
+                    crossfade,
+                    look_at: &look_at,
+                    two_bone_ik: &two_bone_ik,
+                    bone_offsets: &bone_offsets,
+                    morph_overrides: &morph_overrides,
+                },
+            );
+        }
+        if (flags & 2) != 0 {
+            rt.renderer.update_model_instance(&mut rt.device, handle)?;
+        }
         Ok(1)
     })
 }
