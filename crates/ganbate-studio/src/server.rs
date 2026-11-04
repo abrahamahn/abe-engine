@@ -634,7 +634,7 @@ fn find_workspace_repo_root(project_root: & std::path::Path) -> PathBuf {
 
 fn is_forbidden_workspace_path(rel_path: &str) -> bool {
     let lower = rel_path.to_ascii_lowercase();
-    for ext in [".pem", ".key", ".p12", ".pfx", ".env"] {
+    for ext in [".pem", ".key", ".p12", ".pfx", ".env", "credentials.json"] {
         if lower.ends_with(ext) {
             return true;
         }
@@ -642,13 +642,12 @@ fn is_forbidden_workspace_path(rel_path: &str) -> bool {
     rel_path
         .trim_start_matches('/')
         .split('/')
-        .any(|seg| {
+        .enumerate()
+        .any(|(idx, seg)| {
             let s = seg.to_ascii_lowercase();
             s.starts_with('.')
-                || matches!(
-                    s.as_str(),
-                    "private" | "secrets" | "credentials" | "node_modules" | "target"
-                )
+                || matches!(s.as_str(), "node_modules" | "target")
+                || (idx == 0 && matches!(s.as_str(), "private" | "secrets" | "credentials"))
         })
 }
 
@@ -923,6 +922,7 @@ mod tests {
         }
         for allowed in [
             "main/backend/crates/server/src/main.rs",
+            "main/backend/crates/identity/credentials/src/lib.rs",
             "main/tools/scripts/art/sources/hero.glb",
             "src/render/world.rs",
         ] {
