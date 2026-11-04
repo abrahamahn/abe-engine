@@ -2,8 +2,12 @@
 // draws the scene with the engine's web runtime, the same renderer a web game ships. The host
 // owns the files and the undo history; this page shows a document, turns gestures into ops and
 // applies the ops the host confirms.
-import { Host, applyOps } from './protocol.js';
+import { Host, CloudStudioHost, createStudioHost, applyOps } from './protocol.js';
 import { drawLookInspector } from './look-inspector.js';
+import { drawDataInspector, focusDataField } from './data-inspector.js';
+import { createPieViewport } from './pie-viewport.js';
+import { createLayoutRig } from './layout-rig.js';
+import { createLivePublish } from './live-publish.js';
 import * as M from './math.js';
 import { setupViewportFrame } from './viewport-frame.js';
 import { cameraLens, cameraWorld, captureCamera, orbitBasis, orbitFromCamera } from './cameras.js';
@@ -15,13 +19,13 @@ import {
   canPlaceAsset,
   createAssetLibrary,
   placementEntity,
+  projectAssetUrl,
   raycastDropPoint,
 } from './asset-library.js';
 import { t, label, lang, setLang, translate } from './i18n.js';
 
 import { projectToolsPanel } from './project-tools.js';
 
-const loadProjectTools = projectToolsPanel(text => log(2, text));
 const $ = (sel) => document.querySelector(sel);
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
@@ -37,6 +41,7 @@ function el(tag, attrs = {}, ...children) {
 
 const state = {
   host: null,
+  connected: false,
   project: null,
   kinds: {}, // component kind -> schema definition
   assets: [],
@@ -48,6 +53,15 @@ const state = {
   looks: new Map(), // Looks watched in this project; the scene stays open while editing its Look.
   inspectedLook: null,
   lookSection: 'shading',
+  datas: new Map(), // Data documents watched in this project; scene/PIE stays open while editing.
+  inspectedData: null,
+  pendingFocusData: null,
+  openDocs: new Map(), // Custom workbench documents (`material`, `soundbank`, `character`, `seq`, `vfx`).
+  docOpenWaiters: new Map(),
+  createWaiters: new Map(),
+  activeWorkbench: 'world',
+  activeWorkbenchDoc: null,
+  projectWorkbenches: [], // Docked `?embed=studio` tools from `project-tools.json`.
   ids: [],
   mode: 'move',
   cameraFollow: null,
@@ -71,7 +85,9 @@ const state = {
   wanted: null, // the document last asked for, opened again after a reconnect
   inspectorStale: false, // the inspector skipped a redraw while a field was being typed into
   usageTimer: 0,
+  selectionSyncTimer: 0,
   pendingSelectEntity: null,
+  lastVerifyReport: null,
 };
 window.__studio = state;
 // For tests and plugins that need the viewport's geometry.
@@ -143,10 +159,27 @@ async function takeIds(n) {
 /** Queues a request about the open document behind the ones before it (see `Host.edit`):
  * `make(doc)` builds it when its turn comes. It is skipped once that document is closed. */
 function documentById(id) {
-  return state.doc?.id === id ? state.doc : state.looks.get(id);
+  if (!id) return null;
+  if (state.doc?.id === id) return state.doc;
+  if (state.looks.has(id)) return state.looks.get(id);
+  if (state.datas.has(id)) return state.datas.get(id);
+  if (state.openDocs.has(id)) return state.openDocs.get(id);
+  for (const map of [state.datas, state.looks, state.openDocs]) {
+    for (const d of map.values()) {
+      if (d?.path === id) return d;
+    }
+  }
+  if (state.doc?.path === id) return state.doc;
+  return null;
 }
 function activeDocument() {
-  return state.inspectedLook ? state.looks.get(state.inspectedLook) : state.doc;
+  if (state.activeWorkbench !== 'world' && state.activeWorkbench !== 'layout-rig' && state.activeWorkbenchDoc) {
+    const wbDoc = documentById(state.activeWorkbenchDoc);
+    if (wbDoc) return wbDoc;
+  }
+  if (state.inspectedData) return state.datas.get(state.inspectedData);
+  if (state.inspectedLook) return state.looks.get(state.inspectedLook);
+  return state.doc;
 }
 function queued(make, answers, id = state.doc?.id) {
   if (!id) return Promise.resolve(null);
@@ -213,39 +246,70 @@ function onMessage(msg) {
     case 'welcome': {
       state.project = msg.project;
       state.kinds = {};
-      for (const file of msg.schemas) Object.assign(state.kinds, file.components);
-      state.assets = msg.assets;
+      for (const file of msg.schemas || []) Object.assign(state.kinds, file.components || {});
+      state.assets = msg.assets || [];
       state.looks.clear();
+      state.datas.clear();
+      state.openDocs.clear();
+      for (const [wid] of state.docOpenWaiters) resolveOpenWaiters(wid, null);
       state.drafts = msg.drafts || [];
       state.scanning = false;
       state.scanReport = null;
       drawScanReport();
-      $('#project-name').textContent = msg.project.name || 'Project';
+      $('#project-name').textContent = msg.project?.name || 'Project';
       drawAssets();
       scheduleUsageRefresh(20);
-      void loadProjectTools(msg.project, msg.toolCatalogs);
+      void loadProjectTools(msg.project, msg.toolCatalogs, msg.cloudToolsManifest || null);
+      void pieViewport.loadWorkspaces(msg.project, msg.gameWorkspaces, msg.cloudGameManifest || null);
+      void pieViewport.preloadProjectDocs();
       // After a reconnect, the document that was open (or being opened) opens again.
-      const requested = new URLSearchParams(location.search).get('asset');
-      const asset = msg.assets.find(a => a.path === requested);
+      const params = new URLSearchParams(location.search);
+      const requested = params.get('asset');
+      const requestedTab = params.get('tab');
+      const asset = state.assets.find((a) => a.path === requested);
       if (state.wanted) state.host.send({ type: 'open', doc: state.wanted });
       else if (asset && (asset.kind === 'scene' || asset.kind === 'prefab')) openDoc(asset.id);
-      else if (msg.project.startup) openDoc(msg.project.startup);
-      if (state.inspectedLook) watchLook(state.inspectedLook);
+      else if (msg.project?.startup) openDoc(msg.project.startup);
+      if (state.inspectedData) watchData(state.inspectedData);
+      else if (state.inspectedLook) watchLook(state.inspectedLook);
       else if (asset?.kind === 'look') inspectLook(asset.id);
+      else if (asset?.kind === 'data') inspectData(asset.id);
       if (asset) assetLibrary.revealAsset(asset.id);
+      if (requestedTab && requestedTab !== state.activeWorkbench) {
+        void activateWorkbench(requestedTab);
+      } else {
+        drawWorkspaceTabs();
+      }
+      scheduleSelectionSync();
+      emitStudioEvent('assets', state.assets);
+      emitStudioState();
       break;
     }
     case 'rescanned':
       state.scanning = false;
       state.scanReport = msg;
-      if (msg.ok) state.drafts = msg.drafts;
+      if (msg.ok) state.drafts = msg.drafts || [];
+      if (Array.isArray(msg.schemas)) {
+        state.kinds = {};
+        for (const file of msg.schemas) Object.assign(state.kinds, file.components || {});
+      }
+      if (Array.isArray(msg.gameWorkspaces)) {
+        void pieViewport.loadWorkspaces(state.project, msg.gameWorkspaces);
+      }
+      void pieViewport.preloadProjectDocs();
       drawScanReport();
+      drawInspector();
       drawAssets();
+      layoutRig.draw();
       scheduleUsageRefresh(40);
+      emitStudioEvent('assets', state.assets);
+      emitStudioState();
       break;
     case 'assets':
-      state.assets = msg.assets;
+      state.assets = msg.assets || [];
       watchLook(state.inspectedLook);
+      watchData(state.inspectedData);
+      void pieViewport.preloadProjectDocs();
       if (state.pendingRevealAsset && state.assets.some((a) => a.id === state.pendingRevealAsset)) {
         const revealId = state.pendingRevealAsset;
         state.pendingRevealAsset = null;
@@ -254,6 +318,8 @@ function onMessage(msg) {
         drawAssets();
       }
       scheduleUsageRefresh(40);
+      emitStudioEvent('assets', state.assets);
+      emitStudioState();
       break;
     case 'asset-usage':
       if (msg.counts) assetLibrary.setUsageCounts(msg.counts);
@@ -276,21 +342,71 @@ function onMessage(msg) {
       scheduleUsageRefresh(40);
       break;
     case 'doc': {
-      const doc = { id: msg.doc, rev: msg.rev, path: msg.path, kind: msg.kind, root: msg.root, dirty: msg.dirty, undo: msg.undo, redo: msg.redo, issues: msg.issues };
+      const doc = {
+        id: msg.doc,
+        rev: msg.rev,
+        path: msg.path,
+        kind: msg.kind,
+        root: msg.root,
+        dirty: msg.dirty,
+        undo: msg.undo,
+        redo: msg.redo,
+        issues: msg.issues || [],
+      };
       doc.unavailable = msg.unavailable;
       doc.changedOnDisk = msg.changedOnDisk;
-      for (const i of msg.issues) log(1, `${i.path}: ${i.message}`);
+      for (const i of doc.issues) log(1, `${i.path}: ${i.message}`);
+      if (doc.kind === 'data') {
+        state.datas.set(doc.id, doc);
+        resolveOpenWaiters(doc.id, doc);
+        resolveOpenWaiters(doc.path, doc);
+        pieViewport.notifyDocUpdate(doc);
+        drawInspector();
+        drawToolbar();
+        drawAssets();
+        layoutRig.draw();
+        if (state.inspectedData === doc.id && state.pendingFocusData?.doc === doc.id) {
+          const target = state.pendingFocusData.path;
+          state.pendingFocusData = null;
+          focusDataField($('#inspector-body'), target);
+        }
+        scheduleSelectionSync();
+        emitStudioEvent('doc', doc);
+        emitStudioState();
+        break;
+      }
       if (doc.kind === 'look') {
         const before = state.looks.get(doc.id)?.root;
         state.looks.set(doc.id, doc);
+        resolveOpenWaiters(doc.id, doc);
+        resolveOpenWaiters(doc.path, doc);
+        pieViewport.notifyDocUpdate(doc);
         if (doc.id === previewLookId() && !doc.issues.length) updateViewportLook(before, doc.root);
         drawInspector();
         drawToolbar();
         drawAssets();
+        scheduleSelectionSync();
+        emitStudioEvent('doc', doc);
+        emitStudioState();
+        break;
+      }
+      if (doc.kind !== 'scene' && doc.kind !== 'prefab') {
+        state.openDocs.set(doc.id, doc);
+        resolveOpenWaiters(doc.id, doc);
+        resolveOpenWaiters(doc.path, doc);
+        drawToolbar();
+        drawAssets();
+        notifyWorkbenchDoc(doc);
+        scheduleSelectionSync();
+        emitStudioEvent('doc', doc);
+        emitStudioState();
         break;
       }
       if (state.doc?.id !== doc.id) state.cameraFollow = null;
       state.doc = doc;
+      resolveOpenWaiters(doc.id, doc);
+      resolveOpenWaiters(doc.path, doc);
+      pieViewport.notifyDocUpdate(doc);
       if (state.pendingSelectEntity?.doc === doc.id) {
         const target = state.pendingSelectEntity.entity;
         state.pendingSelectEntity = null;
@@ -300,7 +416,11 @@ function onMessage(msg) {
       watchLook(lookAsset()?.look);
       if (state.selection && !entity(state.selection)) state.selection = null;
       drawAll();
-      if (!doc.unavailable) requestCook(0);
+      layoutRig.draw();
+      scheduleSelectionSync();
+      emitStudioEvent('doc', doc);
+      emitStudioState();
+      if (!doc.unavailable && state.host?.kind !== 'cloud') requestCook(0);
       break;
     }
     case 'ops': {
@@ -308,16 +428,41 @@ function onMessage(msg) {
       if (!doc) break;
       applyOps(doc.root, msg.ops);
       Object.assign(doc, { rev: msg.rev, dirty: msg.dirty, undo: msg.undo, redo: msg.redo });
+      if (doc.kind === 'data') {
+        doc.issues = msg.issues || [];
+        pieViewport.notifyDocUpdate(doc, msg.ops);
+        scheduleUsageRefresh(120);
+        drawInspector();
+        drawToolbar();
+        drawAssets();
+        layoutRig.draw();
+        emitStudioEvent('doc', doc);
+        emitStudioState();
+        break;
+      }
       if (doc.kind === 'look') {
         doc.issues = msg.issues || [];
+        pieViewport.notifyDocUpdate(doc, msg.ops);
         if (doc.id === previewLookId() && !doc.issues.length) refreshLook(msg.ops.map(op => (op.set || op.remove)[0]));
         drawInspector();
         drawToolbar();
         drawAssets();
+        emitStudioEvent('doc', doc);
+        emitStudioState();
         break;
       }
+      if (doc.kind !== 'scene' && doc.kind !== 'prefab') {
+        doc.issues = msg.issues || [];
+        drawToolbar();
+        drawAssets();
+        notifyWorkbenchDoc(doc);
+        emitStudioEvent('doc', doc);
+        emitStudioState();
+        break;
+      }
+      pieViewport.notifyDocUpdate(doc, msg.ops);
       if (state.selection && !entity(state.selection)) state.selection = null;
-      followOps(msg.ops);
+      if (state.host?.kind !== 'cloud') followOps(msg.ops);
       if (state.cameraFollow) lookThrough(state.cameraFollow);
       if (msg.ops.some(op => (op.set || op.remove).includes('environment'))) {
         watchLook(lookAsset()?.look);
@@ -330,28 +475,46 @@ function onMessage(msg) {
         scheduleUsageRefresh(120);
       }
       drawAll();
+      scheduleSelectionSync();
+      emitStudioEvent('doc', doc);
+      emitStudioState();
       break;
     }
     case 'saved':
       // A save of an older revision leaves later edits unsaved.
       if (documentById(msg.doc)?.rev === msg.rev) {
-        documentById(msg.doc).dirty = false;
-        documentById(msg.doc).changedOnDisk = false;
+        const d = documentById(msg.doc);
+        d.dirty = false;
+        d.changedOnDisk = false;
         log(0, `saved ${msg.path}`);
         drawToolbar();
         drawAssets();
         scheduleUsageRefresh(60);
+        emitStudioEvent('doc', d);
+        emitStudioState();
       }
       break;
     case 'ids':
       state.ids.push(...msg.ids);
       state.onIds?.();
       break;
-    case 'created':
+    case 'created': {
       log(0, `created ${msg.path}`);
+      const createWaiter = state.createWaiters.get(msg.path);
+      if (createWaiter) {
+        state.createWaiters.delete(msg.path);
+        createWaiter(msg);
+        break;
+      }
       if (msg.kind === 'look') inspectLook(msg.doc);
-      else openDoc(msg.doc);
+      else if (msg.kind === 'data') inspectData(msg.doc);
+      else if (msg.kind === 'scene' || msg.kind === 'prefab') openDoc(msg.doc);
+      else {
+        const wbByKind = { material: 'material', soundbank: 'audio', character: 'character', seq: 'sequencer', vfx: 'vfx' };
+        if (wbByKind[msg.kind]) void activateWorkbench(wbByKind[msg.kind], { doc: msg.doc });
+      }
       break;
+    }
     case 'cooked':
       if (msg.doc !== state.doc?.id) break; // a cook of a document closed since
       state.cooking = false;
@@ -362,17 +525,35 @@ function onMessage(msg) {
       break;
     case 'select':
       break;
+    case 'selection-synced':
+    case 'catalog-results':
+    case 'gbs-applied':
+    case 'scene-verified':
+    case 'brick-crystallized':
+      break;
     case 'error':
       if (msg.req === 'asset-rescan') {
         state.scanning = false;
-        state.scanReport = {ok: false, problems: [msg.message]};
+        state.scanReport = { ok: false, problems: [msg.message] };
         drawScanReport();
       }
       if (typeof msg.req === 'string' && msg.req.startsWith('look-open:')) {
         const id = msg.req.slice('look-open:'.length);
         state.looks.set(id, { id, path: state.assets.find(a => a.id === id)?.path || id, error: msg.message });
+        resolveOpenWaiters(id, null);
         drawInspector();
         drawToolbar();
+      }
+      if (typeof msg.req === 'string' && msg.req.startsWith('data-open:')) {
+        const id = msg.req.slice('data-open:'.length);
+        state.datas.set(id, { id, path: state.assets.find(a => a.id === id)?.path || id, error: msg.message });
+        resolveOpenWaiters(id, null);
+        drawInspector();
+        drawToolbar();
+      }
+      if (typeof msg.req === 'string' && msg.req.startsWith('wb-open:')) {
+        const id = msg.req.slice('wb-open:'.length);
+        resolveOpenWaiters(id, null);
       }
       log(2, msg.message);
       break;
@@ -383,6 +564,10 @@ function onMessage(msg) {
 
 function openDoc(id) {
   state.inspectedLook = null;
+  state.inspectedData = null;
+  if (state.activeWorkbench !== 'world' && state.activeWorkbench !== 'layout-rig') {
+    void activateWorkbench('world');
+  }
   if (state.doc && state.doc.id !== id) {
     state.doc.closed = true; // what is still queued for it is dropped (see `queued`)
     state.host.send({ type: 'close', doc: state.doc.id });
@@ -443,10 +628,40 @@ function watchLook(id, reopen = false) {
   if (!state.looks.has(id)) state.looks.set(id, null);
   state.host.send({ type: 'open', doc: id, req: 'look-open:' + id });
 }
+function watchData(id, reopen = false) {
+  if (!id || ![...state.assets, ...state.drafts].some((a) => a.id === id && a.kind === 'data')) return;
+  if (state.datas.has(id) && (!reopen || state.datas.get(id) === null)) return;
+  if (!state.datas.has(id)) state.datas.set(id, null);
+  state.host.send({ type: 'open', doc: id, req: 'data-open:' + id });
+}
+function resolveOpenWaiters(key, doc) {
+  const list = state.docOpenWaiters.get(key);
+  if (!list) return;
+  state.docOpenWaiters.delete(key);
+  for (const resolve of list) resolve(doc);
+}
+function ensureDocumentOpen(idOrPath, kindHint = null) {
+  if (!idOrPath || !state.host?.open) return Promise.resolve(null);
+  const existing = documentById(idOrPath);
+  if (existing?.root) return Promise.resolve(existing);
+  const asset = state.assets.find((a) => a.id === idOrPath || a.path === idOrPath);
+  const targetId = asset?.id || idOrPath;
+  const kind = kindHint || asset?.kind || null;
+  return new Promise((resolve) => {
+    const list = state.docOpenWaiters.get(targetId) || [];
+    list.push(resolve);
+    state.docOpenWaiters.set(targetId, list);
+    if (kind === 'look') watchLook(targetId, true);
+    else if (kind === 'data') watchData(targetId, true);
+    else if (kind === 'scene' || kind === 'prefab') openDoc(targetId);
+    else state.host.send({ type: 'open', doc: targetId, req: 'wb-open:' + targetId });
+  });
+}
 function previewLookId() {
   return state.inspectedLook || lookAsset()?.look;
 }
 function inspectLook(id) {
+  if (id) state.inspectedData = null;
   const previous = state.looks.get(previewLookId())?.root;
   state.inspectedLook = id;
   watchLook(previewLookId(), !!id);
@@ -455,6 +670,37 @@ function inspectLook(id) {
   drawInspector();
   drawToolbar();
   drawAssets();
+  layoutRig?.draw();
+  scheduleSelectionSync();
+}
+function inspectData(id, focusPath = null) {
+  if (id && state.activeWorkbench !== 'world' && state.activeWorkbench !== 'layout-rig') {
+    void activateWorkbench('world');
+  }
+  if (id && state.inspectedLook) {
+    const previous = state.looks.get(previewLookId())?.root;
+    state.inspectedLook = null;
+    const next = state.looks.get(previewLookId());
+    if (!previewLookId() || (next?.root && !next.issues.length)) updateViewportLook(previous, next?.root);
+  }
+  state.inspectedData = id || null;
+  state.pendingFocusData = id && Array.isArray(focusPath) && focusPath.length
+    ? { doc: id, path: focusPath }
+    : null;
+  if (id) {
+    const cur = state.datas.get(id);
+    watchData(id, !!cur?.error);
+  }
+  drawInspector();
+  drawToolbar();
+  drawAssets();
+  layoutRig?.draw();
+  if (id && state.datas.get(id)?.root && state.pendingFocusData?.doc === id) {
+    const target = state.pendingFocusData.path;
+    state.pendingFocusData = null;
+    focusDataField($('#inspector-body'), target);
+  }
+  scheduleSelectionSync();
 }
 function previewLook() {
   const look = state.looks.get(previewLookId())?.root || {};
@@ -490,6 +736,7 @@ function setTime(hours) {
   state.time = hours;
   $('#time').value = String(hours);
   $('#time-label').textContent = `${hours.toFixed(1)} h`;
+  pieViewport?.notifyEnvironmentChanged();
 }
 
 async function loadWorld(cooked) {
@@ -510,12 +757,15 @@ async function loadWorld(cooked) {
   if (old) old.replaceWith(canvas);
   else host.prepend(canvas);
   state.canvas = canvas;
-  const { createEngine } = await import('/engine/ganbate.js');
-  const api = new URLSearchParams(location.search).get('api') || 'auto';
+  const params = new URLSearchParams(location.search);
+  const engineUrl = params.get('engineUrl') || '/engine/ganbate.js';
+  const wasmUrl = params.get('wasmUrl') || '/engine/ganbate_web.wasm';
+  const { createEngine } = await import(engineUrl);
+  const api = params.get('api') || 'auto';
   const engine = await createEngine({
     canvas,
     api,
-    wasm: '/engine/ganbate_web.wasm',
+    wasm: wasmUrl,
     world: `/cooked/${name}`,
     look,
     onLog: (level, text) => log(level, `engine: ${text}`),
@@ -852,7 +1102,7 @@ function drawSimulateButton() {
 }
 
 function renderLoop(t) {
-  if ($('#project-tool-panel').open) {
+  if ($('#project-tool-panel').open || $('#viewport').hidden || document.body.classList.contains('workbench-active')) {
     state.simClock = t;
     state.last = t;
     requestAnimationFrame(renderLoop);
@@ -1055,10 +1305,14 @@ function inspectorEvents() {
 
 function select(id) {
   if (state.inspectedLook) inspectLook(null);
+  if (state.inspectedData) inspectData(null);
   state.selection = id;
   drawOutliner();
   drawInspector();
   if (state.doc) state.host.send({ type: 'select', doc: state.doc.id, entities: id ? [id] : [] });
+  scheduleSelectionSync();
+  emitStudioEvent('selection', buildSelectionSnapshot());
+  emitStudioState();
 }
 
 function drawAll() {
@@ -1206,6 +1460,11 @@ function inferKindAndSubdir(fileName) {
   if (lower.endsWith('.prefab.json')) return ['prefab', 'prefabs'];
   if (lower.endsWith('.look.json')) return ['look', 'looks'];
   if (lower.endsWith('.material.json')) return ['material', 'materials'];
+  if (lower.endsWith('.data.json')) return ['data', 'data'];
+  if (lower.endsWith('.soundbank.json')) return ['soundbank', 'audio'];
+  if (lower.endsWith('.character.json')) return ['character', 'characters'];
+  if (lower.endsWith('.seq.json')) return ['seq', 'sequences'];
+  if (lower.endsWith('.vfx.json')) return ['vfx', 'vfx'];
   if (lower.endsWith('.glb')) return ['model', 'models'];
   if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.webp')) {
     return ['texture', 'textures'];
@@ -1264,6 +1523,17 @@ function scheduleUsageRefresh(delay = 80) {
 
 function jumpToAssetReference(ref) {
   if (!ref?.doc) return;
+  if (ref.docKind === 'data') {
+    const pathParts = typeof ref.path === 'string'
+      ? ref.path.replace(/^values\.?/, '').split('.').filter(Boolean)
+      : null;
+    inspectData(ref.doc, pathParts);
+    return;
+  }
+  if (ref.docKind === 'look') {
+    inspectLook(ref.doc);
+    return;
+  }
   if (state.doc?.id === ref.doc) {
     if (ref.entity && entity(ref.entity)) {
       select(ref.entity);
@@ -1286,10 +1556,17 @@ const assetLibrary = createAssetLibrary({
     doc: state.doc,
     inspectedLook: state.inspectedLook,
     looks: state.looks,
+    inspectedData: state.inspectedData,
+    datas: state.datas,
+    openDocs: state.openDocs,
     draggingAsset: state.draggingAsset,
   }),
   onOpenDoc: openDoc,
   onInspectLook: inspectLook,
+  onInspectData: (id) => inspectData(id),
+  onOpenWorkbenchDoc: (workbenchId, assetId) => {
+    void activateWorkbench(workbenchId, { doc: assetId });
+  },
   onImportModel: importModelAsScene,
   onPlaceAsset: (asset) => { void placeAsset(asset); },
   onMoveAsset: (asset, to) => {
@@ -1307,6 +1584,838 @@ const assetLibrary = createAssetLibrary({
   },
 });
 state.assetLibrary = assetLibrary;
+
+const loadProjectTools = projectToolsPanel((msg) => log(2, msg), {
+  allowSameOrigin: () => state.host?.kind === 'cloud',
+  onToolsLoaded: (tools) => {
+    state.projectWorkbenches = tools.filter((tool) => tool.open === 'panel');
+    drawWorkspaceTabs();
+  },
+});
+
+const livePublish = createLivePublish({
+  el,
+  t,
+  getContext: () => ({
+    assets: state.assets,
+    datas: state.datas,
+    looks: state.looks,
+    kinds: state.kinds,
+  }),
+  collectBundle: () => pieViewport.collectLiveBundlePayload(),
+  ensureDocumentOpen: (id, kind) => ensureDocumentOpen(id, kind),
+  editDocument: (lbl, ops, merge, docId) => edit(lbl, ops, merge, docId),
+  onInspectPulled: ({ id, kind }) => {
+    if (kind === 'data') inspectData(id);
+    else if (kind === 'look') inspectLook(id);
+  },
+  log: (lvl, text) => log(lvl, text),
+});
+
+const pieViewport = createPieViewport({
+  el,
+  t,
+  getContext: () => ({
+    assets: state.assets,
+    datas: state.datas,
+    looks: state.looks,
+    kinds: state.kinds,
+    doc: state.doc,
+    time: state.time,
+    weather: state.weather,
+    previewLook,
+    allowSameOrigin: state.host?.kind === 'cloud',
+    hostDocRoot: (id) => state.host?.getCachedDocRoot?.(id) || null,
+  }),
+  onSelectData: (docId, path) => inspectData(docId, path),
+  onEditDataFromGame: async ({ docId, label: editLabel, merge, ops }) => {
+    const opened = await ensureDocumentOpen(docId, 'data');
+    if (!opened?.root) return;
+    await queued((doc) => {
+      const schemaDef = state.kinds[doc.root?.schema];
+      const docOps = pieViewport.translateRelativeGameOps(doc, schemaDef, ops);
+      return docOps.length
+        ? { type: 'edit', doc: doc.id, rev: doc.rev, label: editLabel, merge, ops: docOps }
+        : null;
+    }, undefined, docId).then((answer) => {
+      if (answer?.type === 'error') {
+        log(2, `${editLabel}: ${answer.message}`);
+        drawInspector();
+      }
+    });
+  },
+  onSelectEntity: (entityId) => {
+    if (entity(entityId)) select(entityId);
+  },
+  onModeChanged: () => {
+    layoutRig.draw();
+  },
+  onWorkspaceLoaded: (ws) => {
+    livePublish.setWorkspace(ws);
+  },
+  log: (lvl, text) => log(lvl, text),
+});
+
+const layoutRig = createLayoutRig({
+  el,
+  t,
+  getContext: () => ({
+    inspectedDataDoc: state.inspectedData ? state.datas.get(state.inspectedData) : null,
+    kinds: state.kinds,
+    pieMode: pieViewport.getMode(),
+  }),
+  getTargetElement: () => pieViewport.activeLayoutTargetElement(),
+  onEditData: (lbl, ops, merge, docId) => edit(lbl, ops, merge, docId),
+  onFocusField: (docId, path) => {
+    if (state.inspectedData === docId) focusDataField($('#inspector-body'), path);
+  },
+});
+
+// ---- Unified Studio Workbench Deck & `studioApi` (`editor/plugin.d.ts`) ----------------------
+
+const ENGINE_WORKBENCHES = [
+  { id: 'world', labelKey: 'wb_world', builtin: true },
+  {
+    id: 'model',
+    labelKey: 'wb_model',
+    modulePath: './model-studio.js',
+    cssPath: './model-studio.css',
+    exportName: 'mountModelStudio',
+    documentSuffixes: ['.glb'],
+  },
+  {
+    id: 'material',
+    labelKey: 'wb_material',
+    modulePath: './material-studio.js',
+    cssPath: './material-studio.css',
+    exportName: 'mountMaterialStudio',
+    documentSuffixes: ['.material.json'],
+  },
+  {
+    id: 'character',
+    labelKey: 'wb_character',
+    modulePath: './character-studio.js',
+    cssPath: './character-studio.css',
+    exportName: 'mountCharacterStudio',
+    documentSuffixes: ['.character.json'],
+  },
+  {
+    id: 'sequencer',
+    labelKey: 'wb_sequencer',
+    modulePath: './sequencer-studio.js',
+    cssPath: './sequencer-studio.css',
+    exportName: 'mountSequencerStudio',
+    documentSuffixes: ['.seq.json'],
+  },
+  {
+    id: 'vfx',
+    labelKey: 'wb_vfx',
+    modulePath: './vfx-studio.js',
+    cssPath: './vfx-studio.css',
+    exportName: 'mountVfxStudio',
+    documentSuffixes: ['.vfx.json'],
+  },
+  {
+    id: 'audio',
+    labelKey: 'wb_audio',
+    modulePath: './audio-daw.js',
+    cssPath: './audio-daw.css',
+    exportName: 'mountAudioDaw',
+    documentSuffixes: ['.soundbank.json'],
+  },
+  { id: 'layout-rig', labelKey: 'wb_layout_rig', builtin: true },
+  {
+    id: 'profiler',
+    labelKey: 'wb_profiler',
+    modulePath: './telemetry-profiler.js',
+    cssPath: './telemetry-profiler.css',
+    exportName: 'mountTelemetryProfiler',
+  },
+];
+
+const customWorkbenches = new Map(); // id -> descriptor
+const mountedWorkbenches = new Map(); // id -> { pane, instance, cssLoaded }
+const loadedStylesheets = new Set();
+const studioListeners = {
+  state: new Set(),
+  doc: new Set(),
+  selection: new Set(),
+  assets: new Set(),
+  locale: new Set(),
+  stats: new Set(),
+};
+
+function documentSnapshot(doc) {
+  if (!doc || doc.error) return null;
+  return {
+    id: doc.id,
+    path: doc.path,
+    kind: doc.kind,
+    rev: doc.rev ?? 0,
+    dirty: Boolean(doc.dirty),
+    undo: doc.undo ?? null,
+    redo: doc.redo ?? null,
+    root: doc.root,
+    issues: doc.issues || [],
+  };
+}
+
+function buildViewportStats() {
+  const fps = Number.isFinite(state.fps) ? Number(state.fps.toFixed(1)) : 0;
+  const frameTimeMs = fps > 0 ? Number((1000 / fps).toFixed(2)) : 0;
+  const raw = typeof state.engine?.stats === 'function' ? state.engine.stats() : null;
+  return {
+    fps,
+    frameTimeMs: raw?.frameTimeMs ?? frameTimeMs,
+    gpuTimeMs: raw?.gpuTimeMs ?? 0,
+    draws: raw?.draws ?? (state.inst?.length ? Math.ceil(state.inst.length / 8) : 0),
+    triangles: raw?.triangles ?? 0,
+    vramBytes: raw?.vramBytes ?? 0,
+    backend: raw?.backend ?? (state.engine ? 'webgpu/webgl2' : 'idle'),
+  };
+}
+
+function buildSelectionSnapshot() {
+  const activeDoc = activeDocument();
+  return {
+    entityIds: state.selection ? [state.selection] : [],
+    assetId: assetLibrary.state.selectedId || state.inspectedData || state.inspectedLook || null,
+    activeDocumentId: activeDoc?.id || null,
+    activeDocumentPath: activeDoc?.path || null,
+    activeCamera: {
+      eye: state.engine ? eye() : [0, 4, 10],
+      target: state.view.target.slice(),
+      fov: state.view.fov,
+    },
+    cursorWorld: state.view.target.slice(),
+  };
+}
+
+function buildStudioStateSnapshot() {
+  return {
+    transport: state.host?.kind === 'cloud' ? 'cloud' : 'local',
+    connected: Boolean(state.connected),
+    locale: lang() === 'ko' ? 'ko' : 'en',
+    activeWorkbench: state.activeWorkbench,
+    project: state.project ? structuredClone(state.project) : null,
+    assets: state.assets.slice(),
+    activeDocument: documentSnapshot(activeDocument()),
+    selection: buildSelectionSnapshot(),
+    stats: buildViewportStats(),
+  };
+}
+
+function emitStudioEvent(event, payload) {
+  const set = studioListeners[event];
+  if (!set?.size) return;
+  for (const fn of set) {
+    try { fn(payload); } catch (err) { log(2, `workbench listener: ${err.message}`); }
+  }
+}
+
+function emitStudioState() {
+  const snap = buildStudioStateSnapshot();
+  emitStudioEvent('state', snap);
+  for (const entry of mountedWorkbenches.values()) {
+    try { entry.instance?.refresh?.(snap); } catch { /* ignore */ }
+  }
+}
+
+function notifyWorkbenchDoc(doc) {
+  const snap = documentSnapshot(doc);
+  for (const entry of mountedWorkbenches.values()) {
+    try { entry.instance?.setDocument?.(doc.id, snap); } catch { /* ignore */ }
+  }
+}
+
+function ensureWorkbenchStylesheet(relCssPath) {
+  if (!relCssPath) return;
+  const href = new URL(relCssPath, import.meta.url).href;
+  if (loadedStylesheets.has(href)) return;
+  loadedStylesheets.add(href);
+  const link = el('link', { rel: 'stylesheet', href });
+  link.onerror = () => {
+    loadedStylesheets.delete(href);
+    link.remove();
+  };
+  document.head.append(link);
+}
+
+const studioApi = {
+  getTransportKind: () => (state.host?.kind === 'cloud' ? 'cloud' : 'local'),
+  getState: () => buildStudioStateSnapshot(),
+  getProject: () => (state.project ? structuredClone(state.project) : null),
+  getAssets: () => state.assets.slice(),
+  listAssets: (filter = {}) => {
+    const q = typeof filter.query === 'string' ? filter.query.trim().toLowerCase() : '';
+    return state.assets.filter((a) => {
+      if (filter.kind && a.kind !== filter.kind) return false;
+      if (filter.suffix && !a.path.toLowerCase().endsWith(filter.suffix.toLowerCase())) return false;
+      if (q && !`${a.path} ${a.kind}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  },
+  assetUrl: (pathOrId) => {
+    if (!pathOrId) return '';
+    const found = state.assets.find((a) => a.id === pathOrId || a.path === pathOrId);
+    const rel = found ? found.path : pathOrId;
+    if (typeof state.host?.assetUrl === 'function') return state.host.assetUrl(rel);
+    return projectAssetUrl(rel);
+  },
+  importAsset: async (path, data) => {
+    if (!state.host?.open || !path) return null;
+    let bytes;
+    if (typeof data === 'string') bytes = new TextEncoder().encode(data);
+    else if (data instanceof Uint8Array) bytes = data;
+    else if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+    else bytes = new TextEncoder().encode(JSON.stringify(data));
+    const reply = await state.host.request({
+      type: 'asset-import',
+      path,
+      dataBase64: bytesToBase64(bytes),
+    });
+    if (reply?.type === 'error') throw new Error(reply.message);
+    return reply?.id ? { id: reply.id, path: reply.path || path, kind: reply.kind || 'unknown' } : null;
+  },
+  rescanAssets: async () => {
+    if (!state.host?.open) return;
+    await state.host.request({ type: 'rescan' });
+  },
+  getDocument: (idOrPath) => {
+    const target = idOrPath ? documentById(idOrPath) : activeDocument();
+    return documentSnapshot(target);
+  },
+  getActiveDocument: () => documentSnapshot(activeDocument()),
+  listDocuments: (filter = {}) => state.assets.filter((a) => {
+    if (!a.path.toLowerCase().endsWith('.json')) return false;
+    if (filter.kind && a.kind !== filter.kind) return false;
+    if (filter.suffix && !a.path.toLowerCase().endsWith(filter.suffix.toLowerCase())) return false;
+    return true;
+  }),
+  openDocument: async (idOrPath) => {
+    const opened = await ensureDocumentOpen(idOrPath);
+    if (opened && state.activeWorkbench !== 'world' && state.activeWorkbench !== 'layout-rig') {
+      state.activeWorkbenchDoc = opened.id;
+      drawToolbar();
+      scheduleSelectionSync();
+    }
+    return documentSnapshot(opened);
+  },
+  createDocument: async (options = {}) => {
+    if (!state.host?.open || !options.path) return null;
+    const rawPath = String(options.path).trim();
+    const [inferredKind] = inferKindAndSubdir(rawPath);
+    const kind = options.kind || inferredKind || 'data';
+    const created = await new Promise((resolve) => {
+      state.createWaiters.set(rawPath, resolve);
+      state.host.send({
+        type: 'create',
+        kind,
+        path: rawPath,
+        ...(options.schema ? { schema: options.schema } : {}),
+        ...(options.name ? { name: options.name } : { name: assetStem(rawPath) }),
+        ...(options.initialRoot ? { initialRoot: options.initialRoot } : {}),
+      });
+      setTimeout(() => {
+        if (state.createWaiters.get(rawPath) === resolve) {
+          state.createWaiters.delete(rawPath);
+          resolve(null);
+        }
+      }, 4000);
+    });
+    if (!created?.doc) return null;
+    const opened = await ensureDocumentOpen(created.doc, created.kind || kind);
+    if (opened && state.activeWorkbench !== 'world' && state.activeWorkbench !== 'layout-rig') {
+      state.activeWorkbenchDoc = opened.id;
+      drawToolbar();
+    }
+    if (opened && options.initialRoot && typeof options.initialRoot === 'object' && state.host?.kind !== 'cloud') {
+      const initOps = [];
+      for (const [k, v] of Object.entries(options.initialRoot)) {
+        if (k === 'ganbate' || k === 'version' || k === 'id') continue;
+        if (JSON.stringify(opened.root?.[k]) !== JSON.stringify(v)) {
+          initOps.push({ set: [k], value: structuredClone(v) });
+        }
+      }
+      if (initOps.length) await edit('Initialize document', initOps, undefined, opened.id);
+    }
+    return documentSnapshot(documentById(created.doc));
+  },
+  edit: async (idOrPath, ops, editLabel = 'Edit', merge = undefined) => {
+    const target = idOrPath ? await ensureDocumentOpen(idOrPath) : activeDocument();
+    if (!target?.id || !Array.isArray(ops) || !ops.length) return documentSnapshot(target);
+    await edit(editLabel, ops, merge, target.id);
+    return documentSnapshot(documentById(target.id));
+  },
+  editDocument: async (idOrPath, ops, editLabel = 'Edit', merge = undefined) => (
+    studioApi.edit(idOrPath, ops, editLabel, merge)
+  ),
+  undo: async (idOrPath) => {
+    const targetId = (idOrPath ? documentById(idOrPath)?.id : null) || activeDocument()?.id;
+    if (!targetId) return null;
+    await queued(
+      (doc) => (doc.undo != null ? { type: 'undo', doc: doc.id } : null),
+      (m) => m.type === 'ops' && m.doc === targetId && m.undo === null,
+      targetId,
+    );
+    return documentSnapshot(documentById(targetId));
+  },
+  redo: async (idOrPath) => {
+    const targetId = (idOrPath ? documentById(idOrPath)?.id : null) || activeDocument()?.id;
+    if (!targetId) return null;
+    await queued(
+      (doc) => (doc.redo != null ? { type: 'redo', doc: doc.id } : null),
+      (m) => m.type === 'ops' && m.doc === targetId && m.redo === null,
+      targetId,
+    );
+    return documentSnapshot(documentById(targetId));
+  },
+  save: async (idOrPath, options = {}) => {
+    const targetId = (idOrPath ? documentById(idOrPath)?.id : null) || activeDocument()?.id;
+    if (!targetId) return false;
+    const ans = await save(Boolean(options?.force), targetId);
+    return ans?.type === 'saved';
+  },
+  saveDocument: async (idOrPath, options = {}) => studioApi.save(idOrPath, options),
+  getSchemas: () => structuredClone(state.kinds),
+  getSelection: () => buildSelectionSnapshot(),
+  setSelection: (entityIds) => {
+    const first = Array.isArray(entityIds) && entityIds.length ? entityIds[0] : null;
+    select(first);
+  },
+  getEngine: () => state.engine,
+  getViewport: () => ({
+    element: $('#viewport'),
+    engine: state.engine,
+    getStats: () => buildViewportStats(),
+    setTime: (hours) => setTime(hours),
+    setWeather: (preset) => {
+      state.weather = preset;
+      pieViewport.notifyEnvironmentChanged();
+    },
+    setPreviewLook: (look) => {
+      if (state.engine && look) {
+        try { state.engine.setLook(look); } catch { /* ignore */ }
+      }
+    },
+  }),
+  sendPieClock: (clock) => pieViewport.sendClock(clock),
+  sendPieCue: (cue) => pieViewport.sendCue(cue),
+  hostRequest: (message) => (
+    state.host ? state.host.request(message) : Promise.reject(new Error('Studio host not connected'))
+  ),
+  subscribe: (listener) => studioApi.on('state', listener),
+  on: (event, handler) => {
+    const set = studioListeners[event];
+    if (!set || typeof handler !== 'function') return () => {};
+    set.add(handler);
+    return () => set.delete(handler);
+  },
+  activateWorkbench: (workbenchId, options) => activateWorkbench(workbenchId, options),
+  registerWorkbench: (descriptor) => {
+    if (!descriptor || typeof descriptor.id !== 'string' || !descriptor.id.trim()) return;
+    customWorkbenches.set(descriptor.id.trim(), descriptor);
+    if (mountedWorkbenches.has(descriptor.id.trim())) {
+      const prev = mountedWorkbenches.get(descriptor.id.trim());
+      prev.pane?.remove();
+      mountedWorkbenches.delete(descriptor.id.trim());
+    }
+    drawWorkspaceTabs();
+  },
+  notify: (level, message) => {
+    const num = level === 'error' || level === 2 ? 2 : level === 'warn' || level === 1 ? 1 : 0;
+    log(num, String(message));
+  },
+  log: (level, message) => log(level, String(message)),
+  t: (key, ...args) => t(key, ...args) ?? key,
+  getLocale: () => (lang() === 'ko' ? 'ko' : 'en'),
+};
+window.__ganbateStudioApi = studioApi;
+
+function allWorkbenchDescriptors() {
+  const list = ENGINE_WORKBENCHES.map((wb) => customWorkbenches.get(wb.id) || wb);
+  for (const [id, desc] of customWorkbenches) {
+    if (!ENGINE_WORKBENCHES.some((wb) => wb.id === id)) list.push(desc);
+  }
+  return list;
+}
+
+function drawWorkspaceTabs() {
+  const bar = $('#workspace-tabs');
+  if (!bar) return;
+  bar.replaceChildren();
+  for (const wb of allWorkbenchDescriptors()) {
+    const active = state.activeWorkbench === wb.id;
+    const text = wb.label || (wb.labelKey ? t(wb.labelKey) : wb.id);
+    bar.append(el('button', {
+      type: 'button',
+      role: 'tab',
+      class: `workspace-tab${active ? ' on' : ''}`,
+      'aria-selected': String(active),
+      'data-workbench': wb.id,
+      onclick: () => { void activateWorkbench(wb.id); },
+    }, text));
+  }
+  if (state.projectWorkbenches.length) {
+    bar.append(el('span', { class: 'workspace-tab-sep', 'aria-hidden': 'true' }));
+    for (const tool of state.projectWorkbenches) {
+      const tabId = `project:${tool.id}`;
+      const active = state.activeWorkbench === tabId;
+      bar.append(el('button', {
+        type: 'button',
+        role: 'tab',
+        class: `workspace-tab project-tab${active ? ' on' : ''}`,
+        'aria-selected': String(active),
+        'data-workbench': tabId,
+        onclick: () => { void activateWorkbench(tabId); },
+      }, el('span', { class: 'tab-dot', 'aria-hidden': 'true' }), tool.label));
+    }
+  }
+}
+
+async function mountWorkbenchPane(wb) {
+  const deck = $('#workbench-deck');
+  if (!deck) return null;
+  if (mountedWorkbenches.has(wb.id)) return mountedWorkbenches.get(wb.id);
+
+  const pane = el('div', { class: 'workbench-pane', 'data-workbench-pane': wb.id });
+  deck.append(pane);
+
+  if (wb.cssPath) ensureWorkbenchStylesheet(wb.cssPath);
+
+  let mountFn = typeof wb.mount === 'function' ? wb.mount : null;
+  if (!mountFn && (wb.moduleUrl || wb.modulePath)) {
+    const spec = wb.moduleUrl || wb.modulePath;
+    const resolvedUrl = new URL(spec, import.meta.url).href;
+    const mod = await import(resolvedUrl).catch(() => null);
+    if (mod) {
+      mountFn = (wb.exportName && typeof mod[wb.exportName] === 'function' && mod[wb.exportName])
+        || (typeof mod.mount === 'function' && mod.mount)
+        || (typeof mod.default === 'function' && mod.default)
+        || null;
+    }
+  }
+
+  let instance = null;
+  if (mountFn) {
+    try {
+      const res = await mountFn(pane, studioApi);
+      instance = typeof res === 'function' ? { destroy: res } : (res || {});
+    } catch (err) {
+      log(2, `${wb.id}: ${err.message}`);
+      pane.replaceChildren(el('div', { class: 'workbench-placeholder' },
+        el('strong', {}, wb.label || (wb.labelKey ? t(wb.labelKey) : wb.id)),
+        el('span', {}, err.message),
+      ));
+    }
+  } else {
+    pane.replaceChildren(el('div', { class: 'workbench-placeholder' },
+      el('strong', {}, wb.label || (wb.labelKey ? t(wb.labelKey) : wb.id)),
+      el('span', {}, 'Workbench module ready for Wave 2 engine integration.'),
+    ));
+  }
+
+  const record = { pane, instance };
+  mountedWorkbenches.set(wb.id, record);
+  return record;
+}
+
+async function activateWorkbench(workbenchId, options = {}) {
+  const prevId = state.activeWorkbench;
+  if (prevId && prevId !== workbenchId && mountedWorkbenches.has(prevId)) {
+    try { mountedWorkbenches.get(prevId).instance?.onDeactivate?.(); } catch { /* ignore */ }
+  }
+
+  const deck = $('#workbench-deck');
+
+  if (workbenchId === 'world' || workbenchId === 'layout-rig') {
+    state.activeWorkbench = workbenchId;
+    document.body.classList.remove('workbench-active');
+    if (deck) deck.hidden = true;
+    if (workbenchId === 'layout-rig') {
+      const targetAsset = options.doc
+        ? state.assets.find((a) => a.id === options.doc || a.path === options.doc)
+        : (!state.inspectedData ? state.assets.find((a) => a.kind === 'data') : null);
+      if (targetAsset) inspectData(targetAsset.id);
+      layoutRig.draw();
+    }
+    drawWorkspaceTabs();
+    drawToolbar();
+    scheduleSelectionSync();
+    emitStudioState();
+    return;
+  }
+
+  state.activeWorkbench = workbenchId;
+  document.body.classList.add('workbench-active');
+  if (deck) deck.hidden = false;
+  for (const child of deck ? [...deck.children] : []) child.hidden = true;
+
+  if (workbenchId.startsWith('project:')) {
+    const toolId = workbenchId.slice('project:'.length);
+    const tool = state.projectWorkbenches.find((item) => item.id === toolId);
+    if (!tool) {
+      await activateWorkbench('world');
+      return;
+    }
+    let rec = mountedWorkbenches.get(workbenchId);
+    if (!rec && deck) {
+      const frame = el('iframe', {
+        class: 'project-workbench-frame',
+        title: tool.label,
+        src: tool.embedHref,
+        referrerpolicy: 'no-referrer',
+        sandbox: 'allow-forms allow-scripts allow-same-origin allow-downloads allow-popups',
+      });
+      const pane = el('div', { class: 'workbench-pane', 'data-workbench-pane': workbenchId }, frame);
+      deck.append(pane);
+      rec = { pane, instance: null };
+      mountedWorkbenches.set(workbenchId, rec);
+    }
+    if (rec?.pane) rec.pane.hidden = false;
+    drawWorkspaceTabs();
+    drawToolbar();
+    scheduleSelectionSync();
+    emitStudioState();
+    return;
+  }
+
+  const wb = allWorkbenchDescriptors().find((d) => d.id === workbenchId);
+  if (!wb) {
+    await activateWorkbench('world');
+    return;
+  }
+
+  if (options.doc) {
+    const opened = await ensureDocumentOpen(options.doc);
+    if (opened) state.activeWorkbenchDoc = opened.id;
+  } else if (Array.isArray(wb.documentSuffixes) && wb.documentSuffixes.length) {
+    const candidate = state.assets.find((a) => wb.documentSuffixes.some((s) => a.path.toLowerCase().endsWith(s)));
+    if (candidate && candidate.path.endsWith('.json')) {
+      const opened = await ensureDocumentOpen(candidate.id, candidate.kind);
+      if (opened) state.activeWorkbenchDoc = opened.id;
+    }
+  }
+
+  const rec = await mountWorkbenchPane(wb);
+  if (rec?.pane) rec.pane.hidden = false;
+  if (state.activeWorkbenchDoc) {
+    const doc = documentById(state.activeWorkbenchDoc);
+    if (doc) {
+      try { rec?.instance?.setDocument?.(doc.id, documentSnapshot(doc)); } catch { /* ignore */ }
+    }
+  }
+  try { rec?.instance?.onActivate?.(); } catch { /* ignore */ }
+
+  drawWorkspaceTabs();
+  drawToolbar();
+  scheduleSelectionSync();
+  emitStudioState();
+}
+
+// ---- AI Agentic IDE Bar (`M-AI.1..4`) ----------------------------------------------------------
+
+function updateSelectionPill() {
+  const pill = $('#ai-selection-pill');
+  if (!pill) return;
+  if (state.selection && entity(state.selection)) {
+    pill.textContent = `@selection: ${entity(state.selection).name || state.selection}`;
+    pill.title = `Entity ${state.selection} in ${state.doc?.path || 'scene'}`;
+  } else if (activeDocument()) {
+    pill.textContent = `@selection: ${assetBasename(activeDocument().path)}`;
+    pill.title = activeDocument().path;
+  } else {
+    pill.textContent = t('aiSelectionNone');
+    pill.title = '';
+  }
+}
+
+function scheduleSelectionSync() {
+  updateSelectionPill();
+  clearTimeout(state.selectionSyncTimer);
+  state.selectionSyncTimer = setTimeout(() => {
+    if (!state.host?.open) return;
+    const activeDoc = activeDocument();
+    state.host.send({
+      type: 'selection-sync',
+      doc: activeDoc?.id || state.doc?.id || null,
+      entities: state.selection ? [state.selection] : [],
+      asset: assetLibrary.state.selectedId || state.inspectedData || state.inspectedLook || null,
+      cursorWorld: state.view.target.map((v) => M.tidy(v, 3)),
+      camera: {
+        eye: (state.engine ? eye() : [0, 4, 10]).map((v) => M.tidy(v, 3)),
+        target: state.view.target.map((v) => M.tidy(v, 3)),
+        fov: state.view.fov,
+      },
+      workbench: state.activeWorkbench,
+    });
+  }, 30);
+}
+
+async function runAiGbsApply() {
+  const input = $('#ai-gbs-input');
+  const rawScript = input?.value.trim();
+  if (!rawScript || !state.host?.open) return;
+  if (!state.doc?.id) {
+    log(1, t('openHint'));
+    return;
+  }
+  const script = rawScript.replace(/;\s*/g, '\n');
+  const reply = await state.host.request({
+    type: 'gbs-apply',
+    doc: state.doc.id,
+    script,
+  });
+  if (reply?.type === 'error') {
+    log(2, `.gbs: ${reply.message}`);
+    return;
+  }
+  if (input) input.value = '';
+  log(0, t('aiGbsApplied', reply?.statements ?? 1));
+}
+
+async function runAiSceneVerify() {
+  if (!state.host?.open || !state.doc?.id) return null;
+  const reply = await state.host.request({
+    type: 'scene-verify',
+    doc: state.doc.id,
+    contactSheet: true,
+  });
+  if (reply?.type === 'error') {
+    log(2, `verify: ${reply.message}`);
+    return null;
+  }
+  const report = reply?.report || reply;
+  state.lastVerifyReport = report;
+  const badge = $('#ai-verify-badge');
+  const meta = $('#ai-verify-meta');
+  const results = $('#ai-verify-results');
+  const lints = report?.spatialLints || [];
+  const passed = Boolean(report?.passed ?? (lints.length === 0));
+  if (badge) {
+    badge.dataset.state = passed ? 'pass' : 'warn';
+    badge.textContent = passed
+      ? `${t('aiVerifyPass')} · ${Math.round(report?.elapsedMs ?? 0)}ms`
+      : t('aiVerifyIssues', lints.length);
+  }
+  if (meta) {
+    meta.textContent = report?.worldHash
+      ? `${String(report.worldHash).slice(0, 12)} · ${report?.screenBoxes?.length ?? 0} obj`
+      : '';
+  }
+  if (results) {
+    results.replaceChildren();
+    if (report?.contactSheetBase64) {
+      results.append(el('img', {
+        alt: '4-angle scene verification contact sheet',
+        src: `data:image/png;base64,${report.contactSheetBase64}`,
+      }));
+    }
+    if (!lints.length) {
+      results.append(el('div', { class: 'meta' }, `${t('aiVerifyPass')} — 0 spatial lints`));
+    } else {
+      for (const lint of lints) {
+        results.append(el('div', { class: 'ai-catalog-item' },
+          el('span', {}, `[${lint.code}] ${lint.message}`),
+        ));
+      }
+    }
+  }
+  const menu = $('#ai-verify-menu');
+  if (menu) menu.open = true;
+  return report;
+}
+
+async function runAiCatalogQuery(query = '') {
+  if (!state.host?.open) return [];
+  const reply = await state.host.request({
+    type: 'catalog-query',
+    query,
+    limit: 24,
+  });
+  const items = Array.isArray(reply?.items) ? reply.items : [];
+  const box = $('#ai-catalog-results');
+  if (box) {
+    box.replaceChildren();
+    for (const item of items) {
+      const refId = item.brickId || item.id || item.name;
+      const itemLabel = item.name || item.path || refId;
+      box.append(el('div', { class: 'ai-catalog-item' },
+        el('span', { title: item.path || refId }, `${itemLabel} (${item.kind || 'brick'})`),
+        state.doc?.id && (item.kind === 'brick' || item.kind === 'prefab' || item.kind === 'model')
+          ? el('button', {
+              type: 'button',
+              class: 'mini',
+              onclick: () => {
+                const target = state.view.target.map((v) => M.tidy(v, 2)).join(', ');
+                const alias = (item.name || 'Prop').replace(/[^a-zA-Z0-9_]/g, '_') || 'Prop';
+                const gbsInput = $('#ai-gbs-input');
+                if (gbsInput) {
+                  gbsInput.value = `spawn ${alias} ${item.key || item.brickId || item.id}; place $${alias} at [${target}]`;
+                  void runAiGbsApply();
+                }
+              },
+            }, '+')
+          : null,
+      ));
+    }
+  }
+  return items;
+}
+
+async function runAiCrystallize(explicitId = null) {
+  if (!state.host?.open || !state.doc?.id) return null;
+  const defaultSlug = state.selection && entity(state.selection)?.name
+    ? entity(state.selection).name.toLowerCase().replace(/[^a-z0-9_-]+/g, '_')
+    : 'scene_brick';
+  const brickId = explicitId || prompt(t('aiCrystallizePrompt'), defaultSlug);
+  if (!brickId?.trim()) return null;
+  const reply = await state.host.request({
+    type: 'brick-crystallize',
+    doc: state.doc.id,
+    id: brickId.trim(),
+    ...(state.selection ? { entities: [state.selection] } : { fromTx: true }),
+  });
+  if (reply?.type === 'error') {
+    log(2, `crystallize: ${reply.message}`);
+    return null;
+  }
+  const brickPath = reply?.brick?.path || brickId.trim();
+  log(0, t('aiCrystallized', brickPath));
+  if (state.host.kind === 'local') {
+    state.host.send({ type: 'rescan', req: 'asset-rescan' });
+  }
+  return reply?.brick || null;
+}
+
+function setupAiIdeBar() {
+  $('#ai-gbs-apply')?.addEventListener('click', () => { void runAiGbsApply(); });
+  $('#ai-gbs-input')?.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      void runAiGbsApply();
+    }
+  });
+  $('#ai-verify-run')?.addEventListener('click', () => { void runAiSceneVerify(); });
+  $('#ai-verify-menu')?.addEventListener('toggle', (ev) => {
+    if (ev.target.open && !state.lastVerifyReport) void runAiSceneVerify();
+  });
+  $('#ai-catalog-menu')?.addEventListener('toggle', (ev) => {
+    if (ev.target.open) void runAiCatalogQuery($('#ai-catalog-search')?.value || '');
+  });
+  $('#ai-catalog-search')?.addEventListener('input', (ev) => {
+    void runAiCatalogQuery(ev.target.value);
+  });
+  $('#ai-crystallize-btn')?.addEventListener('click', () => { void runAiCrystallize(); });
+}
+
+state.pieViewport = pieViewport;
+state.layoutRig = layoutRig;
+state.livePublish = livePublish;
+state.inspectData = inspectData;
+state.activateWorkbench = activateWorkbench;
+state.runAiSceneVerify = runAiSceneVerify;
+state.runAiCrystallize = runAiCrystallize;
 
 function drawAssets() {
   assetLibrary.draw();
@@ -1555,17 +2664,24 @@ function drawInspector() {
   const box = $('#inspector-body');
   const id = state.selection;
   const focused = box.contains(document.activeElement) ? document.activeElement : null;
-  const same = state.inspectedLook ? box.dataset.entity === 'look:' + state.inspectedLook : box.dataset.entity === id && !!entity(id);
+  const same = state.inspectedData
+    ? box.dataset.entity === 'data:' + state.inspectedData
+    : state.inspectedLook
+      ? box.dataset.entity === 'look:' + state.inspectedLook
+      : box.dataset.entity === id && !!entity(id);
   if (focused?.dataset.typed && same) {
     state.inspectorStale = true;
     return;
   }
   state.inspectorStale = false;
-  const row = focused && [...box.children].find((r) => r.contains(focused));
+  const candidateRow = focused ? focused.closest('[data-key]') : null;
+  const row = candidateRow && box.contains(candidateRow) ? candidateRow : null;
   const at = row ? controlsOf(row).indexOf(focused) : -1;
   buildInspector(box, id);
   if (!focused) return;
-  const fresh = same && row?.dataset.key ? [...box.children].find((r) => r.dataset.key === row.dataset.key) : null;
+  const fresh = same && row?.dataset.key
+    ? box.querySelector(`[data-key="${CSS.escape(row.dataset.key)}"]`)
+    : null;
   let target = box;
   if (fresh && valuesOf(fresh) === valuesOf(row)) {
     fresh.replaceWith(row);
@@ -1578,6 +2694,40 @@ function drawInspector() {
 
 function buildInspector(box, id) {
   box.replaceChildren();
+  if (state.inspectedData) {
+    const dataId = state.inspectedData;
+    const dataDoc = state.datas.get(dataId);
+    const schemaName = dataDoc?.root?.schema;
+    const schemaDef = schemaName ? state.kinds[schemaName] : null;
+    box.dataset.entity = 'data:' + dataId;
+    drawDataInspector(box, {
+      doc: dataDoc,
+      schema: schemaDef,
+      assets: state.assets,
+      entities: entities(),
+      el,
+      t,
+      label,
+      hasAssetDrag,
+      resolveDraggedAsset,
+      draggingAsset: state.draggingAsset,
+      editData: (lbl, ops, merge) => edit(lbl, ops, merge, dataId),
+      renameData: (nextName) => edit(t('vRename'), [{ set: ['name'], value: nextName }], undefined, dataId),
+      retry: () => watchData(dataId, true),
+      back: () => inspectData(null),
+      layoutRigActive: layoutRig.isActiveFor(dataDoc, schemaDef),
+      onToggleLayoutRig: () => {
+        layoutRig.toggleForCurrentDoc();
+        drawInspector();
+      },
+      sequencerActive: state.activeWorkbench === 'sequencer',
+      onToggleSequencer: () => {
+        void activateWorkbench('sequencer');
+      },
+      log,
+    });
+    return;
+  }
   if (state.inspectedLook) {
     const lookId = state.inspectedLook;
     box.dataset.entity = 'look:' + lookId;
@@ -1680,6 +2830,11 @@ const inScene = (node) => !!node && ($('#viewport').contains(node) || $('#outlin
 function commands() {
   setupViewportFrame();
   assetLibrary.setupEvents();
+  pieViewport.setupEvents();
+  layoutRig.setupEvents();
+  livePublish.setupEvents();
+  setupAiIdeBar();
+  drawWorkspaceTabs();
   $('#save').onclick = () => save();
   $('#undo').onclick = () => undoRedo('undo');
   $('#redo').onclick = () => undoRedo('redo');
@@ -1732,6 +2887,64 @@ function commands() {
       const dir = defaultCreateDir('prefab', 'prefabs');
       const path = prompt(t('newPrefabFile'), `${dir}/new.prefab.json`);
       if (path) state.host.send({ type: 'create', kind: 'prefab', path, name: assetStem(path) });
+    };
+  }
+  const newDataBtn = $('#new-data');
+  const newDataDialog = $('#new-data-dialog');
+  if (newDataBtn && newDataDialog) {
+    const schemaSel = $('#new-data-schema');
+    const nameInput = $('#new-data-name');
+    const pathInput = $('#new-data-path');
+    const cancelBtn = $('#new-data-cancel');
+    const form = $('#new-data-form');
+    let userEditedName = false;
+    let userEditedPath = false;
+
+    const syncDefaultsForSchema = (schemaKey) => {
+      const schemaDef = state.kinds[schemaKey];
+      const slug = schemaKey.replace(/\./g, '-');
+      const dir = defaultCreateDir('data', 'data');
+      if (!userEditedName) nameInput.value = label(schemaDef, schemaKey);
+      if (!userEditedPath) pathInput.value = `${dir}/${slug}.data.json`;
+    };
+
+    nameInput?.addEventListener('input', () => { userEditedName = true; });
+    pathInput?.addEventListener('input', () => { userEditedPath = true; });
+    schemaSel?.addEventListener('change', () => {
+      if (schemaSel.value) syncDefaultsForSchema(schemaSel.value);
+    });
+    cancelBtn?.addEventListener('click', () => newDataDialog.close());
+    form?.addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      const schema = schemaSel.value;
+      const rawName = nameInput.value.trim();
+      let rawPath = pathInput.value.trim();
+      if (!schema || !rawPath) return;
+      if (!rawPath.endsWith('.data.json')) rawPath += '.data.json';
+      newDataDialog.close();
+      state.host.send({
+        type: 'create',
+        kind: 'data',
+        schema,
+        path: rawPath,
+        name: rawName || assetStem(rawPath),
+      });
+    });
+
+    newDataBtn.onclick = () => {
+      if (!state.project) return;
+      const schemas = Object.keys(state.kinds).filter((k) => k.includes('.')).sort();
+      if (!schemas.length) {
+        log(1, t('noDataSchemas'));
+        return;
+      }
+      userEditedName = false;
+      userEditedPath = false;
+      schemaSel.replaceChildren(
+        ...schemas.map((s) => el('option', { value: s }, `${label(state.kinds[s], s)} (${s})`)),
+      );
+      syncDefaultsForSchema(schemas[0]);
+      newDataDialog.showModal();
     };
   }
   const outlinerTree = $('#outliner-tree');
@@ -1802,7 +3015,7 @@ function commands() {
   $('#outliner-filter').oninput = drawOutliner;
   $('#time').oninput = (e) => setTime(Number(e.target.value));
   window.addEventListener('keydown', (e) => {
-    if ($('#project-tool-panel').open) return;
+    if ($('#project-tool-panel').open || $('#new-data-dialog')?.open) return;
     const typing = ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName);
     const mod = e.ctrlKey || e.metaKey;
     // A letter shortcut matches the key's position (so Caps Lock and a Korean input method do not
@@ -1849,18 +3062,27 @@ async function main() {
   $('#language').onclick = () => {
     setLang(lang() === 'ko' ? 'en' : 'ko');
     translate();
+    drawWorkspaceTabs();
     drawScanReport();
     drawSimulateButton();
     drawAll();
     drawAssets();
+    pieViewport.syncToolbarUi();
+    layoutRig.draw();
+    livePublish.renderStatus();
+    updateSelectionPill();
+    emitStudioEvent('locale', lang());
+    emitStudioState();
   };
   commands();
   viewportEvents();
   inspectorEvents();
   requestAnimationFrame(renderLoop);
-  const token = new URLSearchParams(location.search).get('token');
+  const params = new URLSearchParams(location.search);
+  const token = params.get('token');
   const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/ws${token ? `?token=${token}` : ''}`;
-  state.host = new Host(url, onMessage, (s) => {
+  state.host = createStudioHost(url, onMessage, (s) => {
+    state.connected = s === 'connected';
     $('#connection').textContent = t(s);
     $('#connection').className = s;
     if (s === 'disconnected') {
@@ -1871,9 +3093,13 @@ async function main() {
     }
     // The first connection, and each one after the host went away, starts with hello.
     if (s === 'connected') state.host.send({ type: 'hello', client: 'editor' });
+    emitStudioState();
+  }, {
+    ...(window.__ganbateStudioHostOptions || {}),
   });
   setInterval(() => {
     $('#fps').textContent = state.engine ? `${state.fps.toFixed(0)} fps` : '';
+    if (state.engine) emitStudioEvent('stats', buildViewportStats());
   }, 500);
   await state.host.connect();
 }
