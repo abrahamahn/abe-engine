@@ -271,6 +271,23 @@ pub fn tools_list() -> Value {
             )]),
             &["prompt"],
         ),
+        tool_def(
+            "world_graph_benchmark",
+            "Run the reproducible native Rust academic benchmark suite measuring Neuro-Symbolic Context Compression, Tri-Modal State Isomorphism & Invertibility, Server-Authority & 120Hz Guardrails, and microsecond systems telemetry.",
+            obj([
+                (
+                    "iterations",
+                    prop_num("Microbenchmark loop count (default 1000, clamped 1..=100000)"),
+                ),
+                (
+                    "format",
+                    prop_str(
+                        "Optional rendered snippet format to attach: json, latex, or markdown",
+                    ),
+                ),
+            ]),
+            &[],
+        ),
     ])
 }
 
@@ -590,6 +607,7 @@ mod tests {
             "world_graph_fetch",
             "world_graph_patch",
             "world_graph_prompt",
+            "world_graph_benchmark",
         ] {
             assert!(tool_names.contains(&expected), "missing tool {expected}");
         }
@@ -714,5 +732,51 @@ mod tests {
                 .any(|(cid, m)| *cid == client_a
                     && m.get("type") == Some(&s("world-graph-prompted")))
         );
+
+        // 8. world_graph_benchmark over MCP and world-graph-benchmark over Studio WebSocket.
+        let (bench_resp, bench_outbox) = handle_rpc_bytes(
+            &mut studio,
+            br#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"world_graph_benchmark","arguments":{"iterations":20,"format":"latex"}}}"#,
+        );
+        assert!(bench_outbox.is_empty());
+        let bench_sc = bench_resp
+            .unwrap()
+            .get("result")
+            .and_then(|r| r.get("structuredContent"))
+            .cloned()
+            .unwrap();
+        assert_eq!(bench_sc.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(
+            bench_sc
+                .get("isomorphism")
+                .and_then(|i| i.get("isomorphism_verified")),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            bench_sc
+                .get("isomorphism")
+                .and_then(|i| i.get("invertibility_verified")),
+            Some(&Value::Bool(true))
+        );
+        assert!(
+            bench_sc
+                .get("rendered")
+                .and_then(|t| t.string().ok())
+                .is_some_and(|tex| tex.contains("\\begin{table}[t]"))
+        );
+
+        let ws_bench = studio.handle(
+            client_a,
+            &json::parse(br#"{"type":"world-graph-benchmark","iterations":16,"req":"wb-1"}"#)
+                .unwrap(),
+        );
+        assert_eq!(ws_bench.len(), 1);
+        assert_eq!(ws_bench[0].0, client_a);
+        assert_eq!(
+            ws_bench[0].1.get("type"),
+            Some(&s("world-graph-benchmark-result"))
+        );
+        assert_eq!(ws_bench[0].1.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(ws_bench[0].1.get("req"), Some(&s("wb-1")));
     }
 }

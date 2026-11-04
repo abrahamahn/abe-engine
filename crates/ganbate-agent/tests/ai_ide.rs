@@ -346,3 +346,172 @@ fn cli_world_graph_fetch_prompt_patch_and_authority_guardrail() {
         saved_before_block
     );
 }
+
+#[test]
+fn cli_bench_json_latex_markdown_and_mcp_world_graph_benchmark() {
+    let dir = TempDir(
+        std::env::temp_dir().join(format!("ganbate-bench-cli-{}", Ids::from_os().entity())),
+    );
+    std::fs::create_dir_all(dir.0.join("src")).unwrap();
+    std::fs::create_dir_all(dir.0.join("web")).unwrap();
+    std::fs::create_dir_all(dir.0.join("target/debug")).unwrap();
+    std::fs::write(
+        dir.0.join("src/engine_loop.rs"),
+        "pub fn step_frame(dt_ms: f32) -> f32 {\n    dt_ms.clamp(0.1, 8.33)\n}\n".repeat(48),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.0.join("web/stage_host.ts"),
+        "export function syncStage(hz: number): boolean { return hz === 120; }\n".repeat(32),
+    )
+    .unwrap();
+    // Ignored build artifact directory must be skipped by compression walker.
+    std::fs::write(
+        dir.0.join("target/debug/ignored.js"),
+        "const ignored = true;\n".repeat(200),
+    )
+    .unwrap();
+
+    let proj_str = dir.0.to_str().unwrap();
+
+    // 1. `ganbate bench --format json` works read-only even without project.ganbate.json!
+    let (st_json, stdout_json, bench_json) = run_cli(
+        &[
+            "bench",
+            "--project",
+            proj_str,
+            "--iterations",
+            "40",
+            "--format",
+            "json",
+        ],
+        "",
+    );
+    assert_eq!(st_json, 0, "{stdout_json}");
+    assert!(
+        !dir.0.join("world.semantic.json").exists(),
+        "ganbate bench must stay strictly read-only"
+    );
+    assert_eq!(bench_json.get("ok"), Some(&Value::Bool(true)));
+    assert_eq!(
+        bench_json.get("schema"),
+        Some(&Value::String("ganbate.academic-benchmark.v1".into()))
+    );
+    assert_eq!(
+        bench_json
+            .get("environment")
+            .and_then(|e| e.get("iterations")),
+        Some(&Value::Number(40.0))
+    );
+    assert_eq!(
+        bench_json
+            .get("compression")
+            .and_then(|c| c.get("source_files")),
+        Some(&Value::Number(2.0))
+    );
+    assert!(
+        bench_json
+            .get("compression")
+            .and_then(|c| c.get("compression_ratio"))
+            .and_then(|v| v.float().ok())
+            .is_some_and(|r| r > 1.0)
+    );
+    assert_eq!(
+        bench_json
+            .get("isomorphism")
+            .and_then(|i| i.get("isomorphism_verified")),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(
+        bench_json
+            .get("isomorphism")
+            .and_then(|i| i.get("invertibility_verified")),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(
+        bench_json
+            .get("isomorphism")
+            .and_then(|i| i.get("byte_drift")),
+        Some(&Value::Number(0.0))
+    );
+    assert_eq!(
+        bench_json
+            .get("guardrails")
+            .and_then(|g| g.get("authority_rejection_rate")),
+        Some(&Value::Number(1.0))
+    );
+    assert_eq!(
+        bench_json
+            .get("guardrails")
+            .and_then(|g| g.get("budget_clamp_rate")),
+        Some(&Value::Number(1.0))
+    );
+    assert_eq!(
+        bench_json
+            .get("latencies_us")
+            .and_then(|l| l.array().ok())
+            .map(|a| a.len()),
+        Some(5)
+    );
+    assert_eq!(
+        bench_json
+            .get("governor_closed_loop")
+            .and_then(|g| g.get("closed_loop_verified")),
+        Some(&Value::Bool(true))
+    );
+
+    // 2. `ganbate bench --format latex` produces ready-to-compile booktabs LaTeX snippet.
+    let latex_args: Vec<String> = [
+        "bench",
+        "--project",
+        proj_str,
+        "--iterations",
+        "24",
+        "--format",
+        "latex",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    let mut empty = Cursor::new(Vec::<u8>::new());
+    let latex_out = ganbate_agent::run(&latex_args, &mut empty, None);
+    assert_eq!(latex_out.status, 0, "{}", latex_out.stdout);
+    assert!(latex_out.stdout.contains("\\begin{table}[t]"));
+    assert!(latex_out.stdout.contains("\\begin{tabular}{lrrrr}"));
+    assert!(latex_out.stdout.contains("\\toprule"));
+    assert!(latex_out.stdout.contains("\\midrule"));
+    assert!(latex_out.stdout.contains("\\bottomrule"));
+    assert!(latex_out.stdout.contains("\\end{tabular}"));
+    assert!(latex_out.stdout.contains("\\end{table}"));
+
+    // 3. Default format (`markdown`) renders GFM summary + latency table.
+    let md_args: Vec<String> = ["bench", "--project", proj_str, "--iterations", "20"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let mut empty_md = Cursor::new(Vec::<u8>::new());
+    let md_out = ganbate_agent::run(&md_args, &mut empty_md, None);
+    assert_eq!(md_out.status, 0, "{}", md_out.stdout);
+    assert!(
+        md_out
+            .stdout
+            .contains("# Ganbate Engine — Reproducible Empirical Benchmark Report")
+    );
+    assert!(md_out.stdout.contains("| Subsystem Operation | Min (µs) |"));
+
+    // 4. `world_graph_benchmark` via `ganbate mcp` stdio JSON-RPC 2.0 on an initialized Ganbate project.
+    let mut ids = Ids::seeded(101);
+    Project::create(&dir.0, "Bench MCP Test", &mut ids).unwrap();
+    let rpc_in = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"world_graph_benchmark","arguments":{"iterations":20,"format":"markdown"}}}"#;
+    let mcp_args = vec!["mcp".to_string(), proj_str.to_string()];
+    let mut cursor = Cursor::new(format!("{rpc_in}\n").into_bytes());
+    let mcp_out = ganbate_agent::run(&mcp_args, &mut cursor, None);
+    assert_eq!(mcp_out.status, 0, "{}", mcp_out.stdout);
+    let rpc_val = json::parse(mcp_out.stdout.trim().as_bytes()).unwrap();
+    let sc = rpc_val
+        .get("result")
+        .and_then(|r| r.get("structuredContent"))
+        .unwrap();
+    assert_eq!(sc.get("ok"), Some(&Value::Bool(true)));
+    assert_eq!(sc.get("format"), Some(&Value::String("markdown".into())));
+}

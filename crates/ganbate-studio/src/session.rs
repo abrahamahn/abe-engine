@@ -1495,6 +1495,18 @@ impl Studio {
                 outbox.push((from, Value::Object(reply)));
                 Ok(outbox)
             }
+            "world-graph-benchmark" => {
+                let res = self.world_graph_benchmark(msg)?;
+                let mut reply = match res {
+                    Value::Object(m) => m,
+                    _ => BTreeMap::new(),
+                };
+                reply.insert("type".into(), s("world-graph-benchmark-result"));
+                if let Some(r) = msg.get("req") {
+                    reply.insert("req".into(), r.clone());
+                }
+                Ok(vec![(from, Value::Object(reply))])
+            }
             "preview" | "select" => {
                 let (id, _) = self.doc_target(msg)?;
                 let watchers = if let Some(o) = self.open.get(&id) {
@@ -2544,6 +2556,7 @@ cam frame <subject|@selection|all> [azimuth=<deg>] [elevation=<deg>]";
                     .ok_or("world_graph_prompt requires prompt")?;
                 self.world_graph_prompt(prompt, outbox)
             }
+            "world_graph_benchmark" => self.world_graph_benchmark(args),
             other => Err(format!("unknown MCP tool {other:?}")),
         }
     }
@@ -2606,6 +2619,34 @@ cam frame <subject|@selection|all> [azimuth=<deg>] [elevation=<deg>]";
             outbox.extend(prompt_outbox);
         }
         Ok(outcome.to_json_value())
+    }
+
+    /// Runs the reproducible read-only academic benchmark suite (`world_graph_benchmark`) against
+    /// `self.project.root`, optionally attaching rendered `latex` or `markdown` text when `format` is requested.
+    pub fn world_graph_benchmark(&self, args: &Value) -> Result<Value, String> {
+        let iterations = match args.get("iterations") {
+            Some(v) => {
+                let raw = v
+                    .unsigned()
+                    .map_err(|_| "iterations must be a positive integer".to_string())?;
+                if raw == 0 {
+                    return Err("iterations must be >= 1".into());
+                }
+                (raw as usize).min(crate::ai::bench::MAX_ITERATIONS)
+            }
+            None => crate::ai::bench::DEFAULT_ITERATIONS,
+        };
+        let requested_format = match args.get("format").and_then(|v| v.string().ok()) {
+            Some(raw) if !raw.trim().is_empty() => Some(crate::ai::bench::BenchFormat::parse(raw)?),
+            _ => None,
+        };
+        let report = crate::ai::bench::run_benchmark(&self.project.root, iterations)?;
+        let mut val = report.to_json_value();
+        if let (Some(fmt), Value::Object(map)) = (requested_format, &mut val) {
+            map.insert("format".into(), s(fmt.as_str()));
+            map.insert("rendered".into(), Value::String(report.render(fmt, false)?));
+        }
+        Ok(val)
     }
 }
 
