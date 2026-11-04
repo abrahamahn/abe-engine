@@ -459,6 +459,24 @@ fn cli_bench_json_latex_markdown_and_mcp_world_graph_benchmark() {
             .and_then(|g| g.get("closed_loop_verified")),
         Some(&Value::Bool(true))
     );
+    assert_eq!(
+        bench_json
+            .get("paper1_spatial_suite")
+            .and_then(|p| p.get("tasks_passed")),
+        Some(&Value::Number(30.0))
+    );
+    assert_eq!(
+        bench_json
+            .get("paper2_ecosystem_governance")
+            .and_then(|p| p.get("external_crates_io_dependencies")),
+        Some(&Value::Number(0.0))
+    );
+    assert_eq!(
+        bench_json
+            .get("paper3_polyglot_systems")
+            .and_then(|p| p.get("all_four_targets_verified")),
+        Some(&Value::Bool(true))
+    );
 
     // 2. `ganbate bench --format latex` produces ready-to-compile booktabs LaTeX snippet.
     let latex_args: Vec<String> = [

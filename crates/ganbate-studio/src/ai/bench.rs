@@ -27,6 +27,15 @@ use super::world_graph::{
     compile_world_graph_prompt,
 };
 
+#[path = "bench_papers.rs"]
+mod papers;
+
+pub use papers::{
+    GbewCookMetrics, Paper1SpatialSuite, Paper2EcosystemGovernance, Paper3PolyglotSystems,
+    PhysicsDeterminismMetrics, ShaderTargetMetrics, run_paper1_spatial_suite,
+    run_paper2_ecosystem_governance, run_paper3_polyglot_systems,
+};
+
 pub const BENCHMARK_SCHEMA: &str = "ganbate.academic-benchmark.v1";
 pub const DEFAULT_ITERATIONS: usize = 1_000;
 pub const MAX_ITERATIONS: usize = 100_000;
@@ -163,10 +172,13 @@ pub struct BenchmarkReport {
     pub guardrails: GuardrailProof,
     pub latencies: Vec<LatencyDistributionUs>,
     pub governor: GovernorConvergenceProof,
+    pub paper1: Paper1SpatialSuite,
+    pub paper2: Paper2EcosystemGovernance,
+    pub paper3: Paper3PolyglotSystems,
 }
 
 #[inline]
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     hex(&sha256(bytes))
 }
 
@@ -198,14 +210,14 @@ fn walk_source_tree(
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
-        let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else {
+        let Ok(ft) = entry.file_type() else {
             continue;
         };
-        if meta.file_type().is_symlink() {
+        if ft.is_symlink() {
             continue;
         }
-        if meta.is_dir() {
+        let path = entry.path();
+        if ft.is_dir() {
             let name = entry.file_name();
             if let Some(s) = name.to_str()
                 && should_skip_dir(s)
@@ -213,19 +225,29 @@ fn walk_source_tree(
                 continue;
             }
             walk_source_tree(&path, source_files, raw_bytes)?;
-        } else if meta.is_file()
-            && meta.len() <= MAX_SOURCE_FILE_BYTES
-            && has_source_extension(&path)
-        {
-            let Ok(bytes) = fs::read(&path) else {
+        } else if ft.is_file() && has_source_extension(&path) {
+            let Ok(meta) = entry.metadata() else {
                 continue;
             };
-            // Skip binary files masquerading under source extensions.
-            if bytes.contains(&0) {
+            let len = meta.len();
+            if len > MAX_SOURCE_FILE_BYTES {
                 continue;
             }
+            if len > 0 {
+                let Ok(mut file) = fs::File::open(&path) else {
+                    continue;
+                };
+                let mut probe = [0u8; 512];
+                let Ok(read_n) = std::io::Read::read(&mut file, &mut probe) else {
+                    continue;
+                };
+                // Skip binary files masquerading under source extensions.
+                if probe[..read_n].contains(&0) {
+                    continue;
+                }
+            }
             *source_files += 1;
-            *raw_bytes += bytes.len() as u64;
+            *raw_bytes += len;
         }
     }
     Ok(())
@@ -576,7 +598,11 @@ fn verify_guardrails() -> Result<GuardrailProof, String> {
     })
 }
 
-fn summarize_samples_ns(id: &str, label: &str, mut samples_ns: Vec<u128>) -> LatencyDistributionUs {
+pub(super) fn summarize_samples_ns(
+    id: &str,
+    label: &str,
+    mut samples_ns: Vec<u128>,
+) -> LatencyDistributionUs {
     if samples_ns.is_empty() {
         return LatencyDistributionUs {
             id: id.into(),
@@ -811,6 +837,9 @@ pub fn run_benchmark(project_root: &Path, iterations: usize) -> Result<Benchmark
     let guardrails = verify_guardrails()?;
     let governor = verify_governor_convergence();
     let latencies = measure_microsecond_telemetry(clamped_iters)?;
+    let paper1 = run_paper1_spatial_suite()?;
+    let paper2 = run_paper2_ecosystem_governance(project_root)?;
+    let paper3 = run_paper3_polyglot_systems()?;
     let total_elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
 
     Ok(BenchmarkReport {
@@ -825,10 +854,13 @@ pub fn run_benchmark(project_root: &Path, iterations: usize) -> Result<Benchmark
         guardrails,
         latencies,
         governor,
+        paper1,
+        paper2,
+        paper3,
     })
 }
 
-fn round_f64(v: f64, decimals: u32) -> f64 {
+pub(super) fn round_f64(v: f64, decimals: u32) -> f64 {
     let factor = 10_f64.powi(decimals as i32);
     (v * factor).round() / factor
 }
@@ -1046,7 +1078,10 @@ impl BenchmarkReport {
             && self.isomorphism.invertibility_verified
             && self.guardrails.authority_rejected_cases == self.guardrails.authority_total_cases
             && self.guardrails.budget_clamped_cases == self.guardrails.budget_total_cases
-            && self.governor.closed_loop_verified;
+            && self.governor.closed_loop_verified
+            && self.paper1.verified()
+            && self.paper2.verified()
+            && self.paper3.verified();
 
         Value::Object(BTreeMap::from([
             ("ok".into(), Value::Bool(all_verified)),
@@ -1077,6 +1112,15 @@ impl BenchmarkReport {
             ("guardrails".into(), guardrails),
             ("latencies_us".into(), latencies),
             ("governor_closed_loop".into(), governor),
+            ("paper1_spatial_suite".into(), self.paper1.to_json_value()),
+            (
+                "paper2_ecosystem_governance".into(),
+                self.paper2.to_json_value(),
+            ),
+            (
+                "paper3_polyglot_systems".into(),
+                self.paper3.to_json_value(),
+            ),
         ]))
     }
 
@@ -1210,7 +1254,7 @@ impl BenchmarkReport {
         }
         out.push('\n');
         out.push_str(&format!(
-            "- **Closed-Loop `120Hz` Governor Convergence:** Overload (`{:.1} ms`) `{}` (floor in `{}` frames) | Deadband Hold: `{}` | Headroom (`{:.1} ms`) `{}` (peak in `{}` frames) | Verified: `{}`",
+            "- **Closed-Loop `120Hz` Governor Convergence:** Overload (`{:.1} ms`) `{}` (floor in `{}` frames) | Deadband Hold: `{}` | Headroom (`{:.1} ms`) `{}` (peak in `{}` frames) | Verified: `{}`\n\n",
             self.governor.overload_input_ms,
             down_chain,
             self.governor.step_down_frames_to_floor,
@@ -1220,10 +1264,149 @@ impl BenchmarkReport {
             self.governor.recovery_frames_to_peak,
             self.governor.closed_loop_verified,
         ));
+
+        // Section 5: Paper 1 (UIST / CHI / SIGGRAPH)
+        out.push_str(&format!(
+            "## 5. Paper 1 (UIST / CHI / SIGGRAPH) — `.gbs` Relational Spatial DSL, `Document` Algebra & `scene_verify` (`N = {}` Tasks)\n\n",
+            self.paper1.total_tasks
+        ));
+        out.push_str("| Paper 1 Invariant | Measured Result |\n");
+        out.push_str("| :--- | ---: |\n");
+        out.push_str(&format!(
+            "| Authoring Tasks Passed (`execute_gbs` + `verify_scene` + `Ctrl+Z`) | `{}/{}` (`{:.1}%`) |\n",
+            self.paper1.tasks_passed,
+            self.paper1.total_tasks,
+            (self.paper1.tasks_passed as f64 / self.paper1.total_tasks.max(1) as f64) * 100.0
+        ));
+        out.push_str(&format!(
+            "| `Document` `Op::Set`/`Op::Remove` SHA-256 `Ctrl+Z` Recovery | `{}/{}` (`{:.1}%`, `Set`+`Remove`: `{}`) |\n",
+            self.paper1.op_ctrl_z_sha256_recovered,
+            self.paper1.total_tasks,
+            self.paper1.op_ctrl_z_sha256_recovery_rate * 100.0,
+            self.paper1.op_set_and_remove_exercised
+        ));
+        out.push_str(&format!(
+            "| Relational `.gbs` Spatial Lint-Free Rate (`snap`/`socket`/`beside`/`ring`) | `{}/{}` (`{:.1}%`) |\n",
+            self.paper1.gbs_snapped_lint_free_tasks,
+            self.paper1.total_tasks,
+            self.paper1.gbs_snapped_spatial_lint_free_rate * 100.0
+        ));
+        out.push_str(&format!(
+            "| Ungrounded Raw-Coordinate Baseline Lint Rate | `{}/{}` linted (`{}` floating, `{}` penetration; `{:.1}%` lint-free) |\n",
+            self.paper1.ungrounded_baseline_linted_tasks,
+            self.paper1.total_tasks,
+            self.paper1.ungrounded_baseline_floating_lints,
+            self.paper1.ungrounded_baseline_penetration_lints,
+            self.paper1.ungrounded_baseline_lint_free_rate * 100.0
+        ));
+        out.push_str(&format!(
+            "| `.gbs` Compile + Apply Latency (`p50` / `p95` / `p99`) | `{:.2}` / `{:.2}` / `{:.2} µs` |\n",
+            self.paper1.gbs_compile_apply_us.p50_us,
+            self.paper1.gbs_compile_apply_us.p95_us,
+            self.paper1.gbs_compile_apply_us.p99_us
+        ));
+        out.push_str(&format!(
+            "| `scene_verify` Spatial/Budget Oracle Latency (`p50` / `p95` / `max` vs. `<100ms` SLA) | `{:.2}` / `{:.2}` / `{:.2} µs` (`SLA PASS: {}`) |\n\n",
+            self.paper1.scene_verify_us.p50_us,
+            self.paper1.scene_verify_us.p95_us,
+            self.paper1.scene_verify_us.max_us,
+            self.paper1.verify_under_100ms_sla
+        ));
+
+        // Section 6: Paper 2 (ICSE / FSE / NeurIPS)
+        out.push_str(
+            "## 6. Paper 2 (ICSE / FSE / NeurIPS) — Zero-Dependency Cargo Audit & Ecosystem Provenance\n\n",
+        );
+        out.push_str("| Paper 2 Invariant | Measured Result |\n");
+        out.push_str("| :--- | ---: |\n");
+        out.push_str(&format!(
+            "| `ganbate-engine` Workspace Crates | `{}` (`{}` internal path edges) |\n",
+            self.paper2.workspace_crates, self.paper2.internal_path_dependencies
+        ));
+        out.push_str(&format!(
+            "| External `crates.io` Dependencies | **`{}`** (`zero_external_deps_verified: {}`) |\n",
+            self.paper2.external_crates_io_dependencies, self.paper2.zero_external_deps_verified
+        ));
+        out.push_str(&format!(
+            "| `#![forbid(unsafe_code)]` Crates | `{}` |\n",
+            self.paper2.forbid_unsafe_crates
+        ));
+        if self.paper2.xray_available {
+            out.push_str(&format!(
+                "| Ecosystem X-Ray (`code-surface-catalog.json`) | `{}` surfaces (`{}` code files, `{}` dependency edges, `{:.0}%` impl / `{:.0}%` integ, `{}` reclaimable LOC) |\n",
+                self.paper2.indexed_surfaces,
+                self.paper2.code_files,
+                self.paper2.dependency_edges,
+                self.paper2.avg_implementation_pct,
+                self.paper2.avg_integration_pct,
+                self.paper2.reclaimable_loc
+            ));
+        } else {
+            out.push_str(
+                "| Ecosystem X-Ray (`code-surface-catalog.json`) | `not present in --project` |\n",
+            );
+        }
+        if self.paper2.pyramid_available {
+            out.push_str(&format!(
+                "| AI Context Pyramid (`ai-context-pyramid.json`) | Health `{:.0}/100` (`{}` clusters, L0 `{} tok`, max L1 `{} tok`, within budget: `{}`) |\n\n",
+                self.paper2.health_score,
+                self.paper2.cluster_count,
+                self.paper2.l0_tokens,
+                self.paper2.max_l1_tokens,
+                self.paper2.pyramid_within_budget
+            ));
+        } else {
+            out.push_str("| AI Context Pyramid (`ai-context-pyramid.json`) | `not present in --project` |\n\n");
+        }
+
+        // Section 7: Paper 3 (EuroSys / ASPLOS / SIGGRAPH / IEEE VR)
+        out.push_str(
+            "## 7. Paper 3 (EuroSys / ASPLOS / SIGGRAPH / IEEE VR) — 4-Target WGSL Compiler, `.gbew` v4 Cooker & `10,000`-Step Physics\n\n",
+        );
+        out.push_str("| Shader Backend (`ganbate-shader`) | Vertex (B) | Fragment (B) | Total (B) | Median Compile (µs) | Verified |\n");
+        out.push_str("| :--- | ---: | ---: | ---: | ---: | :---: |\n");
+        for t in &self.paper3.shader_targets {
+            out.push_str(&format!(
+                "| {} | `{}` | `{}` | `{}` | `{:.2}` | `{}` |\n",
+                t.label, t.vertex_bytes, t.fragment_bytes, t.total_bytes, t.compile_us, t.verified
+            ));
+        }
+        out.push('\n');
+        out.push_str(&format!(
+            "- **`.gbew` v{} Binary Mesh Cooker (`ganbate-assets`):** `{}` verts / `{}` tris -> Raw `{} B` vs. Cooked **`{} B`** (**`{:.2} B/triangle`**, `{:.2}x` compression, max grid error `{:.3} mm`, cook `{:.2} µs`, decode `{:.2} µs`, round-trip verified: `{}`)\n",
+            self.paper3.gbew.version,
+            self.paper3.gbew.vertex_count,
+            self.paper3.gbew.triangle_count,
+            self.paper3.gbew.raw_mesh_bytes,
+            self.paper3.gbew.cooked_gbew_bytes,
+            self.paper3.gbew.bytes_per_triangle,
+            self.paper3.gbew.compression_ratio,
+            self.paper3.gbew.max_position_error_mm,
+            self.paper3.gbew.cook_us,
+            self.paper3.gbew.decode_us,
+            self.paper3.gbew.roundtrip_verified,
+        ));
+        out.push_str(&format!(
+            "- **`{}`-Step `#![forbid(unsafe_code)]` Physics Determinism (`ganbate-physics`):** Run A `{}` == Run B `{}` (initial `{}`, `{:.2} µs/step`, `0` `NaN`: `{}`, bit-exact: `{}`)\n",
+            self.paper3.physics.steps,
+            self.paper3.physics.hash_run_a_hex,
+            self.paper3.physics.hash_run_b_hex,
+            self.paper3.physics.hash_initial_hex,
+            self.paper3.physics.mean_us_per_step,
+            self.paper3.physics.zero_nan_verified,
+            self.paper3.physics.bit_exact_verified,
+        ));
+        out.push_str(&format!(
+            "- **`90Hz VR` (`{:.2} ms`) Closed-Loop Frame Governor:** Floor in `{}` frames, recovery in `{}` frames, verified: `{}`",
+            self.paper3.vr_90hz_target_ms,
+            self.paper3.vr_90hz_step_down_frames,
+            self.paper3.vr_90hz_recovery_frames,
+            self.paper3.vr_90hz_governor_verified,
+        ));
         out
     }
 
-    /// Renders a ready-to-compile academic `booktabs` LaTeX table (`\begin{table}[t] ... \end{table}`).
+    /// Renders ready-to-compile academic `booktabs` LaTeX tables covering all 3 PhD proposal papers.
     pub fn to_latex(&self) -> String {
         let escape_tex = |s: &str| -> String {
             s.replace('\\', "\\textbackslash{}")
@@ -1241,15 +1424,38 @@ impl BenchmarkReport {
             .collect::<Vec<_>>()
             .join(" \\to ");
 
-        let mut out = String::with_capacity(2048);
+        let paper2_prov_tex = if self.paper2.xray_available && self.paper2.pyramid_available {
+            format!(
+                "{} crates (0 ext) \\;\\|\\; {} surf, {} edges, {:.0}/100 health",
+                self.paper2.workspace_crates,
+                self.paper2.indexed_surfaces,
+                self.paper2.dependency_edges,
+                self.paper2.health_score
+            )
+        } else if self.paper2.xray_available {
+            format!(
+                "{} crates (0 ext) \\;\\|\\; {} surf, {} edges",
+                self.paper2.workspace_crates,
+                self.paper2.indexed_surfaces,
+                self.paper2.dependency_edges
+            )
+        } else {
+            format!(
+                "{} crates, 0 external \\texttt{{crates.io}} deps ({} \\texttt{{forbid(unsafe)}})",
+                self.paper2.workspace_crates, self.paper2.forbid_unsafe_crates
+            )
+        };
+
+        let mut out = String::with_capacity(4096);
         out.push_str("\\begin{table}[t]\n");
         out.push_str("\\centering\n");
         out.push_str("\\small\n");
         out.push_str(&format!(
-            "\\caption{{Empirical verification and microsecond latency distribution of \\texttt{{ganbate-engine}} ({}/{}, $N = {}$ iterations; BPE token heuristic $\\lceil \\text{{bytes}}/4 \\rceil$).}}\n",
+            "\\caption{{Three-paper empirical verification and microsecond latency distribution of \\texttt{{ganbate-engine}} ({}/{}, $N = {}$ iterations; total runtime {:.1}\\,ms; BPE token heuristic $\\lceil \\text{{bytes}}/4 \\rceil$).}}\n",
             escape_tex(&self.os),
             escape_tex(&self.arch),
-            self.iterations
+            self.iterations,
+            self.total_elapsed_ms
         ));
         out.push_str("\\label{tab:ganbate-empirical-bench}\n");
         out.push_str("\\begin{tabular}{lrrrr}\n");
@@ -1259,7 +1465,7 @@ impl BenchmarkReport {
         );
         out.push_str("\\midrule\n");
         out.push_str(&format!(
-            "Neuro-Symbolic Context Compression ({} files) & \\multicolumn{{4}}{{r}}{{${:.2}\\times$ ({} $\\to$ {} tok, {:.3}\\% reduction)}} \\\\\n",
+            "P1: Context Compression ({} files) & \\multicolumn{{4}}{{r}}{{${:.2}\\times$ ({} $\\to$ {} tok, {:.3}\\% reduction)}} \\\\\n",
             self.compression.source_files,
             self.compression.compression_ratio,
             self.compression.estimated_raw_tokens,
@@ -1267,7 +1473,7 @@ impl BenchmarkReport {
             self.compression.token_reduction_pct
         ));
         out.push_str(&format!(
-            "Tri-Modal State Isomorphism \\& $P^{{-1}}$ Invertibility & \\multicolumn{{4}}{{r}}{{{} ({} byte drift)}} \\\\\n",
+            "P1: Tri-Modal Isomorphism \\& $P^{{-1}}$ Invertibility & \\multicolumn{{4}}{{r}}{{{} ({} byte drift)}} \\\\\n",
             if self.isomorphism.isomorphism_verified && self.isomorphism.invertibility_verified {
                 "Verified ($\\text{Code} = \\text{UI} = \\text{EN} = \\text{KO}$)"
             } else {
@@ -1276,7 +1482,21 @@ impl BenchmarkReport {
             self.isomorphism.byte_drift
         ));
         out.push_str(&format!(
-            "Server-Authority \\& 120\\,Hz Budget Guardrails & \\multicolumn{{4}}{{r}}{{{:.1}\\% reject ({}/{}) \\;\\|\\; {:.1}\\% clamp ({}/{})}} \\\\\n",
+            "P1: \\texttt{{.gbs}} Spatial Suite ($N={}$) \\& \\texttt{{Ctrl+Z}} & \\multicolumn{{4}}{{r}}{{{}/{} lint-free ({:.0}\\% vs.\\ {:.0}\\% raw) \\;\\|\\; {}/{} SHA-256}} \\\\\n",
+            self.paper1.total_tasks,
+            self.paper1.gbs_snapped_lint_free_tasks,
+            self.paper1.total_tasks,
+            self.paper1.gbs_snapped_spatial_lint_free_rate * 100.0,
+            self.paper1.ungrounded_baseline_lint_free_rate * 100.0,
+            self.paper1.op_ctrl_z_sha256_recovered,
+            self.paper1.total_tasks,
+        ));
+        out.push_str(&format!(
+            "P2: Zero-Dep Cargo \\& Ecosystem Provenance & \\multicolumn{{4}}{{r}}{{{}}} \\\\\n",
+            paper2_prov_tex
+        ));
+        out.push_str(&format!(
+            "P2: Server-Authority \\& 120\\,Hz Guardrails & \\multicolumn{{4}}{{r}}{{{:.1}\\% reject ({}/{}) \\;\\|\\; {:.1}\\% clamp ({}/{})}} \\\\\n",
             self.guardrails.authority_rejection_rate * 100.0,
             self.guardrails.authority_rejected_cases,
             self.guardrails.authority_total_cases,
@@ -1285,10 +1505,21 @@ impl BenchmarkReport {
             self.guardrails.budget_total_cases,
         ));
         out.push_str(&format!(
-            "120\\,Hz Governor Closed-Loop Convergence & \\multicolumn{{4}}{{r}}{{${}$ ({}f) / Recov.\\ ({}f)}} \\\\\n",
+            "P3: 4-Target RHI, \\texttt{{.gbew}} v{} \\& 10k-Step Physics & \\multicolumn{{4}}{{r}}{{{}/4 RHI \\;\\|\\; {:.2}\\,B/tri ({:.2}$\\times$) \\;\\|\\; \\texttt{{{}}} ({:.2}\\,$\\mu$s/step)}} \\\\\n",
+            self.paper3.gbew.version,
+            self.paper3.shader_targets.iter().filter(|t| t.verified).count(),
+            self.paper3.gbew.bytes_per_triangle,
+            self.paper3.gbew.compression_ratio,
+            escape_tex(&self.paper3.physics.hash_run_a_hex[..10.min(self.paper3.physics.hash_run_a_hex.len())]),
+            self.paper3.physics.mean_us_per_step,
+        ));
+        out.push_str(&format!(
+            "P3: 120\\,Hz / 90\\,Hz VR Closed-Loop Governors & \\multicolumn{{4}}{{r}}{{${}$ ({}f/{}f) \\;\\|\\; 90\\,Hz VR ({}f/{}f)}} \\\\\n",
             down_tex,
             self.governor.step_down_frames_to_floor,
             self.governor.recovery_frames_to_peak,
+            self.paper3.vr_90hz_step_down_frames,
+            self.paper3.vr_90hz_recovery_frames,
         ));
         out.push_str("\\midrule\n");
         out.push_str("Subsystem Operation & Min ($\\mu$s) & p50 ($\\mu$s) & p95 ($\\mu$s) & p99 ($\\mu$s) \\\\\n");
@@ -1303,6 +1534,68 @@ impl BenchmarkReport {
                 l.p99_us
             ));
         }
+        for l in [
+            &self.paper1.gbs_compile_apply_us,
+            &self.paper1.scene_verify_us,
+        ] {
+            out.push_str(&format!(
+                "{} & {:.2} & {:.2} & {:.2} & {:.2} \\\\\n",
+                escape_tex(&l.label),
+                l.min_us,
+                l.p50_us,
+                l.p95_us,
+                l.p99_us
+            ));
+        }
+        out.push_str("\\bottomrule\n");
+        out.push_str("\\end{tabular}\n");
+        out.push_str("\\end{table}\n\n");
+
+        // Second companion booktabs table: Paper 3 Polyglot RHI & Binary Asset Systems Breakdown
+        out.push_str("\\begin{table}[t]\n");
+        out.push_str("\\centering\n");
+        out.push_str("\\small\n");
+        out.push_str(&format!(
+            "\\caption{{Paper~3 zero-dependency 4-target WGSL shader toolchain, \\texttt{{.gbew}} v{} binary mesh cooker ({} triangles), and {}-step bit-exact physics verification.}}\n",
+            self.paper3.gbew.version,
+            self.paper3.gbew.triangle_count,
+            self.paper3.physics.steps
+        ));
+        out.push_str("\\label{tab:ganbate-polyglot-systems}\n");
+        out.push_str("\\begin{tabular}{lrrrr}\n");
+        out.push_str("\\toprule\n");
+        out.push_str(
+            "Target / Artifact & Vertex (B) & Fragment (B) & Total (B) & Median ($\\mu$s) \\\\\n",
+        );
+        out.push_str("\\midrule\n");
+        for t in &self.paper3.shader_targets {
+            out.push_str(&format!(
+                "{} & {} & {} & {} & {:.2} \\\\\n",
+                escape_tex(&t.label),
+                t.vertex_bytes,
+                t.fragment_bytes,
+                t.total_bytes,
+                t.compile_us
+            ));
+        }
+        out.push_str("\\midrule\n");
+        out.push_str(&format!(
+            "\\texttt{{.gbew}} v{} Cooked Torus ({}v / {}t) & \\multicolumn{{2}}{{r}}{{Raw: {}\\,B $\\to$ Cooked: {}\\,B}} & {:.2}\\,B/tri & {:.2} \\\\\n",
+            self.paper3.gbew.version,
+            self.paper3.gbew.vertex_count,
+            self.paper3.gbew.triangle_count,
+            self.paper3.gbew.raw_mesh_bytes,
+            self.paper3.gbew.cooked_gbew_bytes,
+            self.paper3.gbew.bytes_per_triangle,
+            self.paper3.gbew.cook_us,
+        ));
+        out.push_str(&format!(
+            "\\texttt{{ganbate-physics}} ({} steps, 60\\,Hz) & \\multicolumn{{3}}{{r}}{{\\texttt{{{}}} $=$ \\texttt{{{}}} (0 NaN)}} & {:.2}/step \\\\\n",
+            self.paper3.physics.steps,
+            escape_tex(&self.paper3.physics.hash_run_a_hex),
+            escape_tex(&self.paper3.physics.hash_run_b_hex),
+            self.paper3.physics.mean_us_per_step,
+        ));
         out.push_str("\\bottomrule\n");
         out.push_str("\\end{tabular}\n");
         out.push_str("\\end{table}");
@@ -1406,12 +1699,65 @@ mod tests {
         assert!(rep.governor.step_down_frames_to_floor > 0);
         assert!(rep.governor.recovery_frames_to_peak > 0);
 
+        // Paper 1: 30/30 .gbs spatial tasks, 30/30 SHA-256 Ctrl+Z recovery, 100% lint-free vs. 0% raw
+        assert!(rep.paper1.verified(), "paper1 failed: {:?}", rep.paper1);
+        assert_eq!(rep.paper1.total_tasks, 30);
+        assert_eq!(rep.paper1.tasks_passed, 30);
+        assert_eq!(rep.paper1.op_ctrl_z_sha256_recovered, 30);
+        assert_eq!(rep.paper1.gbs_snapped_lint_free_tasks, 30);
+        assert_eq!(rep.paper1.ungrounded_baseline_linted_tasks, 30);
+        assert!(rep.paper1.verify_under_100ms_sla);
+
+        // Paper 2: 14 workspace crates & 0 external crates.io dependencies
+        assert!(rep.paper2.verified(), "paper2 failed: {:?}", rep.paper2);
+        assert_eq!(rep.paper2.workspace_crates, 14);
+        assert_eq!(rep.paper2.external_crates_io_dependencies, 0);
+        assert!(!rep.paper2.xray_available);
+
+        // Paper 3: 4 shader targets, .gbew v4 ~7 B/tri, 10,000-step bit-exact physics
+        assert!(rep.paper3.verified(), "paper3 failed: {:?}", rep.paper3);
+        assert_eq!(rep.paper3.shader_targets.len(), 4);
+        assert!(rep.paper3.gbew.triangle_count >= 2_048);
+        assert!(
+            rep.paper3.gbew.bytes_per_triangle > 3.0 && rep.paper3.gbew.bytes_per_triangle < 12.0,
+            "unexpected B/tri: {}",
+            rep.paper3.gbew.bytes_per_triangle
+        );
+        assert_eq!(
+            rep.paper3.physics.hash_run_a_hex,
+            rep.paper3.physics.hash_run_b_hex
+        );
+        assert_ne!(
+            rep.paper3.physics.hash_run_a_hex,
+            rep.paper3.physics.hash_initial_hex
+        );
+
         let json_out = rep.render(BenchFormat::Json, false).unwrap();
         let parsed = json::parse(json_out.as_bytes()).unwrap();
         assert_eq!(parsed.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(
+            parsed
+                .get("paper1_spatial_suite")
+                .and_then(|p| p.get("verified")),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            parsed
+                .get("paper2_ecosystem_governance")
+                .and_then(|p| p.get("external_crates_io_dependencies")),
+            Some(&Value::Number(0.0))
+        );
+        assert_eq!(
+            parsed
+                .get("paper3_polyglot_systems")
+                .and_then(|p| p.get("verified")),
+            Some(&Value::Bool(true))
+        );
 
         let latex_out = rep.render(BenchFormat::Latex, false).unwrap();
         assert!(latex_out.contains("\\begin{table}[t]"));
+        assert!(latex_out.contains("\\label{tab:ganbate-empirical-bench}"));
+        assert!(latex_out.contains("\\label{tab:ganbate-polyglot-systems}"));
         assert!(latex_out.contains("\\begin{tabular}{lrrrr}"));
         assert!(latex_out.contains("\\toprule"));
         assert!(latex_out.contains("\\bottomrule"));
@@ -1419,5 +1765,43 @@ mod tests {
         let md_out = rep.render(BenchFormat::Markdown, false).unwrap();
         assert!(md_out.contains("# Ganbate Engine — Reproducible Empirical Benchmark Report"));
         assert!(md_out.contains("Tri-Modal State Isomorphism"));
+        assert!(md_out.contains("Paper 1 (UIST / CHI / SIGGRAPH)"));
+        assert!(md_out.contains("Paper 2 (ICSE / FSE / NeurIPS)"));
+        assert!(md_out.contains("Paper 3 (EuroSys / ASPLOS / SIGGRAPH / IEEE VR)"));
+    }
+
+    #[test]
+    fn paper2_extracts_xray_catalog_and_context_pyramid_provenance_readonly() {
+        let dir = TempDir(
+            std::env::temp_dir().join(format!("ganbate-p2-prov-{}", Ids::from_os().entity())),
+        );
+        let studio_pub = dir.0.join("main/apps/web/public/ganbate-studio");
+        fs::create_dir_all(&studio_pub).unwrap();
+        fs::write(
+            studio_pub.join("code-surface-catalog.json"),
+            r#"{"schema":"ganbate.code-xray-catalog/2","summary":{"totalItems":3518,"codeFileCount":3159,"totalDependencyEdges":14625,"avgImplementationPct":74,"avgIntegrationPct":83,"reclaimableLoc":98154},"clusters":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            studio_pub.join("ai-context-pyramid.json"),
+            r#"{"schema":"ganbate.ai-context-pyramid/1","budgets":{"actualL0Tokens":456,"maxActualL1Tokens":169,"withinBudget":true},"clusters":[{"id":"c1"},{"id":"c2"}],"optimizationMonitor":{"workspaceHealthSummary":{"healthScore":82}}}"#,
+        )
+        .unwrap();
+
+        let p2 = run_paper2_ecosystem_governance(&dir.0).expect("paper2 provenance");
+        assert!(p2.verified());
+        assert_eq!(p2.workspace_crates, 14);
+        assert_eq!(p2.external_crates_io_dependencies, 0);
+        assert!(p2.xray_available);
+        assert_eq!(p2.indexed_surfaces, 3518);
+        assert_eq!(p2.code_files, 3159);
+        assert_eq!(p2.dependency_edges, 14625);
+        assert_eq!(p2.reclaimable_loc, 98154);
+        assert!(p2.pyramid_available);
+        assert!((p2.health_score - 82.0).abs() < 1e-6);
+        assert_eq!(p2.cluster_count, 2);
+        assert_eq!(p2.l0_tokens, 456);
+        assert_eq!(p2.max_l1_tokens, 169);
+        assert!(p2.pyramid_within_budget);
     }
 }

@@ -90,8 +90,10 @@ dependencies = [
  "ganbate-assets",
  "ganbate-core",
  "ganbate-engine",
+ "ganbate-physics",
  "ganbate-pipeline",
  "ganbate-scene",
+ "ganbate-shader",
 ]
 
 [[package]]

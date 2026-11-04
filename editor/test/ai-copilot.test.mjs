@@ -279,6 +279,31 @@ test('mountAiCopilot dispatches world-graph-benchmark, renders empirical telemet
       budget_total_cases: 8,
       budget_clamped_cases: 8,
     },
+    paper1_spatial_suite: {
+      verified: true,
+      total_tasks: 30,
+      tasks_passed: 30,
+      op_ctrl_z_sha256_recovered: 30,
+      gbs_snapped_lint_free_tasks: 30,
+    },
+    paper2_ecosystem_governance: {
+      verified: true,
+      workspace_crates: 14,
+      external_crates_io_dependencies: 0,
+      xray_available: true,
+      indexed_surfaces: 3518,
+    },
+    paper3_polyglot_systems: {
+      verified: true,
+      shader_targets: [
+        { id: 'spirv_1_0', verified: true },
+        { id: 'msl_2_1', verified: true },
+        { id: 'webgpu_wgsl', verified: true },
+        { id: 'webgl2_glsl_es_300', verified: true },
+      ],
+      gbew_cooker: { version: 4, bytes_per_triangle: 6.9, roundtrip_verified: true },
+      physics_determinism: { steps: 10000, bit_exact_verified: true, zero_nan_verified: true },
+    },
     latencies_us: [
       { id: 'world_graph_roundtrip', label: 'SemanticWorldGraph Round-Trip', p50_us: 10.62, p95_us: 13.71 },
       { id: 'tri_modal_prompt_compile_and_patch', label: 'Tri-Modal Prompt Compile & Patch', p50_us: 8.63, p95_us: 10.89 },
@@ -323,6 +348,9 @@ test('mountAiCopilot dispatches world-graph-benchmark, renders empirical telemet
   assert.match(allText, /6,812\.56x · 268 tok/);
   assert.match(allText, /Code == UI == EN == KO: PASS · 0B drift/);
   assert.match(allText, /16\/16 · 8\/8/);
+  assert.match(allText, /Paper 1: 30\/30 \.gbs/);
+  assert.match(allText, /Paper 2: 14 crates · 0 ext deps · 3518 surf/);
+  assert.match(allText, /Paper 3: 4 RHI · ~6\.9 B\/tri · 10k-step bit-exact/);
   for (const label of Object.values(BENCH_SUBSYSTEM_LABELS)) {
     assert.ok(allText.includes(label), `expected subsystem row ${label} in latency table`);
   }
