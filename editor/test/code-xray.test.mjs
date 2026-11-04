@@ -134,14 +134,6 @@ function createMemoryStorage() {
 }
 
 function createSampleCatalog() {
-  const realCandidate = path.resolve(
-    __dirname,
-    '../../../lane-code-xray-web/main/apps/web/public/ganbate-studio/code-surface-catalog.json',
-  );
-  if (fs.existsSync(realCandidate)) {
-    return JSON.parse(fs.readFileSync(realCandidate, 'utf8'));
-  }
-
   // Standalone engine-only CI fixture matching ganbate.code-xray-catalog/2 schema
   const sharedImgHash = 'f01938938f63aa11223344556677889900aabbccddeeff001122334455667788';
   return {
@@ -149,17 +141,17 @@ function createSampleCatalog() {
     generatedAt: '2026-11-04T09:45:00.000Z',
     clusters: [
       {
-        id: 'cluster:dealer-rei-models',
-        title: 'Dealer Rei 3D Models & Workshop Iterations',
+        id: 'cluster:avatar-hero-models',
+        title: 'Hero Avatar 3D Models & Workshop Iterations',
         severity: 'high',
         kind: '3d-turntable-compare',
-        canonicalItemId: 'character-model:rei-v9.glb',
-        summary: 'Compare Dealer Rei glTF iterations.',
+        canonicalItemId: 'character-model:hero-v9.glb',
+        summary: 'Compare Hero Avatar glTF iterations.',
         itemCount: 3,
         itemIds: [
-          'character-model:rei-v9.glb',
-          'character-model:rei-v8.glb',
-          'character-model:rei-v9-copy.glb',
+          'character-model:hero-v9.glb',
+          'character-model:hero-v8.glb',
+          'character-model:hero-v9-copy.glb',
         ],
         totalBytes: 18_000_000,
         reclaimableBytes: 12_000_000,
@@ -195,12 +187,12 @@ function createSampleCatalog() {
     ],
     items: [
       {
-        id: 'character-model:rei-v9.glb',
-        title: 'rei-v9.glb',
+        id: 'character-model:hero-v9.glb',
+        title: 'hero-v9.glb',
         category: 'character-model',
         repo: 'ganbate-main',
-        sourcePath: 'main/apps/web/public/games/characters/rei-v9.glb',
-        repoPath: 'main/apps/web/public/games/characters/rei-v9.glb',
+        sourcePath: 'main/apps/web/public/games/characters/hero-v9.glb',
+        repoPath: 'main/apps/web/public/games/characters/hero-v9.glb',
         owningSubsystem: 'web-character-assets',
         fileSize: 6_000_000,
         loc: 0,
@@ -208,36 +200,36 @@ function createSampleCatalog() {
         provenance: {
           sha256: '1111111111111111111111111111111111111111111111111111111111111111',
           shortHash: '111111111111',
-          identicalHashPeers: ['character-model:rei-v9-copy.glb'],
-          forkGroup: 'fork-group:dealer-rei',
+          identicalHashPeers: ['character-model:hero-v9-copy.glb'],
+          forkGroup: 'fork-group:avatar-hero',
           existsOnMainBranch: true,
         },
         referenceCount: 4,
         consumers: [
-          { itemId: 'editor-tool:engine-audio-daw', repo: 'ganbate-main', path: 'GanbatePokerStage.tsx', kind: 'asset-ref' },
+          { itemId: 'editor-tool:engine-audio-daw', repo: 'ganbate-main', path: 'GanbateStageView.tsx', kind: 'asset-ref' },
         ],
         dependencies: [],
         editorExposure: 'asset-library-only',
-        authoritySource: { kind: 'binary-asset', ref: 'rei-v9.glb' },
-        candidateCanonicalId: 'character-model:rei-v9.glb',
+        authoritySource: { kind: 'binary-asset', ref: 'hero-v9.glb' },
+        candidateCanonicalId: 'character-model:hero-v9.glb',
         status: 'canonical',
         surfaceBucket: 'live',
         runtimeExposure: 'live_production',
-        statusReason: 'Canonical Dealer Rei.',
+        statusReason: 'Canonical Hero Avatar.',
         implementationPct: 100,
         integrationPct: 100,
         recommendedAction: 'Keep',
-        preview: { kind: 'glb', assetUrl: '/games/characters/rei-v9.glb', sandboxKey: 'glb:rei-v9' },
+        preview: { kind: 'glb', assetUrl: '/games/characters/hero-v9.glb', sandboxKey: 'glb:hero-v9' },
         glbStats: { meshes: 6, primitives: 8, vertices: 24000, triangles: 42000, materials: 4, textures: 4, bones: 65, morphTargets: 24, animations: 8 },
-        clusterIds: ['cluster:dealer-rei-models'],
+        clusterIds: ['cluster:avatar-hero-models'],
       },
       {
-        id: 'character-model:rei-v8.glb',
-        title: 'rei-v8.glb',
+        id: 'character-model:hero-v8.glb',
+        title: 'hero-v8.glb',
         category: 'character-model',
         repo: 'ganbate-main',
-        sourcePath: 'main/apps/web/public/games/characters/rei-v8.glb',
-        repoPath: 'main/apps/web/public/games/characters/rei-v8.glb',
+        sourcePath: 'main/apps/web/public/games/characters/hero-v8.glb',
+        repoPath: 'main/apps/web/public/games/characters/hero-v8.glb',
         owningSubsystem: 'web-character-assets',
         fileSize: 6_200_000,
         loc: 0,
@@ -246,15 +238,15 @@ function createSampleCatalog() {
           sha256: '2222222222222222222222222222222222222222222222222222222222222222',
           shortHash: '222222222222',
           identicalHashPeers: [],
-          forkGroup: 'fork-group:dealer-rei',
+          forkGroup: 'fork-group:avatar-hero',
           existsOnMainBranch: true,
         },
         referenceCount: 1,
         consumers: [],
         dependencies: [],
         editorExposure: 'asset-library-only',
-        authoritySource: { kind: 'binary-asset', ref: 'rei-v8.glb' },
-        candidateCanonicalId: 'character-model:rei-v9.glb',
+        authoritySource: { kind: 'binary-asset', ref: 'hero-v8.glb' },
+        candidateCanonicalId: 'character-model:hero-v9.glb',
         status: 'deprecated',
         surfaceBucket: 'duplicate',
         runtimeExposure: 'editor_only',
@@ -262,17 +254,17 @@ function createSampleCatalog() {
         implementationPct: 95,
         integrationPct: 18,
         recommendedAction: 'Refactor',
-        preview: { kind: 'glb', assetUrl: '/games/characters/rei-v8.glb', sandboxKey: 'glb:rei-v8' },
+        preview: { kind: 'glb', assetUrl: '/games/characters/hero-v8.glb', sandboxKey: 'glb:hero-v8' },
         glbStats: { meshes: 5, primitives: 6, vertices: 21000, triangles: 38000, materials: 3, textures: 3, bones: 65, morphTargets: 12, animations: 5 },
-        clusterIds: ['cluster:dealer-rei-models'],
+        clusterIds: ['cluster:avatar-hero-models'],
       },
       {
-        id: 'character-model:rei-v9-copy.glb',
-        title: 'rei-v9-copy.glb',
+        id: 'character-model:hero-v9-copy.glb',
+        title: 'hero-v9-copy.glb',
         category: 'character-model',
         repo: 'ganbate-main',
-        sourcePath: 'main/tools/scripts/art/sources/rei-v9-copy.glb',
-        repoPath: 'main/tools/scripts/art/sources/rei-v9-copy.glb',
+        sourcePath: 'main/tools/scripts/art/sources/hero-v9-copy.glb',
+        repoPath: 'main/tools/scripts/art/sources/hero-v9-copy.glb',
         owningSubsystem: 'art-workshop-sources',
         fileSize: 6_000_000,
         loc: 0,
@@ -280,16 +272,16 @@ function createSampleCatalog() {
         provenance: {
           sha256: '1111111111111111111111111111111111111111111111111111111111111111',
           shortHash: '111111111111',
-          identicalHashPeers: ['character-model:rei-v9.glb'],
-          forkGroup: 'fork-group:dealer-rei',
+          identicalHashPeers: ['character-model:hero-v9.glb'],
+          forkGroup: 'fork-group:avatar-hero',
           existsOnMainBranch: true,
         },
         referenceCount: 0,
         consumers: [],
         dependencies: [],
         editorExposure: 'none',
-        authoritySource: { kind: 'binary-asset', ref: 'rei-v9-copy.glb' },
-        candidateCanonicalId: 'character-model:rei-v9.glb',
+        authoritySource: { kind: 'binary-asset', ref: 'hero-v9-copy.glb' },
+        candidateCanonicalId: 'character-model:hero-v9.glb',
         status: 'orphaned',
         surfaceBucket: 'orphan',
         runtimeExposure: 'unwired_code',
@@ -297,9 +289,9 @@ function createSampleCatalog() {
         implementationPct: 100,
         integrationPct: 0,
         recommendedAction: 'Delete',
-        preview: { kind: 'glb', assetUrl: null, sandboxKey: 'glb:rei-v9-copy' },
+        preview: { kind: 'glb', assetUrl: null, sandboxKey: 'glb:hero-v9-copy' },
         glbStats: { meshes: 6, primitives: 8, vertices: 24000, triangles: 42000, materials: 4, textures: 4, bones: 65, morphTargets: 24, animations: 8 },
-        clusterIds: ['cluster:dealer-rei-models'],
+        clusterIds: ['cluster:avatar-hero-models'],
       },
       {
         id: 'editor-tool:AudioCueMixer',
@@ -324,7 +316,7 @@ function createSampleCatalog() {
           { itemId: null, repo: 'ganbate-main', path: 'DevStudioPage.tsx', kind: 'es-import' },
         ],
         dependencies: [
-          { itemId: 'character-model:rei-v9.glb', repo: 'ganbate-main', path: 'roomAudio.ts', kind: 'es-import' },
+          { itemId: 'character-model:hero-v9.glb', repo: 'ganbate-main', path: 'roomAudio.ts', kind: 'es-import' },
         ],
         editorExposure: 'dev-studio-panel',
         authoritySource: { kind: 'localStorage', ref: 'localStorage:ganbate.dev.audioMixer.v1' },
@@ -406,7 +398,7 @@ test('loadXrayCatalog probes exact URL fallback chain and falls back to studioAp
   const resOffline = await loadXrayCatalog({
     fetchImpl: async () => ({ ok: false, status: 503 }),
     studioApi: {
-      listAssets: () => [{ id: 'a1', path: 'content/rei.glb', bytes: 4096, usages: 2 }],
+      listAssets: () => [{ id: 'a1', path: 'content/hero.glb', bytes: 4096, usages: 2 }],
     },
   });
   assert.equal(resOffline.sourceUrl, 'studio-assets-fallback');
@@ -440,10 +432,10 @@ test('KPIs, filters, dependency graph, and SHA-256 glTF fork vs copy comparison 
   assert.equal(hood.canonicalTarget?.id, 'editor-tool:engine-audio-daw');
   assert.ok(hood.consumers.length >= 1);
 
-  const glbRows = compareGlbClusterItems(catalog, 'cluster:dealer-rei-models');
+  const glbRows = compareGlbClusterItems(catalog, 'cluster:avatar-hero-models');
   assert.ok(glbRows.length >= 2);
-  const canonRow = glbRows.find((r) => r.id === 'character-model:rei-v9.glb');
-  const forkRow = glbRows.find((r) => r.id === 'character-model:rei-v8.glb');
+  const canonRow = glbRows.find((r) => r.id === 'character-model:hero-v9.glb');
+  const forkRow = glbRows.find((r) => r.id === 'character-model:hero-v8.glb');
   assert.equal(canonRow.provenanceRelation, 'CANONICAL');
   assert.equal(forkRow.provenanceRelation, 'MODIFIED FORK');
 });
@@ -460,9 +452,9 @@ test('non-destructive human triage persists to localStorage and Studio host and 
       notes: 'Absorb foley buses into editor/audio-daw.js',
       updatedAt: '2026-11-04T09:50:00.000Z',
     },
-    'character-model:rei-v8.glb': {
+    'character-model:hero-v8.glb': {
       action: 'Archive',
-      notes: 'Keep rei-v9.glb canonical in public/',
+      notes: 'Keep hero-v9.glb canonical in public/',
       updatedAt: '2026-11-04T09:50:00.000Z',
     },
   };
@@ -470,7 +462,7 @@ test('non-destructive human triage persists to localStorage and Studio host and 
   saveTriageDecisionsToStorage(decisions, storage);
   const loaded = loadTriageDecisionsFromStorage(storage);
   assert.equal(loaded['editor-tool:AudioCueMixer'].action, 'Merge');
-  assert.equal(loaded['character-model:rei-v8.glb'].action, 'Archive');
+  assert.equal(loaded['character-model:hero-v8.glb'].action, 'Archive');
 
   const createdDocs = [];
   const saveRes = await persistTriageDecisionsToStudio(

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::error::{Error, usage};
 
 /// Options that take a value. `--component` may repeat; the others may not.
-const VALUED: [&str; 16] = [
+const VALUED: [&str; 17] = [
     "--entity",
     "--component",
     "--depth",
@@ -22,6 +22,7 @@ const VALUED: [&str; 16] = [
     "--contact-sheet",
     "--studio",
     "--token",
+    "--project",
 ];
 const SWITCHES: [&str; 5] = ["--defaults", "--dry-run", "--from-tx", "--pretty", "--help"];
 

@@ -1941,6 +1941,17 @@ export async function createEngine(options) {
     return v;
   };
   const out = (n) => new Float32Array(x.memory.buffer, reserve(n * 4), n);
+  const readBudget = (p) => {
+    const v = new Float32Array(x.memory.buffer, p, 6);
+    return {
+      resolutionScale: v[0],
+      maxDynamicLights: v[1] >>> 0,
+      ambientParticles: v[2] > 0.5,
+      shadowTier: v[3] >>> 0,
+      tier: v[4] >>> 0,
+      rollingMeanMs: v[5],
+    };
+  };
 
   // The world (decoded, its images decoded by the browser) and the Look.
   let world = null;
@@ -2018,6 +2029,38 @@ export async function createEngine(options) {
       dst[15] = f ? f.blur ?? 0.006 : 0;
       dst[16] = f ? 1 : 0;
       ok('setView', x.ganbate_rt_set_view(p));
+    },
+    /** Selects stereo XR eye (`0` mono, `-1` left eye, `+1` right eye) with IPD in metres (`0.050..=0.078`, default `0.063`). */
+    setStereoEye(eye = 0, ipdMetres = 0.063) {
+      ok('setStereoEye', x.ganbate_rt_set_stereo_eye(eye | 0, ipdMetres));
+    },
+    /** Parallel-axis left/right stereo view pair derived from the current camera and IPD. */
+    stereoViews() {
+      const p = out(16).byteOffset;
+      ok('stereoViews', x.ganbate_rt_stereo_views(p));
+      const v = Array.from(new Float32Array(x.memory.buffer, p, 16));
+      return {
+        left: { eye: v.slice(0, 3), target: v.slice(3, 6) },
+        right: { eye: v.slice(6, 9), target: v.slice(9, 12) },
+        rightAxis: v.slice(12, 15),
+        ipdMetres: v[15],
+      };
+    },
+    /** Records a completed frame duration (`dtMs`, ms) into the 120Hz (`8.333ms`) governor and returns its quality budget. */
+    recordFrameBudget(dtMs) {
+      const p = out(6).byteOffset;
+      ok('recordFrameBudget', x.ganbate_rt_governor_record(dtMs, p));
+      return readBudget(p);
+    },
+    /** Queries the current 120Hz (`8.333ms`) governor quality budget without recording a frame sample. */
+    frameBudget() {
+      const p = out(6).byteOffset;
+      ok('frameBudget', x.ganbate_rt_governor_query(p));
+      return readBudget(p);
+    },
+    /** Resets the 120Hz governor rolling window and restores top quality tier (`3`). */
+    resetFrameGovernor() {
+      ok('resetFrameGovernor', x.ganbate_rt_governor_reset());
     },
     /** Time of day in hours and the animation clock in seconds. */
     setClock(hours, seconds = 0) { ok('setClock', x.ganbate_rt_set_clock(hours, seconds)); },

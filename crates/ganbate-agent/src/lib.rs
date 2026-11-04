@@ -61,7 +61,7 @@ impl Reply {
 }
 
 /// The commands, their operands and options, and what they do.
-const COMMANDS: [(&str, &str, &str); 14] = [
+const COMMANDS: [(&str, &str, &str); 17] = [
     (
         "scene inspect",
         "ganbate scene inspect PROJECT SCENE [--entity REF] [--component KIND]... [--depth N] [--defaults]",
@@ -123,6 +123,21 @@ const COMMANDS: [(&str, &str, &str); 14] = [
         "serve JSON-RPC 2.0 MCP over stdio (in-process or bridged to a running ganbate-studio host)",
     ),
     (
+        "graph fetch",
+        "ganbate graph fetch [--project <path>]",
+        "output canonical world.semantic.json (ganbate://context)",
+    ),
+    (
+        "graph prompt",
+        "ganbate graph prompt [--project <path>] \"<natural-language instruction>\"",
+        "compile a bilingual EN/KO World Graph prompt under 120Hz and server-authority guardrails",
+    ),
+    (
+        "graph patch",
+        "ganbate graph patch [--project <path>] '<json-patch>'",
+        "apply a validated JSON patch to world.semantic.json (ganbate://context)",
+    ),
+    (
         "render",
         "ganbate render PROJECT SCENE --out FILE.png [--camera REF] [--size WxH] [--time H] [--weather W] [--samples N]",
         "cook the scene in memory and render a still with the offscreen renderer",
@@ -148,13 +163,22 @@ pub fn run(
 ) -> Outcome {
     let pretty = args.iter().any(|a| a == "--pretty");
     if let Ok(parsed) = args::parse(args)
-        && parsed.words.first().map(String::as_str) == Some("mcp")
         && !parsed.switch("--help")
     {
-        return match ai_cli::run_mcp_buffered(&parsed, stdin) {
-            Ok(out) => out,
-            Err(e) => answer(Obj::new(), Some(e), pretty),
-        };
+        if parsed.words.first().map(String::as_str) == Some("mcp") {
+            return match ai_cli::run_mcp_buffered(&parsed, stdin) {
+                Ok(out) => out,
+                Err(e) => answer(Obj::new(), Some(e), pretty),
+            };
+        }
+        if parsed.words.first().map(String::as_str) == Some("graph")
+            && parsed.words.get(1).map(String::as_str) == Some("fetch")
+        {
+            return match ai_cli::run_graph_fetch(&parsed) {
+                Ok(out) => out,
+                Err(e) => answer(Obj::new(), Some(e), pretty),
+            };
+        }
     }
     match dispatch(args, stdin, backend) {
         Ok(reply) => answer(reply.body, reply.error, pretty),
@@ -285,6 +309,11 @@ fn dispatch(
             )?;
             ai_cli::verify_scene_cli(project, scene, &a)
         }
+        ["graph", "prompt", rest @ ..] => ai_cli::graph_prompt(&a, rest),
+        ["graph", "patch", rest @ ..] => ai_cli::graph_patch(&a, rest, stdin),
+        ["graph", ..] => Err(error::usage(
+            "usage: ganbate graph <fetch|prompt|patch> [--project <path>] ...",
+        )),
         ["render", rest @ ..] => {
             let [project, scene] = operands(rest, "render")?;
             a.only(

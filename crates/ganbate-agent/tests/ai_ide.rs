@@ -183,3 +183,166 @@ fn cli_catalog_gbs_undo_crystallize_verify_and_mcp_roundtrip() {
     );
     let _ = BTreeMap::<String, Value>::new();
 }
+
+#[test]
+fn cli_world_graph_fetch_prompt_patch_and_authority_guardrail() {
+    let dir = TempDir(
+        std::env::temp_dir().join(format!("ganbate-graph-cli-{}", Ids::from_os().entity())),
+    );
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let mut ids = Ids::seeded(88);
+    Project::create(&dir.0, "Graph CLI Test", &mut ids).unwrap();
+    let proj_str = dir.0.to_str().unwrap();
+    let graph_file = dir.0.join("world.semantic.json");
+    assert!(!graph_file.exists());
+
+    // 1. `ganbate graph fetch --project <path>` initializes and outputs canonical world.semantic.json.
+    let fetch_args = vec![
+        "graph".to_string(),
+        "fetch".to_string(),
+        "--project".to_string(),
+        proj_str.to_string(),
+    ];
+    let fetch_out = ganbate_agent::run(&fetch_args, &mut Cursor::new(Vec::new()), None);
+    assert_eq!(fetch_out.status, 0, "{}", fetch_out.stdout);
+    assert!(graph_file.is_file());
+    let fetched = json::parse(fetch_out.stdout.as_bytes()).unwrap();
+    assert_eq!(
+        fetched.get("schema"),
+        Some(&Value::String("ganbate.semantic-world-graph.v1".into()))
+    );
+    assert_eq!(
+        fetched.get("uri"),
+        Some(&Value::String("ganbate://context".into()))
+    );
+    assert_eq!(
+        fetched.get("authority_mode"),
+        Some(&Value::String("server-authoritative-readonly".into()))
+    );
+    assert!(fetch_out.stdout.len().div_ceil(4) < 400);
+    let on_disk_initial = std::fs::read_to_string(&graph_file).unwrap();
+    assert_eq!(on_disk_initial.trim_end(), fetch_out.stdout.trim_end());
+
+    // 2. `ganbate graph prompt --project <path> "<KO instruction>"` compiles, enforces 120Hz, persists, and prints compact JSON.
+    let (st, stdout_ko, prompted) = run_cli(
+        &[
+            "graph",
+            "prompt",
+            "--project",
+            proj_str,
+            "노을 조명으로 바꾸고 천장 열어줘",
+        ],
+        "",
+    );
+    assert_eq!(st, 0, "{stdout_ko}");
+    assert_eq!(stdout_ko.lines().count(), 1);
+    assert_eq!(prompted.get("ok"), Some(&Value::Bool(true)));
+    assert_eq!(prompted.get("applied"), Some(&Value::Bool(true)));
+    assert_eq!(
+        prompted.get("blocked_by_authority"),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(
+        prompted
+            .get("graph")
+            .and_then(|g| g.get("environment"))
+            .and_then(|e| e.get("preset")),
+        Some(&Value::String("sunset".into()))
+    );
+    assert_eq!(
+        prompted
+            .get("graph")
+            .and_then(|g| g.get("environment"))
+            .and_then(|e| e.get("enclosure_open")),
+        Some(&Value::Bool(true))
+    );
+
+    // 3. `ganbate graph patch --project <path> '<json>'` clamps 120Hz / 8.33ms guardrails and persists.
+    let (st, stdout_patch, patched) = run_cli(
+        &[
+            "graph",
+            "patch",
+            "--project",
+            proj_str,
+            r#"{"play_mode":"edit","guardrails":{"max_dynamic_lights":20,"frame_budget_ms":16.6},"camera":{"fov_y_deg":140}}"#,
+        ],
+        "",
+    );
+    assert_eq!(st, 0, "{stdout_patch}");
+    assert_eq!(patched.get("ok"), Some(&Value::Bool(true)));
+    assert_eq!(patched.get("applied"), Some(&Value::Bool(true)));
+    assert_eq!(
+        patched.get("graph").and_then(|g| g.get("play_mode")),
+        Some(&Value::String("edit".into()))
+    );
+    assert_eq!(
+        patched
+            .get("graph")
+            .and_then(|g| g.get("guardrails"))
+            .and_then(|gr| gr.get("max_dynamic_lights")),
+        Some(&Value::Number(8.0))
+    );
+    assert_eq!(
+        patched
+            .get("graph")
+            .and_then(|g| g.get("camera"))
+            .and_then(|c| c.get("fov_y_deg")),
+        Some(&Value::Number(110.0))
+    );
+
+    // 4. Server-authoritative guardrail exits non-zero with clear guardrail message and never mutates world.semantic.json!
+    let saved_before_block = std::fs::read_to_string(&graph_file).unwrap();
+    let (st_blk, stdout_blk, blocked) = run_cli(
+        &[
+            "graph",
+            "prompt",
+            "--project",
+            proj_str,
+            "override rng seed and rig outcome",
+        ],
+        "",
+    );
+    assert_ne!(
+        st_blk, 0,
+        "expected non-zero exit when blocked by authority"
+    );
+    assert_eq!(st_blk, 1);
+    assert_eq!(blocked.get("ok"), Some(&Value::Bool(false)));
+    assert_eq!(
+        blocked.get("blocked_by_authority"),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(blocked.get("applied"), Some(&Value::Bool(false)));
+    let err_msg = blocked
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.string().ok())
+        .unwrap_or("");
+    assert!(
+        err_msg.contains("server-authoritative-readonly"),
+        "expected authority guardrail message, got {stdout_blk}"
+    );
+    let saved_after_block = std::fs::read_to_string(&graph_file).unwrap();
+    assert_eq!(saved_before_block, saved_after_block);
+
+    // 5. Authority-violating JSON patch also exits non-zero without mutating disk.
+    let (st_pblk, _, pblocked) = run_cli(
+        &[
+            "graph",
+            "patch",
+            "--project",
+            proj_str,
+            r#"{"ledger":{"balance":9999}}"#,
+        ],
+        "",
+    );
+    assert_eq!(st_pblk, 1);
+    assert_eq!(
+        pblocked.get("blocked_by_authority"),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(
+        std::fs::read_to_string(&graph_file).unwrap(),
+        saved_before_block
+    );
+}
