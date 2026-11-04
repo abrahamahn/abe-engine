@@ -129,6 +129,16 @@ fn main() {
         .collect();
     let outcome = match args {
         Ok(args) => {
+            if args.first().map(String::as_str) == Some("mcp")
+                && !args.iter().any(|a| a == "--help" || a == "-h")
+            {
+                let code = ganbate_agent::run_mcp_stdio(
+                    &args[1..],
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stdout().lock(),
+                );
+                std::process::exit(code);
+            }
             let pretty = args.iter().any(|a| a == "--pretty");
             std::panic::catch_unwind(AssertUnwindSafe(|| {
                 ganbate_agent::run(&args, &mut std::io::stdin().lock(), Some(&Offscreen))
