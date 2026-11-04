@@ -1,0 +1,123 @@
+.gb-vfx-studio {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg, #16171b);
+  color: var(--text, #d9dce3);
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: 12px;
+}
+
+.gb-vfx-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--panel, #1e2025);
+  border-bottom: 1px solid var(--line, #2c2f36);
+  flex-shrink: 0;
+}
+
+.gb-vfx-title {
+  font-weight: 600;
+  color: var(--accent, #e8b44a);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  font-size: 11px;
+}
+
+.gb-vfx-spacer {
+  flex: 1 1 auto;
+}
+
+.gb-vfx-hud {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: var(--bg, #16171b);
+  border: 1px solid var(--line, #2c2f36);
+}
+
+.gb-vfx-hud.is-over {
+  border-color: var(--error, #ff6b6b);
+  color: var(--error, #ff6b6b);
+}
+
+.gb-vfx-grid {
+  display: grid;
+  grid-template-columns: 230px 1fr 290px;
+  gap: 1px;
+  flex: 1 1 auto;
+  min-height: 0;
+  background: var(--line, #2c2f36);
+}
+
+.gb-vfx-col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--panel-alt, #181a1f);
+}
+
+.gb-vfx-card {
+  background: var(--panel, #1e2025);
+  border: 1px solid var(--line, #2c2f36);
+  border-radius: 4px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.gb-vfx-btn,
+.gb-vfx-select,
+.gb-vfx-input {
+  background: var(--bg, #16171b);
+  color: var(--text, #d9dce3);
+  border: 1px solid var(--line, #2c2f36);
+  border-radius: 3px;
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+.gb-vfx-btn {
+  cursor: pointer;
+}
+
+.gb-vfx-btn:hover {
+  border-color: var(--accent, #e8b44a);
+}
+
+.gb-vfx-btn.is-active {
+  background: var(--accent, #e8b44a);
+  color: #16171b;
+  border-color: var(--accent, #e8b44a);
+  font-weight: 600;
+}
+
+.gb-vfx-canvas {
+  width: 100%;
+  height: 240px;
+  background: radial-gradient(circle at 50% 60%, #20232b 0%, #121318 100%);
+  border: 1px solid var(--line, #2c2f36);
+  border-radius: 4px;
+}
+
+.gb-vfx-row {
+  display: grid;
+  grid-template-columns: 92px 1fr 44px;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.gb-vfx-val {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--dim, #8a909c);
+}
