@@ -10,15 +10,20 @@ import {
   buildPlaceLayerOp,
   computeMidSideMatrix,
   createDefaultStrip,
+  createRotaryKnob,
   createStarterSoundBank,
+  createVerticalFader,
   decodeQoaBytes,
+  describeKnobArc,
   evaluateFadeCurve,
   evaluateStripResponseDb,
+  faderNormToVolume,
   mountAudioDaw,
   normalizeSoundBankRoot,
   orderedBuses,
   orderedLayers,
   validateSoundBankRoot,
+  volumeToFaderNorm,
 } from '../audio-daw.js';
 import { applyOps } from '../protocol.js';
 
@@ -103,6 +108,7 @@ function createFakeDocument() {
     }
   }
 
+  const docListeners = new Map();
   const doc = {
     head: null,
     createElement(tag) {
@@ -117,8 +123,21 @@ function createFakeDocument() {
     getElementById(id) {
       return doc.head?.queryByAttr('id', id) || null;
     },
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener(type, fn) {
+      if (!docListeners.has(type)) docListeners.set(type, []);
+      docListeners.get(type).push(fn);
+    },
+    removeEventListener(type, fn) {
+      const arr = docListeners.get(type);
+      if (!arr) return;
+      const idx = arr.indexOf(fn);
+      if (idx >= 0) arr.splice(idx, 1);
+    },
+    dispatchEvent(type, eventObj = {}) {
+      const fns = [...(docListeners.get(type) || [])];
+      const evt = { preventDefault() {}, stopPropagation() {}, ...eventObj };
+      for (const fn of fns) fn(evt);
+    },
   };
   doc.head = new FakeNode('head', doc);
   const container = new FakeNode('div', doc);
@@ -363,4 +382,86 @@ test('mountAudioDaw integrates with StudioWorkbenchApi ops, undo/redo/save, and 
 
   daw.destroy();
   assert.equal(listeners.size, 0, 'all StudioWorkbenchApi subscriptions cleaned up on destroy');
+});
+
+test('hardware rotary knob and vertical fader support vertical drag, Shift 10x precision, dblclick reset, keyboard, and bipolar arcs', async () => {
+  const { doc, container } = createFakeDocument();
+
+  // 1. Standalone bipolar rotary knob: drag, Shift+Drag 10x fine precision, dblclick reset, keyboard
+  const observed = [];
+  const knobRoot = createRotaryKnob(doc, {
+    label: 'EQ Mid Gain',
+    value: 0,
+    min: -18,
+    max: 18,
+    step: 0.5,
+    defaultValue: 0,
+    bipolar: true,
+    accent: 'gold',
+    format: (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)} dB`,
+    onChange: (v) => observed.push(v),
+  });
+  const dial = knobRoot.queryByAttr('role', 'slider');
+  assert.ok(dial);
+  assert.equal(dial.getAttribute('data-bipolar'), 'true');
+  assert.equal(dial.getAttribute('aria-valuetext'), '+0.0 dB');
+  assert.ok(describeKnobArc(22, 22, 18.2, 0, 90).startsWith('M '));
+
+  // Normal vertical drag up by 66px (half of 132px full span => +0.5 * 36 = +18 dB)
+  dial.dispatchEvent('pointerdown', { clientY: 200, shiftKey: false, preventDefault() {} });
+  doc.dispatchEvent('pointermove', { clientY: 167, shiftKey: false }); // +33px = 0.25 * 36 = +9.0 dB
+  doc.dispatchEvent('pointerup', {});
+  assert.equal(observed.at(-1), 9);
+  assert.equal(dial.getAttribute('aria-valuetext'), '+9.0 dB');
+
+  // Double-click resets immediately to defaultValue (0 dB)
+  dial.dispatchEvent('dblclick', { preventDefault() {} });
+  assert.equal(observed.at(-1), 0);
+
+  // Shift+Drag 10x fine precision: +33px upward moves only 0.025 * 36 = +0.9 dB (10x finer than +9.0 dB!)
+  dial.dispatchEvent('pointerdown', { clientY: 200, shiftKey: true, preventDefault() {} });
+  doc.dispatchEvent('pointermove', { clientY: 167, shiftKey: true });
+  doc.dispatchEvent('pointerup', {});
+  assert.equal(observed.at(-1), 0.9);
+
+  // Keyboard ArrowUp (+0.5 dB -> 1.4 -> 1.5 quantized) & Home reset (0 dB)
+  dial.dispatchEvent('keydown', { key: 'ArrowUp', shiftKey: false, preventDefault() {} });
+  assert.equal(observed.at(-1), 1.5);
+  dial.dispatchEvent('keydown', { key: 'Home', shiftKey: false, preventDefault() {} });
+  assert.equal(observed.at(-1), 0);
+
+  // 2. Studio console vertical fader law & unity reset
+  assert.ok(Math.abs(volumeToFaderNorm(1.0, 2.0) - Math.SQRT1_2) < 1e-6);
+  assert.ok(Math.abs(faderNormToVolume(volumeToFaderNorm(1.0, 2.0), 2.0) - 1.0) < 1e-3);
+
+  let faderVal = 0.5;
+  const faderRoot = createVerticalFader(doc, {
+    ariaLabel: 'SFX volume',
+    value: faderVal,
+    max: 2.0,
+    defaultValue: 1.0,
+    busId: 'sfx',
+    onChange: (v) => {
+      faderVal = v;
+    },
+  });
+  const faderTrack = faderRoot.queryByAttr('role', 'slider');
+  faderTrack.dispatchEvent('dblclick', { preventDefault() {} });
+  assert.equal(faderVal, 1.0);
+
+  // 3. Mounted workbench exposes 3D Spatializer knobs & illuminated LOOP / BYP buttons
+  const daw = mountAudioDaw(container, {});
+  const spatialMaxKnob = container.queryByAttr('data-dsp', 'spatial.maxDistance');
+  assert.ok(spatialMaxKnob, '3D Spatializer Max Distance rotary knob rendered');
+  spatialMaxKnob.dispatchEvent('pointerdown', { clientY: 200, shiftKey: false, preventDefault() {} });
+  doc.dispatchEvent('pointermove', { clientY: 150, shiftKey: false });
+  doc.dispatchEvent('pointerup', {});
+  assert.ok(daw.getState().root.buses.master.strip.spatial.maxDistance > 35);
+
+  const loopBtn = container.queryByAttr('data-action', 'toggle-loop');
+  assert.ok(loopBtn);
+  assert.equal(loopBtn.getAttribute('aria-pressed'), 'false');
+  loopBtn.click();
+  assert.equal(container.queryByAttr('data-action', 'toggle-loop').getAttribute('aria-pressed'), 'true');
+  daw.destroy();
 });
