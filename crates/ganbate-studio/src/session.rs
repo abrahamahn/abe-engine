@@ -145,6 +145,84 @@ fn validate_look(root: &Value) -> Result<(), String> {
     ganbate_engine::render::LookFile::from_value(root).map(|_| ())
 }
 
+/// Canonical empty `.data.json` document for a registered non-engine `schema`.
+pub fn new_data_document(id: &str, schema: &str, name: &str) -> Value {
+    Value::Object(BTreeMap::from([
+        ("ganbate".into(), Value::String("data".into())),
+        ("version".into(), Value::Number(1.0)),
+        ("id".into(), Value::String(id.into())),
+        ("schema".into(), Value::String(schema.into())),
+        ("name".into(), Value::String(name.into())),
+        ("values".into(), Value::Object(BTreeMap::new())),
+    ]))
+}
+
+/// Validates a `Kind::Data` (`*.data.json`) document header and its `values` against `registry`.
+pub fn validate_data(root: &Value, registry: &Registry) -> BTreeSet<(String, String)> {
+    let mut issues = BTreeSet::new();
+    let Value::Object(map) = root else {
+        issues.insert(("".into(), "a data document is an object".into()));
+        return issues;
+    };
+    for key in map.keys() {
+        if !matches!(
+            key.as_str(),
+            "ganbate" | "version" | "id" | "schema" | "name" | "values"
+        ) {
+            issues.insert((key.clone(), format!("unknown data document key {key:?}")));
+        }
+    }
+    if map.get("ganbate").and_then(|v| v.string().ok()) != Some("data") {
+        issues.insert(("ganbate".into(), "expected \"ganbate\": \"data\"".into()));
+    }
+    if map.get("version").and_then(|v| v.unsigned().ok()) != Some(1) {
+        issues.insert(("version".into(), "expected \"version\": 1".into()));
+    }
+    if !map
+        .get("id")
+        .and_then(|v| v.string().ok())
+        .is_some_and(is_asset_id)
+    {
+        issues.insert(("id".into(), "expected a 16-hex-digit asset id".into()));
+    }
+    if !map
+        .get("name")
+        .is_some_and(|v| matches!(v, Value::String(_)))
+    {
+        issues.insert(("name".into(), "expected a string".into()));
+    }
+    let valid_schema = match map.get("schema").and_then(|v| v.string().ok()) {
+        Some(s) if ganbate_scene::schema::valid_kind_name(s, false) => Some(s),
+        Some(s) => {
+            issues.insert(("schema".into(), format!("invalid data schema name {s:?}")));
+            None
+        }
+        None => {
+            issues.insert(("schema".into(), "expected a schema name".into()));
+            None
+        }
+    };
+    let values_obj = match map.get("values") {
+        Some(v @ Value::Object(_)) => Some(v),
+        _ => {
+            issues.insert(("values".into(), "expected an object".into()));
+            None
+        }
+    };
+    if let Some(schema) = valid_schema {
+        if registry.get(schema).is_some() {
+            if let Some(values) = values_obj {
+                for issue in registry.check_component(schema, values, "values") {
+                    issues.insert((issue.path, issue.message));
+                }
+            }
+        } else {
+            issues.insert(("schema".into(), format!("unknown schema {schema:?}")));
+        }
+    }
+    issues
+}
+
 /// Every problem of `root`, including what only expanding its prefabs shows (a parent cycle
 /// through what an instance shows, a missing or broken prefab).
 fn issue_set(
@@ -159,6 +237,9 @@ fn issue_set(
             .map(|error| ("look".into(), error))
             .into_iter()
             .collect();
+    }
+    if kind == Kind::Data {
+        return validate_data(root, registry);
     }
     scene::check_with_prefabs(root, registry, load)
         .into_iter()
@@ -246,6 +327,19 @@ impl Studio {
         self.project.root.join(&self.cache_rel)
     }
 
+    pub(super) fn game_workspaces(&self) -> Value {
+        Value::Array(
+            self.project
+                .manifest
+                .editor
+                .iter()
+                .map(|dir| format!("{dir}/studio-game.json"))
+                .filter(|path| self.inside(path).is_ok() && self.project.root.join(path).is_file())
+                .map(|path| s(&path))
+                .collect(),
+        )
+    }
+
     fn assets(&self) -> Value {
         Value::Array(
             self.project
@@ -319,7 +413,7 @@ impl Studio {
             ("undo", label_or(o.history.can_undo())),
             ("redo", label_or(o.history.can_redo())),
         ];
-        if o.kind == Kind::Look {
+        if matches!(o.kind, Kind::Look | Kind::Data) {
             m.push((
                 "issues",
                 Value::Array(
@@ -376,7 +470,10 @@ impl Studio {
             .entry(id)
             .ok_or_else(|| format!("no asset {id}"))?
             .clone();
-        if !matches!(entry.kind, Kind::Scene | Kind::Prefab | Kind::Look) {
+        if !matches!(
+            entry.kind,
+            Kind::Scene | Kind::Prefab | Kind::Look | Kind::Data
+        ) {
             return Err(format!("{} is not an editable document", entry.path));
         }
         self.inside(&entry.path)?;
@@ -449,6 +546,7 @@ impl Studio {
                                     .collect(),
                             ),
                         ),
+                        ("gameWorkspaces", self.game_workspaces()),
                         ("schemas", Value::Array(self.registry.sources().to_vec())),
                         ("assets", self.assets()),
                         ("drafts", self.unavailable_drafts()),
@@ -486,6 +584,9 @@ impl Studio {
                 let o = self.open.get(&id).ok_or("open the document first")?;
                 if o.kind == Kind::Look {
                     return Err("a Look has no entities".into());
+                }
+                if o.kind == Kind::Data {
+                    return Err("a data document has no entities".into());
                 }
                 let ids = msg
                     .get("ids")
@@ -626,10 +727,36 @@ impl Studio {
                     let id = self.project.create_look(&path, &self.ids.asset())?;
                     return Ok(self.created(from, &id, &path));
                 }
+                if msg.get("kind").and_then(|k| k.string().ok()) == Some("data") {
+                    let schema = msg
+                        .get("schema")
+                        .and_then(|v| v.string().ok())
+                        .ok_or("create data needs a schema")?;
+                    if !ganbate_scene::schema::valid_kind_name(schema, false) {
+                        return Err(format!("invalid data schema name {schema:?}"));
+                    }
+                    if self.registry.get(schema).is_none() {
+                        return Err(format!("unknown schema {schema:?}"));
+                    }
+                    let path = self.new_path(msg, "data")?;
+                    if let Some(parent) = self.project.root.join(&path).parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("{}: {e}", parent.display()))?;
+                    }
+                    self.inside(&path)?;
+                    let name = msg
+                        .get("name")
+                        .and_then(|v| v.string().ok())
+                        .unwrap_or("Untitled");
+                    let id = self.fresh_asset_id();
+                    let root = new_data_document(&id, schema, name);
+                    self.project.write_document(&path, Kind::Data, &root)?;
+                    return Ok(self.created(from, &id, &path));
+                }
                 let kind = match msg.get("kind").and_then(|k| k.string().ok()) {
                     Some("scene") => scene::Kind::Scene,
                     Some("prefab") => scene::Kind::Prefab,
-                    _ => return Err("create a scene, prefab or Look".into()),
+                    _ => return Err("create a scene, prefab, Look or data document".into()),
                 };
                 let path = self.new_path(msg, kind.name())?;
                 let name = msg
@@ -785,13 +912,24 @@ impl Studio {
             return Err("an edit has at least one op".into());
         }
         for op in &ops {
-            if self.open[&id].kind != Kind::Look
-                && !matches!(op.path()[0].as_str(), "entities" | "name")
-            {
-                return Err(format!(
-                    "{:?} cannot be edited (only entities and name)",
-                    op.path()[0]
-                ));
+            match self.open[&id].kind {
+                Kind::Look => {}
+                Kind::Data => {
+                    if !matches!(op.path()[0].as_str(), "values" | "name") {
+                        return Err(format!(
+                            "{:?} cannot be edited (only values and name)",
+                            op.path()[0]
+                        ));
+                    }
+                }
+                _ => {
+                    if !matches!(op.path()[0].as_str(), "entities" | "name") {
+                        return Err(format!(
+                            "{:?} cannot be edited (only entities and name)",
+                            op.path()[0]
+                        ));
+                    }
+                }
             }
         }
         let label = msg
@@ -843,12 +981,13 @@ impl Studio {
 
     fn cook(&mut self, from: ClientId, msg: &Value) -> Result<Outbox, String> {
         let id = Self::doc_id(msg)?.to_string();
-        if self
-            .project
-            .entry(&id)
-            .is_some_and(|asset| asset.kind == Kind::Look)
-        {
-            return Err("cook a scene or prefab to preview a Look".into());
+        if let Some(asset) = self.project.entry(&id) {
+            if asset.kind == Kind::Look {
+                return Err("cook a scene or prefab to preview a Look".into());
+            }
+            if asset.kind == Kind::Data {
+                return Err("a data document cannot be cooked; cook a scene or prefab".into());
+            }
         }
         // A document read again from disk goes to everyone watching it before the cook.
         let mut out: Outbox = if self.ensure_open(&id)? {
@@ -2015,5 +2154,284 @@ mod tests {
             reopened.project.entry(&tex_id).unwrap().path,
             "content/textures/albedo.png"
         );
+    }
+
+    #[test]
+    fn data_documents_validate_against_schemas_undo_save_track_usage_and_expose_game_workspaces() {
+        let (_, t) = studio("data-doc");
+        // Configure schemas and editor folders in manifest + studio-game.json + schema file.
+        let manifest_path = t.0.join(ganbate_pipeline::project::MANIFEST);
+        let mut manifest = ganbate_pipeline::project::read_json(&manifest_path).unwrap();
+        if let Value::Object(map) = &mut manifest {
+            map.insert("schemas".into(), Value::Array(vec![s("schemas")]));
+            map.insert("editor".into(), Value::Array(vec![s("editor")]));
+        }
+        ganbate_pipeline::project::write_json(&manifest_path, &manifest).unwrap();
+        std::fs::create_dir_all(t.0.join("schemas")).unwrap();
+        std::fs::create_dir_all(t.0.join("editor")).unwrap();
+        std::fs::write(
+            t.0.join("editor/studio-game.json"),
+            br#"{"version":1,"origin":"http://127.0.0.1:5173","entry":"/?studioPie=1"}"#,
+        )
+        .unwrap();
+        let schema_json = msg(r#"{
+              "ganbate": "schema",
+              "version": 1,
+              "components": {
+                "hud.anchors": {
+                  "label": "Observatory HUD",
+                  "editor": "layout-rig",
+                  "fields": {
+                    "opacity": { "type": "float", "min": 0, "max": 1, "default": 1 },
+                    "banner": { "type": "vec2", "unit": "norm", "default": [0.5, 0.1] },
+                    "cue_sound": { "type": "asset", "kind": "sound" },
+                    "cues": {
+                      "type": "array",
+                      "max": 4,
+                      "items": {
+                        "type": "object",
+                        "fields": {
+                          "delay": { "type": "float", "min": 0, "max": 10, "default": 0 },
+                          "clip": { "type": "asset", "kind": "sound" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }"#);
+        ganbate_pipeline::project::write_json(&t.0.join("schemas/hud.schema.json"), &schema_json)
+            .unwrap();
+
+        let (mut st, notes) = Studio::open(&t.0, Ids::seeded(41)).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        let a = st.connect("designer");
+        let b = st.connect("pie");
+
+        // Welcome advertises gameWorkspaces alongside schemas.
+        let hello = st.handle(a, &msg(r#"{"type":"hello","client":"designer"}"#));
+        let welcome = &of_type(&hello, "welcome")[0].1;
+        assert_eq!(
+            welcome.get("gameWorkspaces"),
+            Some(&Value::Array(vec![s("editor/studio-game.json")]))
+        );
+
+        // Creating with unknown or engine schema is refused.
+        assert!(
+            !of_type(
+                &st.handle(
+                    a,
+                    &msg(
+                        r#"{"type":"create","kind":"data","schema":"unknown.kind","path":"content/hud.data.json"}"#
+                    ),
+                ),
+                "error"
+            )
+            .is_empty()
+        );
+        assert!(
+            !of_type(
+                &st.handle(
+                    a,
+                    &msg(
+                        r#"{"type":"create","kind":"data","schema":"transform","path":"content/hud.data.json"}"#
+                    ),
+                ),
+                "error"
+            )
+            .is_empty()
+        );
+
+        // Create valid data document in nested subfolder.
+        let created = st.handle(
+            a,
+            &msg(
+                r#"{"type":"create","kind":"data","schema":"hud.anchors","path":"content/data/hud.data.json","name":"Observatory HUD"}"#,
+            ),
+        );
+        let created_msg = &of_type(&created, "created")[0].1;
+        assert_eq!(created_msg.get("kind"), Some(&s("data")));
+        let data_id = created_msg
+            .get("doc")
+            .unwrap()
+            .string()
+            .unwrap()
+            .to_string();
+        assert!(is_asset_id(&data_id));
+        assert!(!t.0.join("content/data/hud.data.json.meta.json").exists());
+
+        // Import a WAV sound asset to test asset-usage from Kind::Data.
+        let wav: Vec<u8> = [
+            b"RIFF".as_slice(),
+            &36u32.to_le_bytes(),
+            b"WAVEfmt ",
+            &16u32.to_le_bytes(),
+            &1u16.to_le_bytes(),
+            &1u16.to_le_bytes(),
+            &44100u32.to_le_bytes(),
+            &88200u32.to_le_bytes(),
+            &2u16.to_le_bytes(),
+            &16u16.to_le_bytes(),
+            b"data",
+            &0u32.to_le_bytes(),
+        ]
+        .concat();
+        let sound_import = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"asset-import","path":"content/audio/chime.wav","dataBase64":"{}"}}"#,
+                ganbate_core::digest::base64(&wav)
+            )),
+        );
+        let sound_id = of_type(&sound_import, "asset-imported")[0]
+            .1
+            .get("id")
+            .unwrap()
+            .string()
+            .unwrap()
+            .to_string();
+
+        // Open data doc from both watchers.
+        for who in [a, b] {
+            let opened = st.handle(
+                who,
+                &msg(&format!(r#"{{"type":"open","doc":"{data_id}"}}"#)),
+            );
+            let doc_msg = &of_type(&opened, "doc")[0].1;
+            assert_eq!(doc_msg.get("kind"), Some(&s("data")));
+            assert_eq!(doc_msg.get("issues"), Some(&Value::Array(vec![])));
+        }
+
+        // Valid edit updates values, broadcasts ops + issues, and tracks Undo/Redo.
+        let valid_edit = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"edit","doc":"{data_id}","rev":0,"label":"Tune HUD","ops":[
+                    {{"set":["values","opacity"],"value":0.8}},
+                    {{"set":["values","banner"],"value":[0.25,0.15]}},
+                    {{"set":["values","cue_sound"],"value":"{sound_id}"}},
+                    {{"set":["values","cues"],"value":[{{"delay":0.5,"clip":"{sound_id}"}}]}}
+                ]}}"#
+            )),
+        );
+        let ops_msgs = of_type(&valid_edit, "ops");
+        assert_eq!(ops_msgs.len(), 2);
+        assert_eq!(ops_msgs[0].1.get("issues"), Some(&Value::Array(vec![])));
+
+        assert_eq!(st.open[&data_id].doc.revision(), 4);
+
+        // Out-of-range, wrong-type, unknown-field, header edits, delete, and cook are refused with rollback.
+        for bad in [
+            format!(
+                r#"{{"type":"edit","doc":"{data_id}","rev":4,"ops":[{{"set":["values","opacity"],"value":2.5}}]}}"#
+            ),
+            format!(
+                r#"{{"type":"edit","doc":"{data_id}","rev":4,"ops":[{{"set":["values","banner"],"value":"bad"}}]}}"#
+            ),
+            format!(
+                r#"{{"type":"edit","doc":"{data_id}","rev":4,"ops":[{{"set":["values","unknown_key"],"value":1}}]}}"#
+            ),
+            format!(
+                r#"{{"type":"edit","doc":"{data_id}","rev":4,"ops":[{{"set":["schema"],"value":"other.kind"}}]}}"#
+            ),
+            format!(
+                r#"{{"type":"edit","doc":"{data_id}","rev":4,"ops":[{{"set":["id"],"value":"0123456789abcdef0123456789abcdef"}}]}}"#
+            ),
+            format!(r#"{{"type":"delete","doc":"{data_id}","ids":["0000000000000001"]}}"#),
+            format!(r#"{{"type":"cook","doc":"{data_id}"}}"#),
+        ] {
+            let reply = st.handle(a, &msg(&bad));
+            assert!(
+                !of_type(&reply, "error").is_empty(),
+                "expected error for {bad}"
+            );
+            assert!(
+                of_type(&reply, "doc").is_empty(),
+                "must not be stale-rev rejection: {bad}"
+            );
+        }
+        assert_eq!(st.open[&data_id].doc.revision(), 4);
+
+        // Asset usage counts both top-level and nested array asset references in Kind::Data.
+        let usage = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"asset-usage","id":"{sound_id}","req":"u-sound"}}"#
+            )),
+        );
+        let uses = of_type(&usage, "asset-usage")[0]
+            .1
+            .get("uses")
+            .unwrap()
+            .array()
+            .unwrap();
+        assert_eq!(uses.len(), 2);
+        assert_eq!(uses[0].get("doc"), Some(&s(&data_id)));
+        assert_eq!(uses[0].get("docKind"), Some(&s("data")));
+        assert_eq!(uses[0].get("entityName"), Some(&s("Observatory HUD")));
+
+        // Undo & Redo work cleanly.
+        st.handle(a, &msg(&format!(r#"{{"type":"undo","doc":"{data_id}"}}"#)));
+        assert_eq!(
+            st.open[&data_id].doc.root().get("values"),
+            Some(&Value::Object(BTreeMap::new()))
+        );
+        st.handle(a, &msg(&format!(r#"{{"type":"redo","doc":"{data_id}"}}"#)));
+        assert_eq!(
+            st.open[&data_id]
+                .doc
+                .root()
+                .get("values")
+                .unwrap()
+                .get("opacity"),
+            Some(&Value::Number(0.8))
+        );
+
+        // CHANGED_ON_DISK protection works on save, and force overwrites cleanly.
+        let mut external = st.project.read_document(&data_id).unwrap();
+        if let Value::Object(map) = &mut external {
+            map.insert("name".into(), s("External Edit"));
+        }
+        ganbate_pipeline::project::write_json(&t.0.join("content/data/hud.data.json"), &external)
+            .unwrap();
+        let refused = st.handle(a, &msg(&format!(r#"{{"type":"save","doc":"{data_id}"}}"#)));
+        assert_eq!(
+            of_type(&refused, "error")[0].1.get("code"),
+            Some(&s(CHANGED_ON_DISK))
+        );
+        let saved = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"save","force":true,"doc":"{data_id}"}}"#
+            )),
+        );
+        assert_eq!(of_type(&saved, "saved").len(), 2);
+
+        // asset-import and asset-move work for .data.json.
+        let imported_json =
+            json::to_canonical(&st.project.read_document(&data_id).unwrap()).unwrap();
+        let imported = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"asset-import","path":"content/data/hud_copy.data.json","dataBase64":"{}"}}"#,
+                ganbate_core::digest::base64(imported_json.as_bytes())
+            )),
+        );
+        let copy_id = of_type(&imported, "asset-imported")[0]
+            .1
+            .get("id")
+            .unwrap()
+            .string()
+            .unwrap()
+            .to_string();
+        assert_ne!(copy_id, data_id);
+        let moved = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"asset-move","id":"{data_id}","to":"content/data/observatory_hud.data.json"}}"#
+            )),
+        );
+        assert_eq!(of_type(&moved, "asset-moved").len(), 1);
+        assert!(t.0.join("content/data/observatory_hud.data.json").is_file());
     }
 }

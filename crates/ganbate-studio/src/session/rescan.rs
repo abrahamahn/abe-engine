@@ -61,6 +61,24 @@ impl Studio {
             (old != path).then(|| obj(vec![("id", s(id)), ("from", s(old)), ("to", s(path))]))
         });
         let mut problems: BTreeSet<String> = scan.problems.into_iter().collect();
+        match self.project.schema_files() {
+            Ok(files) => {
+                let mut next_registry = engine_registry();
+                let mut schemas_valid = true;
+                for (path, file) in files {
+                    if let Err(e) = next_registry.add(&file, false) {
+                        problems.insert(format!("{path}: {e}"));
+                        schemas_valid = false;
+                    }
+                }
+                if schemas_valid {
+                    self.registry = next_registry;
+                }
+            }
+            Err(e) => {
+                problems.insert(e);
+            }
+        }
         self.open.retain(|id, doc| {
             after.contains_key(id) || doc.history.dirty() || !doc.watchers.is_empty()
         });
@@ -94,6 +112,14 @@ impl Studio {
                     doc.doc.root(),
                     &mut problems,
                 );
+            } else if doc.kind == Kind::Data {
+                collect_data_references(
+                    &self.project,
+                    &self.registry,
+                    &doc.path,
+                    doc.doc.root(),
+                    &mut problems,
+                );
             }
         }
 
@@ -109,6 +135,8 @@ impl Studio {
             ("created", strings(scan.created)),
             ("drafts", self.unavailable_drafts()),
             ("problems", strings(problems)),
+            ("schemas", Value::Array(self.registry.sources().to_vec())),
+            ("gameWorkspaces", self.game_workspaces()),
         ]);
         for client in self.clients.keys() {
             out.push((*client, assets.clone()));
@@ -267,6 +295,35 @@ fn collect_references(
                     );
                 }
             }
+        }
+    }
+}
+
+fn collect_data_references(
+    project: &Project,
+    registry: &Registry,
+    filename: &str,
+    root: &Value,
+    errors: &mut BTreeSet<String>,
+) {
+    let Some(schema_name) = root.get("schema").and_then(|v| v.string().ok()) else {
+        return;
+    };
+    let Some(schema) = registry.get(schema_name) else {
+        return;
+    };
+    let Some(values) = root.get("values") else {
+        return;
+    };
+    for (name, field) in &schema.fields {
+        if let Some(value) = values.get(name) {
+            check_field(
+                project,
+                field,
+                value,
+                &format!("{filename} · values.{name}"),
+                errors,
+            );
         }
     }
 }
