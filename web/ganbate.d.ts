@@ -49,6 +49,24 @@ export interface GanbateFocus {
   readonly blur?: number;
 }
 
+export type GanbateStereoEye = -1 | 0 | 1;
+
+export interface GanbateStereoViews {
+  readonly left: { readonly eye: [number, number, number]; readonly target: [number, number, number] };
+  readonly right: { readonly eye: [number, number, number]; readonly target: [number, number, number] };
+  readonly rightAxis: [number, number, number];
+  readonly ipdMetres: number;
+}
+
+export interface GanbateQualityBudget {
+  readonly resolutionScale: number;
+  readonly maxDynamicLights: number;
+  readonly ambientParticles: boolean;
+  readonly shadowTier: number;
+  readonly tier: number;
+  readonly rollingMeanMs: number;
+}
+
 /** RGBA8 pixels, or a canvas, image bitmap or loaded image. */
 export type GanbateImageSource =
   | { readonly width: number; readonly height: number; readonly data: ArrayLike<number> & ArrayBufferView }
@@ -183,6 +201,16 @@ export interface GanbateEngine {
   size(): { width: number; height: number };
   setLook(look: object | string): void;
   setView(view: GanbateView): void;
+  /** Selects stereo XR eye (`0` mono, `-1` left eye, `+1` right eye) with IPD in metres (`0.050..=0.078`, default `0.063`). */
+  setStereoEye(eye?: GanbateStereoEye, ipdMetres?: number): void;
+  /** Parallel-axis left/right stereo view pair derived from the current camera and IPD. */
+  stereoViews(): GanbateStereoViews;
+  /** Records a frame duration (`dtMs`, ms) into the `120Hz` (`8.333ms`) governor and returns its quality budget. */
+  recordFrameBudget(dtMs: number): GanbateQualityBudget;
+  /** Queries the current `120Hz` (`8.333ms`) governor quality budget without recording a frame sample. */
+  frameBudget(): GanbateQualityBudget;
+  /** Resets the `120Hz` governor rolling window and restores top quality tier (`3`). */
+  resetFrameGovernor(): void;
   /** Time of day in hours and the animation clock in seconds. */
   setClock(hours: number, seconds?: number): void;
   /** The world's lamps `boost` times as bright as the hour lights them, glow and light alike (1: as it does). */

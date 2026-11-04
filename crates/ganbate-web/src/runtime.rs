@@ -24,6 +24,9 @@ use ganbate_engine::render::{
 };
 use ganbate_engine::render::{GameLight, LightDesc, ModelId, ModelInstance, SpotCone};
 use ganbate_engine::world::World;
+use ganbate_engine::xr::{
+    DEFAULT_IPD_METRES, FrameBudgetGovernor, QualityBudget, clamp_ipd_metres, compute_stereo_views,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -31,6 +34,12 @@ struct Runtime {
     device: Device<'static>,
     renderer: Renderer,
     view: View,
+    /// Stereo eye selector (`0` = mono, `-1` = left eye, `+1` = right eye).
+    stereo_eye: i32,
+    /// Interpupillary distance in metres (`0.050..=0.078`, default `0.063`).
+    stereo_ipd_metres: f32,
+    /// Deterministic `120Hz` (`8.333ms`) rolling-window frame budget governor.
+    frame_governor: FrameBudgetGovernor,
     time: TimeOfDay,
     weather: Weather,
     seconds: f32,
@@ -41,6 +50,27 @@ struct Runtime {
     pending: Vec<Option<Model>>,
     /// Snapshotted poses per model instance for zero-copy in-Rust cross-fading.
     crossfade_from: HashMap<u32, Pose>,
+}
+
+impl Runtime {
+    fn active_view(&self) -> View {
+        match self.stereo_eye {
+            -1 => compute_stereo_views(&self.view, self.stereo_ipd_metres).left,
+            1 => compute_stereo_views(&self.view, self.stereo_ipd_metres).right,
+            _ => self.view.clone(),
+        }
+    }
+}
+
+fn governor_snapshot_floats(gov: &FrameBudgetGovernor, budget: QualityBudget) -> [f32; 6] {
+    [
+        budget.resolution_scale,
+        budget.max_dynamic_lights as f32,
+        if budget.ambient_particles { 1.0 } else { 0.0 },
+        f32::from(budget.shadow_tier),
+        f32::from(gov.tier()),
+        gov.rolling_mean_ms(),
+    ]
 }
 
 thread_local! {
@@ -196,6 +226,9 @@ fn start(world: &World, look: &[u8], quality: u32) -> Result<Runtime, String> {
         device,
         renderer,
         view: file.views.first().cloned().unwrap_or_default(),
+        stereo_eye: 0,
+        stereo_ipd_metres: DEFAULT_IPD_METRES,
+        frame_governor: FrameBudgetGovernor::new(),
         time: file.time,
         weather: file.weather,
         seconds: 0.0,
@@ -277,6 +310,106 @@ pub unsafe extern "C" fn ganbate_rt_set_view(ptr: *const u8) -> u32 {
     })
 }
 
+/// Configures stereo XR eye selection for subsequent `ganbate_rt_render`, `ganbate_rt_project`,
+/// and `ganbate_rt_pick*` calls:
+/// - `eye = 0`: mono (`rt.view` directly)
+/// - `eye = -1`: left eye (`compute_stereo_views(&rt.view, ipd_metres).left`)
+/// - `eye = 1`: right eye (`compute_stereo_views(&rt.view, ipd_metres).right`)
+///
+/// `ipd_metres <= 0.0` or non-finite defaults to `DEFAULT_IPD_METRES` (`0.063m`); otherwise it is
+/// clamped to the realistic human range `0.050..=0.078`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_set_stereo_eye(eye: i32, ipd_metres: f32) -> u32 {
+    with(0, |rt| {
+        if !(-1..=1).contains(&eye) {
+            return Err(format!(
+                "set_stereo_eye: eye must be -1, 0, or 1, got {eye}"
+            ));
+        }
+        let ipd = if !ipd_metres.is_finite() || ipd_metres <= 0.0 {
+            DEFAULT_IPD_METRES
+        } else {
+            clamp_ipd_metres(ipd_metres)
+        };
+        rt.stereo_eye = eye;
+        rt.stereo_ipd_metres = ipd;
+        Ok(1)
+    })
+}
+
+/// Computes the parallel-axis stereo [`View`] pair for the current mono camera and IPD, writing
+/// 16 little-endian floats at `out`:
+/// `[left.eye(3), left.target(3), right.eye(3), right.target(3), right_axis(3), ipd_metres]`.
+///
+/// # Safety
+/// `out` must address 64 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ganbate_rt_stereo_views(out: *mut u8) -> u32 {
+    with(0, |rt| {
+        if out.is_null() {
+            return Err("stereo_views: null output buffer".into());
+        }
+        let pair = compute_stereo_views(&rt.view, rt.stereo_ipd_metres);
+        let mut v = [0.0f32; 16];
+        v[0..3].copy_from_slice(&pair.left.eye);
+        v[3..6].copy_from_slice(&pair.left.target);
+        v[6..9].copy_from_slice(&pair.right.eye);
+        v[9..12].copy_from_slice(&pair.right.target);
+        v[12..15].copy_from_slice(&pair.right_axis);
+        v[15] = pair.ipd_metres;
+        // SAFETY: the caller passes 64 writable bytes.
+        unsafe { write_floats(out, &v) };
+        Ok(1)
+    })
+}
+
+/// Records a frame duration (`dt_ms`, milliseconds) into the `120Hz` (`8.333ms`)
+/// [`FrameBudgetGovernor`] and, when `out` is non-null, writes 6 floats:
+/// `[resolution_scale, max_dynamic_lights, ambient_particles, shadow_tier, tier, rolling_mean_ms]`.
+///
+/// # Safety
+/// `out` must be null or address 24 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ganbate_rt_governor_record(dt_ms: f32, out: *mut u8) -> u32 {
+    with(0, |rt| {
+        let budget = rt.frame_governor.record_frame_ms(dt_ms);
+        if !out.is_null() {
+            let snap = governor_snapshot_floats(&rt.frame_governor, budget);
+            // SAFETY: when non-null, the caller passes 24 writable bytes.
+            unsafe { write_floats(out, &snap) };
+        }
+        Ok(1)
+    })
+}
+
+/// Queries the current `120Hz` [`FrameBudgetGovernor`] state without recording a sample, writing
+/// 6 floats at `out`:
+/// `[resolution_scale, max_dynamic_lights, ambient_particles, shadow_tier, tier, rolling_mean_ms]`.
+///
+/// # Safety
+/// `out` must address 24 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ganbate_rt_governor_query(out: *mut u8) -> u32 {
+    with(0, |rt| {
+        if out.is_null() {
+            return Err("governor_query: null output buffer".into());
+        }
+        let snap = governor_snapshot_floats(&rt.frame_governor, rt.frame_governor.budget());
+        // SAFETY: the caller passes 24 writable bytes.
+        unsafe { write_floats(out, &snap) };
+        Ok(1)
+    })
+}
+
+/// Resets the `120Hz` [`FrameBudgetGovernor`] rolling window and restores top quality tier (`3`).
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_governor_reset() -> u32 {
+    with(0, |rt| {
+        rt.frame_governor.reset();
+        Ok(1)
+    })
+}
+
 /// Sets the time of day (`hours`, 0..24) and the animation clock (`seconds`: water, clouds,
 /// grass and weather move with it).
 #[unsafe(no_mangle)]
@@ -338,11 +471,12 @@ pub extern "C" fn ganbate_rt_render() -> u32 {
             rt.seconds,
         );
         env.lamp_level *= rt.lamp_boost;
+        let active_view = rt.active_view();
         let mut enc = rt.device.encoder();
         rt.renderer.encode(
             &mut rt.device,
             &mut enc,
-            &rt.view,
+            &active_view,
             &env,
             [0.0, 0.0],
             0,
@@ -809,7 +943,8 @@ pub extern "C" fn ganbate_rt_light_destroy(light: u32) -> u32 {
 pub unsafe extern "C" fn ganbate_rt_project(x: f32, y: f32, z: f32, out: *mut u8) -> u32 {
     with(0, |rt| {
         let size = rt.renderer.size();
-        let Some(p) = rt.renderer.project(&rt.view, size, [x, y, z]) else {
+        let active_view = rt.active_view();
+        let Some(p) = rt.renderer.project(&active_view, size, [x, y, z]) else {
             return Ok(0);
         };
         // SAFETY: the caller passes 12 writable bytes.
@@ -899,7 +1034,8 @@ pub extern "C" fn ganbate_rt_set_world_light(index: u32, x: f32, y: f32, z: f32)
 pub unsafe extern "C" fn ganbate_rt_pick_world(x: f32, y: f32, out: *mut u8) -> u32 {
     with(0, |rt| {
         let size = rt.renderer.size();
-        let Some(hit) = rt.renderer.pick_world(&rt.view, size, (x, y)) else {
+        let active_view = rt.active_view();
+        let Some(hit) = rt.renderer.pick_world(&active_view, size, (x, y)) else {
             return Ok(0);
         };
         let p = hit.point;
@@ -919,7 +1055,8 @@ pub unsafe extern "C" fn ganbate_rt_pick_world(x: f32, y: f32, out: *mut u8) -> 
 pub unsafe extern "C" fn ganbate_rt_pick(x: f32, y: f32, layers: u32, out: *mut u8) -> u32 {
     with(0, |rt| {
         let size = rt.renderer.size();
-        let Some(hit) = rt.renderer.pick(&rt.view, size, (x, y), layers) else {
+        let active_view = rt.active_view();
+        let Some(hit) = rt.renderer.pick(&active_view, size, (x, y), layers) else {
             return Ok(0);
         };
         let p = hit.point;

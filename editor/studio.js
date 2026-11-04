@@ -534,6 +534,28 @@ function onMessage(msg) {
     case 'scene-verified':
     case 'brick-crystallized':
       break;
+    case 'world-graph-updated':
+    case 'world-graph-result':
+    case 'world-graph-patched':
+    case 'world-graph-prompted':
+      if (msg.graph) {
+        state.worldGraph = msg.graph;
+        if (msg.type === 'world-graph-updated') {
+          if (typeof msg.graph.environment?.time_hours === 'number') {
+            state.time = msg.graph.environment.time_hours;
+            const timeEl = $('#time');
+            const timeLbl = $('#time-label');
+            if (timeEl) timeEl.value = String(state.time);
+            if (timeLbl) timeLbl.textContent = `${state.time.toFixed(1)} h`;
+          }
+          if (typeof msg.graph.environment?.weather === 'string' && msg.graph.environment.weather) {
+            state.weather = msg.graph.environment.weather;
+          }
+          markViewportDirty(6, 250);
+        }
+        state.aiCopilot?.updateWorldGraph?.(msg);
+      }
+      break;
     case 'error':
       if (msg.req === 'asset-rescan') {
         state.scanning = false;
@@ -2596,6 +2618,24 @@ function setupAiIdeBar() {
       if (!state.host?.open || state.host.kind === 'cloud') return null;
       const reply = await state.host.request({ type: 'project-context', limit: 24 });
       return reply?.context || null;
+    },
+    fetchWorldGraph: async () => {
+      if (!state.host?.open || state.host.kind === 'cloud') return null;
+      const reply = await state.host.request({ type: 'world-graph-fetch' });
+      if (reply?.type === 'error') return null;
+      return reply;
+    },
+    promptWorldGraph: async (prompt) => {
+      if (!state.host?.open || state.host.kind === 'cloud') return null;
+      const reply = await state.host.request({ type: 'world-graph-prompt', prompt });
+      if (reply?.type === 'error') return { ok: false, error: reply.message };
+      return reply;
+    },
+    patchWorldGraph: async (patch) => {
+      if (!state.host?.open || state.host.kind === 'cloud') return null;
+      const reply = await state.host.request({ type: 'world-graph-patch', patch });
+      if (reply?.type === 'error') return { ok: false, error: reply.message };
+      return reply;
     },
     applyGbs: async (script) => {
       if (!state.host?.open || !state.doc?.id) {

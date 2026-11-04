@@ -449,6 +449,83 @@ function domEl(doc, tag, className = '', text = '') {
 }
 
 /**
+ * Builds the clean `<400`-token default Tri-Modal Semantic World Graph (`ganbate://context`).
+ */
+export function buildDefaultWorldGraph() {
+  return {
+    schema: 'ganbate.semantic-world-graph.v1',
+    uri: 'ganbate://context',
+    authority_mode: 'server-authoritative-readonly',
+    play_mode: 'play',
+    guardrails: {
+      target_hz: 120,
+      frame_budget_ms: 8.33,
+      max_dynamic_lights: 8,
+      max_draw_calls: 256,
+    },
+    environment: {
+      preset: 'daylight',
+      time_hours: 15.5,
+      weather: 'clear',
+      ambient_particles: true,
+      light_boost: 1.0,
+      enclosure_open: false,
+    },
+    camera: {
+      preset: 'default',
+      position: [0, 1.65, 3.2],
+      target: [0, 1, 0],
+      fov_y_deg: 50,
+    },
+    entities: [
+      {
+        id: 'primary_actor',
+        role: 'host',
+        offset_metres: [0, 0, -1.2],
+        yaw_deg: 0,
+        visible: true,
+        style_preset: 'default',
+        tint_rgba: [1, 1, 1, 1],
+        speed_scale: 1,
+      },
+      {
+        id: 'stage_center',
+        role: 'surface',
+        offset_metres: [0, 0, 0],
+        yaw_deg: 0,
+        visible: true,
+        style_preset: 'default',
+        tint_rgba: [1, 1, 1, 1],
+        speed_scale: 1,
+      },
+    ],
+  };
+}
+
+function formatClockHours(hours) {
+  const h = Number.isFinite(Number(hours)) ? ((Number(hours) % 24) + 24) % 24 : 15.5;
+  const totalMin = Math.round(h * 60) % (24 * 60);
+  const hh = String(Math.floor(totalMin / 60)).padStart(2, '0');
+  const mm = String(totalMin % 60).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+/**
+ * Formats a compact 1-line summary for the live `ganbate://context` (`120Hz`) Copilot badge.
+ */
+export function formatWorldGraphSummary(graph) {
+  const wg = graph && typeof graph === 'object' ? graph : buildDefaultWorldGraph();
+  const hz = wg.guardrails?.target_hz ?? 120;
+  const ms = Number(wg.guardrails?.frame_budget_ms ?? 8.33).toFixed(2);
+  const mode = wg.play_mode || 'play';
+  const preset = wg.environment?.preset || 'daylight';
+  const clock = formatClockHours(wg.environment?.time_hours ?? 15.5);
+  const weather = wg.environment?.weather || 'clear';
+  const openTag = wg.environment?.enclosure_open ? ' · open-sky' : '';
+  return `${wg.uri || 'ganbate://context'} · ${hz}Hz (${ms}ms) · ${mode} · ${preset} ${clock} · ${weather}${openTag}`;
+}
+
+/**
  * Mounts the docked Single-App AI Copilot, Starter Templates & AI Context drawer.
  */
 export function mountAiCopilot(container, hooks = {}) {
@@ -456,11 +533,13 @@ export function mountAiCopilot(container, hooks = {}) {
   let activeTab = 'chat';
   let catalogCache = [];
   let contextCache = null;
+  let worldGraphCache = null;
+  let worldGraphNotices = [];
   const agentCfg = loadAgentConfig();
   const messages = [
     {
       role: 'assistant',
-      text: 'Welcome! Describe what to build in plain English (or connect any LLM / MCP Agent). Every edit runs as one validated, undoable transaction.',
+      text: 'Welcome! Describe what to build in plain English or Korean (or connect any LLM / MCP Agent). Every edit runs under 120Hz & server-authority guardrails.',
       code: '',
       canUndo: false,
     },
@@ -481,6 +560,45 @@ export function mountAiCopilot(container, hooks = {}) {
   closeBtn.addEventListener('click', () => api.close());
   head.append(titleWrap, closeBtn);
 
+  // Live `ganbate://context` (`120Hz`) Tri-Modal World Graph status strip
+  const wgBar = domEl(doc, 'div', 'gb-copilot-wg-bar');
+  wgBar.dataset.role = 'world-graph-badge';
+  const wgBadge = domEl(doc, 'span', 'gb-copilot-badge', 'ganbate://context (120Hz)');
+  const wgMeta = domEl(doc, 'span', 'meta', '');
+  wgBar.append(wgBadge, wgMeta);
+
+  function syncWorldGraphBanner() {
+    const wg = worldGraphCache || buildDefaultWorldGraph();
+    const hz = wg.guardrails?.target_hz ?? 120;
+    const ms = Number(wg.guardrails?.frame_budget_ms ?? 8.33).toFixed(2);
+    wgBadge.textContent = `${wg.uri || 'ganbate://context'} (${hz}Hz · ${ms}ms)`;
+    const mode = wg.play_mode || 'play';
+    const preset = wg.environment?.preset || 'daylight';
+    const clock = formatClockHours(wg.environment?.time_hours ?? 15.5);
+    const weather = wg.environment?.weather || 'clear';
+    const openSuffix = wg.environment?.enclosure_open ? ' · open' : '';
+    wgMeta.textContent = `${mode} · ${preset} ${clock} · ${weather}${openSuffix}`;
+  }
+
+  function applyWorldGraphPayload(payload, rerender = false) {
+    if (!payload || typeof payload !== 'object') return false;
+    const nextGraph = payload.graph && typeof payload.graph === 'object'
+      ? payload.graph
+      : (payload.uri === 'ganbate://context' || payload.schema === 'ganbate.semantic-world-graph.v1'
+          ? payload
+          : null);
+    if (!nextGraph) return false;
+    worldGraphCache = nextGraph;
+    if (Array.isArray(payload.guardrail_notices)) {
+      worldGraphNotices = payload.guardrail_notices.slice();
+    }
+    syncWorldGraphBanner();
+    if (rerender) renderBody();
+    return true;
+  }
+
+  syncWorldGraphBanner();
+
   const tabBar = domEl(doc, 'div', 'gb-copilot-tabs');
   const TABS = [
     ['chat', 'Prompt & Copilot'],
@@ -494,7 +612,7 @@ export function mountAiCopilot(container, hooks = {}) {
     b.dataset.copilotTab = id;
     b.addEventListener('click', () => {
       activeTab = id;
-      void refreshCatalogAndContext();
+      void refreshCatalogAndContext({ forceWorldGraph: id === 'context' });
       renderBody();
     });
     tabButtons.set(id, b);
@@ -513,10 +631,10 @@ export function mountAiCopilot(container, hooks = {}) {
   composeRow.append(statusSpan, sendBtn);
   compose.append(promptInput, composeRow);
 
-  root.append(head, tabBar, body, compose);
+  root.append(head, wgBar, tabBar, body, compose);
   container.append(root);
 
-  async function refreshCatalogAndContext() {
+  async function refreshCatalogAndContext({ forceWorldGraph = false } = {}) {
     try {
       if (typeof hooks.queryCatalog === 'function') {
         const items = await hooks.queryCatalog('');
@@ -524,6 +642,10 @@ export function mountAiCopilot(container, hooks = {}) {
       }
       if (typeof hooks.fetchProjectContext === 'function') {
         contextCache = await hooks.fetchProjectContext();
+      }
+      if ((!worldGraphCache || forceWorldGraph) && typeof hooks.fetchWorldGraph === 'function') {
+        const wgReply = await hooks.fetchWorldGraph();
+        if (wgReply) applyWorldGraphPayload(wgReply, false);
       }
     } catch { /* ignore */ }
     if (!contextCache) {
@@ -535,6 +657,10 @@ export function mountAiCopilot(container, hooks = {}) {
         catalogItems: catalogCache,
         workbench: hooks.getActiveWorkbench?.() || 'world',
       });
+    }
+    if (!worldGraphCache) {
+      worldGraphCache = buildDefaultWorldGraph();
+      syncWorldGraphBanner();
     }
   }
 
@@ -560,6 +686,39 @@ export function mountAiCopilot(container, hooks = {}) {
     renderBody();
 
     await refreshCatalogAndContext();
+
+    // 1. Dispatch natural-language Tri-Modal World Graph prompts (`world-graph-prompt`) alongside `.gbs`
+    const firstLine = clean.split(/\r?\n|;/)[0].trim();
+    let wgOutcome = null;
+    if (!isDirectGbsLine(firstLine) && typeof hooks.promptWorldGraph === 'function') {
+      try {
+        wgOutcome = await hooks.promptWorldGraph(clean);
+      } catch { /* ignore fallback */ }
+      if (wgOutcome?.blocked_by_authority) {
+        const noticeText = Array.isArray(wgOutcome.guardrail_notices) && wgOutcome.guardrail_notices.length
+          ? wgOutcome.guardrail_notices.join(' · ')
+          : 'Blocked by server-authoritative-readonly security guardrail';
+        messages.push({
+          role: 'assistant',
+          text: `[Authority Guardrail] ${noticeText}`,
+          code: '',
+          canUndo: false,
+        });
+        statusSpan.textContent = '@selection live';
+        renderBody();
+        return;
+      }
+      if (wgOutcome) {
+        applyWorldGraphPayload(wgOutcome, false);
+        if (wgOutcome.applied && typeof wgOutcome.patch?.environment?.time_hours === 'number') {
+          hooks.setTimeOfDay?.(
+            wgOutcome.patch.environment.time_hours,
+            wgOutcome.patch.environment.preset || null,
+          );
+        }
+      }
+    }
+
     await ensureEditableSceneOpen('copilot_scene');
 
     let gbsScript = '';
@@ -611,10 +770,12 @@ export function mountAiCopilot(container, hooks = {}) {
       gbsScript = plan.gbsScript;
       timeOfDay = plan.timeOfDay;
       lightingPreset = plan.lightingPreset;
-      summary = summary ? `${summary} · ${plan.summary}` : plan.summary;
+      if (gbsScript || !wgOutcome?.applied) {
+        summary = summary ? `${summary} · ${plan.summary}` : plan.summary;
+      }
     }
 
-    if (timeOfDay != null && typeof hooks.setTimeOfDay === 'function') {
+    if (timeOfDay != null && !wgOutcome?.applied && typeof hooks.setTimeOfDay === 'function') {
       hooks.setTimeOfDay(timeOfDay, lightingPreset);
     }
 
@@ -636,10 +797,24 @@ export function mountAiCopilot(container, hooks = {}) {
       }
     }
 
+    let codeBlock = gbsScript;
+    if (wgOutcome?.applied) {
+      const wgSummary = formatWorldGraphSummary(wgOutcome.graph || worldGraphCache);
+      const noticePart = Array.isArray(wgOutcome.guardrail_notices) && wgOutcome.guardrail_notices.length
+        ? ` (${wgOutcome.guardrail_notices.join('; ')})`
+        : '';
+      summary = gbsScript
+        ? `Synced ${wgSummary}${noticePart} · ${summary}`
+        : `Updated ${wgSummary}${noticePart}`;
+      if (!codeBlock && wgOutcome.patch && Object.keys(wgOutcome.patch).length) {
+        codeBlock = JSON.stringify(wgOutcome.patch, null, 2);
+      }
+    }
+
     messages.push({
       role: 'assistant',
       text: `${summary}${verifyNote}`,
-      code: gbsScript,
+      code: codeBlock,
       canUndo: appliedOk || timeOfDay != null,
     });
     statusSpan.textContent = '@selection live';
@@ -670,6 +845,8 @@ export function mountAiCopilot(container, hooks = {}) {
     const samples = [
       'Ring 6 lanterns around selection radius 4m at dusk',
       'Create a path of 5 trees spacing 3m',
+      'Set lighting to sunset and open enclosure',
+      'Pause into edit mode',
       'Set time to midnight and frame camera on all',
       'Place prop beside selection right',
     ];
@@ -805,6 +982,43 @@ export function mountAiCopilot(container, hooks = {}) {
   }
 
   function renderContextTab() {
+    const wg = worldGraphCache || buildDefaultWorldGraph();
+    const wgJson = JSON.stringify(wg, null, 2);
+    const wgTokens = Math.ceil(wgJson.length / 4);
+    const wgCard = domEl(doc, 'div', 'gb-copilot-card');
+    wgCard.dataset.role = 'world-graph-card';
+    const wgHdr = domEl(doc, 'h4');
+    wgHdr.append(
+      domEl(doc, 'span', '', 'Tri-Modal Semantic World Graph (ganbate://context)'),
+      domEl(
+        doc,
+        'span',
+        'gb-copilot-badge',
+        `${wg.guardrails?.target_hz ?? 120}Hz · ~${wgTokens} tokens`,
+      ),
+    );
+    const copyWgBtn = domEl(doc, 'button', 'mini', 'Copy ganbate://context JSON');
+    copyWgBtn.type = 'button';
+    copyWgBtn.addEventListener('click', () => {
+      globalThis.navigator?.clipboard?.writeText?.(wgJson);
+      copyWgBtn.textContent = 'Copied!';
+      setTimeout(() => { copyWgBtn.textContent = 'Copy ganbate://context JSON'; }, 1200);
+    });
+    wgCard.append(
+      wgHdr,
+      domEl(
+        doc,
+        'p',
+        '',
+        `Authority: ${wg.authority_mode || 'server-authoritative-readonly'} · Mode: ${wg.play_mode || 'play'} · Budget: ${Number(wg.guardrails?.frame_budget_ms ?? 8.33).toFixed(2)}ms`,
+      ),
+    );
+    if (worldGraphNotices.length) {
+      wgCard.append(domEl(doc, 'p', 'meta', `Guardrails: ${worldGraphNotices.join(' · ')}`));
+    }
+    wgCard.append(domEl(doc, 'pre', 'gb-copilot-code', wgJson), copyWgBtn);
+    body.append(wgCard);
+
     const ctx = contextCache || buildFallbackProjectContext();
     const digestCard = domEl(doc, 'div', 'gb-copilot-card');
     const hdr = domEl(doc, 'h4');
@@ -917,6 +1131,8 @@ export function mountAiCopilot(container, hooks = {}) {
       else api.close();
     },
     executePrompt,
+    updateWorldGraph: (payload) => applyWorldGraphPayload(payload, !root.hidden),
+    getWorldGraph: () => worldGraphCache || buildDefaultWorldGraph(),
     destroy: () => root.remove(),
   };
 

@@ -13,7 +13,7 @@ use std::time::Duration;
 use ganbate_core::digest;
 use ganbate_core::id::Ids;
 use ganbate_core::json::{self as core_json, Value, to_canonical};
-use ganbate_studio::ai::{catalog, gbs, mcp, verify};
+use ganbate_studio::ai::{catalog, gbs, mcp, verify, world_graph};
 use ganbate_studio::session::Studio;
 
 use crate::args::Args;
@@ -437,4 +437,148 @@ pub fn run_mcp_buffered(a: &Args, stdin: &mut dyn Read) -> Result<Outcome, Error
         stdout.pop();
     }
     Ok(Outcome { status: 0, stdout })
+}
+
+fn resolve_graph_project<'a>(
+    a: &'a Args,
+    rest: &[&'a str],
+    expected_after: usize,
+    usage_str: &str,
+) -> Result<(&'a str, Vec<&'a str>), Error> {
+    if let Some(proj) = a.value("--project")? {
+        if rest.len() != expected_after {
+            return Err(error::usage(usage_str));
+        }
+        Ok((proj, rest.to_vec()))
+    } else if rest.len() == expected_after {
+        Ok((".", rest.to_vec()))
+    } else if rest.len() == expected_after + 1 {
+        Ok((rest[0], rest[1..].to_vec()))
+    } else {
+        Err(error::usage(usage_str))
+    }
+}
+
+fn graph_outcome_reply(outcome: world_graph::WorldGraphMutationOutcome) -> Reply {
+    let notices: Vec<J> = outcome
+        .guardrail_notices
+        .iter()
+        .map(|n| J::from(n.as_str()))
+        .collect();
+    let summary = if outcome.blocked_by_authority {
+        outcome
+            .guardrail_notices
+            .first()
+            .cloned()
+            .unwrap_or_else(|| {
+                "blocked by server-authoritative-readonly security guardrail".to_string()
+            })
+    } else if outcome.applied {
+        let keys = match &outcome.patch {
+            Value::Object(m) if !m.is_empty() => m.keys().cloned().collect::<Vec<_>>().join(", "),
+            _ => "world.semantic.json".to_string(),
+        };
+        format!(
+            "updated {} ({keys}; {}Hz / {:.2}ms)",
+            world_graph::WORLD_GRAPH_URI,
+            outcome.graph.guardrails.target_hz,
+            outcome.graph.guardrails.frame_budget_ms
+        )
+    } else {
+        outcome
+            .guardrail_notices
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "no world graph changes applied".to_string())
+    };
+    let body = Obj::new()
+        .with("uri", world_graph::WORLD_GRAPH_URI)
+        .with("path", world_graph::WORLD_GRAPH_REL_PATH)
+        .with("applied", outcome.applied)
+        .with("blocked_by_authority", outcome.blocked_by_authority)
+        .with("summary", summary.as_str())
+        .with("guardrail_notices", J::Arr(notices))
+        .with("patch", outcome.patch)
+        .with("estimated_tokens", outcome.graph.estimated_tokens())
+        .with("graph", outcome.graph.to_json_value());
+    if outcome.blocked_by_authority {
+        Reply {
+            body,
+            error: Some(error::bad_edit(summary)),
+        }
+    } else {
+        Reply::ok(body)
+    }
+}
+
+/// Outputs canonical `world.semantic.json` (`ganbate://context`) for `ganbate graph fetch`.
+pub fn run_graph_fetch(a: &Args) -> Result<Outcome, Error> {
+    a.only(&["--project"], "ganbate graph fetch")?;
+    let rest: Vec<&str> = a.words.iter().skip(2).map(String::as_str).collect();
+    let (project, _) =
+        resolve_graph_project(a, &rest, 0, "usage: ganbate graph fetch [--project <path>]")?;
+    let ws = workspace::open(project)?;
+    let (graph, _) =
+        world_graph::load_or_init_world_graph(&ws.project.root).map_err(error::invalid)?;
+    let mut canonical = graph.to_canonical_json().map_err(error::invalid)?;
+    if canonical.ends_with('\n') {
+        canonical.pop();
+    }
+    Ok(Outcome {
+        status: 0,
+        stdout: canonical,
+    })
+}
+
+/// Compiles a bilingual (EN/KO) natural-language prompt and persists to `world.semantic.json`
+/// unless blocked by authority guardrails.
+pub fn graph_prompt(a: &Args, rest: &[&str]) -> Result<Reply, Error> {
+    a.only(&["--project"], "ganbate graph prompt")?;
+    let (project, after) = resolve_graph_project(
+        a,
+        rest,
+        1,
+        "usage: ganbate graph prompt [--project <path>] \"<natural-language instruction>\"",
+    )?;
+    let prompt_text = after[0];
+    let ws = workspace::open(project)?;
+    let (current, _) =
+        world_graph::load_or_init_world_graph(&ws.project.root).map_err(error::invalid)?;
+    let (outcome, _) = world_graph::compile_world_graph_prompt(&current, prompt_text, &[]);
+    if !outcome.blocked_by_authority && outcome.applied {
+        world_graph::save_world_graph(&ws.project.root, &outcome.graph).map_err(error::io)?;
+    }
+    Ok(graph_outcome_reply(outcome))
+}
+
+/// Applies a validated JSON patch to `world.semantic.json` unless blocked by authority guardrails.
+pub fn graph_patch(a: &Args, rest: &[&str], stdin: &mut dyn Read) -> Result<Reply, Error> {
+    a.only(&["--project"], "ganbate graph patch")?;
+    let (project, after) = resolve_graph_project(
+        a,
+        rest,
+        1,
+        "usage: ganbate graph patch [--project <path>] '<json-patch>'",
+    )?;
+    let raw_arg = after[0];
+    let patch_bytes = if raw_arg == "-" {
+        workspace::read_all(stdin, "standard input")?
+    } else if raw_arg.trim_start().starts_with('{') {
+        raw_arg.as_bytes().to_vec()
+    } else if Path::new(raw_arg).is_file() {
+        workspace::read_file(Path::new(raw_arg))?
+    } else {
+        raw_arg.as_bytes().to_vec()
+    };
+    let patch_val = core_json::parse(&patch_bytes)
+        .map_err(|e| error::bad_edit(format!("invalid world graph JSON patch: {e}")))?;
+    let ws = workspace::open(project)?;
+    let (current, _) =
+        world_graph::load_or_init_world_graph(&ws.project.root).map_err(error::invalid)?;
+    let outcome =
+        world_graph::apply_world_graph_patch(&current, &patch_val).map_err(error::bad_edit)?;
+    if !outcome.blocked_by_authority && outcome.applied {
+        world_graph::save_world_graph(&ws.project.root, &outcome.graph).map_err(error::io)?;
+    }
+    Ok(graph_outcome_reply(outcome))
 }

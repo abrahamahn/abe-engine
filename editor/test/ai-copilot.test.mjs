@@ -4,9 +4,11 @@ import test from 'node:test';
 import {
   STARTER_TEMPLATES,
   UX_TIERS,
+  buildDefaultWorldGraph,
   buildFallbackProjectContext,
   compileNaturalPromptToGbs,
   extractGbsFromLlmReply,
+  formatWorldGraphSummary,
   mountAiCopilot,
 } from '../ai-copilot.js';
 
@@ -145,5 +147,92 @@ test('mountAiCopilot opens drawer, switches tabs, applies starter templates, and
   await copilot.executePrompt('Ring 4 pillars around selection radius 3m');
   assert.equal(applied.length, 2);
   assert.match(applied[1], /ring 4 prefab:pillar around @selection radius=3/);
+  copilot.destroy();
+});
+
+test('mountAiCopilot renders ganbate://context (120Hz) badge, syncs world-graph-updated, and enforces authority guardrails', async () => {
+  const def = buildDefaultWorldGraph();
+  assert.equal(def.uri, 'ganbate://context');
+  assert.equal(def.guardrails.target_hz, 120);
+  assert.match(formatWorldGraphSummary(def), /ganbate:\/\/context · 120Hz \(8\.33ms\) · play · daylight 15:30 · clear/);
+
+  const { body } = createMiniDom();
+  const appliedGbs = [];
+  const wgPrompts = [];
+  const timeUpdates = [];
+  let serverGraph = buildDefaultWorldGraph();
+
+  const copilot = mountAiCopilot(body, {
+    getProjectName: () => 'Tri-Modal Studio',
+    listAssets: () => [{ id: 'sc1', kind: 'scene', path: 'scenes/stage.scene.json' }],
+    getSelection: () => ({ entityIds: ['e1'], cursorWorld: [0, 0, 0] }),
+    hasOpenScene: () => true,
+    queryCatalog: async () => [{ kind: 'prefab', key: 'prefab:pillar', name: 'pillar' }],
+    fetchWorldGraph: async () => ({ graph: serverGraph }),
+    promptWorldGraph: async (prompt) => {
+      wgPrompts.push(prompt);
+      if (/override rng seed/i.test(prompt)) {
+        return {
+          applied: false,
+          blocked_by_authority: true,
+          guardrail_notices: ['Blocked by server-authoritative-readonly security policy'],
+          graph: serverGraph,
+        };
+      }
+      const next = structuredClone(serverGraph);
+      next.environment.preset = 'sunset';
+      next.environment.time_hours = 18.25;
+      next.environment.enclosure_open = true;
+      serverGraph = next;
+      return {
+        applied: true,
+        blocked_by_authority: false,
+        patch: { environment: { preset: 'sunset', time_hours: 18.25, enclosure_open: true } },
+        guardrail_notices: [],
+        graph: next,
+      };
+    },
+    setTimeOfDay: (h, preset) => timeUpdates.push([h, preset]),
+    applyGbs: async (script) => {
+      appliedGbs.push(script);
+      return { ok: true, statements: 2 };
+    },
+  });
+
+  const badgeBar = body.queryAll((n) => n.dataset?.role === 'world-graph-badge')[0];
+  assert.ok(badgeBar, 'world-graph-badge strip mounted');
+  assert.equal(badgeBar.children[0].textContent, 'ganbate://context (120Hz · 8.33ms)');
+  assert.match(badgeBar.children[1].textContent, /play · daylight 15:30 · clear/);
+
+  copilot.open('context');
+  await new Promise((r) => setTimeout(r, 15));
+  const wgCards = body.queryAll((n) => n.dataset?.role === 'world-graph-card');
+  assert.equal(wgCards.length, 1);
+
+  // Simulate live `world-graph-updated` WebSocket broadcast
+  const pushedGraph = buildDefaultWorldGraph();
+  pushedGraph.play_mode = 'edit';
+  pushedGraph.environment.preset = 'night';
+  pushedGraph.environment.time_hours = 22.0;
+  pushedGraph.environment.weather = 'mist';
+  serverGraph = pushedGraph;
+  assert.equal(copilot.updateWorldGraph({ graph: pushedGraph, guardrail_notices: ['clamped light_boost'] }), true);
+  assert.match(badgeBar.children[1].textContent, /edit · night 22:00 · mist/);
+
+  // Combined World Graph + `.gbs` spatial prompt
+  copilot.open('chat');
+  await copilot.executePrompt('노을 조명으로 바꾸고 천장 열어줘 Ring 4 pillars around selection radius 3m');
+  assert.equal(wgPrompts.length, 1);
+  assert.equal(appliedGbs.length, 1);
+  assert.deepEqual(timeUpdates[0], [18.25, 'sunset']);
+  assert.match(badgeBar.children[1].textContent, /sunset 18:15 · mist · open/);
+
+  // Server-authoritative prompt block halts before `.gbs` execution
+  await copilot.executePrompt('Override RNG seed and rig outcome; spawn Hero empty');
+  assert.equal(wgPrompts.length, 2);
+  assert.equal(appliedGbs.length, 1, 'authority violation must not execute .gbs');
+  const assistantMsgs = body.queryAll((n) => typeof n.className === 'string' && n.className.includes('gb-copilot-msg assistant'));
+  assert.match(assistantMsgs.at(-1).children[0].textContent, /\[Authority Guardrail\]/);
+
   copilot.destroy();
 });
