@@ -13,7 +13,7 @@ use std::time::Duration;
 use ganbate_core::digest;
 use ganbate_core::id::Ids;
 use ganbate_core::json::{self as core_json, Value, to_canonical};
-use ganbate_studio::ai::{catalog, gbs, mcp, verify, world_graph};
+use ganbate_studio::ai::{bench, catalog, gbs, mcp, verify, world_graph};
 use ganbate_studio::session::Studio;
 
 use crate::args::Args;
@@ -581,4 +581,43 @@ pub fn graph_patch(a: &Args, rest: &[&str], stdin: &mut dyn Read) -> Result<Repl
         world_graph::save_world_graph(&ws.project.root, &outcome.graph).map_err(error::io)?;
     }
     Ok(graph_outcome_reply(outcome))
+}
+
+/// Runs the reproducible academic benchmark suite (`ganbate bench [--project <path>] [--iterations <N>] [--format json|latex|markdown]`).
+pub fn run_bench(a: &Args, pretty: bool) -> Result<Outcome, Error> {
+    const USAGE_STR: &str =
+        "usage: ganbate bench [--project <path>] [--iterations <N>] [--format json|latex|markdown]";
+    a.only(&["--project", "--iterations", "--format"], "ganbate bench")?;
+    let rest: Vec<&str> = a.words.iter().skip(1).map(String::as_str).collect();
+    let (project, _) = resolve_graph_project(a, &rest, 0, USAGE_STR)?;
+
+    let project_path = Path::new(project);
+    if !project_path.is_dir() {
+        return Err(error::not_found(format!(
+            "benchmark directory not found: {project}"
+        )));
+    }
+
+    let iterations = match a.value("--iterations")? {
+        Some(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| (1..=bench::MAX_ITERATIONS).contains(&n))
+            .ok_or_else(|| {
+                error::usage(format!(
+                    "--iterations must be an integer in 1..={}",
+                    bench::MAX_ITERATIONS
+                ))
+            })?,
+        None => bench::DEFAULT_ITERATIONS,
+    };
+
+    let format = match a.value("--format")? {
+        Some(raw) => bench::BenchFormat::parse(raw).map_err(error::usage)?,
+        None => bench::BenchFormat::Markdown,
+    };
+
+    let report = bench::run_benchmark(project_path, iterations).map_err(error::invalid)?;
+    let stdout = report.render(format, pretty).map_err(error::invalid)?;
+    Ok(Outcome { status: 0, stdout })
 }

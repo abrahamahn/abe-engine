@@ -61,7 +61,7 @@ impl Reply {
 }
 
 /// The commands, their operands and options, and what they do.
-const COMMANDS: [(&str, &str, &str); 17] = [
+const COMMANDS: [(&str, &str, &str); 18] = [
     (
         "scene inspect",
         "ganbate scene inspect PROJECT SCENE [--entity REF] [--component KIND]... [--depth N] [--defaults]",
@@ -138,6 +138,11 @@ const COMMANDS: [(&str, &str, &str); 17] = [
         "apply a validated JSON patch to world.semantic.json (ganbate://context)",
     ),
     (
+        "bench",
+        "ganbate bench [--project <path>] [--iterations <N>] [--format json|latex|markdown]",
+        "run reproducible empirical benchmark suite (context compression, isomorphism, guardrails, and µs telemetry)",
+    ),
+    (
         "render",
         "ganbate render PROJECT SCENE --out FILE.png [--camera REF] [--size WxH] [--time H] [--weather W] [--samples N]",
         "cook the scene in memory and render a still with the offscreen renderer",
@@ -175,6 +180,12 @@ pub fn run(
             && parsed.words.get(1).map(String::as_str) == Some("fetch")
         {
             return match ai_cli::run_graph_fetch(&parsed) {
+                Ok(out) => out,
+                Err(e) => answer(Obj::new(), Some(e), pretty),
+            };
+        }
+        if parsed.words.first().map(String::as_str) == Some("bench") {
+            return match ai_cli::run_bench(&parsed, pretty) {
                 Ok(out) => out,
                 Err(e) => answer(Obj::new(), Some(e), pretty),
             };
