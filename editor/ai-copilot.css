@@ -372,6 +372,12 @@ body[data-ux-tier="creator"] .frame-options {
   color: #f4d284;
 }
 
+.gb-copilot-bench-papers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
 .gb-copilot-bench-metrics {
   display: flex;
   flex-direction: column;

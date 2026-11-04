@@ -24,8 +24,13 @@ pub const MAX_IPD_METRES: f32 = 0.078;
 
 /// Target frame budget (`8.333333ms`) for locked `120Hz` XR and high-refresh rendering.
 pub const TARGET_120HZ_MS: f32 = 8.333_333;
-/// Required sustained frame-time headroom (`< 6.8ms`) before stepping quality back up.
+/// Required sustained frame-time headroom (`< 6.8ms`) before stepping quality back up at `120Hz`.
 pub const HEADROOM_120HZ_MS: f32 = 6.8;
+
+/// Target frame budget (`11.111111ms`) for locked `90Hz` standalone/PC VR headsets.
+pub const TARGET_90HZ_VR_MS: f32 = 11.111_111;
+/// Required sustained frame-time headroom (`< 9.0ms`) before stepping quality back up at `90Hz` VR.
+pub const HEADROOM_90HZ_VR_MS: f32 = 9.0;
 
 /// Maximum finite coordinate magnitude accepted from network spatial poses (`10km`).
 pub const MAX_POSE_COORD_METRES: f32 = 10_000.0;
@@ -659,14 +664,17 @@ impl QualityBudget {
     }
 }
 
-/// Deterministic `120Hz` (`8.333ms`) rolling-window frame-time governor with hysteresis.
+/// Deterministic rolling-window frame-time governor (`120Hz` `8.333ms` default, or `90Hz` VR
+/// `11.111ms`) with hysteresis.
 ///
-/// Steps down one tier at a time on sustained `> 8.333ms` frames to prevent XR motion sickness,
-/// holds steady inside the `[6.8ms, 8.333ms]` hysteresis deadband, and steps back up only after
-/// sustained headroom (`< 6.8ms`).
+/// Steps down one tier at a time on sustained over-budget frames to prevent XR motion sickness,
+/// holds steady inside the `[headroom_ms, target_ms]` hysteresis deadband, and steps back up only
+/// after sustained headroom (`< headroom_ms`).
 #[derive(Clone, Debug)]
 pub struct FrameBudgetGovernor {
     window_capacity: usize,
+    target_ms: f32,
+    headroom_ms: f32,
     samples_ms: VecDeque<f32>,
     tier: u8,
     over_budget_streak: u32,
@@ -685,16 +693,54 @@ impl FrameBudgetGovernor {
         Self::with_window(DEFAULT_GOVERNOR_WINDOW)
     }
 
+    /// Creates a `90Hz` VR (`11.111ms` budget, `9.0ms` recovery headroom) closed-loop governor.
+    pub fn new_90hz_vr() -> Self {
+        Self::with_target_ms(
+            DEFAULT_GOVERNOR_WINDOW,
+            TARGET_90HZ_VR_MS,
+            HEADROOM_90HZ_VR_MS,
+        )
+    }
+
     pub fn with_window(window_capacity: usize) -> Self {
+        Self::with_target_ms(window_capacity, TARGET_120HZ_MS, HEADROOM_120HZ_MS)
+    }
+
+    /// Creates a closed-loop governor with custom rolling window, frame-time target, and recovery headroom.
+    pub fn with_target_ms(window_capacity: usize, target_ms: f32, headroom_ms: f32) -> Self {
         let cap = window_capacity.clamp(4, 240);
+        let safe_target = if target_ms.is_finite() && target_ms >= 1.0 {
+            target_ms
+        } else {
+            TARGET_120HZ_MS
+        };
+        let safe_headroom = if headroom_ms.is_finite() && headroom_ms > 0.0 {
+            headroom_ms.min(safe_target * 0.95)
+        } else {
+            safe_target * 0.82
+        };
         Self {
             window_capacity: cap,
+            target_ms: safe_target,
+            headroom_ms: safe_headroom,
             samples_ms: VecDeque::with_capacity(cap),
             tier: MAX_QUALITY_TIER,
             over_budget_streak: 0,
             headroom_streak: 0,
             cooldown_frames: 0,
         }
+    }
+
+    /// Target frame budget in milliseconds (e.g. `8.333ms` at `120Hz` or `11.111ms` at `90Hz` VR).
+    #[inline]
+    pub fn target_ms(&self) -> f32 {
+        self.target_ms
+    }
+
+    /// Recovery headroom threshold in milliseconds.
+    #[inline]
+    pub fn headroom_ms(&self) -> f32 {
+        self.headroom_ms
     }
 
     /// Current quality tier (`0..=3`).
@@ -724,7 +770,7 @@ impl FrameBudgetGovernor {
         (sum / (self.samples_ms.len() as f64)) as f32
     }
 
-    /// Resets rolling samples and restores the top `120Hz` quality tier.
+    /// Resets rolling samples and restores the top quality tier.
     pub fn reset(&mut self) {
         self.samples_ms.clear();
         self.tier = MAX_QUALITY_TIER;
@@ -753,14 +799,14 @@ impl FrameBudgetGovernor {
             self.cooldown_frames -= 1;
         }
 
-        if clamped_dt > TARGET_120HZ_MS {
+        if clamped_dt > self.target_ms {
             self.over_budget_streak = self.over_budget_streak.saturating_add(1);
             self.headroom_streak = 0;
-        } else if clamped_dt < HEADROOM_120HZ_MS {
+        } else if clamped_dt < self.headroom_ms {
             self.headroom_streak = self.headroom_streak.saturating_add(1);
             self.over_budget_streak = 0;
         } else {
-            // Hysteresis deadband `[6.8ms, 8.333333ms]`: neither upgrade nor downgrade builds streak.
+            // Hysteresis deadband `[headroom_ms, target_ms]`: neither upgrade nor downgrade builds streak.
             self.over_budget_streak = 0;
             self.headroom_streak = 0;
         }
@@ -771,8 +817,8 @@ impl FrameBudgetGovernor {
         if self.cooldown_frames == 0 && self.tier > 0 {
             let sustained_spike = self.over_budget_streak >= DOWNGRADE_STREAK_FRAMES;
             let sustained_mean_over = self.samples_ms.len() >= half_window
-                && mean > TARGET_120HZ_MS
-                && clamped_dt > TARGET_120HZ_MS;
+                && mean > self.target_ms
+                && clamped_dt > self.target_ms;
             if sustained_spike || sustained_mean_over {
                 self.tier -= 1;
                 self.over_budget_streak = 0;
@@ -786,7 +832,7 @@ impl FrameBudgetGovernor {
             && self.tier < MAX_QUALITY_TIER
             && self.headroom_streak >= UPGRADE_STREAK_FRAMES
             && self.samples_ms.len() >= half_window
-            && mean < HEADROOM_120HZ_MS
+            && mean < self.headroom_ms
         {
             self.tier += 1;
             self.headroom_streak = 0;
@@ -1068,5 +1114,24 @@ mod tests {
         gov.reset();
         assert_eq!(gov.tier(), MAX_QUALITY_TIER);
         assert_eq!(gov.sample_count(), 0);
+    }
+
+    #[test]
+    fn vr_90hz_governor_steps_down_holds_deadband_and_recovers() {
+        let mut gov = FrameBudgetGovernor::new_90hz_vr();
+        assert!((gov.target_ms() - TARGET_90HZ_VR_MS).abs() < 1e-6);
+        assert!((gov.headroom_ms() - HEADROOM_90HZ_VR_MS).abs() < 1e-6);
+        for _ in 0..32 {
+            gov.record_frame_ms(13.8);
+        }
+        assert_eq!(gov.tier(), 0);
+        for _ in 0..16 {
+            gov.record_frame_ms(10.0);
+            assert_eq!(gov.tier(), 0);
+        }
+        for _ in 0..96 {
+            gov.record_frame_ms(7.8);
+        }
+        assert_eq!(gov.tier(), MAX_QUALITY_TIER);
     }
 }

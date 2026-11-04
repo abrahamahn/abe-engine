@@ -12,3 +12,5 @@ ganbate-core = { path = "../ganbate-core" }
 ganbate-assets = { path = "../ganbate-assets" }
 ganbate-pipeline = { path = "../ganbate-pipeline" }
 ganbate-scene = { path = "../ganbate-scene" }
+ganbate-shader = { path = "../ganbate-shader" }
+ganbate-physics = { path = "../ganbate-physics" }
