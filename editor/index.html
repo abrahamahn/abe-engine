@@ -9,7 +9,7 @@
 <body>
 <header id="toolbar">
   <strong id="project-name">ABE Studio</strong>
-  <span id="doc-name" data-i18n="noDocument">No document</span>
+  <span id="doc-name" data-i18n="noDocument">No document</span><button id="download-draft" hidden data-i18n="downloadDraft">Download draft</button>
   <span class="sep"></span>
   <button id="save" data-i18n="save" data-i18n-title="saveTip">Save</button>
   <button id="undo" data-i18n="undo">Undo</button>
@@ -19,6 +19,21 @@
   <button id="mode-rotate" data-i18n="rotate" data-i18n-title="rotateTip">Rotate</button>
   <button id="mode-scale" data-i18n="scale" data-i18n-title="scaleTip">Scale</button>
   <button id="frame" data-i18n="frame" data-i18n-title="frameTip">Frame</button>
+  <details class="frame-options">
+    <summary data-i18n="frameOptions">View guides</summary>
+    <div class="frame-fields">
+      <label><span data-i18n="previewShape">Preview shape</span>
+        <select id="frame-shape">
+          <option value="free" data-i18n="availableSpace">Available space</option>
+          <option value="portrait" data-i18n="portraitFrame">Portrait · 9:16</option>
+          <option value="landscape" data-i18n="landscapeFrame">Landscape · 16:9</option>
+          <option value="classic" data-i18n="classicFrame">Classic · 4:3</option>
+        </select>
+      </label>
+      <label><input id="show-frame-guide" type="checkbox"> <span data-i18n="marginGuide">Margin guide</span></label>
+      <label><span data-i18n="guideInset">Guide inset</span> <input id="frame-margin" type="number" value="5" min="0" max="45" step="any">%</label>
+    </div>
+  </details>
   <label class="view-lens"><span data-i18n="viewLens">Lens</span> <input id="viewport-fov" type="number" min="1" max="170" step="any" value="50" data-i18n-title="viewLensTip">°</label>
   <span class="sep"></span>
   <label class="time"><span data-i18n="time">Time</span> <input id="time" type="range" min="0" max="24" step="0.1" value="17.5"> <span id="time-label">17.5 h</span></label>
@@ -34,7 +49,8 @@
 <main>
   <section id="left">
     <div class="panel" id="assets">
-      <h2><span data-i18n="assets">Assets</span><span><button id="new-scene" class="mini" data-i18n="newScene" data-i18n-title="newSceneTip">+ Scene</button><button id="new-look" class="mini" data-i18n="newLook" data-i18n-title="newLookFile">+ Look</button></span></h2>
+      <h2><span data-i18n="assets">Assets</span><span><button id="rescan-assets" class="mini" data-i18n="rescanAssets" data-i18n-title="rescanAssetsTip">Rescan</button><button id="new-scene" class="mini" data-i18n="newScene" data-i18n-title="newSceneTip">+ Scene</button><button id="new-look" class="mini" data-i18n="newLook" data-i18n-title="newLookFile">+ Look</button></span></h2>
+      <div id="asset-scan-report" aria-live="polite"></div>
       <div id="assets-list"></div>
     </div>
     <div class="panel" id="outliner">
@@ -50,9 +66,10 @@
       <div id="outliner-tree" tabindex="0"></div>
     </div>
   </section>
-  <section id="viewport" tabindex="0">
+  <div id="preview-frame"><section id="viewport" tabindex="0">
     <canvas id="overlay"></canvas>
-  </section>
+    <div id="frame-guide" hidden aria-hidden="true"></div>
+  </section></div>
   <section id="right" class="panel">
     <h2 data-i18n="inspector">Inspector</h2>
     <div id="inspector-body" tabindex="-1"></div>

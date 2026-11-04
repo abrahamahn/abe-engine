@@ -169,7 +169,17 @@ Plugins are project code, trusted like the game's own code. They never write fil
 
 ### Authoring a camera
 
-Orbit the viewport and set **Lens** to the desired vertical field of view. **+ Camera** in the Outliner saves that view as a named scene entity. To change an existing shot, select its camera and choose **Align camera to view**. The transform and lens undo together. **Look through** restores the saved view, including roll. A camera under a transformed parent keeps its local scale when aligned.
+Orbit the viewport and set **Lens** to the desired vertical field of view. **View guides** previews the viewport at `9:16`, `16:9`, or `4:3` with an optional margin inset without modifying the scene. **+ Camera** in the Outliner saves that view as a named scene entity. To change an existing shot, select its camera and choose **Align camera to view**; the transform and lens undo together. **Look through** follows the saved view, including roll and authored near plane, lens shift, and depth-of-field focus edited in the Inspector. A camera under a transformed parent keeps its local scale when aligned.
+
+### Rescanning project assets
+
+Use **Rescan** in Assets after adding or re-exporting files in the project's content folders.
+Move a model or Look together with its `.meta.json` file to keep its id. Every open editor
+receives the updated paths. If a file changes elsewhere while its document has unsaved edits,
+Studio keeps the draft and asks before replacing the disk version. If the source disappears
+or changes identity, Save is unavailable until it is restored and rescanned. **Download draft**
+exports a local copy. The report lists new, moved and missing assets and unresolved references
+in open scenes. A duplicate id leaves the previous asset list in use.
 
 ### Authoring a Look
 

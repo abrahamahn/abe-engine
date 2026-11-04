@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { cameraWorld, captureCamera, orbitBasis, orbitFromCamera } from '../cameras.js';
+import { cameraLens, cameraWorld, captureCamera, orbitBasis, orbitFromCamera } from '../cameras.js';
 import { fromTRS, IDENTITY, multiply, quatFromEuler } from '../math.js';
 
 function close(actual, expected) {
@@ -43,4 +43,14 @@ test('uses authored parents with their current transforms, and refuses collapsed
   assert.equal(orbitFromCamera(flat), null);
   assert.equal(captureCamera({}, flat), null);
   assert.equal(captureCamera({}, IDENTITY, { scale: [1, 0, 1] }), null);
+});
+
+test('capturing a lens copies its authored optics and retains unrelated camera properties', () => {
+  const focus = { enabled: true, distance: 3, depth: 4, blur: 0.01 };
+  const source = { fov: 53, near: 0.2, shift: [-0.3, 0.4], focus };
+  const result = cameraLens(source, { extension: 17, near: 0.05 });
+  assert.deepEqual(result, { extension: 17, ...source });
+  result.focus.distance = 8;
+  assert.equal(focus.distance, 3);
+  assert.deepEqual(cameraLens({ fov: 61 }, result), { extension: 17, fov: 61 });
 });

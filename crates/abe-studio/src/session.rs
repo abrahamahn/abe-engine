@@ -5,6 +5,7 @@
 //! | Client sends | Host answers |
 //! | --- | --- |
 //! | `hello {client}` | `welcome {project, schemas, assets}` |
+//! | `rescan` | all clients receive the updated assets, a scan report, and refreshed documents they watch; on a failed scan, the last valid index stays in use |
 //! | `open {doc}` | `doc {doc, rev, path, kind, root, dirty, undo, redo, issues}` (a document open with no unsaved edits is read again if its file changed on disk, and everyone watching it gets the new `doc`) |
 //! | `close {doc}` | nothing |
 //! | `edit {doc, rev, label, merge?, ops, req?}` | everyone watching: `ops {doc, rev, ops, label, by, req}`; on failure the sender gets `error {req, message}` (and `doc` when its revision was stale) |
@@ -21,6 +22,8 @@
 //! only `entities` and `name` may change; an edit that adds a validation problem (including
 //! the problems only expanding its prefabs shows, such as a parent cycle through what an
 //! instance shows) is refused.
+mod rescan;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -57,6 +60,8 @@ struct Open {
     /// The document as last read from or written to its file, to notice another tool (`abe`,
     /// git, a second host) changing the file meanwhile.
     on_disk: Value,
+    unavailable: Option<String>,
+    changed_on_disk: bool,
 }
 
 pub struct Studio {
@@ -266,6 +271,11 @@ impl Studio {
             ("kind", s(o.kind.name())),
             ("root", o.doc.root().clone()),
             ("dirty", Value::Bool(o.history.dirty())),
+            (
+                "unavailable",
+                o.unavailable.as_deref().map_or(Value::Null, s),
+            ),
+            ("changedOnDisk", Value::Bool(o.changed_on_disk)),
             ("undo", label(o.history.can_undo())),
             ("redo", label(o.history.can_redo())),
             (
@@ -328,7 +338,7 @@ impl Studio {
     fn open_prefabs(&self) -> BTreeMap<String, Value> {
         self.open
             .iter()
-            .filter(|(_, o)| o.kind == Kind::Prefab)
+            .filter(|(_, o)| o.kind == Kind::Prefab && o.unavailable.is_none())
             .map(|(k, o)| (k.clone(), o.doc.root().clone()))
             .collect()
     }
@@ -337,7 +347,7 @@ impl Studio {
     /// again when its file changed on disk (another tool edited it); returns whether it was.
     fn ensure_open(&mut self, id: &str) -> Result<bool, String> {
         if let Some(o) = self.open.get(id) {
-            if o.history.dirty() {
+            if o.history.dirty() || o.unavailable.is_some() {
                 return Ok(false);
             }
             self.inside(&o.path)?;
@@ -353,6 +363,7 @@ impl Studio {
             o.history = History::new(HISTORY_LIMIT);
             o.known_issues = known_issues;
             o.on_disk = disk;
+            o.changed_on_disk = false;
             return Ok(true);
         }
         let entry = self
@@ -378,6 +389,8 @@ impl Studio {
                 watchers: BTreeSet::new(),
                 known_issues,
                 on_disk: root,
+                unavailable: None,
+                changed_on_disk: false,
             },
         );
         Ok(false)
@@ -433,9 +446,11 @@ impl Studio {
                         ),
                         ("schemas", Value::Array(self.registry.sources().to_vec())),
                         ("assets", self.assets()),
+                        ("drafts", self.unavailable_drafts()),
                     ]),
                 )])
             }
+            "rescan" => Ok(self.rescan()),
             "open" => {
                 let id = Self::doc_id(msg)?.to_string();
                 let reread = self.ensure_open(&id)?;
@@ -526,15 +541,31 @@ impl Studio {
             "save" => {
                 let id = Self::doc_id(msg)?.to_string();
                 let o = self.open.get(&id).ok_or("open the document first")?;
+                if let Some(error) = &o.unavailable {
+                    return Err(error.clone());
+                }
                 let (path, kind, root) = (o.path.clone(), o.kind, o.doc.root().clone());
                 self.inside(&path)?;
+                if !self.project.root.join(&path).is_file() {
+                    return Err(format!("{path} is missing; rescan before saving"));
+                }
                 let force = msg.get("force") == Some(&Value::Bool(true));
                 // A file another tool changed since this host read or wrote it is not
                 // overwritten without being asked to (`force`).
-                let changed = match self.project.read_document(&id) {
-                    Ok(disk) => disk != o.on_disk,
-                    Err(_) => true,
-                };
+                let disk = self.project.read_document(&id);
+                if kind.self_identified()
+                    && disk
+                        .as_ref()
+                        .ok()
+                        .and_then(|d| d.get("id"))
+                        .and_then(|id| id.string().ok())
+                        != Some(&id)
+                {
+                    return Err(format!(
+                        "{path} no longer identifies this document; rescan before saving"
+                    ));
+                }
+                let changed = disk.as_ref().ok() != Some(&o.on_disk);
                 if changed && !force {
                     let mut e = error(
                         msg.get("req"),
@@ -559,6 +590,7 @@ impl Studio {
                 }
                 let o = self.open.get_mut(&id).expect("open");
                 o.on_disk = root;
+                o.changed_on_disk = false;
                 o.history.mark_saved();
                 let msg = obj(vec![
                     ("type", s("saved")),
@@ -822,6 +854,9 @@ impl Studio {
             vec![]
         };
         let o = &self.open[&id];
+        if let Some(error) = &self.open[&id].unavailable {
+            return Err(error.clone());
+        }
         let root = o.doc.root().clone();
         let rev = o.doc.revision();
         // Open prefabs are cooked as edited, others as saved.
@@ -1116,6 +1151,181 @@ mod tests {
             reopened.project.entry(&id).unwrap().path,
             "content/new.look.json"
         );
+    }
+
+    #[test]
+    fn rescanning_renamed_assets_keeps_edits_and_notifies_both_viewers() {
+        let (mut st, t) = studio("rescan-moved");
+        let a = st.connect("artist");
+        let b = st.connect("reviewer");
+        let old = "content/day.look.json";
+        let moved = "content/new-day.look.json";
+        let id = created_doc(&create(&mut st, a, "look", old));
+        let send = |st: &mut Studio, who, message: &str| {
+            st.handle(who, &msg(&message.replace("$id", &id)))
+        };
+        for who in [a, b] {
+            send(&mut st, who, r#"{"type":"open","doc":"$id"}"#);
+        }
+        send(
+            &mut st,
+            a,
+            r#"{"type":"edit","doc":"$id","rev":0,"label":"Exposure","ops":[{"set":["post","exposure"],"value":0.75}]}"#,
+        );
+        std::fs::rename(t.0.join(old), t.0.join(moved)).unwrap();
+        std::fs::rename(
+            t.0.join(format!("{old}.meta.json")),
+            t.0.join(format!("{moved}.meta.json")),
+        )
+        .unwrap();
+        let outside = msg(r#"{"about":"changed by artist"}"#);
+        abe_pipeline::project::write_json(&t.0.join(moved), &outside).unwrap();
+        std::fs::write(t.0.join("content/new.glb"), b"model").unwrap();
+        let out = send(&mut st, b, r#"{"type":"rescan"}"#);
+        assert_eq!(of_type(&out, "assets").len(), 2);
+        let report = &of_type(&out, "rescanned")[0].1;
+        assert_eq!(report.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(
+            report.get("moved").unwrap().array().unwrap()[0].get("id"),
+            Some(&s(&id))
+        );
+        assert!(st.project.find_path("content/new.glb").is_some());
+        let docs = of_type(&out, "doc");
+        assert_eq!(docs.len(), 2);
+        assert!(
+            docs.iter()
+                .all(|(_, doc)| doc.get("dirty") == Some(&Value::Bool(true))
+                    && doc.get("path") == Some(&s(moved)))
+        );
+        assert_eq!(docs[0].1.get("rev"), Some(&n(1)));
+        assert_eq!(docs[0].1.get("undo"), Some(&s("Exposure")));
+        assert_eq!(docs[0].1.get("changedOnDisk"), Some(&Value::Bool(true)));
+        let refused = send(&mut st, a, r#"{"type":"save","doc":"$id"}"#);
+        assert_eq!(
+            of_type(&refused, "error")[0].1.get("code"),
+            Some(&s(CHANGED_ON_DISK))
+        );
+        assert_eq!(
+            abe_pipeline::project::read_json(&t.0.join(moved)).unwrap(),
+            outside
+        );
+        send(&mut st, a, r#"{"type":"save","force":true,"doc":"$id"}"#);
+        assert!(!t.0.join(old).exists());
+        assert_eq!(
+            st.project
+                .read_document(&id)
+                .unwrap()
+                .get("post")
+                .unwrap()
+                .get("exposure"),
+            Some(&Value::Number(0.75))
+        );
+        send(&mut st, b, r#"{"type":"undo","doc":"$id"}"#);
+        assert_eq!(st.open[&id].doc.root(), &msg("{}"));
+        send(&mut st, b, r#"{"type":"redo","doc":"$id"}"#);
+        abe_pipeline::project::write_json(&t.0.join(moved), &outside).unwrap();
+        let refreshed = send(&mut st, a, r#"{"type":"rescan"}"#);
+        assert!(
+            of_type(&refreshed, "doc")
+                .iter()
+                .all(|(_, doc)| doc.get("root") == Some(&outside))
+        );
+    }
+
+    #[test]
+    fn rescan_keeps_an_orphan_draft_and_never_replaces_another_identity() {
+        let (mut st, t) = studio("rescan-orphan");
+        let a = st.connect("artist");
+        let path = "content/main.scene.json";
+        let id = created_doc(&create(&mut st, a, "scene", path));
+        let send =
+            |st: &mut Studio, message: &str| st.handle(a, &msg(&message.replace("$id", &id)));
+        send(&mut st, r#"{"type":"open","doc":"$id"}"#);
+        send(
+            &mut st,
+            r#"{"type":"edit","doc":"$id","rev":0,"ops":[{"set":["name"],"value":"Draft"}]}"#,
+        );
+        let original = st.project.read_document(&id).unwrap();
+        std::fs::remove_file(t.0.join(path)).unwrap();
+        assert!(
+            !of_type(
+                &send(&mut st, r#"{"type":"save","force":true,"doc":"$id"}"#),
+                "error"
+            )
+            .is_empty()
+        );
+        assert!(!t.0.join(path).exists());
+        let out = send(&mut st, r#"{"type":"rescan"}"#);
+        let doc = &of_type(&out, "doc")[0].1;
+        assert!(
+            doc.get("unavailable")
+                .unwrap()
+                .string()
+                .unwrap()
+                .contains("missing")
+        );
+        assert_eq!(doc.get("root").unwrap().get("name"), Some(&s("Draft")));
+        assert_eq!(
+            of_type(&out, "rescanned")[0]
+                .1
+                .get("drafts")
+                .unwrap()
+                .array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let replacement = scene::new_document(
+            scene::Kind::Scene,
+            "abcdef0123456789abcdef0123456789",
+            "Replacement",
+        );
+        abe_pipeline::project::write_json(&t.0.join(path), &replacement).unwrap();
+        send(&mut st, r#"{"type":"rescan"}"#);
+        let denied = send(&mut st, r#"{"type":"save","force":true,"doc":"$id"}"#);
+        assert!(!of_type(&denied, "error").is_empty());
+        assert_eq!(
+            abe_pipeline::project::read_json(&t.0.join(path)).unwrap(),
+            replacement
+        );
+        abe_pipeline::project::write_json(&t.0.join(path), &original).unwrap();
+        send(&mut st, r#"{"type":"rescan"}"#);
+        let restored = send(&mut st, r#"{"type":"save","doc":"$id"}"#);
+        assert_eq!(of_type(&restored, "saved").len(), 1);
+        assert_eq!(
+            st.project.read_document(&id).unwrap().get("name"),
+            Some(&s("Draft"))
+        );
+    }
+
+    #[test]
+    fn duplicate_rescan_keeps_the_previous_index_and_creates_no_sidecars() {
+        let (mut st, t) = studio("rescan-duplicate");
+        let a = st.connect("artist");
+        let b = st.connect("viewer");
+        let id = created_doc(&create(&mut st, a, "look", "content/style.look.json"));
+        let old = st.assets();
+        std::fs::write(t.0.join("content/00new.glb"), b"not registered").unwrap();
+        for suffix in ["", ".meta.json"] {
+            std::fs::copy(
+                t.0.join(format!("content/style.look.json{suffix}")),
+                t.0.join(format!("content/copy.look.json{suffix}")),
+            )
+            .unwrap();
+        }
+        let out = st.handle(b, &msg(r#"{"type":"rescan"}"#));
+        let reports = of_type(&out, "rescanned");
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].1.get("ok"), Some(&Value::Bool(false)));
+        assert!(
+            reports[0].1.get("problems").unwrap().array().unwrap()[0]
+                .string()
+                .unwrap()
+                .contains(&id)
+        );
+        assert!(of_type(&out, "assets").is_empty());
+        assert_eq!(st.assets(), old);
+        assert!(!t.0.join("content/00new.glb.meta.json").exists());
     }
 
     #[test]

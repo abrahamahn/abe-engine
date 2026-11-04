@@ -283,6 +283,10 @@ impl Project {
 
     /// Opens the project in `root` without scanning it.
     pub fn open(root: &Path) -> Result<Self, String> {
+        let real_root = root
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", root.display()))?;
+        within_project(&real_root, &root.join(MANIFEST))?;
         let manifest = Manifest::parse(&read_json(&root.join(MANIFEST))?)?;
         Ok(Self {
             root: root.to_path_buf(),
@@ -295,25 +299,30 @@ impl Project {
     /// one (with a fresh id); without, they are reported as unregistered.
     pub fn scan(&mut self, mut ids: Option<&mut Ids>) -> Result<ScanReport, String> {
         let mut report = ScanReport::default();
-        let mut files = vec![];
-        for folder in &self.manifest.content {
-            let dir = self.root.join(folder);
-            if dir.is_dir() {
-                walk(&dir, 0, &mut files)?;
-            }
-        }
-        // A folder listed twice, or inside another listed folder, lists its files twice.
-        files.sort();
-        files.dedup();
-        let mut by_id: BTreeMap<String, Entry> = BTreeMap::new();
+        let real_root = self
+            .root
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", self.root.display()))?;
+        let files = project_files(&self.root, &real_root, &self.manifest.content)?;
+        let mut by_id = BTreeMap::new();
+        let mut pending = Vec::new();
         for file in files {
             let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
+            let rel = slash_path(&self.root, &file).ok_or("a file outside the project")?;
             let Some(kind) = Kind::of_file(name) else {
+                if let Some(source) = rel.strip_suffix(".meta.json") {
+                    if Kind::of_file(source).is_some_and(|k| !k.self_identified())
+                        && !std::fs::symlink_metadata(self.root.join(source))
+                            .is_ok_and(|m| m.is_file())
+                    {
+                        report.problems.push(format!("{rel}: its source file {source} is missing; move a source and its sidecar together"));
+                    }
+                }
                 continue;
             };
-            let rel = slash_path(&self.root, &file).ok_or("a file outside the project")?;
+            within_project(&real_root, &file)?;
             let id = if kind.self_identified() {
                 match read_json(&file) {
                     Ok(v) => match v.get("id").and_then(|x| x.string().ok()) {
@@ -330,38 +339,60 @@ impl Project {
                 }
             } else {
                 let meta = sidecar_path(&file);
-                if meta.exists() {
-                    match read_json(&meta).and_then(|m| sidecar_id(&m, kind)) {
+                match std::fs::symlink_metadata(&meta) {
+                    Ok(_) => {
+                        within_project(&real_root, &meta)?;
+                        match read_json(&meta).and_then(|v| sidecar_id(&v, kind)) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                report.problems.push(format!("{rel}.meta.json: {e}"));
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        pending.push((file, rel, kind));
+                        continue;
+                    }
+                    Err(e) => return Err(format!("{}: {e}", meta.display())),
+                }
+            };
+            index_entry(&mut by_id, id, kind, rel)?;
+        }
+        // Detect all existing duplicates before assigning new identities. If another writer
+        // creates a sidecar during the scan, index its actual identity without replacing it.
+        for (file, rel, kind) in pending {
+            let Some(ids) = ids.as_deref_mut() else {
+                report.unregistered.push(rel);
+                continue;
+            };
+            let id = loop {
+                let id = ids.asset();
+                if !by_id.contains_key(&id) {
+                    break id;
+                }
+            };
+            within_project(&real_root, &file)?;
+            let meta = sidecar_path(&file);
+            let text = json::to_canonical(&new_sidecar(&id, kind))?;
+            let id = match abe_assets::create_asset(&meta, text.as_bytes()) {
+                Ok(()) => {
+                    report.created.push(rel.clone());
+                    id
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    within_project(&real_root, &meta)?;
+                    match read_json(&meta).and_then(|v| sidecar_id(&v, kind)) {
                         Ok(id) => id,
                         Err(e) => {
                             report.problems.push(format!("{rel}.meta.json: {e}"));
                             continue;
                         }
                     }
-                } else if let Some(ids) = ids.as_deref_mut() {
-                    let id = ids.asset();
-                    write_json(&meta, &new_sidecar(&id, kind))?;
-                    report.created.push(rel.clone());
-                    id
-                } else {
-                    report.unregistered.push(rel);
-                    continue;
                 }
+                Err(e) => return Err(format!("{}: {e}", meta.display())),
             };
-            if let Some(other) = by_id.get(&id) {
-                return Err(format!(
-                    "{} and {rel} have the same id {id}; give the copy a new id",
-                    other.path
-                ));
-            }
-            by_id.insert(
-                id.clone(),
-                Entry {
-                    id,
-                    kind,
-                    path: rel,
-                },
-            );
+            index_entry(&mut by_id, id, kind, rel)?;
         }
         self.by_id = by_id;
         Ok(report)
@@ -551,19 +582,16 @@ impl Project {
 
     /// The schema files the project declares (`*.schema.json` in its schema folders).
     pub fn schema_files(&self) -> Result<Vec<(String, Value)>, String> {
-        let mut files = vec![];
-        for folder in &self.manifest.schemas {
-            let dir = self.root.join(folder);
-            if dir.is_dir() {
-                walk(&dir, 0, &mut files)?;
-            }
-        }
-        files.sort();
-        files.dedup();
+        let real_root = self
+            .root
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", self.root.display()))?;
+        let files = project_files(&self.root, &real_root, &self.manifest.schemas)?;
         let mut out = vec![];
         for f in files {
             if f.to_str().is_some_and(|s| s.ends_with(".schema.json")) {
                 let rel = slash_path(&self.root, &f).unwrap_or_default();
+                within_project(&real_root, &f)?;
                 out.push((rel, read_json(&f)?));
             }
         }
@@ -599,6 +627,61 @@ fn sidecar_id(m: &Value, kind: Kind) -> Result<String, String> {
         .filter(|s| is_asset_id(s))
         .map(String::from)
         .ok_or_else(|| "no valid id".into())
+}
+
+fn within_project(real_root: &Path, path: &Path) -> Result<(), String> {
+    let actual = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !actual.starts_with(real_root) {
+        return Err(format!("{} leads outside the project", path.display()));
+    }
+    Ok(())
+}
+
+fn project_files(
+    root: &Path,
+    real_root: &Path,
+    folders: &[String],
+) -> Result<Vec<PathBuf>, String> {
+    let mut files = vec![];
+    for folder in folders {
+        let dir = root.join(folder);
+        match std::fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+            Ok(_) => within_project(real_root, &dir)?,
+        }
+        if dir.is_dir() {
+            walk(&dir, 0, &mut files)?;
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn index_entry(
+    entries: &mut BTreeMap<String, Entry>,
+    id: String,
+    kind: Kind,
+    rel: String,
+) -> Result<(), String> {
+    if let Some(other) = entries.get(&id) {
+        return Err(format!(
+            "{} and {rel} have the same id {id}; give the copy a new id",
+            other.path
+        ));
+    }
+    entries.insert(
+        id.clone(),
+        Entry {
+            id,
+            kind,
+            path: rel,
+        },
+    );
+    Ok(())
 }
 
 fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -790,6 +873,43 @@ pub(crate) mod tests {
         assert_eq!(
             name_of(&r.read_document(&b).unwrap()).as_deref(),
             Some("B2")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_never_registers_assets_through_an_outside_content_folder_or_sidecar() {
+        use std::os::unix::fs::symlink;
+        let root = TempDir::new("scan-root");
+        let outside = TempDir::new("scan-outside");
+        let mut ids = Ids::seeded(17);
+        let mut project = Project::create(&root.0, "Confined", &mut ids).unwrap();
+        let content = root.0.join("content");
+        std::fs::remove_dir_all(&content).unwrap();
+        std::fs::write(outside.0.join("foreign.glb"), b"outside").unwrap();
+        symlink(&outside.0, &content).unwrap();
+        assert!(
+            project
+                .scan(Some(&mut ids))
+                .unwrap_err()
+                .contains("outside")
+        );
+        assert!(!outside.0.join("foreign.glb.meta.json").exists());
+        std::fs::remove_file(&content).unwrap();
+        std::fs::create_dir(&content).unwrap();
+        std::fs::write(content.join("local.glb"), b"inside").unwrap();
+        let foreign = outside.0.join("foreign.json");
+        write_json(
+            &foreign,
+            &new_sidecar("abcdef0123456789abcdef0123456789", Kind::Model),
+        )
+        .unwrap();
+        symlink(&foreign, content.join("local.glb.meta.json")).unwrap();
+        assert!(
+            project
+                .scan(Some(&mut ids))
+                .unwrap_err()
+                .contains("outside")
         );
     }
 

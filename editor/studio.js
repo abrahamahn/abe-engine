@@ -5,7 +5,8 @@
 import { Host, applyOps } from './protocol.js';
 import { drawLookInspector } from './look-inspector.js';
 import * as M from './math.js';
-import { cameraWorld, captureCamera, orbitBasis, orbitFromCamera } from './cameras.js';
+import { setupViewportFrame } from './viewport-frame.js';
+import { cameraLens, cameraWorld, captureCamera, orbitBasis, orbitFromCamera } from './cameras.js';
 import { t, label, lang, setLang, translate } from './i18n.js';
 
 import { projectToolsPanel } from './project-tools.js';
@@ -28,6 +29,9 @@ const state = {
   project: null,
   kinds: {}, // component kind -> schema definition
   assets: [],
+  scanReport: null,
+  scanning: false,
+  drafts: [],
   doc: null, // {id, rev, path, kind, root, dirty, undo, redo, issues}
   selection: null,
   looks: new Map(), // Looks watched in this project; the scene stays open while editing its Look.
@@ -35,6 +39,7 @@ const state = {
   lookSection: 'shading',
   ids: [],
   mode: 'move',
+  cameraFollow: null,
   view: { target: [0, 1, 0], yaw: 0.7, pitch: 0.35, distance: 22, fov: 50 },
   time: 17.5,
   weather: 'clear',
@@ -163,7 +168,7 @@ function undoRedo(type) {
 /** Saves the open document after the edits made before it, the field being typed into too.
  * When another tool changed the file since it was opened, asks before overwriting it. */
 async function save(force = false, id = activeDocument()?.id) {
-  if (!id) return;
+  if (!id || documentById(id)?.unavailable) return;
   commitTyping();
   const answer = await queued((doc) => ({ type: 'save', doc: doc.id, ...(force ? { force: true } : {}) }),
     (m) => m.type === 'saved' && m.doc === id, id);
@@ -183,7 +188,8 @@ function commitTyping() {
 }
 
 function setField(id, kind, field, value, merge) {
-  return edit(`${t('vSet')} ${field}`, [{ set: ['entities', id, 'components', kind, field], value }], merge);
+  const path = Array.isArray(field) ? field : [field];
+  return edit(`${t('vSet')} ${path.join('.')}`, [{ set: ['entities', id, 'components', kind, ...path], value }], merge);
 }
 
 // ---- Messages from the host -------------------------------------------------------------------
@@ -196,6 +202,10 @@ function onMessage(msg) {
       for (const file of msg.schemas) Object.assign(state.kinds, file.components);
       state.assets = msg.assets;
       state.looks.clear();
+      state.drafts = msg.drafts || [];
+      state.scanning = false;
+      state.scanReport = null;
+      drawScanReport();
       $('#project-name').textContent = msg.project.name || 'Project';
       drawAssets();
       void loadProjectTools(msg.project, msg.toolCatalogs);
@@ -210,6 +220,13 @@ function onMessage(msg) {
       if (asset) document.querySelector(`#assets-list [data-id="${CSS.escape(asset.id)}"]`)?.scrollIntoView({ block: 'nearest' });
       break;
     }
+    case 'rescanned':
+      state.scanning = false;
+      state.scanReport = msg;
+      if (msg.ok) state.drafts = msg.drafts;
+      drawScanReport();
+      drawAssets();
+      break;
     case 'assets':
       state.assets = msg.assets;
       watchLook(state.inspectedLook);
@@ -217,6 +234,8 @@ function onMessage(msg) {
       break;
     case 'doc': {
       const doc = { id: msg.doc, rev: msg.rev, path: msg.path, kind: msg.kind, root: msg.root, dirty: msg.dirty, undo: msg.undo, redo: msg.redo, issues: msg.issues };
+      doc.unavailable = msg.unavailable;
+      doc.changedOnDisk = msg.changedOnDisk;
       for (const i of msg.issues) log(1, `${i.path}: ${i.message}`);
       if (doc.kind === 'look') {
         const before = state.looks.get(doc.id)?.root;
@@ -227,11 +246,13 @@ function onMessage(msg) {
         drawAssets();
         break;
       }
+      if (state.doc?.id !== doc.id) state.cameraFollow = null;
       state.doc = doc;
+      if (state.cameraFollow) lookThrough(state.cameraFollow);
       watchLook(lookAsset()?.look);
       if (state.selection && !entity(state.selection)) state.selection = null;
       drawAll();
-      requestCook(0);
+      if (!doc.unavailable) requestCook(0);
       break;
     }
     case 'ops': {
@@ -249,6 +270,7 @@ function onMessage(msg) {
       }
       if (state.selection && !entity(state.selection)) state.selection = null;
       followOps(msg.ops);
+      if (state.cameraFollow) lookThrough(state.cameraFollow);
       if (msg.ops.some(op => (op.set || op.remove).includes('environment'))) {
         watchLook(lookAsset()?.look);
         refreshLook(['time', 'weather']);
@@ -260,6 +282,7 @@ function onMessage(msg) {
       // A save of an older revision leaves later edits unsaved.
       if (documentById(msg.doc)?.rev === msg.rev) {
         documentById(msg.doc).dirty = false;
+        documentById(msg.doc).changedOnDisk = false;
         log(0, `saved ${msg.path}`);
         drawToolbar();
         drawAssets();
@@ -285,6 +308,11 @@ function onMessage(msg) {
     case 'select':
       break;
     case 'error':
+      if (msg.req === 'asset-rescan') {
+        state.scanning = false;
+        state.scanReport = {ok: false, problems: [msg.message]};
+        drawScanReport();
+      }
       if (typeof msg.req === 'string' && msg.req.startsWith('look-open:')) {
         const id = msg.req.slice('look-open:'.length);
         state.looks.set(id, { id, path: state.assets.find(a => a.id === id)?.path || id, error: msg.message });
@@ -335,6 +363,7 @@ function followOps(ops) {
 // ---- Viewport --------------------------------------------------------------------------------
 
 function requestCook(delay) {
+  if (state.doc?.unavailable) return;
   clearTimeout(state.cookTimer);
   state.cookTimer = setTimeout(() => {
     if (!state.doc) return;
@@ -354,7 +383,7 @@ function lookAsset() {
 // The scene and its Look have independent revisions and undo stacks. Watching rather than
 // fetching the Look also picks up edits from another open editor before they are saved.
 function watchLook(id, reopen = false) {
-  if (!id || !state.assets.some(a => a.id === id && a.kind === 'look')) return;
+  if (!id || ![...state.assets, ...state.drafts].some(a => a.id === id && a.kind === 'look')) return;
   if (state.looks.has(id) && (!reopen || state.looks.get(id) === null)) return;
   if (!state.looks.has(id)) state.looks.set(id, null);
   state.host.send({ type: 'open', doc: id, req: 'look-open:' + id });
@@ -469,7 +498,8 @@ async function loadWorld(cooked) {
   }
   if (!state.framed) {
     state.framed = true;
-    frameAll();
+    if (state.cameraFollow) lookThrough(state.cameraFollow);
+    else frameAll();
   }
 }
 
@@ -558,6 +588,7 @@ function boundsOf(id) {
 }
 
 function frameBounds(b) {
+  state.cameraFollow = null;
   if (!b) return;
   const c = [0, 1, 2].map((i) => (b[0][i] + b[1][i]) / 2);
   const size = Math.max(0.5, Math.hypot(b[1][0] - b[0][0], b[1][1] - b[0][1], b[1][2] - b[0][2]));
@@ -783,7 +814,10 @@ function renderLoop(t) {
   }
   if (state.engine) {
     try {
-      state.engine.setView({ eye: eye(), target: state.view.target, up: orbitBasis(state.view).up, fov: state.view.fov });
+      state.engine.fitCanvas(Math.min(window.devicePixelRatio || 1, 2));
+      const v = state.view;
+      state.engine.setView({ eye: eye(), target: v.target, up: orbitBasis(v).up, fov: v.fov,
+        near: v.near, shift: v.shift, focus: v.focus?.enabled ? v.focus : undefined });
       state.engine.setClock(state.time, t / 1000);
       state.engine.render();
     } catch (e) {
@@ -895,13 +929,14 @@ function viewportEvents() {
       orbit.x = e.clientX;
       orbit.y = e.clientY;
       const v = state.view;
+      if (dx || dy) state.cameraFollow = null;
       if (orbit.pan) {
         const k = v.distance * 0.0015;
         const { right, up } = orbitBasis(v);
         v.target = v.target.map((x, i) => x + k * (up[i] * dy - right[i] * dx));
       } else {
         v.yaw -= dx * 0.005;
-        v.pitch = Math.max(-1.5, Math.min(1.5, v.pitch + dy * 0.005));
+        v.pitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, v.pitch + dy * 0.005));
       }
       return;
     }
@@ -918,6 +953,7 @@ function viewportEvents() {
   });
   vp.addEventListener('wheel', (e) => {
     e.preventDefault();
+    state.cameraFollow = null;
     state.view.distance = Math.max(0.2, Math.min(5000, state.view.distance * Math.exp(e.deltaY * 0.001)));
   }, { passive: false });
 }
@@ -952,20 +988,51 @@ function drawAll() {
 
 function drawToolbar() {
   const d = activeDocument();
-  $('#doc-name').textContent = d ? `${d.path}${d.dirty ? ' •' : ''}` : t('noDocument');
+  const source = d?.unavailable ? t('sourceUnavailable') : d?.changedOnDisk ? t('sourceChanged') : '';
+  $('#doc-name').textContent = d ? `${d.path}${d.dirty ? ' •' : ''}${source ? ' · ' + source : ''}` : t('noDocument');
+  $('#doc-name').title = d?.unavailable || source;
+  $('#download-draft').hidden = !d?.unavailable || !d.dirty;
   $('#undo').disabled = !d?.undo;
   $('#undo').title = d?.undo ? t('undoX', d.undo) : t('nothingToUndo');
   $('#redo').disabled = !d?.redo;
   $('#redo').title = d?.redo ? t('redoX', d.redo) : t('nothingToRedo');
-  $('#save').disabled = !d || (!d.dirty && !document.activeElement?.dataset.typed);
+  $('#save').disabled = !d || !!d.unavailable || (!d.dirty && !document.activeElement?.dataset.typed);
   $('#bookmark-camera').disabled = !d?.root.entities;
   for (const m of ['move', 'rotate', 'scale']) $(`#mode-${m}`).classList.toggle('on', state.mode === m);
+}
+
+function drawScanReport() {
+  const box = $('#asset-scan-report');
+  box.replaceChildren();
+  $('#rescan-assets').disabled = state.scanning || !state.host?.open;
+  if (state.scanning) { box.textContent = t('scanWorking'); return; }
+  const report = state.scanReport;
+  if (!report) return;
+  const details = el('details', {open: report.problems.length > 0});
+  details.append(el('summary', {}, report.ok ? t('scanComplete', report.count) +
+    ` · +${report.added.length} / ↔${report.moved.length} / −${report.removed.length}` : t('scanFailed')));
+  for (const [label, items] of [
+    ['scanProblems', report.problems],
+    ['scanMoved', (report.moved || []).map(asset => asset.from + ' → ' + asset.to)],
+    ['scanAdded', report.added || []], ['scanRemoved', report.removed || []], ['scanIdentity', report.created || []],
+  ]) {
+    if (items.length) details.append(el('strong', {}, t(label)),
+      el('ul', {}, items.map(text => el('li', {}, text))));
+  }
+  box.append(details);
 }
 
 function drawAssets() {
   const list = $('#assets-list');
   const requested = new URLSearchParams(location.search).get('asset');
   list.replaceChildren();
+  if (state.drafts.length) {
+    list.append(el('div', {class: 'group'}, t('missingDrafts')));
+    for (const doc of state.drafts) {
+      list.append(el('div', {class: 'asset missing-draft', title: doc.path}, doc.path.split('/').pop(),
+        el('button', {type: 'button', class: 'mini', onclick: () => doc.kind === 'look' ? inspectLook(doc.id) : openDoc(doc.id)}, t('open'))));
+    }
+  }
   const kinds = ['scene', 'prefab', 'model', 'look', 'texture', 'material', 'sound'];
   for (const kind of kinds) {
     const items = state.assets.filter((a) => a.kind === kind).sort((a, b) => a.path.localeCompare(b.path));
@@ -1072,9 +1139,12 @@ async function duplicateSelection() {
 }
 
 function fieldWidget(id, kind, name, schema, stored) {
+  const path = Array.isArray(name) ? name : [name];
+  const key = path.join('.');
+  const leaf = path[path.length - 1];
   const def = schema.default;
   const value = stored === undefined ? def : stored;
-  const commit = (v, merge) => setField(id, kind, name, v, merge);
+  const commit = (v, merge) => setField(id, kind, path, v, merge);
   const ty = schema.type;
   const unit = schema.unit ? ` ${schema.unit}` : '';
   // An emptied or unreadable number commits nothing (it would read as 0): the field shows the
@@ -1133,14 +1203,39 @@ function fieldWidget(id, kind, name, schema, stored) {
       options.map((a) => el('option', { value: a.id, selected: a.id === value }, a.path.split('/').pop())));
   } else {
     input = el('input', { type: 'text', value: JSON.stringify(value ?? null), onchange: (e) => {
-      try { commit(JSON.parse(e.target.value)); } catch (err) { log(2, `${name}: ${err.message}`); }
+      try { commit(JSON.parse(e.target.value)); } catch (err) { log(2, `${key}: ${err.message}`); }
     } });
   }
   const reset = stored !== undefined
-    ? el('button', { class: 'mini', title: t('resetDefault'), onclick: () => edit(`${t('vReset')} ${name}`, [{ remove: ['entities', id, 'components', kind, name] }]) }, '↺')
+    ? el('button', { class: 'mini', title: t('resetDefault'), onclick: () => edit(`${t('vReset')} ${key}`, [{ remove: ['entities', id, 'components', kind, ...path] }]) }, '↺')
     : null;
-  return el('div', { class: `field${stored === undefined ? ' default' : ''}`, title: schema.doc || '', 'data-key': `${kind}.${name}` },
-    el('label', {}, `${label(schema, name)}${unit}`), input, reset);
+  return el('div', { class: `field${path.length > 1 ? ' subfield' : ''}${stored === undefined ? ' default' : ''}`, title: schema.doc || '', 'data-key': `${kind}.${key}` },
+    el('label', {}, `${label(schema, leaf)}${unit}`), input, reset);
+}
+
+function appendField(box, id, kind, path, f, stored) {
+  if (f.hidden) return;
+  if (f.type === 'object' && f.fields) {
+    const key = path.join('.');
+    const leaf = path[path.length - 1];
+    const obj = stored !== null && typeof stored === 'object' && !Array.isArray(stored) ? stored : undefined;
+    box.append(el('div', {
+      class: `field subfield-group${stored === undefined ? ' default' : ''}`,
+      title: f.doc || '',
+      'data-key': `${kind}.${key}#`,
+    },
+      el('label', {}, label(f, leaf)),
+      el('span'),
+      stored !== undefined
+        ? el('button', { class: 'mini', title: t('resetDefault'), onclick: () => edit(`${t('vReset')} ${key}`, [{ remove: ['entities', id, 'components', kind, ...path] }]) }, '↺')
+        : null,
+    ));
+    for (const [sub, sf] of Object.entries(f.fields).sort(([a], [b]) => a.localeCompare(b))) {
+      appendField(box, id, kind, [...path, sub], sf, obj?.[sub]);
+    }
+    return;
+  }
+  box.append(fieldWidget(id, kind, path, f, stored));
 }
 
 const CONTROLS = 'input, select, textarea, button';
@@ -1213,7 +1308,7 @@ function buildInspector(box, id) {
     }
     for (const [name, f] of Object.entries(schema.fields || {}).sort(([a], [b]) => a.localeCompare(b))) {
       if (f.hidden) continue;
-      box.append(fieldWidget(id, kind, name, f, stored[name]));
+      appendField(box, id, kind, [name], f, stored[name]);
       if (f.type === 'asset' && f.kind === 'look' && stored[name]) {
         const exists = state.assets.some(asset => asset.kind === 'look' && asset.id === stored[name]);
         box.append(el('button', {type: 'button', 'data-key': 'edit-look', disabled: !exists,
@@ -1241,9 +1336,12 @@ function buildInspector(box, id) {
 }
 
 function lookThrough(id) {
-  const view = orbitFromCamera(cameraWorld(entities(), id), entity(id).components.camera.fov);
-  if (!view) return log(1, t('cameraSingular'));
-  state.view = view;
+  const camera = entity(id)?.components?.camera;
+  if (!camera) { state.cameraFollow = null; return; }
+  const view = orbitFromCamera(cameraWorld(entities(), id), camera.fov);
+  if (!view) { state.cameraFollow = null; return log(1, t('cameraSingular')); }
+  state.cameraFollow = id;
+  state.view = { ...view, ...cameraLens(camera) };
   $('#viewport-fov').value = String(view.fov);
 }
 
@@ -1253,7 +1351,7 @@ function alignCamera(id) {
   if (!transform) return log(1, t('cameraSingular'));
   return edit(t('alignCamera'), [
     { set: ['entities', id, 'components', 'transform'], value: transform },
-    { set: ['entities', id, 'components', 'camera', 'fov'], value: state.view.fov },
+    { set: ['entities', id, 'components', 'camera'], value: cameraLens(state.view, e.components.camera) },
   ]);
 }
 
@@ -1263,7 +1361,7 @@ async function bookmarkCamera() {
   const name = prompt(t('cameraName'), t('camera'));
   if (!name?.trim()) return;
   const transform = captureCamera(state.view, M.IDENTITY);
-  const camera = { fov: state.view.fov };
+  const camera = cameraLens(state.view);
   const [id] = (await takeIds(1)) || [];
   if (!id || state.doc?.id !== doc.id || !transform) return;
   const value = { name: name.trim(), components: { transform, camera } };
@@ -1278,6 +1376,7 @@ async function bookmarkCamera() {
 const inScene = (node) => !!node && ($('#viewport').contains(node) || $('#outliner').contains(node));
 
 function commands() {
+  setupViewportFrame();
   $('#save').onclick = () => save();
   $('#undo').onclick = () => undoRedo('undo');
   $('#redo').onclick = () => undoRedo('redo');
@@ -1288,7 +1387,10 @@ function commands() {
   $('#bookmark-camera').onclick = bookmarkCamera;
   $('#viewport-fov').onchange = (event) => {
     const input = event.target;
-    if (input.value && input.validity.valid) state.view.fov = input.valueAsNumber;
+    if (input.value && input.validity.valid) {
+      state.cameraFollow = null;
+      state.view.fov = input.valueAsNumber;
+    }
     input.value = String(state.view.fov);
   };
   $('#delete-entity').onclick = deleteSelection;
@@ -1296,6 +1398,20 @@ function commands() {
   $('#frame').onclick = () => frameBounds(state.selection ? boundsOf(state.selection) : null);
   $('#recook').onclick = () => requestCook(0);
   $('#simulate').onclick = toggleSimulation;
+  $('#rescan-assets').onclick = () => {
+    if (!state.host.open || state.scanning) return;
+    state.scanning = true;
+    drawScanReport();
+    state.host.send({type: 'rescan', req: 'asset-rescan'});
+  };
+  $('#download-draft').onclick = () => {
+    const doc = activeDocument();
+    if (!doc?.unavailable || !doc.dirty) return;
+    const url = URL.createObjectURL(new Blob([JSON.stringify(doc.root, null, 2) + '\n'], {type: 'application/json'}));
+    const link = el('a', {href: url, download: 'recovered-' + doc.path.split('/').pop()});
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
   $('#new-look').onclick = () => {
     if (!state.project) return;
     const previous = state.assets.find(asset => asset.kind === 'look');
@@ -1357,6 +1473,7 @@ async function main() {
   $('#language').onclick = () => {
     setLang(lang() === 'ko' ? 'en' : 'ko');
     translate();
+    drawScanReport();
     drawSimulateButton();
     drawAll();
     drawAssets();
@@ -1371,6 +1488,8 @@ async function main() {
     $('#connection').textContent = t(s);
     $('#connection').className = s;
     if (s === 'disconnected') {
+      state.scanning = false;
+      drawScanReport();
       log(1, 'the studio host closed the connection; connecting again');
       state.onIds?.(); // whoever waits for ids gives up (see takeIds)
     }

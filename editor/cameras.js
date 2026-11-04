@@ -44,6 +44,17 @@ export function orbitFromCamera(world, fov = 50, distance = 5) {
   return { yaw, pitch, roll, target, distance, fov };
 }
 
+/** Camera fields shared by authored shots and the viewport. Copy only present overrides, so
+ * a camera with the standard lens still serializes without extra settings. */
+export function cameraLens(source, existing = {}) {
+  const camera = { ...existing, fov: source.fov ?? 50 };
+  for (const field of ['near', 'shift', 'focus']) {
+    if (source[field] === undefined) delete camera[field];
+    else camera[field] = structuredClone(source[field]);
+  }
+  return camera;
+}
+
 /** Write a view in parent space without changing scale or other authored transform properties.
  * Under scaled parents the camera direction and projected up still match the viewport. */
 export function captureCamera(view, parentWorld, existing = {}) {

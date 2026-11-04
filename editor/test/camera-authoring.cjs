@@ -37,6 +37,33 @@ module.exports = async function checkCameraAuthoring(page, check) {
     JSON.stringify(undone.pose) === JSON.stringify(saved.pose) && undone.fov === saved.fov);
   await page.locator('#redo').click();
   await waitRev(undone.rev);
+  await page.locator('[data-key="camera#look"]').click();
+  const nearInput = page.locator('#inspector-body [data-key="camera.near"] input');
+  let curRev = (await s()).rev;
+  await nearInput.fill('0.24');
+  await nearInput.press('Enter');
+  await waitRev(curRev);
+  curRev = (await s()).rev;
+  const shiftX = page.locator('#inspector-body [data-key="camera.shift"] input').first();
+  await shiftX.fill('-0.18');
+  await shiftX.press('Enter');
+  await waitRev(curRev);
+  curRev = (await s()).rev;
+  await page.locator('#inspector-body [data-key="camera.focus.enabled"] input').check();
+  await waitRev(curRev);
+  curRev = (await s()).rev;
+  const focusDist = page.locator('#inspector-body [data-key="camera.focus.distance"] input');
+  await focusDist.fill('2.7');
+  await focusDist.press('Enter');
+  await waitRev(curRev);
+  const liveOptics = await page.evaluate(() => ({
+    near: window.__studio.view.near,
+    shift: window.__studio.view.shift,
+    focus: window.__studio.view.focus,
+  }));
+  check('camera optical fields and focus subfields update the followed viewport live',
+    liveOptics.near === 0.24 && liveOptics.shift?.[0] === -0.18 &&
+    liveOptics.focus?.enabled === true && liveOptics.focus?.distance === 2.7, liveOptics);
   await page.locator('#save').click();
   await page.waitForFunction(() => !window.__studio.doc.dirty && !window.__studio.host.waiting);
   await page.reload();
@@ -44,7 +71,14 @@ module.exports = async function checkCameraAuthoring(page, check) {
   await page.evaluate(id => window.__studioView.select(id), saved.id);
   await page.locator('[data-key="camera#look"]').click();
   const reopened = await s();
+  const reopenedView = await page.evaluate(() => ({
+    fov: window.__studio.view.fov,
+    near: window.__studio.view.near,
+    shift: window.__studio.view.shift,
+    focus: window.__studio.view.focus,
+  }));
   check('a saved camera can be looked through after reopening the project',
     JSON.stringify(reopened.pose) === JSON.stringify(aligned.pose) &&
-    await page.evaluate(() => window.__studio.view.fov) === aligned.fov);
+    reopenedView.fov === aligned.fov && reopenedView.near === 0.24 &&
+    reopenedView.shift?.[0] === -0.18 && reopenedView.focus?.distance === 2.7);
 };

@@ -71,7 +71,7 @@ version requirements and plugin lists join it when they exist; unknown keys are 
 | Cooked or published file | SHA-256 of its bytes | its file name and the package manifest |
 
 Random ids mean two people adding things on separate branches never collide, and renaming or moving a file never
-breaks a reference. The editor creates a missing sidecar when it opens the project (M1 scans only at start-up) and
+breaks a reference. Move the source and its sidecar together. Studio creates missing sidecars when it opens the project or when an artist uses **Rescan** in Assets. It
 refuses to open a project in which two files share one id (a copied file), naming both; in M1 the copy's id is
 changed by hand (an offer to give it a new id is planned). A sidecar is small and committed beside its file:
 
