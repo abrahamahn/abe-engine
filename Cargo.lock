@@ -22,6 +22,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ganbate-audio"
+version = "0.2.0"
+dependencies = [
+ "ganbate-core",
+]
+
+[[package]]
 name = "ganbate-core"
 version = "0.2.0"
 
