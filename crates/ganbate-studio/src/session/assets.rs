@@ -386,6 +386,20 @@ impl Studio {
                         visit_material_references(&entry.id, &entry.path, &disk, "", &mut emit);
                     }
                 }
+                Kind::Data => {
+                    let root = if let Some(open) = self.open.get(&entry.id)
+                        && open.unavailable.is_none()
+                    {
+                        open.doc.root().clone()
+                    } else if self.inside(&entry.path).is_ok()
+                        && let Ok(disk) = self.project.read_document(&entry.id)
+                    {
+                        disk
+                    } else {
+                        continue;
+                    };
+                    visit_data_references(&self.registry, &entry.id, &entry.path, &root, &mut emit);
+                }
                 _ => {}
             }
         }
@@ -581,6 +595,26 @@ impl Studio {
                 self.project.write_document(&path, Kind::Material, &doc)?;
                 id
             }
+            Kind::Data => {
+                let mut doc = json::parse(&bytes).map_err(|e| format!("{path}: {e}"))?;
+                let id = self.prepare_imported_document(&mut doc, Kind::Data)?;
+                let issues = validate_data(&doc, &self.registry);
+                if let Some((at, message)) = issues.iter().next() {
+                    let prefix = if at.is_empty() {
+                        path.clone()
+                    } else {
+                        format!("{path} · {at}")
+                    };
+                    return Err(format!("{prefix}: {message}"));
+                }
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("{}: {e}", parent.display()))?;
+                }
+                self.inside(&path)?;
+                self.project.write_document(&path, Kind::Data, &doc)?;
+                id
+            }
             Kind::Look => {
                 let doc = json::parse(&bytes).map_err(|e| format!("{path}: {e}"))?;
                 validate_look(&doc).map_err(|e| format!("{path}: {e}"))?;
@@ -622,7 +656,7 @@ impl Studio {
         Ok(out)
     }
 
-    fn fresh_asset_id(&mut self) -> String {
+    pub(super) fn fresh_asset_id(&mut self) -> String {
         loop {
             let candidate = self.ids.asset();
             if self.project.entry(&candidate).is_none() {
@@ -959,6 +993,43 @@ fn visit_material_references(
             }
         }
         _ => {}
+    }
+}
+
+fn visit_data_references(
+    registry: &Registry,
+    doc_id: &str,
+    doc_path: &str,
+    root: &Value,
+    emit: &mut impl FnMut(AssetRef),
+) {
+    let Some(schema_name) = root.get("schema").and_then(|v| v.string().ok()) else {
+        return;
+    };
+    let Some(schema) = registry.get(schema_name) else {
+        return;
+    };
+    let Some(values) = root.get("values") else {
+        return;
+    };
+    let doc_name = root
+        .get("name")
+        .and_then(|v| v.string().ok())
+        .map(String::from);
+    for (field_name, field_def) in &schema.fields {
+        if let Some(value) = values.get(field_name) {
+            visit_field_refs(field_def, value, field_name, &mut |target, field| {
+                emit(AssetRef {
+                    target: target.to_string(),
+                    doc: Some(doc_id.to_string()),
+                    doc_path: doc_path.to_string(),
+                    doc_kind: "data",
+                    entity: None,
+                    entity_name: doc_name.clone(),
+                    field: field.to_string(),
+                });
+            });
+        }
     }
 }
 

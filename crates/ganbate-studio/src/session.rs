@@ -68,13 +68,48 @@ struct Open {
     changed_on_disk: bool,
 }
 
+struct CustomOpen {
+    kind: &'static str,
+    path: String,
+    doc: Document,
+    history: History,
+    watchers: BTreeSet<ClientId>,
+    on_disk: Value,
+    changed_on_disk: bool,
+}
+
+const CUSTOM_DOC_SUFFIXES: [(&str, &str); 4] = [
+    (".soundbank.json", "soundbank"),
+    (".character.json", "character"),
+    (".seq.json", "seq"),
+    (".vfx.json", "vfx"),
+];
+
+pub fn custom_kind_of_path(path: &str) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    CUSTOM_DOC_SUFFIXES
+        .iter()
+        .find_map(|(suf, kind)| lower.ends_with(suf).then_some(*kind))
+}
+
+pub fn custom_doc_id(rel_path: &str) -> String {
+    let digest = ganbate_core::digest::sha256(format!("custom:{rel_path}").as_bytes());
+    ganbate_core::digest::hex(&digest)[..ganbate_core::id::ASSET_ID_LEN].to_string()
+}
+
 pub struct Studio {
     pub project: Project,
     pub registry: Registry,
     ids: Ids,
     open: BTreeMap<String, Open>,
+    custom_open: BTreeMap<String, CustomOpen>,
     clients: BTreeMap<ClientId, String>,
     next_client: ClientId,
+    /// Live `@selection` reported per Studio client (`selection-sync`), plus the most recently active client.
+    selections: BTreeMap<ClientId, crate::ai::SelectionContext>,
+    active_client: Option<ClientId>,
+    /// Entities touched by the latest in-memory transaction per document (for `brick crystallize --from-tx`).
+    last_tx_entities: BTreeMap<String, Vec<String>>,
     /// Where cooked previews are written (inside the project's `.ganbate` folder).
     cache_rel: String,
     /// The project folder with every symlink resolved: whatever the host reads or writes in
@@ -145,6 +180,84 @@ fn validate_look(root: &Value) -> Result<(), String> {
     ganbate_engine::render::LookFile::from_value(root).map(|_| ())
 }
 
+/// Canonical empty `.data.json` document for a registered non-engine `schema`.
+pub fn new_data_document(id: &str, schema: &str, name: &str) -> Value {
+    Value::Object(BTreeMap::from([
+        ("ganbate".into(), Value::String("data".into())),
+        ("version".into(), Value::Number(1.0)),
+        ("id".into(), Value::String(id.into())),
+        ("schema".into(), Value::String(schema.into())),
+        ("name".into(), Value::String(name.into())),
+        ("values".into(), Value::Object(BTreeMap::new())),
+    ]))
+}
+
+/// Validates a `Kind::Data` (`*.data.json`) document header and its `values` against `registry`.
+pub fn validate_data(root: &Value, registry: &Registry) -> BTreeSet<(String, String)> {
+    let mut issues = BTreeSet::new();
+    let Value::Object(map) = root else {
+        issues.insert(("".into(), "a data document is an object".into()));
+        return issues;
+    };
+    for key in map.keys() {
+        if !matches!(
+            key.as_str(),
+            "ganbate" | "version" | "id" | "schema" | "name" | "values"
+        ) {
+            issues.insert((key.clone(), format!("unknown data document key {key:?}")));
+        }
+    }
+    if map.get("ganbate").and_then(|v| v.string().ok()) != Some("data") {
+        issues.insert(("ganbate".into(), "expected \"ganbate\": \"data\"".into()));
+    }
+    if map.get("version").and_then(|v| v.unsigned().ok()) != Some(1) {
+        issues.insert(("version".into(), "expected \"version\": 1".into()));
+    }
+    if !map
+        .get("id")
+        .and_then(|v| v.string().ok())
+        .is_some_and(is_asset_id)
+    {
+        issues.insert(("id".into(), "expected a 16-hex-digit asset id".into()));
+    }
+    if !map
+        .get("name")
+        .is_some_and(|v| matches!(v, Value::String(_)))
+    {
+        issues.insert(("name".into(), "expected a string".into()));
+    }
+    let valid_schema = match map.get("schema").and_then(|v| v.string().ok()) {
+        Some(s) if ganbate_scene::schema::valid_kind_name(s, false) => Some(s),
+        Some(s) => {
+            issues.insert(("schema".into(), format!("invalid data schema name {s:?}")));
+            None
+        }
+        None => {
+            issues.insert(("schema".into(), "expected a schema name".into()));
+            None
+        }
+    };
+    let values_obj = match map.get("values") {
+        Some(v @ Value::Object(_)) => Some(v),
+        _ => {
+            issues.insert(("values".into(), "expected an object".into()));
+            None
+        }
+    };
+    if let Some(schema) = valid_schema {
+        if registry.get(schema).is_some() {
+            if let Some(values) = values_obj {
+                for issue in registry.check_component(schema, values, "values") {
+                    issues.insert((issue.path, issue.message));
+                }
+            }
+        } else {
+            issues.insert(("schema".into(), format!("unknown schema {schema:?}")));
+        }
+    }
+    issues
+}
+
 /// Every problem of `root`, including what only expanding its prefabs shows (a parent cycle
 /// through what an instance shows, a missing or broken prefab).
 fn issue_set(
@@ -159,6 +272,12 @@ fn issue_set(
             .map(|error| ("look".into(), error))
             .into_iter()
             .collect();
+    }
+    if kind == Kind::Data {
+        return validate_data(root, registry);
+    }
+    if kind == Kind::Material {
+        return BTreeSet::new();
     }
     scene::check_with_prefabs(root, registry, load)
         .into_iter()
@@ -204,8 +323,12 @@ impl Studio {
             registry,
             ids,
             open: BTreeMap::new(),
+            custom_open: BTreeMap::new(),
             clients: BTreeMap::new(),
             next_client: 1,
+            selections: BTreeMap::new(),
+            active_client: None,
+            last_tx_entities: BTreeMap::new(),
             cache_rel: ".ganbate/cooked".into(),
             real_root,
             previews: BTreeMap::new(),
@@ -237,7 +360,14 @@ impl Studio {
 
     pub fn disconnect(&mut self, client: ClientId) {
         self.clients.remove(&client);
+        self.selections.remove(&client);
+        if self.active_client == Some(client) {
+            self.active_client = self.selections.keys().next_back().copied();
+        }
         for o in self.open.values_mut() {
+            o.watchers.remove(&client);
+        }
+        for o in self.custom_open.values_mut() {
             o.watchers.remove(&client);
         }
     }
@@ -246,20 +376,151 @@ impl Studio {
         self.project.root.join(&self.cache_rel)
     }
 
-    fn assets(&self) -> Value {
+    pub(super) fn game_workspaces(&self) -> Value {
         Value::Array(
             self.project
-                .entries()
-                .map(|e| {
-                    obj(vec![
-                        ("id", s(&e.id)),
-                        ("kind", s(e.kind.name())),
-                        ("path", s(&e.path)),
-                        ("bytes", n(self.asset_bytes(&e.path))),
-                    ])
-                })
+                .manifest
+                .editor
+                .iter()
+                .map(|dir| format!("{dir}/studio-game.json"))
+                .filter(|path| self.inside(path).is_ok() && self.project.root.join(path).is_file())
+                .map(|path| s(&path))
                 .collect(),
         )
+    }
+
+    /// Discovers custom workbench JSON documents (`*.soundbank.json`, `*.character.json`,
+    /// `*.seq.json`, `*.vfx.json`) under `manifest.content` and `manifest.editor`.
+    fn scan_custom_docs(&self) -> BTreeMap<String, (&'static str, String)> {
+        fn walk(
+            studio: &Studio,
+            dir: &Path,
+            rel_prefix: &str,
+            depth: usize,
+            out: &mut BTreeMap<String, (&'static str, String)>,
+        ) {
+            if depth > MAX_FOLDER_DEPTH {
+                return;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            let mut sorted: Vec<_> = entries.flatten().collect();
+            sorted.sort_by_key(|e| e.file_name());
+            for entry in sorted {
+                let fname = entry.file_name();
+                let Some(name) = fname.to_str() else {
+                    continue;
+                };
+                if name.starts_with('.') || name.ends_with(".meta.json") {
+                    continue;
+                }
+                let rel = format!("{rel_prefix}/{name}");
+                if studio.inside(&rel).is_err() {
+                    continue;
+                }
+                let full = entry.path();
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_dir() {
+                    walk(studio, &full, &rel, depth + 1, out);
+                } else if ft.is_file()
+                    && let Some(kind) = custom_kind_of_path(&rel)
+                {
+                    let id = custom_doc_id(&rel);
+                    if studio.project.entry(&id).is_none() {
+                        out.insert(id, (kind, rel));
+                    }
+                }
+            }
+        }
+
+        let mut out = BTreeMap::new();
+        for folder in self
+            .project
+            .manifest
+            .content
+            .iter()
+            .chain(self.project.manifest.editor.iter())
+        {
+            if self.inside(folder).is_ok() {
+                walk(self, &self.project.root.join(folder), folder, 0, &mut out);
+            }
+        }
+        out
+    }
+
+    fn assets(&self) -> Value {
+        let mut items: Vec<Value> = self
+            .project
+            .entries()
+            .map(|e| {
+                obj(vec![
+                    ("id", s(&e.id)),
+                    ("kind", s(e.kind.name())),
+                    ("path", s(&e.path)),
+                    ("bytes", n(self.asset_bytes(&e.path))),
+                ])
+            })
+            .collect();
+        for (id, (kind, rel)) in self.scan_custom_docs() {
+            items.push(obj(vec![
+                ("id", s(&id)),
+                ("kind", s(kind)),
+                ("path", s(&rel)),
+                ("bytes", n(self.asset_bytes(&rel))),
+            ]));
+        }
+        Value::Array(items)
+    }
+
+    fn custom_doc_message(&self, id: &str) -> Value {
+        let o = &self.custom_open[id];
+        let label = |l: Option<&str>| l.map_or(Value::Null, s);
+        obj(vec![
+            ("type", s("doc")),
+            ("doc", s(id)),
+            ("rev", n(o.doc.revision())),
+            ("path", s(&o.path)),
+            ("kind", s(o.kind)),
+            ("root", o.doc.root().clone()),
+            ("dirty", Value::Bool(o.history.dirty())),
+            ("unavailable", Value::Null),
+            ("changedOnDisk", Value::Bool(o.changed_on_disk)),
+            ("undo", label(o.history.can_undo())),
+            ("redo", label(o.history.can_redo())),
+            ("issues", Value::Array(Vec::new())),
+        ])
+    }
+
+    fn broadcast_custom_ops(
+        &self,
+        id: &str,
+        ops: &[Op],
+        label: &str,
+        by: ClientId,
+        req: Option<&Value>,
+    ) -> Outbox {
+        let o = &self.custom_open[id];
+        let label_or = |l: Option<&str>| l.map_or(Value::Null, s);
+        let mut m = vec![
+            ("type", s("ops")),
+            ("doc", s(id)),
+            ("rev", n(o.doc.revision())),
+            ("label", s(label)),
+            ("ops", Value::Array(ops.iter().map(op_to_json).collect())),
+            ("by", n(by)),
+            ("dirty", Value::Bool(o.history.dirty())),
+            ("undo", label_or(o.history.can_undo())),
+            ("redo", label_or(o.history.can_redo())),
+            ("issues", Value::Array(Vec::new())),
+        ];
+        if let Some(r) = req {
+            m.push(("req", r.clone()));
+        }
+        let msg = obj(m);
+        o.watchers.iter().map(|w| (*w, msg.clone())).collect()
     }
 
     fn doc_message(&self, id: &str) -> Value {
@@ -319,7 +580,7 @@ impl Studio {
             ("undo", label_or(o.history.can_undo())),
             ("redo", label_or(o.history.can_redo())),
         ];
-        if o.kind == Kind::Look {
+        if matches!(o.kind, Kind::Look | Kind::Data | Kind::Material) {
             m.push((
                 "issues",
                 Value::Array(
@@ -346,6 +607,57 @@ impl Studio {
             .filter(|(_, o)| o.kind == Kind::Prefab && o.unavailable.is_none())
             .map(|(k, o)| (k.clone(), o.doc.root().clone()))
             .collect()
+    }
+
+    fn read_custom_json(&self, rel: &str) -> Result<Value, String> {
+        self.inside(rel)?;
+        let bytes = ganbate_assets::read_asset(&self.project.root.join(rel))?;
+        json::parse(&bytes).map_err(|e| format!("{rel}: {e}"))
+    }
+
+    fn ensure_custom_open(&mut self, id: &str, hint_path: Option<&str>) -> Result<bool, String> {
+        if let Some(o) = self.custom_open.get(id) {
+            if o.history.dirty() {
+                return Ok(false);
+            }
+            let disk = self.read_custom_json(&o.path)?;
+            if disk == o.on_disk {
+                return Ok(false);
+            }
+            let o = self.custom_open.get_mut(id).expect("custom_open");
+            o.doc.reload(disk.clone())?;
+            o.history = History::new(HISTORY_LIMIT);
+            o.on_disk = disk;
+            o.changed_on_disk = false;
+            return Ok(true);
+        }
+        let scanned = self.scan_custom_docs();
+        let (kind, rel) = if let Some((k, p)) = scanned.get(id) {
+            (*k, p.clone())
+        } else if let Some(p) = hint_path
+            && let Some(k) = custom_kind_of_path(p)
+            && custom_doc_id(p) == id
+            && self.inside(p).is_ok()
+            && self.project.root.join(p).is_file()
+        {
+            (k, p.to_string())
+        } else {
+            return Err(format!("no asset {id}"));
+        };
+        let root = self.read_custom_json(&rel)?;
+        self.custom_open.insert(
+            id.to_string(),
+            CustomOpen {
+                kind,
+                path: rel,
+                doc: Document::new(root.clone())?,
+                history: History::new(HISTORY_LIMIT),
+                watchers: BTreeSet::new(),
+                on_disk: root,
+                changed_on_disk: false,
+            },
+        );
+        Ok(false)
     }
 
     /// Opens `id` if it is not open yet. A document already open with no unsaved edits is read
@@ -376,7 +688,10 @@ impl Studio {
             .entry(id)
             .ok_or_else(|| format!("no asset {id}"))?
             .clone();
-        if !matches!(entry.kind, Kind::Scene | Kind::Prefab | Kind::Look) {
+        if !matches!(
+            entry.kind,
+            Kind::Scene | Kind::Prefab | Kind::Look | Kind::Data | Kind::Material
+        ) {
             return Err(format!("{} is not an editable document", entry.path));
         }
         self.inside(&entry.path)?;
@@ -410,11 +725,112 @@ impl Studio {
         }
     }
 
-    fn doc_id(msg: &Value) -> Result<&str, String> {
-        msg.get("doc")
-            .and_then(|d| d.string().ok())
-            .filter(|d| is_asset_id(d))
-            .ok_or_else(|| "missing or invalid doc id".into())
+    fn resolve_doc_ref(&self, raw: &str) -> Result<(String, Option<String>), String> {
+        let trimmed = raw.trim();
+        if is_asset_id(trimmed) {
+            return Ok((trimmed.to_string(), None));
+        }
+        if let Some(entry) = self.project.find_path(trimmed) {
+            return Ok((entry.id.clone(), Some(entry.path.clone())));
+        }
+        if custom_kind_of_path(trimmed).is_some() {
+            return Ok((custom_doc_id(trimmed), Some(trimmed.to_string())));
+        }
+        Err("missing or invalid doc id".into())
+    }
+
+    fn doc_target(&self, msg: &Value) -> Result<(String, Option<String>), String> {
+        if let Some(d) = msg.get("doc").and_then(|v| v.string().ok())
+            && !d.trim().is_empty()
+        {
+            let mut res = self.resolve_doc_ref(d)?;
+            if res.1.is_none()
+                && let Some(p) = msg.get("path").and_then(|v| v.string().ok())
+                && !p.trim().is_empty()
+            {
+                res.1 = Some(p.to_string());
+            }
+            return Ok(res);
+        }
+        if let Some(p) = msg.get("path").and_then(|v| v.string().ok())
+            && !p.trim().is_empty()
+        {
+            return self.resolve_doc_ref(p);
+        }
+        Err("missing or invalid doc id".into())
+    }
+
+    fn resolve_active_or_explicit_doc(
+        &self,
+        msg: &Value,
+        client_hint: Option<ClientId>,
+    ) -> Result<String, String> {
+        if (msg
+            .get("doc")
+            .and_then(|v| v.string().ok())
+            .is_some_and(|s| !s.trim().is_empty()))
+            || (msg
+                .get("path")
+                .and_then(|v| v.string().ok())
+                .is_some_and(|s| !s.trim().is_empty()))
+        {
+            return self.doc_target(msg).map(|(id, _)| id);
+        }
+        if let Some(cid) = client_hint.or(self.active_client)
+            && let Some(sel) = self.selections.get(&cid)
+            && let Some(doc_ref) = &sel.doc
+            && let Ok((id, _)) = self.resolve_doc_ref(doc_ref)
+        {
+            return Ok(id);
+        }
+        if let Some((id, _)) = self
+            .open
+            .iter()
+            .find(|(_, o)| matches!(o.kind, Kind::Scene | Kind::Prefab) && o.unavailable.is_none())
+            .or_else(|| self.open.iter().find(|(_, o)| o.unavailable.is_none()))
+        {
+            return Ok(id.clone());
+        }
+        if let Some((id, _)) = self.custom_open.iter().next() {
+            return Ok(id.clone());
+        }
+        if let Some(startup) = &self.project.manifest.startup
+            && self.project.entry(startup).is_some()
+        {
+            return Ok(startup.clone());
+        }
+        let scenes: Vec<_> = self
+            .project
+            .entries()
+            .filter(|e| e.kind == Kind::Scene)
+            .collect();
+        if scenes.len() == 1 {
+            return Ok(scenes[0].id.clone());
+        }
+        Err("specify doc or open a document in Studio first".into())
+    }
+
+    fn active_selection_for(
+        &self,
+        client_hint: Option<ClientId>,
+    ) -> Option<&crate::ai::SelectionContext> {
+        client_hint
+            .and_then(|c| self.selections.get(&c))
+            .or_else(|| self.active_client.and_then(|c| self.selections.get(&c)))
+            .or_else(|| self.selections.values().next_back())
+    }
+
+    fn is_custom_target(&self, id: &str, hint_path: Option<&str>) -> bool {
+        if self.custom_open.contains_key(id) {
+            return true;
+        }
+        if self.project.entry(id).is_some() {
+            return false;
+        }
+        if hint_path.is_some_and(|p| custom_kind_of_path(p).is_some()) {
+            return true;
+        }
+        self.scan_custom_docs().contains_key(id)
     }
 
     fn dispatch(&mut self, from: ClientId, msg: &Value) -> Result<Outbox, String> {
@@ -449,6 +865,7 @@ impl Studio {
                                     .collect(),
                             ),
                         ),
+                        ("gameWorkspaces", self.game_workspaces()),
                         ("schemas", Value::Array(self.registry.sources().to_vec())),
                         ("assets", self.assets()),
                         ("drafts", self.unavailable_drafts()),
@@ -457,10 +874,33 @@ impl Studio {
             }
             "rescan" => Ok(self.rescan()),
             "open" => {
-                let id = Self::doc_id(msg)?.to_string();
+                let (id, hint_path) = self.doc_target(msg)?;
+                if self.is_custom_target(&id, hint_path.as_deref()) {
+                    let reread = self.ensure_custom_open(&id, hint_path.as_deref())?;
+                    self.custom_open
+                        .get_mut(&id)
+                        .expect("custom_open")
+                        .watchers
+                        .insert(from);
+                    let mut doc = self.custom_doc_message(&id);
+                    if let (Some(r), Value::Object(m)) = (msg.get("req"), &mut doc) {
+                        m.insert("req".into(), r.clone());
+                    }
+                    if reread {
+                        return Ok(self.custom_open[&id]
+                            .watchers
+                            .iter()
+                            .map(|w| (*w, doc.clone()))
+                            .collect());
+                    }
+                    return Ok(vec![(from, doc)]);
+                }
                 let reread = self.ensure_open(&id)?;
                 self.open.get_mut(&id).expect("open").watchers.insert(from);
-                let doc = self.doc_message(&id);
+                let mut doc = self.doc_message(&id);
+                if let (Some(r), Value::Object(m)) = (msg.get("req"), &mut doc) {
+                    m.insert("req".into(), r.clone());
+                }
                 if reread {
                     // Everyone watching it had the old text.
                     return Ok(self.open[&id]
@@ -472,8 +912,11 @@ impl Studio {
                 Ok(vec![(from, doc)])
             }
             "close" => {
-                let id = Self::doc_id(msg)?;
-                if let Some(o) = self.open.get_mut(id) {
+                let (id, _) = self.doc_target(msg)?;
+                if let Some(o) = self.open.get_mut(&id) {
+                    o.watchers.remove(&from);
+                }
+                if let Some(o) = self.custom_open.get_mut(&id) {
                     o.watchers.remove(&from);
                 }
                 Ok(vec![])
@@ -482,10 +925,19 @@ impl Studio {
             "delete" => {
                 // Entities are deleted through the expanded hierarchy (scene::delete), so what
                 // was added under the entities a prefab instance shows goes with the instance.
-                let id = Self::doc_id(msg)?.to_string();
+                let (id, _) = self.doc_target(msg)?;
+                if self.custom_open.contains_key(&id) {
+                    return Err("a custom workbench document has no scene entities".into());
+                }
                 let o = self.open.get(&id).ok_or("open the document first")?;
                 if o.kind == Kind::Look {
                     return Err("a Look has no entities".into());
+                }
+                if o.kind == Kind::Data {
+                    return Err("a data document has no entities".into());
+                }
+                if o.kind == Kind::Material {
+                    return Err("a material document has no entities".into());
                 }
                 let ids = msg
                     .get("ids")
@@ -514,7 +966,28 @@ impl Studio {
                 self.edit(from, &Value::Object(m))
             }
             "undo" | "redo" => {
-                let id = Self::doc_id(msg)?.to_string();
+                let (id, _) = self.doc_target(msg)?;
+                if let Some(o) = self.custom_open.get_mut(&id) {
+                    let before = o.doc.revision();
+                    let done = if ty == "undo" {
+                        o.history.undo(&mut o.doc)
+                    } else {
+                        o.history.redo(&mut o.doc)
+                    };
+                    let done = match done {
+                        Ok(done) => done,
+                        Err(e) => {
+                            o.doc.rollback(&[], before)?;
+                            return Err(e);
+                        }
+                    };
+                    return match done {
+                        Some((label, ops)) => {
+                            Ok(self.broadcast_custom_ops(&id, &ops, &label, from, msg.get("req")))
+                        }
+                        None => Ok(vec![]),
+                    };
+                }
                 let o = self.open.get_mut(&id).ok_or("open the document first")?;
                 let before = o.doc.revision();
                 let done = if ty == "undo" {
@@ -544,7 +1017,47 @@ impl Studio {
                 }
             }
             "save" => {
-                let id = Self::doc_id(msg)?.to_string();
+                let (id, _) = self.doc_target(msg)?;
+                if self.custom_open.contains_key(&id) {
+                    let (path, root, on_disk) = {
+                        let o = &self.custom_open[&id];
+                        (o.path.clone(), o.doc.root().clone(), o.on_disk.clone())
+                    };
+                    self.inside(&path)?;
+                    if !self.project.root.join(&path).is_file() {
+                        return Err(format!("{path} is missing; rescan before saving"));
+                    }
+                    let force = msg.get("force") == Some(&Value::Bool(true));
+                    let disk = self.read_custom_json(&path);
+                    let changed = disk.as_ref().ok() != Some(&on_disk);
+                    if changed && !force {
+                        let mut e = error(
+                            msg.get("req"),
+                            &format!(
+                                "{path} changed on disk since it was opened; save again with force to overwrite it, or reopen it"
+                            ),
+                        );
+                        if let Value::Object(m) = &mut e {
+                            m.insert("code".into(), s(CHANGED_ON_DISK));
+                            m.insert("doc".into(), s(&id));
+                        }
+                        return Ok(vec![(from, e)]);
+                    }
+                    ganbate_pipeline::project::write_json(&self.project.root.join(&path), &root)?;
+                    let o = self.custom_open.get_mut(&id).expect("custom_open");
+                    o.on_disk = root;
+                    o.changed_on_disk = false;
+                    o.history.mark_saved();
+                    let saved_msg = obj(vec![
+                        ("type", s("saved")),
+                        ("by", n(from)),
+                        ("req", msg.get("req").cloned().unwrap_or(Value::Null)),
+                        ("doc", s(&id)),
+                        ("rev", n(o.doc.revision())),
+                        ("path", s(&path)),
+                    ]);
+                    return Ok(o.watchers.iter().map(|w| (*w, saved_msg.clone())).collect());
+                }
                 let o = self.open.get(&id).ok_or("open the document first")?;
                 if let Some(error) = &o.unavailable {
                     return Err(error.clone());
@@ -620,18 +1133,109 @@ impl Studio {
                 )])
             }
             "create" => {
-                if msg.get("kind").and_then(|k| k.string().ok()) == Some("look") {
+                let kind_str = msg.get("kind").and_then(|k| k.string().ok());
+                if kind_str == Some("look") {
                     let path = self.new_path(msg, "look")?;
+                    if let Some(parent) = self.project.root.join(&path).parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("{}: {e}", parent.display()))?;
+                    }
                     self.inside(&format!("{path}.meta.json"))?;
                     let id = self.project.create_look(&path, &self.ids.asset())?;
-                    return Ok(self.created(from, &id, &path));
+                    return Ok(self.created_with_req(from, &id, &path, msg.get("req")));
                 }
-                let kind = match msg.get("kind").and_then(|k| k.string().ok()) {
+                if kind_str == Some("material") {
+                    let path = self.new_path(msg, "material")?;
+                    if let Some(parent) = self.project.root.join(&path).parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("{}: {e}", parent.display()))?;
+                    }
+                    self.inside(&path)?;
+                    let name = msg
+                        .get("name")
+                        .and_then(|v| v.string().ok())
+                        .unwrap_or("Untitled Material");
+                    let id = self.fresh_asset_id();
+                    let mut root_map = match msg.get("initial") {
+                        Some(Value::Object(m)) => m.clone(),
+                        _ => BTreeMap::new(),
+                    };
+                    root_map.insert("ganbate".into(), s("material"));
+                    root_map.insert("version".into(), Value::Number(1.0));
+                    root_map.insert("id".into(), s(&id));
+                    root_map
+                        .entry("name".to_string())
+                        .or_insert_with(|| s(name));
+                    let root = Value::Object(root_map);
+                    self.project.write_document(&path, Kind::Material, &root)?;
+                    return Ok(self.created_with_req(from, &id, &path, msg.get("req")));
+                }
+                if let Some(ck) =
+                    kind_str.filter(|k| matches!(*k, "soundbank" | "character" | "seq" | "vfx"))
+                {
+                    let path = self.new_custom_path(msg, ck)?;
+                    if let Some(parent) = self.project.root.join(&path).parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("{}: {e}", parent.display()))?;
+                    }
+                    self.inside(&path)?;
+                    let name = msg
+                        .get("name")
+                        .and_then(|v| v.string().ok())
+                        .unwrap_or("Untitled");
+                    let id = custom_doc_id(&path);
+                    let mut root_map = match msg.get("initial") {
+                        Some(Value::Object(m)) => m.clone(),
+                        _ => BTreeMap::new(),
+                    };
+                    root_map.insert("ganbate".into(), s(ck));
+                    root_map.insert("version".into(), Value::Number(1.0));
+                    root_map.insert("id".into(), s(&id));
+                    root_map
+                        .entry("name".to_string())
+                        .or_insert_with(|| s(name));
+                    ganbate_pipeline::project::write_json(
+                        &self.project.root.join(&path),
+                        &Value::Object(root_map),
+                    )?;
+                    return Ok(self.created_custom(from, ck, &id, &path, msg.get("req")));
+                }
+                if kind_str == Some("data") {
+                    let schema = msg
+                        .get("schema")
+                        .and_then(|v| v.string().ok())
+                        .ok_or("create data needs a schema")?;
+                    if !ganbate_scene::schema::valid_kind_name(schema, false) {
+                        return Err(format!("invalid data schema name {schema:?}"));
+                    }
+                    if self.registry.get(schema).is_none() {
+                        return Err(format!("unknown schema {schema:?}"));
+                    }
+                    let path = self.new_path(msg, "data")?;
+                    if let Some(parent) = self.project.root.join(&path).parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("{}: {e}", parent.display()))?;
+                    }
+                    self.inside(&path)?;
+                    let name = msg
+                        .get("name")
+                        .and_then(|v| v.string().ok())
+                        .unwrap_or("Untitled");
+                    let id = self.fresh_asset_id();
+                    let root = new_data_document(&id, schema, name);
+                    self.project.write_document(&path, Kind::Data, &root)?;
+                    return Ok(self.created_with_req(from, &id, &path, msg.get("req")));
+                }
+                let kind = match kind_str {
                     Some("scene") => scene::Kind::Scene,
                     Some("prefab") => scene::Kind::Prefab,
-                    _ => return Err("create a scene, prefab or Look".into()),
+                    _ => return Err("create a scene, prefab, Look or data document".into()),
                 };
                 let path = self.new_path(msg, kind.name())?;
+                if let Some(parent) = self.project.root.join(&path).parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("{}: {e}", parent.display()))?;
+                }
                 let name = msg
                     .get("name")
                     .and_then(|v| v.string().ok())
@@ -651,7 +1255,7 @@ impl Studio {
                     Kind::Prefab
                 };
                 self.project.write_document(&path, pk, &root)?;
-                Ok(self.created(from, &id, &path))
+                Ok(self.created_with_req(from, &id, &path, msg.get("req")))
             }
             "import" => {
                 let model = msg
@@ -676,20 +1280,179 @@ impl Studio {
                 let id = self.ids.asset();
                 let root = cook::scene_from_model(&nodes, model, &id, &name, &mut self.ids);
                 self.project.write_document(&path, Kind::Scene, &root)?;
-                Ok(self.created(from, &id, &path))
+                Ok(self.created_with_req(from, &id, &path, msg.get("req")))
             }
             "asset-usage" => self.asset_usage(from, msg),
             "asset-move" => self.asset_move(from, msg),
             "asset-import" => self.asset_import(from, msg),
             "cook" => self.cook(from, msg),
+            "selection-sync" => {
+                let sel = crate::ai::SelectionContext::from_message(msg);
+                self.selections.insert(from, sel);
+                self.active_client = Some(from);
+                if let Some(r) = msg.get("req") {
+                    Ok(vec![(
+                        from,
+                        obj(vec![("type", s("selection-synced")), ("req", r.clone())]),
+                    )])
+                } else {
+                    Ok(vec![])
+                }
+            }
+            "catalog-query" => {
+                let cat = crate::ai::catalog::build_catalog(&self.project, &self.registry, true)?;
+                let query = msg.get("query").and_then(|v| v.string().ok());
+                let kind = msg.get("kind").and_then(|v| v.string().ok());
+                let limit = msg
+                    .get("limit")
+                    .and_then(|v| v.unsigned().ok())
+                    .unwrap_or(64) as usize;
+                let items: Vec<Value> = cat
+                    .search(query, kind, limit)
+                    .into_iter()
+                    .map(crate::ai::catalog::CatalogItem::to_json)
+                    .collect();
+                let mut resp = vec![
+                    ("type", s("catalog-results")),
+                    ("items", Value::Array(items)),
+                    ("indexText", s(&cat.index_text())),
+                ];
+                if let Some(r) = msg.get("req") {
+                    resp.push(("req", r.clone()));
+                }
+                Ok(vec![(from, obj(resp))])
+            }
+            "catalog-inspect" => {
+                let reference = msg
+                    .get("ref")
+                    .and_then(|v| v.string().ok())
+                    .ok_or("catalog-inspect requires ref")?;
+                let cat = crate::ai::catalog::build_catalog(&self.project, &self.registry, false)?;
+                let item = crate::ai::catalog::inspect_item(&cat, &self.project, reference)?;
+                let mut resp = vec![("type", s("catalog-inspected")), ("item", item)];
+                if let Some(r) = msg.get("req") {
+                    resp.push(("req", r.clone()));
+                }
+                Ok(vec![(from, obj(resp))])
+            }
+            "gbs-apply" => {
+                let doc_id = self.resolve_active_or_explicit_doc(msg, Some(from))?;
+                let script = msg
+                    .get("script")
+                    .and_then(|v| v.string().ok())
+                    .ok_or("gbs-apply requires script")?;
+                let dry_run = msg.get("dryRun") == Some(&Value::Bool(true));
+                let mut outbox = Vec::new();
+                let payload = self.apply_gbs_internal(
+                    from,
+                    &doc_id,
+                    script,
+                    dry_run,
+                    msg.get("req"),
+                    &mut outbox,
+                )?;
+                let mut reply = match payload {
+                    Value::Object(m) => m,
+                    _ => BTreeMap::new(),
+                };
+                reply.insert("type".into(), s("gbs-applied"));
+                if let Some(r) = msg.get("req") {
+                    reply.insert("req".into(), r.clone());
+                }
+                outbox.push((from, Value::Object(reply)));
+                Ok(outbox)
+            }
+            "scene-verify" => {
+                let doc_id = self.resolve_active_or_explicit_doc(msg, Some(from))?;
+                let cam = msg
+                    .get("camera")
+                    .and_then(|v| v.string().ok())
+                    .map(String::from);
+                let width = msg
+                    .get("width")
+                    .and_then(|v| v.unsigned().ok())
+                    .unwrap_or(320) as u32;
+                let height = msg
+                    .get("height")
+                    .and_then(|v| v.unsigned().ok())
+                    .unwrap_or(180) as u32;
+                let want_sheet = msg.get("contactSheet") == Some(&Value::Bool(true));
+                let contact_path = msg
+                    .get("contactSheetPath")
+                    .and_then(|v| v.string().ok())
+                    .map(String::from);
+                let report = self.verify_doc_internal(
+                    &doc_id,
+                    Some(from),
+                    cam,
+                    width,
+                    height,
+                    want_sheet || contact_path.is_some(),
+                    contact_path.as_deref(),
+                )?;
+                let mut resp = vec![
+                    ("type", s("scene-verified")),
+                    ("doc", s(&doc_id)),
+                    ("report", report),
+                ];
+                if let Some(r) = msg.get("req") {
+                    resp.push(("req", r.clone()));
+                }
+                Ok(vec![(from, obj(resp))])
+            }
+            "brick-crystallize" => {
+                let doc_id = self.resolve_active_or_explicit_doc(msg, Some(from))?;
+                let brick_id = msg
+                    .get("id")
+                    .and_then(|v| v.string().ok())
+                    .ok_or("brick-crystallize requires id")?;
+                let from_tx = msg.get("fromTx") == Some(&Value::Bool(true));
+                let explicit_entities: Vec<String> = msg
+                    .get("entities")
+                    .and_then(|v| v.array().ok())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.string().ok().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let params: Vec<String> = msg
+                    .get("params")
+                    .and_then(|v| v.array().ok())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.string().ok().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let brick = self.crystallize_doc_internal(
+                    &doc_id,
+                    Some(from),
+                    brick_id,
+                    &explicit_entities,
+                    from_tx,
+                    &params,
+                )?;
+                let mut resp = vec![("type", s("brick-crystallized")), ("brick", brick)];
+                if let Some(r) = msg.get("req") {
+                    resp.push(("req", r.clone()));
+                }
+                Ok(vec![(from, obj(resp))])
+            }
             "preview" | "select" => {
-                let id = Self::doc_id(msg)?;
-                let o = self.open.get(id).ok_or("open the document first")?;
+                let (id, _) = self.doc_target(msg)?;
+                let watchers = if let Some(o) = self.open.get(&id) {
+                    &o.watchers
+                } else if let Some(o) = self.custom_open.get(&id) {
+                    &o.watchers
+                } else {
+                    return Err("open the document first".into());
+                };
                 let mut relayed = msg.clone();
                 if let Value::Object(m) = &mut relayed {
                     m.insert("by".into(), n(from));
                 }
-                Ok(o.watchers
+                Ok(watchers
                     .iter()
                     .filter(|w| **w != from)
                     .map(|w| (*w, relayed.clone()))
@@ -739,27 +1502,142 @@ impl Studio {
         Ok(path.to_string())
     }
 
-    fn created(&self, from: ClientId, id: &str, path: &str) -> Outbox {
-        let mut out = vec![(
-            from,
-            obj(vec![
-                ("type", s("created")),
-                (
-                    "kind",
-                    s(self.project.entry(id).expect("created asset").kind.name()),
-                ),
-                ("doc", s(id)),
-                ("path", s(path)),
-            ]),
-        )];
+    fn new_custom_path(&self, msg: &Value, kind: &str) -> Result<String, String> {
+        let path = msg
+            .get("path")
+            .and_then(|p| p.string().ok())
+            .ok_or("give the new document a path")?;
+        let suffix = format!(".{kind}.json");
+        if !path.ends_with(&suffix) {
+            return Err(format!("a {kind} file ends in {suffix}"));
+        }
+        if path
+            .split('/')
+            .any(|p| p.is_empty() || p.starts_with('.') || p.contains(['\\', ':', '\0']))
+        {
+            return Err(format!(
+                "{path:?} is not a plain path (names separated by /, none starting with a dot)"
+            ));
+        }
+        let Some(folder) = self
+            .project
+            .manifest
+            .content
+            .iter()
+            .chain(self.project.manifest.editor.iter())
+            .find(|c| path.starts_with(&format!("{c}/")))
+        else {
+            return Err("put new workbench documents in a content or editor folder".into());
+        };
+        let depth = path[folder.len() + 1..].matches('/').count();
+        if depth > MAX_FOLDER_DEPTH {
+            return Err(format!(
+                "{path} is {depth} folders deep in {folder}; a project keeps to {MAX_FOLDER_DEPTH}"
+            ));
+        }
+        if std::fs::symlink_metadata(self.project.root.join(path)).is_ok() {
+            return Err(format!("{path} already exists"));
+        }
+        self.inside(path)?;
+        Ok(path.to_string())
+    }
+
+    fn created_with_req(
+        &self,
+        from: ClientId,
+        id: &str,
+        path: &str,
+        req: Option<&Value>,
+    ) -> Outbox {
+        let mut pairs = vec![
+            ("type", s("created")),
+            (
+                "kind",
+                s(self.project.entry(id).expect("created asset").kind.name()),
+            ),
+            ("doc", s(id)),
+            ("path", s(path)),
+        ];
+        if let Some(r) = req {
+            pairs.push(("req", r.clone()));
+        }
+        let mut out = vec![(from, obj(pairs))];
+        let assets = obj(vec![("type", s("assets")), ("assets", self.assets())]);
+        out.extend(self.clients.keys().map(|c| (*c, assets.clone())));
+        out
+    }
+
+    fn created_custom(
+        &self,
+        from: ClientId,
+        kind: &str,
+        id: &str,
+        path: &str,
+        req: Option<&Value>,
+    ) -> Outbox {
+        let mut pairs = vec![
+            ("type", s("created")),
+            ("kind", s(kind)),
+            ("doc", s(id)),
+            ("path", s(path)),
+        ];
+        if let Some(r) = req {
+            pairs.push(("req", r.clone()));
+        }
+        let mut out = vec![(from, obj(pairs))];
         let assets = obj(vec![("type", s("assets")), ("assets", self.assets())]);
         out.extend(self.clients.keys().map(|c| (*c, assets.clone())));
         out
     }
 
     fn edit(&mut self, from: ClientId, msg: &Value) -> Result<Outbox, String> {
-        let id = Self::doc_id(msg)?.to_string();
+        let (id, _) = self.doc_target(msg)?;
         let req = msg.get("req");
+        if self.custom_open.contains_key(&id) {
+            let rev = msg.get("rev").and_then(|r| r.unsigned().ok());
+            if rev != Some(self.custom_open[&id].doc.revision()) {
+                return Ok(vec![
+                    (
+                        from,
+                        error(req, "the document changed; edit refused, here it is again"),
+                    ),
+                    (from, self.custom_doc_message(&id)),
+                ]);
+            }
+            let ops = msg
+                .get("ops")
+                .ok_or("an edit has ops")?
+                .array()?
+                .iter()
+                .map(op_from_json)
+                .collect::<Result<Vec<_>, _>>()?;
+            if ops.is_empty() {
+                return Err("an edit has at least one op".into());
+            }
+            for op in &ops {
+                if matches!(op.path()[0].as_str(), "id" | "ganbate" | "version") {
+                    return Err(format!("{:?} cannot be edited", op.path()[0]));
+                }
+            }
+            let label = msg
+                .get("label")
+                .and_then(|l| l.string().ok())
+                .unwrap_or("Edit");
+            let merge = msg.get("merge").and_then(|m| m.string().ok());
+            let o = self.custom_open.get_mut(&id).expect("custom_open");
+            let before = o.doc.revision();
+            let undo = match o.doc.apply_all(&ops) {
+                Ok(undo) => undo,
+                Err(e) => {
+                    o.doc.rollback(&[], before)?;
+                    return Err(e);
+                }
+            };
+            let applied = ops.clone();
+            o.history.record(label, merge, ops, undo);
+            return Ok(self.broadcast_custom_ops(&id, &applied, label, from, req));
+        }
+
         if !self.open.contains_key(&id) {
             return Err("open the document first".into());
         }
@@ -785,13 +1663,29 @@ impl Studio {
             return Err("an edit has at least one op".into());
         }
         for op in &ops {
-            if self.open[&id].kind != Kind::Look
-                && !matches!(op.path()[0].as_str(), "entities" | "name")
-            {
-                return Err(format!(
-                    "{:?} cannot be edited (only entities and name)",
-                    op.path()[0]
-                ));
+            match self.open[&id].kind {
+                Kind::Look => {}
+                Kind::Material => {
+                    if matches!(op.path()[0].as_str(), "id" | "ganbate" | "version") {
+                        return Err(format!("{:?} cannot be edited", op.path()[0]));
+                    }
+                }
+                Kind::Data => {
+                    if !matches!(op.path()[0].as_str(), "values" | "name") {
+                        return Err(format!(
+                            "{:?} cannot be edited (only values and name)",
+                            op.path()[0]
+                        ));
+                    }
+                }
+                _ => {
+                    if !matches!(op.path()[0].as_str(), "entities" | "name") {
+                        return Err(format!(
+                            "{:?} cannot be edited (only entities and name)",
+                            op.path()[0]
+                        ));
+                    }
+                }
             }
         }
         let label = msg
@@ -821,9 +1715,22 @@ impl Studio {
             o.doc.rollback(&undo, before)?;
             return Err(e);
         }
+        let mut touched = BTreeSet::new();
+        for op in &ops {
+            if let Op::Set { path, .. } = op
+                && path.len() >= 2
+                && path[0] == "entities"
+            {
+                touched.insert(path[1].clone());
+            }
+        }
         let applied = ops.clone();
         o.history.record(label, merge, ops, undo);
         o.known_issues = after;
+        if !touched.is_empty() {
+            self.last_tx_entities
+                .insert(id.clone(), touched.into_iter().collect());
+        }
         Ok(self.broadcast_ops(&id, &applied, label, from, req))
     }
 
@@ -842,13 +1749,22 @@ impl Studio {
     }
 
     fn cook(&mut self, from: ClientId, msg: &Value) -> Result<Outbox, String> {
-        let id = Self::doc_id(msg)?.to_string();
-        if self
-            .project
-            .entry(&id)
-            .is_some_and(|asset| asset.kind == Kind::Look)
-        {
-            return Err("cook a scene or prefab to preview a Look".into());
+        let (id, hint_path) = self.doc_target(msg)?;
+        if self.is_custom_target(&id, hint_path.as_deref()) {
+            return Err(
+                "a custom workbench document cannot be cooked; cook a scene or prefab".into(),
+            );
+        }
+        if let Some(asset) = self.project.entry(&id) {
+            if asset.kind == Kind::Look {
+                return Err("cook a scene or prefab to preview a Look".into());
+            }
+            if asset.kind == Kind::Data {
+                return Err("a data document cannot be cooked; cook a scene or prefab".into());
+            }
+            if asset.kind == Kind::Material {
+                return Err("a material document cannot be cooked; cook a scene or prefab".into());
+            }
         }
         // A document read again from disk goes to everyone watching it before the cook.
         let mut out: Outbox = if self.ensure_open(&id)? {
@@ -986,6 +1902,461 @@ impl Studio {
             ]),
         ));
         Ok(out)
+    }
+
+    fn apply_gbs_internal(
+        &mut self,
+        by: ClientId,
+        doc_id: &str,
+        script: &str,
+        dry_run: bool,
+        req: Option<&Value>,
+        outbox: &mut Outbox,
+    ) -> Result<Value, String> {
+        let reread = self.ensure_open(doc_id)?;
+        if reread {
+            let doc_msg = self.doc_message(doc_id);
+            outbox.extend(
+                self.open[doc_id]
+                    .watchers
+                    .iter()
+                    .map(|w| (*w, doc_msg.clone())),
+            );
+        }
+        let kind = self.open[doc_id].kind;
+        if !matches!(kind, Kind::Scene | Kind::Prefab | Kind::Look) {
+            return Err(format!(
+                ".gbs spatial scripts apply to scene, prefab, or Look documents (not {})",
+                kind.name()
+            ));
+        }
+        let root = self.open[doc_id].doc.root().clone();
+        let sel = self.active_selection_for((by != 0).then_some(by)).cloned();
+        let open_prefs = self.open_prefabs();
+        let outcome = {
+            let (project, real_root, registry) = (&self.project, &self.real_root, &self.registry);
+            let load = |a: &str| load_prefab(&open_prefs, project, real_root, a);
+            crate::ai::gbs::execute_gbs(
+                project,
+                registry,
+                &root,
+                script,
+                sel.as_ref(),
+                &load,
+                &mut self.ids,
+            )?
+        };
+        let spawned_json = outcome.spawned_json();
+        let outcome_label = outcome.label.clone();
+        let outcome_statements = outcome.statements;
+        let rev = if !dry_run {
+            let open_prefs = self.open_prefabs();
+            let (project, real_root, registry) = (&self.project, &self.real_root, &self.registry);
+            let load = |a: &str| load_prefab(&open_prefs, project, real_root, a);
+            let o = self.open.get_mut(doc_id).expect("open");
+            let before = o.doc.revision();
+            let undo = match o.doc.apply_all(&outcome.ops) {
+                Ok(u) => u,
+                Err(e) => {
+                    o.doc.rollback(&[], before)?;
+                    return Err(e);
+                }
+            };
+            let after = issue_set(o.kind, o.doc.root(), registry, &load);
+            let fresh: Vec<&(String, String)> = after.difference(&o.known_issues).collect();
+            if let Some((p, m)) = fresh.first() {
+                let err_str = format!("{p}: {m}");
+                o.doc.rollback(&undo, before)?;
+                return Err(err_str);
+            }
+            let applied = outcome.ops.clone();
+            o.history.record(&outcome_label, None, outcome.ops, undo);
+            o.known_issues = after;
+            let new_rev = o.doc.revision();
+            let mut touched: BTreeSet<String> =
+                outcome.spawned.iter().map(|(id, _)| id.clone()).collect();
+            for op in &applied {
+                if let Op::Set { path, .. } = op
+                    && path.len() >= 2
+                    && path[0] == "entities"
+                {
+                    touched.insert(path[1].clone());
+                }
+            }
+            if !touched.is_empty() {
+                self.last_tx_entities
+                    .insert(doc_id.to_string(), touched.into_iter().collect());
+            }
+            outbox.extend(self.broadcast_ops(doc_id, &applied, &outcome_label, by, req));
+            new_rev
+        } else {
+            self.open[doc_id].doc.revision()
+        };
+
+        Ok(obj(vec![
+            ("ok", Value::Bool(true)),
+            ("doc", s(doc_id)),
+            ("rev", n(rev)),
+            ("label", s(&outcome_label)),
+            ("statements", n(outcome_statements as u64)),
+            ("spawned", spawned_json),
+            ("dryRun", Value::Bool(dry_run)),
+        ]))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_doc_internal(
+        &mut self,
+        doc_id: &str,
+        client_hint: Option<ClientId>,
+        camera_ref: Option<String>,
+        width: u32,
+        height: u32,
+        render_sheet: bool,
+        contact_sheet_rel: Option<&str>,
+    ) -> Result<Value, String> {
+        let _ = self.ensure_open(doc_id)?;
+        let kind = self.open[doc_id].kind;
+        if !matches!(kind, Kind::Scene | Kind::Prefab) {
+            return Err("scene verification applies to scene or prefab documents".into());
+        }
+        let root = self.open[doc_id].doc.root().clone();
+        let sel = self.active_selection_for(client_hint).cloned();
+        let open_prefs = self.open_prefabs();
+        let opts = crate::ai::verify::VerifyOptions {
+            camera_ref,
+            width,
+            height,
+            render_contact_sheet: render_sheet || contact_sheet_rel.is_some(),
+            ..Default::default()
+        };
+        let report = {
+            let (project, real_root, registry) = (&self.project, &self.real_root, &self.registry);
+            let load = |a: &str| load_prefab(&open_prefs, project, real_root, a);
+            crate::ai::verify::verify_scene(project, registry, &root, sel.as_ref(), &load, &opts)?
+        };
+        let mut written_rel = None;
+        if let Some(rel) = contact_sheet_rel
+            && let Some(png) = &report.contact_sheet_png
+        {
+            self.inside(rel)?;
+            let full = self.project.root.join(rel);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("{}: {e}", parent.display()))?;
+            }
+            ganbate_assets::write_asset(&full, png).map_err(|e| format!("{rel}: {e}"))?;
+            written_rel = Some(rel);
+        }
+        let mut out = report.to_json(written_rel);
+        if render_sheet
+            && contact_sheet_rel.is_none()
+            && let (Some(png), Value::Object(m)) = (&report.contact_sheet_png, &mut out)
+        {
+            m.insert(
+                "contactSheetBase64".into(),
+                Value::String(ganbate_core::digest::base64(png)),
+            );
+        }
+        Ok(out)
+    }
+
+    fn crystallize_doc_internal(
+        &mut self,
+        doc_id: &str,
+        client_hint: Option<ClientId>,
+        brick_id: &str,
+        explicit_entities: &[String],
+        from_tx: bool,
+        params: &[String],
+    ) -> Result<Value, String> {
+        let _ = self.ensure_open(doc_id)?;
+        let kind = self.open[doc_id].kind;
+        if !matches!(kind, Kind::Scene | Kind::Prefab) {
+            return Err("brick crystallize requires a scene or prefab document".into());
+        }
+        let root = self.open[doc_id].doc.root().clone();
+        let seeds: Vec<String> = if !explicit_entities.is_empty() {
+            explicit_entities.to_vec()
+        } else if from_tx {
+            if let Some(in_mem) = self.last_tx_entities.get(doc_id)
+                && !in_mem.is_empty()
+            {
+                in_mem.clone()
+            } else {
+                crate::ai::catalog::entities_from_history_tx(&self.project.root, doc_id, None)?
+            }
+        } else if let Some(sel) = self.active_selection_for(client_hint)
+            && !sel.entity_ids.is_empty()
+        {
+            sel.entity_ids.clone()
+        } else {
+            Vec::new()
+        };
+        crate::ai::catalog::crystallize_brick(
+            &self.project,
+            &self.registry,
+            &root,
+            brick_id,
+            &seeds,
+            params,
+        )
+    }
+
+    /// Returns enriched live `@selection` details for MCP `studio_selection` and `ganbate://selection`.
+    pub fn mcp_selection_details(&self) -> Value {
+        let Some(sel) = self.active_selection_for(None) else {
+            return obj(vec![
+                ("ok", Value::Bool(true)),
+                ("active", Value::Bool(false)),
+                ("doc", Value::Null),
+                ("entityIds", Value::Array(Vec::new())),
+                ("entities", Value::Array(Vec::new())),
+            ]);
+        };
+        let mut base = match sel.to_json() {
+            Value::Object(m) => m,
+            _ => BTreeMap::new(),
+        };
+        base.insert("ok".into(), Value::Bool(true));
+        base.insert("active".into(), Value::Bool(true));
+        let mut resolved_entities = Vec::new();
+        if let Some(doc_ref) = &sel.doc
+            && let Ok((doc_id, _)) = self.resolve_doc_ref(doc_ref)
+            && let Some(o) = self.open.get(&doc_id)
+            && let Some(Value::Object(ents)) = o.doc.root().get("entities")
+        {
+            base.insert("docPath".into(), s(&o.path));
+            for eid in &sel.entity_ids {
+                if let Some(ent) = ents.get(eid) {
+                    resolved_entities.push(obj(vec![
+                        ("id", s(eid)),
+                        ("name", ent.get("name").cloned().unwrap_or_else(|| s(""))),
+                        (
+                            "components",
+                            ent.get("components")
+                                .cloned()
+                                .unwrap_or_else(|| obj(vec![])),
+                        ),
+                    ]));
+                }
+            }
+        }
+        base.insert("entities".into(), Value::Array(resolved_entities));
+        Value::Object(base)
+    }
+
+    /// Dispatches an MCP `tools/call` invocation against this `Studio` session (`M-AI.1`).
+    pub fn call_mcp_tool(
+        &mut self,
+        name: &str,
+        args: &Value,
+        outbox: &mut Outbox,
+    ) -> Result<Value, String> {
+        const MCP_CLIENT: ClientId = 0;
+        match name {
+            "studio_status" => {
+                let mut open_docs = Vec::new();
+                for (id, o) in &self.open {
+                    open_docs.push(obj(vec![
+                        ("id", s(id)),
+                        ("kind", s(o.kind.name())),
+                        ("path", s(&o.path)),
+                        ("rev", n(o.doc.revision())),
+                        ("dirty", Value::Bool(o.history.dirty())),
+                    ]));
+                }
+                for (id, o) in &self.custom_open {
+                    open_docs.push(obj(vec![
+                        ("id", s(id)),
+                        ("kind", s(o.kind)),
+                        ("path", s(&o.path)),
+                        ("rev", n(o.doc.revision())),
+                        ("dirty", Value::Bool(o.history.dirty())),
+                    ]));
+                }
+                Ok(obj(vec![
+                    ("ok", Value::Bool(true)),
+                    ("project", self.project.manifest.to_value()),
+                    ("openDocuments", Value::Array(open_docs)),
+                    ("connectedClients", n(self.clients.len() as u64)),
+                    ("selection", self.mcp_selection_details()),
+                ]))
+            }
+            "studio_selection" => Ok(self.mcp_selection_details()),
+            "catalog_search" => {
+                let cat = crate::ai::catalog::build_catalog(&self.project, &self.registry, true)?;
+                let query = args.get("query").and_then(|v| v.string().ok());
+                let kind = args.get("kind").and_then(|v| v.string().ok());
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.unsigned().ok())
+                    .unwrap_or(32) as usize;
+                let hits = cat.search(query, kind, limit);
+                let lines: Vec<Value> = hits.iter().map(|it| s(&it.signature)).collect();
+                let items: Vec<Value> = hits
+                    .into_iter()
+                    .map(crate::ai::catalog::CatalogItem::to_json)
+                    .collect();
+                Ok(obj(vec![
+                    ("ok", Value::Bool(true)),
+                    ("count", n(items.len() as u64)),
+                    ("signatures", Value::Array(lines)),
+                    ("items", Value::Array(items)),
+                ]))
+            }
+            "catalog_inspect" => {
+                let r = args
+                    .get("ref")
+                    .and_then(|v| v.string().ok())
+                    .ok_or("catalog_inspect requires ref")?;
+                let cat = crate::ai::catalog::build_catalog(&self.project, &self.registry, false)?;
+                crate::ai::catalog::inspect_item(&cat, &self.project, r)
+            }
+            "brick_crystallize" => {
+                let doc_id = self.resolve_active_or_explicit_doc(args, None)?;
+                let brick_id = args
+                    .get("id")
+                    .and_then(|v| v.string().ok())
+                    .ok_or("brick_crystallize requires id")?;
+                let from_tx = args.get("fromTx") == Some(&Value::Bool(true));
+                let ents: Vec<String> = args
+                    .get("entities")
+                    .and_then(|v| v.array().ok())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.string().ok().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let params: Vec<String> = args
+                    .get("params")
+                    .and_then(|v| v.array().ok())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.string().ok().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.crystallize_doc_internal(&doc_id, None, brick_id, &ents, from_tx, &params)
+            }
+            "scene_gbs" => {
+                let doc_id = self.resolve_active_or_explicit_doc(args, None)?;
+                let script = args
+                    .get("script")
+                    .and_then(|v| v.string().ok())
+                    .ok_or("scene_gbs requires script")?;
+                let dry_run = args.get("dryRun") == Some(&Value::Bool(true));
+                self.apply_gbs_internal(MCP_CLIENT, &doc_id, script, dry_run, None, outbox)
+            }
+            "scene_verify" => {
+                let doc_id = self.resolve_active_or_explicit_doc(args, None)?;
+                let cam = args
+                    .get("camera")
+                    .and_then(|v| v.string().ok())
+                    .map(String::from);
+                let sheet_path = args.get("contactSheetPath").and_then(|v| v.string().ok());
+                self.verify_doc_internal(
+                    &doc_id,
+                    None,
+                    cam,
+                    320,
+                    180,
+                    sheet_path.is_some(),
+                    sheet_path,
+                )
+            }
+            "doc_open" => {
+                let (id, hint_path) = self.doc_target(args)?;
+                if self.is_custom_target(&id, hint_path.as_deref()) {
+                    let _ = self.ensure_custom_open(&id, hint_path.as_deref())?;
+                    Ok(self.custom_doc_message(&id))
+                } else {
+                    let _ = self.ensure_open(&id)?;
+                    Ok(self.doc_message(&id))
+                }
+            }
+            "doc_edit" => {
+                let doc_id = self.resolve_active_or_explicit_doc(args, None)?;
+                let ops_val = args.get("ops").cloned().ok_or("doc_edit requires ops")?;
+                let label = args
+                    .get("label")
+                    .and_then(|v| v.string().ok())
+                    .unwrap_or("MCP Edit");
+                let cur_rev = if self.custom_open.contains_key(&doc_id) {
+                    self.custom_open[&doc_id].doc.revision()
+                } else {
+                    let _ = self.ensure_open(&doc_id)?;
+                    self.open[&doc_id].doc.revision()
+                };
+                let edit_msg = obj(vec![
+                    ("type", s("edit")),
+                    ("doc", s(&doc_id)),
+                    ("rev", n(cur_rev)),
+                    ("label", s(label)),
+                    ("ops", ops_val),
+                ]);
+                let sent = self.edit(MCP_CLIENT, &edit_msg)?;
+                outbox.extend(sent);
+                let new_rev = if let Some(o) = self.custom_open.get(&doc_id) {
+                    o.doc.revision()
+                } else {
+                    self.open[&doc_id].doc.revision()
+                };
+                Ok(obj(vec![
+                    ("ok", Value::Bool(true)),
+                    ("doc", s(&doc_id)),
+                    ("rev", n(new_rev)),
+                ]))
+            }
+            "doc_undo" | "doc_redo" => {
+                let doc_id = self.resolve_active_or_explicit_doc(args, None)?;
+                let ty = if name == "doc_undo" { "undo" } else { "redo" };
+                let sent =
+                    self.dispatch(MCP_CLIENT, &obj(vec![("type", s(ty)), ("doc", s(&doc_id))]))?;
+                let changed = !sent.is_empty();
+                outbox.extend(sent);
+                let rev = if let Some(o) = self.custom_open.get(&doc_id) {
+                    o.doc.revision()
+                } else if let Some(o) = self.open.get(&doc_id) {
+                    o.doc.revision()
+                } else {
+                    0
+                };
+                Ok(obj(vec![
+                    ("ok", Value::Bool(true)),
+                    ("doc", s(&doc_id)),
+                    ("changed", Value::Bool(changed)),
+                    ("rev", n(rev)),
+                ]))
+            }
+            "doc_save" => {
+                let doc_id = self.resolve_active_or_explicit_doc(args, None)?;
+                let force = args.get("force") == Some(&Value::Bool(true));
+                let sent = self.dispatch(
+                    MCP_CLIENT,
+                    &obj(vec![
+                        ("type", s("save")),
+                        ("doc", s(&doc_id)),
+                        ("force", Value::Bool(force)),
+                    ]),
+                )?;
+                outbox.extend(sent);
+                let (path, rev) = if let Some(o) = self.custom_open.get(&doc_id) {
+                    (o.path.clone(), o.doc.revision())
+                } else {
+                    let o = &self.open[&doc_id];
+                    (o.path.clone(), o.doc.revision())
+                };
+                Ok(obj(vec![
+                    ("ok", Value::Bool(true)),
+                    ("doc", s(&doc_id)),
+                    ("path", s(&path)),
+                    ("rev", n(rev)),
+                ]))
+            }
+            other => Err(format!("unknown MCP tool {other:?}")),
+        }
     }
 }
 
@@ -2015,5 +3386,480 @@ mod tests {
             reopened.project.entry(&tex_id).unwrap().path,
             "content/textures/albedo.png"
         );
+    }
+
+    #[test]
+    fn data_documents_validate_against_schemas_undo_save_track_usage_and_expose_game_workspaces() {
+        let (_, t) = studio("data-doc");
+        // Configure schemas and editor folders in manifest + studio-game.json + schema file.
+        let manifest_path = t.0.join(ganbate_pipeline::project::MANIFEST);
+        let mut manifest = ganbate_pipeline::project::read_json(&manifest_path).unwrap();
+        if let Value::Object(map) = &mut manifest {
+            map.insert("schemas".into(), Value::Array(vec![s("schemas")]));
+            map.insert("editor".into(), Value::Array(vec![s("editor")]));
+        }
+        ganbate_pipeline::project::write_json(&manifest_path, &manifest).unwrap();
+        std::fs::create_dir_all(t.0.join("schemas")).unwrap();
+        std::fs::create_dir_all(t.0.join("editor")).unwrap();
+        std::fs::write(
+            t.0.join("editor/studio-game.json"),
+            br#"{"version":1,"origin":"http://127.0.0.1:5173","entry":"/?studioPie=1"}"#,
+        )
+        .unwrap();
+        let schema_json = msg(r#"{
+              "ganbate": "schema",
+              "version": 1,
+              "components": {
+                "hud.anchors": {
+                  "label": "Observatory HUD",
+                  "editor": "layout-rig",
+                  "fields": {
+                    "opacity": { "type": "float", "min": 0, "max": 1, "default": 1 },
+                    "banner": { "type": "vec2", "unit": "norm", "default": [0.5, 0.1] },
+                    "cue_sound": { "type": "asset", "kind": "sound" },
+                    "cues": {
+                      "type": "array",
+                      "max": 4,
+                      "items": {
+                        "type": "object",
+                        "fields": {
+                          "delay": { "type": "float", "min": 0, "max": 10, "default": 0 },
+                          "clip": { "type": "asset", "kind": "sound" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }"#);
+        ganbate_pipeline::project::write_json(&t.0.join("schemas/hud.schema.json"), &schema_json)
+            .unwrap();
+
+        let (mut st, notes) = Studio::open(&t.0, Ids::seeded(41)).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        let a = st.connect("designer");
+        let b = st.connect("pie");
+
+        // Welcome advertises gameWorkspaces alongside schemas.
+        let hello = st.handle(a, &msg(r#"{"type":"hello","client":"designer"}"#));
+        let welcome = &of_type(&hello, "welcome")[0].1;
+        assert_eq!(
+            welcome.get("gameWorkspaces"),
+            Some(&Value::Array(vec![s("editor/studio-game.json")]))
+        );
+
+        // Creating with unknown or engine schema is refused.
+        assert!(
+            !of_type(
+                &st.handle(
+                    a,
+                    &msg(
+                        r#"{"type":"create","kind":"data","schema":"unknown.kind","path":"content/hud.data.json"}"#
+                    ),
+                ),
+                "error"
+            )
+            .is_empty()
+        );
+        assert!(
+            !of_type(
+                &st.handle(
+                    a,
+                    &msg(
+                        r#"{"type":"create","kind":"data","schema":"transform","path":"content/hud.data.json"}"#
+                    ),
+                ),
+                "error"
+            )
+            .is_empty()
+        );
+
+        // Create valid data document in nested subfolder.
+        let created = st.handle(
+            a,
+            &msg(
+                r#"{"type":"create","kind":"data","schema":"hud.anchors","path":"content/data/hud.data.json","name":"Observatory HUD"}"#,
+            ),
+        );
+        let created_msg = &of_type(&created, "created")[0].1;
+        assert_eq!(created_msg.get("kind"), Some(&s("data")));
+        let data_id = created_msg
+            .get("doc")
+            .unwrap()
+            .string()
+            .unwrap()
+            .to_string();
+        assert!(is_asset_id(&data_id));
+        assert!(!t.0.join("content/data/hud.data.json.meta.json").exists());
+
+        // Import a WAV sound asset to test asset-usage from Kind::Data.
+        let wav: Vec<u8> = [
+            b"RIFF".as_slice(),
+            &36u32.to_le_bytes(),
+            b"WAVEfmt ",
+            &16u32.to_le_bytes(),
+            &1u16.to_le_bytes(),
+            &1u16.to_le_bytes(),
+            &44100u32.to_le_bytes(),
+            &88200u32.to_le_bytes(),
+            &2u16.to_le_bytes(),
+            &16u16.to_le_bytes(),
+            b"data",
+            &0u32.to_le_bytes(),
+        ]
+        .concat();
+        let sound_import = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"asset-import","path":"content/audio/chime.wav","dataBase64":"{}"}}"#,
+                ganbate_core::digest::base64(&wav)
+            )),
+        );
+        let sound_id = of_type(&sound_import, "asset-imported")[0]
+            .1
+            .get("id")
+            .unwrap()
+            .string()
+            .unwrap()
+            .to_string();
+
+        // Open data doc from both watchers.
+        for who in [a, b] {
+            let opened = st.handle(
+                who,
+                &msg(&format!(r#"{{"type":"open","doc":"{data_id}"}}"#)),
+            );
+            let doc_msg = &of_type(&opened, "doc")[0].1;
+            assert_eq!(doc_msg.get("kind"), Some(&s("data")));
+            assert_eq!(doc_msg.get("issues"), Some(&Value::Array(vec![])));
+        }
+
+        // Valid edit updates values, broadcasts ops + issues, and tracks Undo/Redo.
+        let valid_edit = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"edit","doc":"{data_id}","rev":0,"label":"Tune HUD","ops":[
+                    {{"set":["values","opacity"],"value":0.8}},
+                    {{"set":["values","banner"],"value":[0.25,0.15]}},
+                    {{"set":["values","cue_sound"],"value":"{sound_id}"}},
+                    {{"set":["values","cues"],"value":[{{"delay":0.5,"clip":"{sound_id}"}}]}}
+                ]}}"#
+            )),
+        );
+        let ops_msgs = of_type(&valid_edit, "ops");
+        assert_eq!(ops_msgs.len(), 2);
+        assert_eq!(ops_msgs[0].1.get("issues"), Some(&Value::Array(vec![])));
+
+        assert_eq!(st.open[&data_id].doc.revision(), 4);
+
+        // Out-of-range, wrong-type, unknown-field, header edits, delete, and cook are refused with rollback.
+        for bad in [
+            format!(
+                r#"{{"type":"edit","doc":"{data_id}","rev":4,"ops":[{{"set":["values","opacity"],"value":2.5}}]}}"#
+            ),
+            format!(
+                r#"{{"type":"edit","doc":"{data_id}","rev":4,"ops":[{{"set":["values","banner"],"value":"bad"}}]}}"#
+            ),
+            format!(
+                r#"{{"type":"edit","doc":"{data_id}","rev":4,"ops":[{{"set":["values","unknown_key"],"value":1}}]}}"#
+            ),
+            format!(
+                r#"{{"type":"edit","doc":"{data_id}","rev":4,"ops":[{{"set":["schema"],"value":"other.kind"}}]}}"#
+            ),
+            format!(
+                r#"{{"type":"edit","doc":"{data_id}","rev":4,"ops":[{{"set":["id"],"value":"0123456789abcdef0123456789abcdef"}}]}}"#
+            ),
+            format!(r#"{{"type":"delete","doc":"{data_id}","ids":["0000000000000001"]}}"#),
+            format!(r#"{{"type":"cook","doc":"{data_id}"}}"#),
+        ] {
+            let reply = st.handle(a, &msg(&bad));
+            assert!(
+                !of_type(&reply, "error").is_empty(),
+                "expected error for {bad}"
+            );
+            assert!(
+                of_type(&reply, "doc").is_empty(),
+                "must not be stale-rev rejection: {bad}"
+            );
+        }
+        assert_eq!(st.open[&data_id].doc.revision(), 4);
+
+        // Asset usage counts both top-level and nested array asset references in Kind::Data.
+        let usage = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"asset-usage","id":"{sound_id}","req":"u-sound"}}"#
+            )),
+        );
+        let uses = of_type(&usage, "asset-usage")[0]
+            .1
+            .get("uses")
+            .unwrap()
+            .array()
+            .unwrap();
+        assert_eq!(uses.len(), 2);
+        assert_eq!(uses[0].get("doc"), Some(&s(&data_id)));
+        assert_eq!(uses[0].get("docKind"), Some(&s("data")));
+        assert_eq!(uses[0].get("entityName"), Some(&s("Observatory HUD")));
+
+        // Undo & Redo work cleanly.
+        st.handle(a, &msg(&format!(r#"{{"type":"undo","doc":"{data_id}"}}"#)));
+        assert_eq!(
+            st.open[&data_id].doc.root().get("values"),
+            Some(&Value::Object(BTreeMap::new()))
+        );
+        st.handle(a, &msg(&format!(r#"{{"type":"redo","doc":"{data_id}"}}"#)));
+        assert_eq!(
+            st.open[&data_id]
+                .doc
+                .root()
+                .get("values")
+                .unwrap()
+                .get("opacity"),
+            Some(&Value::Number(0.8))
+        );
+
+        // CHANGED_ON_DISK protection works on save, and force overwrites cleanly.
+        let mut external = st.project.read_document(&data_id).unwrap();
+        if let Value::Object(map) = &mut external {
+            map.insert("name".into(), s("External Edit"));
+        }
+        ganbate_pipeline::project::write_json(&t.0.join("content/data/hud.data.json"), &external)
+            .unwrap();
+        let refused = st.handle(a, &msg(&format!(r#"{{"type":"save","doc":"{data_id}"}}"#)));
+        assert_eq!(
+            of_type(&refused, "error")[0].1.get("code"),
+            Some(&s(CHANGED_ON_DISK))
+        );
+        let saved = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"save","force":true,"doc":"{data_id}"}}"#
+            )),
+        );
+        assert_eq!(of_type(&saved, "saved").len(), 2);
+
+        // asset-import and asset-move work for .data.json.
+        let imported_json =
+            json::to_canonical(&st.project.read_document(&data_id).unwrap()).unwrap();
+        let imported = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"asset-import","path":"content/data/hud_copy.data.json","dataBase64":"{}"}}"#,
+                ganbate_core::digest::base64(imported_json.as_bytes())
+            )),
+        );
+        let copy_id = of_type(&imported, "asset-imported")[0]
+            .1
+            .get("id")
+            .unwrap()
+            .string()
+            .unwrap()
+            .to_string();
+        assert_ne!(copy_id, data_id);
+        let moved = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"asset-move","id":"{data_id}","to":"content/data/observatory_hud.data.json"}}"#
+            )),
+        );
+        assert_eq!(of_type(&moved, "asset-moved").len(), 1);
+        assert!(t.0.join("content/data/observatory_hud.data.json").is_file());
+    }
+
+    #[test]
+    fn custom_workbench_documents_support_create_open_edit_undo_redo_save_and_rescan() {
+        let (mut st, t) = studio("custom-workbenches");
+        let a = st.connect("workbench-author");
+
+        // 1. Material (`Kind::Material`)
+        let created_mat = st.handle(
+            a,
+            &msg(
+                r#"{"type":"create","kind":"material","path":"content/materials/velvet.material.json","name":"Velvet","initial":{"roughness":0.82,"nodes":[]}}"#,
+            ),
+        );
+        let mat_id = of_type(&created_mat, "created")[0]
+            .1
+            .get("doc")
+            .unwrap()
+            .string()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            of_type(&created_mat, "created")[0].1.get("kind"),
+            Some(&s("material"))
+        );
+        let opened_mat = st.handle(a, &msg(&format!(r#"{{"type":"open","doc":"{mat_id}"}}"#)));
+        assert_eq!(opened_mat[0].1.get("kind"), Some(&s("material")));
+        let edited_mat = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"edit","doc":"{mat_id}","rev":0,"label":"Tune Roughness","ops":[{{"set":["roughness"],"value":0.35}}]}}"#
+            )),
+        );
+        assert_eq!(of_type(&edited_mat, "ops").len(), 1);
+        let saved_mat = st.handle(a, &msg(&format!(r#"{{"type":"save","doc":"{mat_id}"}}"#)));
+        assert_eq!(of_type(&saved_mat, "saved").len(), 1);
+        assert!(t.0.join("content/materials/velvet.material.json").is_file());
+
+        // 2. Custom JSON workbenches (`soundbank`, `character`, `seq`, `vfx`)
+        for (kind, rel) in [
+            ("soundbank", "content/audio/ambient.soundbank.json"),
+            ("character", "content/chars/hero.character.json"),
+            ("seq", "content/cinematics/intro.seq.json"),
+            ("vfx", "content/fx/sparks.vfx.json"),
+        ] {
+            let created = st.handle(
+                a,
+                &msg(&format!(
+                    r#"{{"type":"create","kind":"{kind}","path":"{rel}","name":"Sample {kind}","initial":{{"tracks":[]}}}}"#
+                )),
+            );
+            let cid = of_type(&created, "created")[0]
+                .1
+                .get("doc")
+                .unwrap()
+                .string()
+                .unwrap()
+                .to_string();
+            assert_eq!(cid, custom_doc_id(rel));
+            let opened = st.handle(a, &msg(&format!(r#"{{"type":"open","path":"{rel}"}}"#)));
+            assert_eq!(opened[0].1.get("kind"), Some(&s(kind)));
+            assert_eq!(opened[0].1.get("doc"), Some(&s(&cid)));
+
+            let edited = st.handle(
+                a,
+                &msg(&format!(
+                    r#"{{"type":"edit","doc":"{cid}","rev":0,"label":"Add Track","ops":[{{"set":["tracks"],"value":["main"]}}]}}"#
+                )),
+            );
+            assert_eq!(of_type(&edited, "ops").len(), 1);
+
+            // Rescan does not mark custom_open unavailable!
+            let _ = st.handle(a, &msg(r#"{"type":"rescan"}"#));
+            let undone = st.handle(a, &msg(&format!(r#"{{"type":"undo","doc":"{cid}"}}"#)));
+            assert_eq!(of_type(&undone, "ops").len(), 1);
+            let redone = st.handle(a, &msg(&format!(r#"{{"type":"redo","doc":"{cid}"}}"#)));
+            assert_eq!(of_type(&redone, "ops").len(), 1);
+            let saved = st.handle(a, &msg(&format!(r#"{{"type":"save","doc":"{cid}"}}"#)));
+            assert_eq!(of_type(&saved, "saved").len(), 1);
+            assert!(t.0.join(rel).is_file());
+        }
+    }
+
+    #[test]
+    fn ai_ide_gbs_verify_crystallize_and_mcp_roundtrip_under_100ms() {
+        let (mut st, t) = studio("ai-ide");
+        let a = st.connect("studio-viewport");
+
+        // Create and open a scene.
+        let created = st.handle(
+            a,
+            &msg(
+                r#"{"type":"create","kind":"scene","path":"content/harbor.scene.json","name":"Harbor"}"#,
+            ),
+        );
+        let scene_id = of_type(&created, "created")[0]
+            .1
+            .get("doc")
+            .unwrap()
+            .string()
+            .unwrap()
+            .to_string();
+        st.handle(a, &msg(&format!(r#"{{"type":"open","doc":"{scene_id}"}}"#)));
+
+        // Sync live @selection from Studio client.
+        let synced = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"selection-sync","doc":"{scene_id}","entities":[],"cursorWorld":[0,0,0],"workbench":"world","req":"sync1"}}"#
+            )),
+        );
+        assert_eq!(of_type(&synced, "selection-synced").len(), 1);
+
+        // Apply a .gbs relational spatial script (spawn table + snap lantern onto table + camera frame).
+        let script = [
+            r#"tx "Build Shrine Table""#,
+            r#"spawn pedestal empty name="Pedestal""#,
+            r#"attach @this collider shape="box" half_extents=[1.0, 0.5, 1.0]"#,
+            r#"place @this snap onto ground at [0, 0]"#,
+            r#"spawn lantern empty name="ShrineLantern""#,
+            r#"attach @this collider shape="box" half_extents=[0.2, 0.3, 0.2]"#,
+            r#"attach @this light intensity=4.0 range=8.0"#,
+            r#"place @this socket top_center on $pedestal"#,
+            r#"spawn hero_cam empty name="HeroCam""#,
+            r#"attach @this camera fov=50"#,
+            r#"cam frame $pedestal dist=4.5 elev=25 yaw=35 camera=$hero_cam"#,
+        ]
+        .join("\n");
+
+        let gbs_req = obj(vec![
+            ("type", s("gbs-apply")),
+            ("doc", s(&scene_id)),
+            ("script", s(&script)),
+            ("req", s("g1")),
+        ]);
+        let gbs_out = st.handle(a, &gbs_req);
+        assert_eq!(of_type(&gbs_out, "ops").len(), 1);
+        assert_eq!(of_type(&gbs_out, "gbs-applied").len(), 1);
+
+        // Run <100ms verify oracle with contactSheet PNG.
+        let ver_out = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"scene-verify","doc":"{scene_id}","contactSheet":true,"req":"v1"}}"#
+            )),
+        );
+        let ver_msg = &of_type(&ver_out, "scene-verified")[0].1;
+        let report = ver_msg.get("report").unwrap();
+        assert_eq!(report.get("passed"), Some(&Value::Bool(true)));
+        let elapsed = report.get("elapsedMs").unwrap().float().unwrap();
+        assert!(elapsed < 100.0, "verify took {elapsed}ms");
+        assert!(
+            report
+                .get("contactSheetBase64")
+                .and_then(|v| v.string().ok())
+                .is_some_and(|b| b.len() > 64)
+        );
+        // Neither pedestal nor lantern should trigger floating-prop because pedestal snapped onto ground and lantern snapped to pedestal's top_center!
+        let lints = report.get("spatialLints").unwrap().array().unwrap();
+        assert!(
+            !lints
+                .iter()
+                .any(|l| l.get("code") == Some(&s("floating-prop"))),
+            "unexpected spatial lints: {lints:?}"
+        );
+
+        // Crystallize the transaction into a parameterized Brick (`shrine_set`) and spawn 3 in a ring via MCP!
+        let cryst_out = st.handle(
+            a,
+            &msg(&format!(
+                r#"{{"type":"brick-crystallize","doc":"{scene_id}","id":"shrine_set","fromTx":true,"params":["glow=light.intensity"],"req":"c1"}}"#
+            )),
+        );
+        assert_eq!(of_type(&cryst_out, "brick-crystallized").len(), 1);
+        assert!(t.0.join(".ganbate/bricks/shrine_set.brick.json").is_file());
+        assert!(t.0.join(".ganbate/catalog.idx").is_file());
+
+        // Test MCP JSON-RPC 2.0 `tools/call` (`scene_gbs` + `doc_undo`) broadcasting to Studio watcher `a`!
+        let mcp_call = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"scene_gbs","arguments":{"script":"ring shrines brick:shrine_set count=3 radius=5.0 glow=6.5"}}}"#;
+        let (rpc_resp, mcp_outbox) = crate::ai::mcp::handle_rpc_bytes(&mut st, mcp_call);
+        let resp_val = rpc_resp.expect("json-rpc response");
+        assert_eq!(
+            resp_val.get("result").and_then(|r| r.get("isError")),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(of_type(&mcp_outbox, "ops").len(), 1);
+        assert_eq!(mcp_outbox[0].0, a);
+
+        // Undo via MCP `doc_undo` restores exact previous revision!
+        let rev_after_ring = st.open[&scene_id].doc.revision();
+        let (_, undo_outbox) = crate::ai::mcp::handle_rpc_bytes(
+            &mut st,
+            br#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"doc_undo","arguments":{}}}"#,
+        );
+        assert_eq!(of_type(&undo_outbox, "ops").len(), 1);
+        assert!(st.open[&scene_id].doc.revision() > rev_after_ring);
     }
 }

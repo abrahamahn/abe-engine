@@ -70,8 +70,11 @@ fn build_complex_world() -> (PhysicsWorld, BodyId, BodyId, BodyId, BodyId) {
             ..Default::default()
         })
         .unwrap();
-    w.add_collider(hf_body, &ColliderDesc::new(Shape::Heightfield(Arc::new(hf))))
-        .unwrap();
+    w.add_collider(
+        hf_body,
+        &ColliderDesc::new(Shape::Heightfield(Arc::new(hf))),
+    )
+    .unwrap();
 
     // 2. Convex hulls: sheared prism & octahedron.
     let prism_hull = Arc::new(

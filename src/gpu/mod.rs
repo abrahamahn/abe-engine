@@ -73,8 +73,8 @@
 )]
 mod encoder;
 mod types;
-pub(crate) use encoder::{Command, PassView, Span, TransferCmd};
 pub use encoder::Encoder;
+pub(crate) use encoder::{Command, PassView, Span, TransferCmd};
 pub use ganbate_shader as shader;
 pub use types::*;
 

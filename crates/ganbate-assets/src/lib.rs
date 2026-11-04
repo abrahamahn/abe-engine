@@ -5,8 +5,8 @@ pub mod glb;
 pub mod image;
 /// The JSON reader and writer now live in `ganbate-core`; this keeps `ganbate_assets::json` working.
 pub use ganbate_core::json;
-pub mod mip;
 pub mod mesh_opt;
+pub mod mip;
 pub mod model;
 pub mod png;
 pub mod zlib;

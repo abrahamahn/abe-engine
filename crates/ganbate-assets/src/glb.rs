@@ -127,13 +127,23 @@ impl Access<'_> {
             self.bytes
                 .chunks_exact(12)
                 .take(self.count)
-                .map(|b| Vec3(Self::read_f32(b, 0), Self::read_f32(b, 4), Self::read_f32(b, 8)))
+                .map(|b| {
+                    Vec3(
+                        Self::read_f32(b, 0),
+                        Self::read_f32(b, 4),
+                        Self::read_f32(b, 8),
+                    )
+                })
                 .collect()
         } else {
             (0..self.count)
                 .map(|i| {
                     let b = self.at(i);
-                    Vec3(Self::read_f32(b, 0), Self::read_f32(b, 4), Self::read_f32(b, 8))
+                    Vec3(
+                        Self::read_f32(b, 0),
+                        Self::read_f32(b, 4),
+                        Self::read_f32(b, 8),
+                    )
                 })
                 .collect()
         }
@@ -171,7 +181,10 @@ impl Access<'_> {
     }
     fn indices(&self) -> Vec<u32> {
         match (self.component, self.stride) {
-            (5121, 1) => self.bytes[..self.count].iter().map(|&b| u32::from(b)).collect(),
+            (5121, 1) => self.bytes[..self.count]
+                .iter()
+                .map(|&b| u32::from(b))
+                .collect(),
             (5121, _) => (0..self.count).map(|i| u32::from(self.at(i)[0])).collect(),
             (5123, 2) => self
                 .bytes

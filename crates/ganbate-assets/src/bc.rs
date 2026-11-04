@@ -22,7 +22,11 @@ fn rgb565_to_rgb8(c: u16) -> [u8; 3] {
     let r5 = ((c >> 11) & 0x1F) as u8;
     let g6 = ((c >> 5) & 0x3F) as u8;
     let b5 = (c & 0x1F) as u8;
-    [(r5 << 3) | (r5 >> 2), (g6 << 2) | (g6 >> 4), (b5 << 3) | (b5 >> 2)]
+    [
+        (r5 << 3) | (r5 >> 2),
+        (g6 << 2) | (g6 >> 4),
+        (b5 << 3) | (b5 >> 2),
+    ]
 }
 
 fn bc1_palette(c0: u16, c1: u16) -> [[u8; 4]; 4] {
@@ -55,7 +59,12 @@ fn bc1_palette(c0: u16, c1: u16) -> [[u8; 4]; 4] {
     }
 }
 
-fn eval_bc1_candidate(texels: &[[u8; 4]; 16], mut c0: u16, mut c1: u16, punchthrough: bool) -> (u32, [u8; 8]) {
+fn eval_bc1_candidate(
+    texels: &[[u8; 4]; 16],
+    mut c0: u16,
+    mut c1: u16,
+    punchthrough: bool,
+) -> (u32, [u8; 8]) {
     if punchthrough {
         if c0 > c1 {
             std::mem::swap(&mut c0, &mut c1);
@@ -151,8 +160,16 @@ pub fn encode_bc1_block(texels: &[[u8; 4]; 16]) -> [u8; 8] {
     }
 
     // Bounding-box candidate (with slight inset).
-    let span = [max_c[0] - min_c[0], max_c[1] - min_c[1], max_c[2] - min_c[2]];
-    let inset = [span[0] * (1.0 / 16.0), span[1] * (1.0 / 16.0), span[2] * (1.0 / 16.0)];
+    let span = [
+        max_c[0] - min_c[0],
+        max_c[1] - min_c[1],
+        max_c[2] - min_c[2],
+    ];
+    let inset = [
+        span[0] * (1.0 / 16.0),
+        span[1] * (1.0 / 16.0),
+        span[2] * (1.0 / 16.0),
+    ];
     let bb0 = rgb565_from_rgb8(
         (min_c[0] + inset[0]).clamp(0.0, 255.0).round() as u8,
         (min_c[1] + inset[1]).clamp(0.0, 255.0).round() as u8,
@@ -219,8 +236,16 @@ pub fn encode_bc1_block(texels: &[[u8; 4]; 16]) -> [u8; 8] {
                 (mean[1] + axis[1] * max_t).clamp(0.0, 255.0),
                 (mean[2] + axis[2] * max_t).clamp(0.0, 255.0),
             ];
-            let p0 = rgb565_from_rgb8(e0[0].round() as u8, e0[1].round() as u8, e0[2].round() as u8);
-            let p1 = rgb565_from_rgb8(e1[0].round() as u8, e1[1].round() as u8, e1[2].round() as u8);
+            let p0 = rgb565_from_rgb8(
+                e0[0].round() as u8,
+                e0[1].round() as u8,
+                e0[2].round() as u8,
+            );
+            let p1 = rgb565_from_rgb8(
+                e1[0].round() as u8,
+                e1[1].round() as u8,
+                e1[2].round() as u8,
+            );
             let cand_pca = eval_bc1_candidate(texels, p0, p1, punchthrough);
             if cand_pca.0 < best.0 {
                 best = cand_pca;
@@ -353,7 +378,13 @@ fn eval_bc7_mode6_pbits(
     (total_err, e0, e1, indices)
 }
 
-fn pack_bc7_mode6(mut e0: [u8; 4], mut e1: [u8; 4], mut p0: u8, mut p1: u8, mut indices: [u8; 16]) -> [u8; 16] {
+fn pack_bc7_mode6(
+    mut e0: [u8; 4],
+    mut e1: [u8; 4],
+    mut p0: u8,
+    mut p1: u8,
+    mut indices: [u8; 16],
+) -> [u8; 16] {
     if indices[0] >= 8 {
         std::mem::swap(&mut e0, &mut e1);
         std::mem::swap(&mut p0, &mut p1);
@@ -462,16 +493,21 @@ pub fn encode_bc7_block(texels: &[[u8; 4]; 16]) -> [u8; 16] {
     for _ in 0..6 {
         let mut next = [0f32; 4];
         for r in 0..4 {
-            next[r] = cov[r][0] * axis[0] + cov[r][1] * axis[1] + cov[r][2] * axis[2] + cov[r][3] * axis[3];
+            next[r] = cov[r][0] * axis[0]
+                + cov[r][1] * axis[1]
+                + cov[r][2] * axis[2]
+                + cov[r][3] * axis[3];
         }
-        let len = (next[0] * next[0] + next[1] * next[1] + next[2] * next[2] + next[3] * next[3]).sqrt();
+        let len =
+            (next[0] * next[0] + next[1] * next[1] + next[2] * next[2] + next[3] * next[3]).sqrt();
         if len <= 1e-6 {
             break;
         }
         axis = [next[0] / len, next[1] / len, next[2] / len, next[3] / len];
     }
 
-    let axis_len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2] + axis[3] * axis[3]).sqrt();
+    let axis_len =
+        (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2] + axis[3] * axis[3]).sqrt();
     let (mut f0, mut f1) = if axis_len > 1e-6 {
         let dir = [
             axis[0] / axis_len,
@@ -569,8 +605,18 @@ pub fn decode_bc7_block(block: &[u8; 16]) -> Result<[[u8; 4]; 16], String> {
     let p0 = ((bits >> 63) & 1) as u8;
     let p1 = ((bits >> 64) & 1) as u8;
 
-    let e0 = [(r0 << 1) | p0, (g0 << 1) | p0, (b0 << 1) | p0, (a0 << 1) | p0];
-    let e1 = [(r1 << 1) | p1, (g1 << 1) | p1, (b1 << 1) | p1, (a1 << 1) | p1];
+    let e0 = [
+        (r0 << 1) | p0,
+        (g0 << 1) | p0,
+        (b0 << 1) | p0,
+        (a0 << 1) | p0,
+    ];
+    let e1 = [
+        (r1 << 1) | p1,
+        (g1 << 1) | p1,
+        (b1 << 1) | p1,
+        (a1 << 1) | p1,
+    ];
 
     let mut out = [[0u8; 4]; 16];
     for (i, dst) in out.iter_mut().enumerate() {
@@ -649,7 +695,11 @@ pub fn encode_astc4x4_block(texels: &[[u8; 4]; 16]) -> [u8; 16] {
             f32::from(t[0]) - mean[0],
             f32::from(t[1]) - mean[1],
             f32::from(t[2]) - mean[2],
-            if opaque { 0.0 } else { f32::from(t[3]) - mean[3] },
+            if opaque {
+                0.0
+            } else {
+                f32::from(t[3]) - mean[3]
+            },
         ];
         for r in 0..dims {
             for c in 0..dims {
@@ -670,13 +720,15 @@ pub fn encode_astc4x4_block(texels: &[[u8; 4]; 16]) -> [u8; 16] {
                 next[r] += cov[r][c] * axis[c];
             }
         }
-        let len = (next[0] * next[0] + next[1] * next[1] + next[2] * next[2] + next[3] * next[3]).sqrt();
+        let len =
+            (next[0] * next[0] + next[1] * next[1] + next[2] * next[2] + next[3] * next[3]).sqrt();
         if len <= 1e-6 {
             break;
         }
         axis = [next[0] / len, next[1] / len, next[2] / len, next[3] / len];
     }
-    let axis_len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2] + axis[3] * axis[3]).sqrt();
+    let axis_len =
+        (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2] + axis[3] * axis[3]).sqrt();
     let (mut e0, mut e1) = if axis_len > 1e-6 {
         let dir = [
             axis[0] / axis_len,
@@ -718,8 +770,18 @@ pub fn encode_astc4x4_block(texels: &[[u8; 4]; 16]) -> [u8; 16] {
         )
     } else {
         (
-            [min_c[0] as u8, min_c[1] as u8, min_c[2] as u8, if opaque { 255 } else { min_c[3] as u8 }],
-            [max_c[0] as u8, max_c[1] as u8, max_c[2] as u8, if opaque { 255 } else { max_c[3] as u8 }],
+            [
+                min_c[0] as u8,
+                min_c[1] as u8,
+                min_c[2] as u8,
+                if opaque { 255 } else { min_c[3] as u8 },
+            ],
+            [
+                max_c[0] as u8,
+                max_c[1] as u8,
+                max_c[2] as u8,
+                if opaque { 255 } else { max_c[3] as u8 },
+            ],
         )
     };
 
@@ -826,7 +888,9 @@ pub fn decode_astc4x4_block(block: &[u8; 16]) -> Result<[[u8; 4]; 16], String> {
     let low2 = block_mode & 3;
     let mid2 = (block_mode >> 2) & 3;
     if low2 == 0 || mid2 != 0 {
-        return Err(format!("unsupported ASTC 4x4 block mode 0x{block_mode:03x}"));
+        return Err(format!(
+            "unsupported ASTC 4x4 block mode 0x{block_mode:03x}"
+        ));
     }
     let r_code = (low2 << 1) | ((block_mode >> 4) & 1);
     let a_grid = (block_mode >> 5) & 3;
@@ -843,7 +907,11 @@ pub fn decode_astc4x4_block(block: &[u8; 16]) -> Result<[[u8; 4]; 16], String> {
         (0, 4) => 2usize,
         (0, 7) => 3usize,
         (1, 4) => 4usize,
-        _ => return Err(format!("unsupported ASTC weight range (H={high_prec}, R={r_code})")),
+        _ => {
+            return Err(format!(
+                "unsupported ASTC weight range (H={high_prec}, R={r_code})"
+            ));
+        }
     };
 
     let cem = ((bits >> 13) & 0xF) as u32;
@@ -925,7 +993,8 @@ fn extract_block(rgba: &[u8], width: u32, height: u32, bx: u32, by: u32) -> [[u8
         for px in 0..4u32 {
             let sx = (bx * 4 + px).min(w_max);
             let off = ((sy * width + sx) * 4) as usize;
-            block[(py * 4 + px) as usize] = [rgba[off], rgba[off + 1], rgba[off + 2], rgba[off + 3]];
+            block[(py * 4 + px) as usize] =
+                [rgba[off], rgba[off + 1], rgba[off + 2], rgba[off + 3]];
         }
     }
     block
@@ -1064,7 +1133,12 @@ pub fn compress_texture(
         } else {
             Filter::Linear
         };
-        mip::texture(texture.width, texture.height, texture.levels[0].clone(), filter)?
+        mip::texture(
+            texture.width,
+            texture.height,
+            texture.levels[0].clone(),
+            filter,
+        )?
     } else {
         texture.clone()
     };
@@ -1097,7 +1171,10 @@ pub fn compress_world_textures(
         {
             *slot = true;
         }
-        for slot_idx in [m.base_color_texture, m.emissive_texture].into_iter().flatten() {
+        for slot_idx in [m.base_color_texture, m.emissive_texture]
+            .into_iter()
+            .flatten()
+        {
             if let Some(slot) = color_used.get_mut(slot_idx as usize) {
                 *slot = true;
             }
@@ -1245,7 +1322,10 @@ mod tests {
                 TextureCompression::Bc7 => 4.0,
                 TextureCompression::Astc4x4 => 4.5,
             };
-            assert!(rmse <= max_rmse, "{comp:?} 64x64 rmse {rmse:.2} > {max_rmse}");
+            assert!(
+                rmse <= max_rmse,
+                "{comp:?} 64x64 rmse {rmse:.2} > {max_rmse}"
+            );
         }
 
         // 3. Discontinuous alpha punch-through on BC1 (1-bit) and smooth/mixed alpha on BC7 & ASTC 4x4.
@@ -1296,7 +1376,10 @@ mod tests {
             let comp_tex = &world.textures[0];
             assert_eq!(comp_tex.compression(), Some(comp));
             let comp_vram: usize = comp_tex.levels.iter().map(Vec::len).sum();
-            assert!(comp_vram * 3 < raw_vram, "{comp:?}: {comp_vram} vs {raw_vram}");
+            assert!(
+                comp_vram * 3 < raw_vram,
+                "{comp:?}: {comp_vram} vs {raw_vram}"
+            );
 
             let bytes = crate::cooked::encode(&world).unwrap();
             let decoded_world = crate::cooked::decode(&bytes).unwrap();

@@ -220,7 +220,13 @@ pub(crate) fn cast_hull_vertices(
     b: &Convex,
     target: f32,
 ) -> Option<CastHit> {
-    cast_impl(HullVerts { vertices, centroid }, iso, translation, b, target)
+    cast_impl(
+        HullVerts { vertices, centroid },
+        iso,
+        translation,
+        b,
+        target,
+    )
 }
 
 fn cast_impl<A: CoreShape>(
@@ -449,16 +455,13 @@ struct SupportPoint {
 /// the convex's position is `offset`.
 #[inline]
 fn support_shape<S: CoreShape>(shape: S, iso: &Iso, offset: Vec3, d: Vec3) -> Vec3 {
-    iso.rotation.rotate(shape.support_core(iso.inverse_vector(d))) + offset
+    iso.rotation
+        .rotate(shape.support_core(iso.inverse_vector(d)))
+        + offset
 }
 
 /// GJK on the cores of `a` and `b`, in world axes shifted to `origin`.
-fn closest_cores<A: CoreShape>(
-    a_shape: A,
-    a_iso: &Iso,
-    b: &Convex,
-    origin: Vec3,
-) -> CoreDistance {
+fn closest_cores<A: CoreShape>(a_shape: A, a_iso: &Iso, b: &Convex, origin: Vec3) -> CoreDistance {
     let (offset_a, offset_b) = (a_iso.position - origin, b.iso.position - origin);
     let support_point = |d: Vec3| {
         let (pa, pb) = (

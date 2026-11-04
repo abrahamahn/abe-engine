@@ -321,6 +321,27 @@ fn connection(
             .map_err(|e| e.to_string())?;
         return socket(reader, writer, shared, limits);
     }
+    if req.path == "/api/mcp" {
+        if req.method != "POST" {
+            return respond(
+                &mut writer,
+                Response::text(405, "POST JSON-RPC 2.0 to /api/mcp"),
+            );
+        }
+        let resp = {
+            let mut g = lock(shared);
+            let (rpc_reply, outbox) = crate::ai::mcp::handle_rpc_bytes(&mut g.studio, &req.body);
+            deliver(&mut g, outbox);
+            match rpc_reply {
+                Some(val) => {
+                    let text = json::to_compact(&val).unwrap_or_else(|_| "{}".into());
+                    Response::json(200, text)
+                }
+                None => Response::new(204, "text/plain; charset=utf-8", Vec::new()),
+            }
+        };
+        return respond(&mut writer, resp);
+    }
     let mut resp = if req.method != "GET" {
         Response::text(405, "only GET outside the edit protocol")
     } else {
@@ -406,7 +427,7 @@ fn own_page(origin: &str, port: u16) -> bool {
 impl Host {
     /// Decides whether to answer a request, or how to refuse it.
     fn admit(&self, req: &Request, peer: IpAddr) -> Result<Admitted, Response> {
-        let protocol = req.path == "/api/ws";
+        let protocol = req.path == "/api/ws" || req.path == "/api/mcp";
         let Some(token) = &self.config.token else {
             if !addressed_here(req, self.port) {
                 return Err(forbidden(&format!(

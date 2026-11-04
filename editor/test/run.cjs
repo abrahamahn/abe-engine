@@ -639,6 +639,7 @@ async function main() {
     await require('./camera-authoring.cjs')(page, check);
     await require('./assets.cjs')(page, project, check, o.out);
     await require('./framing.cjs')(page, check);
+    await require('./game-editor.cjs')(page, project, check);
   } catch (e) {
     failed = e.message;
     console.log(`FAIL ${e.message}`);

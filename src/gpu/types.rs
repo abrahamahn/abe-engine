@@ -111,20 +111,13 @@ impl Format {
     }
     /// Block footprint `(width, height)` in texels (`(4, 4)` for BC/ASTC, `(1, 1)` otherwise).
     pub const fn block_dimensions(self) -> (u32, u32) {
-        if self.is_compressed() {
-            (4, 4)
-        } else {
-            (1, 1)
-        }
+        if self.is_compressed() { (4, 4) } else { (1, 1) }
     }
     /// Bytes per texel block (`8` for BC1, `16` for BC7/ASTC 4x4, `texel_size()` otherwise).
     pub const fn block_bytes(self) -> u32 {
         match self {
             Self::Bc1RgbaUnorm | Self::Bc1RgbaSrgb => 8,
-            Self::Bc7RgbaUnorm
-            | Self::Bc7RgbaSrgb
-            | Self::Astc4x4Unorm
-            | Self::Astc4x4Srgb => 16,
+            Self::Bc7RgbaUnorm | Self::Bc7RgbaSrgb | Self::Astc4x4Unorm | Self::Astc4x4Srgb => 16,
             _ => self.texel_size(),
         }
     }
@@ -505,7 +498,9 @@ pub struct Limits {
 #[inline]
 pub(crate) fn as_le_bytes_f32(values: &[f32]) -> &[u8] {
     // SAFETY: `f32` has no padding or uninitialized bytes and `u8` has alignment 1.
-    unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values)) }
+    unsafe {
+        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
 }
 
 /// Zero-copy view of `values` as little-endian bytes on little-endian targets.
@@ -513,7 +508,9 @@ pub(crate) fn as_le_bytes_f32(values: &[f32]) -> &[u8] {
 #[inline]
 pub(crate) fn as_le_bytes_u32(values: &[u32]) -> &[u8] {
     // SAFETY: `u32` has no padding or uninitialized bytes and `u8` has alignment 1.
-    unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values)) }
+    unsafe {
+        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
 }
 
 /// Little-endian bytes of `values`, for `write_buffer` and `push_constants`.

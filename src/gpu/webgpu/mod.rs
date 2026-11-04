@@ -1300,8 +1300,8 @@ impl<'w> Gpu<'w> {
                         }
                         _ => unreachable!("matched texture kinds above"),
                     }
-                    let (mips, layers) =
-                        view_for(view, res, &desc, storage).map_err(|m| format!("{}: {m}", at()))?;
+                    let (mips, layers) = view_for(view, res, &desc, storage)
+                        .map_err(|m| format!("{}: {m}", at()))?;
                     words.extend([
                         e.binding,
                         1,

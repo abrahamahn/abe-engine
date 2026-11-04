@@ -549,7 +549,9 @@ impl<'w> Gpu<'w> {
             d.format
         };
         let renders = d.usage.contains(TextureUsage::COLOR_TARGET)
-            || (d.usage.contains(TextureUsage::COPY_DST) && !depth && !actual_format.is_compressed())
+            || (d.usage.contains(TextureUsage::COPY_DST)
+                && !depth
+                && !actual_format.is_compressed())
             || (d.mips > 1 && d.usage.contains(TextureUsage::COPY_SRC));
         if renders && is_float(actual_format) && !self.info.color_float {
             return Err(format!(

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::error::{Error, usage};
 
 /// Options that take a value. `--component` may repeat; the others may not.
-const VALUED: [&str; 9] = [
+const VALUED: [&str; 16] = [
     "--entity",
     "--component",
     "--depth",
@@ -15,8 +15,15 @@ const VALUED: [&str; 9] = [
     "--time",
     "--weather",
     "--samples",
+    "--kind",
+    "--limit",
+    "--id",
+    "--param",
+    "--contact-sheet",
+    "--studio",
+    "--token",
 ];
-const SWITCHES: [&str; 4] = ["--defaults", "--dry-run", "--pretty", "--help"];
+const SWITCHES: [&str; 5] = ["--defaults", "--dry-run", "--from-tx", "--pretty", "--help"];
 
 #[derive(Debug, Default)]
 pub struct Args {

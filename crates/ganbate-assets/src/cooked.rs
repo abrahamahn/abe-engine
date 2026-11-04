@@ -188,11 +188,11 @@ fn code_mesh(m: &Mesh) -> Result<(usize, Vec<u8>), String> {
     let has_uvs = !m.uvs.is_empty();
     let mut first = vec![u32::MAX; m.positions.len()];
     let mut order = Vec::with_capacity(m.positions.len());
-    let est_bytes = m
-        .indices
-        .len()
-        .saturating_mul(2)
-        .saturating_add(m.positions.len().saturating_mul(plane_bytes(has_normals, has_uvs) as usize));
+    let est_bytes = m.indices.len().saturating_mul(2).saturating_add(
+        m.positions
+            .len()
+            .saturating_mul(plane_bytes(has_normals, has_uvs) as usize),
+    );
     let mut v = Vec::with_capacity(est_bytes);
     let mut next: u64 = 0;
     for &i in &m.indices {

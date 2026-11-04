@@ -331,7 +331,9 @@ impl BatchGuard<'_> {
         while self.pending.load(Ordering::Acquire) != 0 {
             if !self.pool.try_run_one(0) {
                 let guard = self.pool.complete_lock.lock().unwrap();
-                if self.pending.load(Ordering::Acquire) != 0 && self.pool.queued_jobs.load(Ordering::Acquire) == 0 {
+                if self.pending.load(Ordering::Acquire) != 0
+                    && self.pool.queued_jobs.load(Ordering::Acquire) == 0
+                {
                     drop(self.pool.complete_cv.wait(guard).unwrap());
                 }
             }
@@ -412,7 +414,10 @@ mod tests {
     #[test]
     fn single_and_multi_thread_par_map_match_sequential() {
         let input: Vec<u32> = (0..4097).collect();
-        let expected: Vec<u64> = input.iter().map(|&x| u64::from(x) * u64::from(x) + 7).collect();
+        let expected: Vec<u64> = input
+            .iter()
+            .map(|&x| u64::from(x) * u64::from(x) + 7)
+            .collect();
 
         let single = JobPool::new(1);
         assert_eq!(single.worker_count(), 1);

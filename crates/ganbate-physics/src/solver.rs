@@ -722,11 +722,7 @@ mod tests {
         );
         // The soft pass takes out most of the approach; the relax pass the rest.
         solve_contacts(&mut c, &bodies, &mut vels, &ctx, true, false);
-        assert!(
-            vels[1].v.y < 0.0 && vels[1].v.y > -0.2,
-            "{:?}",
-            vels[1].v
-        );
+        assert!(vels[1].v.y < 0.0 && vels[1].v.y > -0.2, "{:?}", vels[1].v);
         solve_contacts(&mut c, &bodies, &mut vels, &ctx, false, true);
         assert!(
             vels[1].v.y.abs() < 1e-4,

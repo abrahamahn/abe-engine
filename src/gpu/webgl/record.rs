@@ -122,8 +122,7 @@ impl Ring {
                 self.used += 1;
                 return offset;
             }
-            if len as usize == data.len()
-                && &self.bytes[off as usize..(off + len) as usize] == data
+            if len as usize == data.len() && &self.bytes[off as usize..(off + len) as usize] == data
             {
                 return off;
             }
@@ -289,7 +288,15 @@ impl Gpu<'_> {
                         return Err("begin_pass without end_pass".into());
                     };
                     let desc = e.pass(colors, depth);
-                    self.record_pass(e, desc, &commands[i + 1..end], out, ring, &mut host, acquired)?;
+                    self.record_pass(
+                        e,
+                        desc,
+                        &commands[i + 1..end],
+                        out,
+                        ring,
+                        &mut host,
+                        acquired,
+                    )?;
                     i = end;
                 }
                 Command::Transfer(idx) => match &e.transfers[idx as usize] {
@@ -309,7 +316,9 @@ impl Gpu<'_> {
                         dst,
                         dst_offset,
                         size,
-                    } => self.record_buffer_copy((src, src_offset), (dst, dst_offset), size, out)?,
+                    } => {
+                        self.record_buffer_copy((src, src_offset), (dst, dst_offset), size, out)?
+                    }
                     &TransferCmd::Blit { src, dst, filter } => {
                         self.record_blit(src, dst, filter, out, acquired)?;
                         // The host's blit program changes the program, units and vertex array.
@@ -396,8 +405,13 @@ impl Gpu<'_> {
                 Load::Clear(v) => (1, v),
                 Load::DontCare => (2, [0.0; 4]),
             };
-            words[word_len..word_len + 5]
-                .copy_from_slice(&[t.js, a.mip, a.layer, load, u32::from(a.store)]);
+            words[word_len..word_len + 5].copy_from_slice(&[
+                t.js,
+                a.mip,
+                a.layer,
+                load,
+                u32::from(a.store),
+            ]);
             word_len += 5;
             if depth {
                 words[word_len] = clear[0].clamp(0.0, 1.0).to_bits();

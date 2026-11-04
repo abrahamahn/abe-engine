@@ -544,9 +544,7 @@ impl<'w> Gpu<'w> {
         let serial = self.serial;
         let garbage = &mut self.garbage;
         self.framebuffers.retain(|k, &mut f| {
-            let hit = k.views[..k.len as usize]
-                .iter()
-                .any(|v| views.contains(v));
+            let hit = k.views[..k.len as usize].iter().any(|v| views.contains(v));
             if hit {
                 garbage.push((serial, Garbage::Framebuffer(f)));
             }

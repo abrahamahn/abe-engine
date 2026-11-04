@@ -22,6 +22,7 @@ use ganbate_core::json::{Value, to_canonical};
 use ganbate_scene::doc::Document;
 use ganbate_scene::scene;
 
+mod ai_cli;
 mod args;
 mod diff;
 mod edit;
@@ -34,6 +35,7 @@ pub mod render;
 mod validate;
 mod workspace;
 
+pub use ai_cli::run_mcp_stdio;
 pub use error::Error;
 use json::{J, Obj};
 use refs::Tree;
@@ -59,7 +61,7 @@ impl Reply {
 }
 
 /// The commands, their operands and options, and what they do.
-const COMMANDS: [(&str, &str, &str); 7] = [
+const COMMANDS: [(&str, &str, &str); 14] = [
     (
         "scene inspect",
         "ganbate scene inspect PROJECT SCENE [--entity REF] [--component KIND]... [--depth N] [--defaults]",
@@ -73,7 +75,7 @@ const COMMANDS: [(&str, &str, &str); 7] = [
     (
         "scene apply",
         "ganbate scene apply PROJECT SCENE EDITS|- [--dry-run]",
-        "apply edits (set, remove, create, delete, reparent, duplicate) as one transaction",
+        "apply edits (set, remove, create, delete, reparent, duplicate, or .gbs) as one transaction",
     ),
     (
         "scene undo",
@@ -84,6 +86,41 @@ const COMMANDS: [(&str, &str, &str); 7] = [
         "scene diff",
         "ganbate scene diff A|- B|-",
         "semantic diff of two scene documents by entity id",
+    ),
+    (
+        "catalog build",
+        "ganbate catalog build PROJECT",
+        "build .ganbate/catalog.idx 1-line typed signatures for Bricks, prefabs, models, schemas and Looks",
+    ),
+    (
+        "catalog search",
+        "ganbate catalog search PROJECT [QUERY] [--kind KIND] [--limit N]",
+        "search the token-compact Brick and asset catalog",
+    ),
+    (
+        "catalog inspect",
+        "ganbate catalog inspect PROJECT REF",
+        "inspect full AABB, sockets, parameters and example .gbs snippet for one catalog entry",
+    ),
+    (
+        "brick crystallize",
+        "ganbate brick crystallize PROJECT SCENE --id SLUG [--entity REF]... [--from-tx] [--param NAME=PATH]...",
+        "crystallize scene entities into a reusable parameterized Brick in .ganbate/bricks/",
+    ),
+    (
+        "gbs apply",
+        "ganbate gbs apply PROJECT SCENE SCRIPT|- [--dry-run]",
+        "apply a .gbs relational spatial script (snap, socket, ring, beside, cam frame) as one undoable transaction",
+    ),
+    (
+        "verify",
+        "ganbate verify PROJECT SCENE [--camera REF] [--size WxH] [--contact-sheet FILE.png]",
+        "run the <100ms spatial, screen-box ([u0,v0,u1,v1] + occlusion), world-hash and GPU-budget oracle",
+    ),
+    (
+        "mcp",
+        "ganbate mcp PROJECT [--studio http://127.0.0.1:PORT] [--token TOKEN]",
+        "serve JSON-RPC 2.0 MCP over stdio (in-process or bridged to a running ganbate-studio host)",
     ),
     (
         "render",
@@ -110,6 +147,15 @@ pub fn run(
     backend: Option<&dyn render::Backend>,
 ) -> Outcome {
     let pretty = args.iter().any(|a| a == "--pretty");
+    if let Ok(parsed) = args::parse(args)
+        && parsed.words.first().map(String::as_str) == Some("mcp")
+        && !parsed.switch("--help")
+    {
+        return match ai_cli::run_mcp_buffered(&parsed, stdin) {
+            Ok(out) => out,
+            Err(e) => answer(Obj::new(), Some(e), pretty),
+        };
+    }
     match dispatch(args, stdin, backend) {
         Ok(reply) => answer(reply.body, reply.error, pretty),
         Err(e) => answer(Obj::new(), Some(e), pretty),
@@ -182,7 +228,11 @@ fn dispatch(
         ["scene", "apply", rest @ ..] => {
             let [project, scene, edits] = operands(rest, "scene apply")?;
             a.only(&["--dry-run"], "ganbate scene apply")?;
-            apply(project, scene, edits, a.switch("--dry-run"), stdin)
+            if edits.ends_with(".gbs") {
+                ai_cli::gbs_apply(project, scene, edits, a.switch("--dry-run"), stdin)
+            } else {
+                apply(project, scene, edits, a.switch("--dry-run"), stdin)
+            }
         }
         ["scene", "undo", rest @ ..] => {
             let [project, scene] = operands(rest, "scene undo")?;
@@ -193,6 +243,47 @@ fn dispatch(
             let [x, y] = operands(rest, "scene diff")?;
             a.only(&[], "ganbate scene diff")?;
             diff(x, y, stdin)
+        }
+        ["catalog", "build", rest @ ..] => {
+            let [project] = operands(rest, "catalog build")?;
+            a.only(&[], "ganbate catalog build")?;
+            ai_cli::catalog_build(project)
+        }
+        ["catalog", "search", rest @ ..] => {
+            a.only(&["--kind", "--limit"], "ganbate catalog search")?;
+            match rest {
+                [project] => ai_cli::catalog_search(project, None, &a),
+                [project, query] => ai_cli::catalog_search(project, Some(query), &a),
+                _ => Err(error::usage(
+                    "usage: ganbate catalog search PROJECT [QUERY] [--kind KIND] [--limit N]",
+                )),
+            }
+        }
+        ["catalog", "inspect", rest @ ..] => {
+            let [project, reference] = operands(rest, "catalog inspect")?;
+            a.only(&[], "ganbate catalog inspect")?;
+            ai_cli::catalog_inspect(project, reference)
+        }
+        ["brick", "crystallize", rest @ ..] => {
+            let [project, scene] = operands(rest, "brick crystallize")?;
+            a.only(
+                &["--id", "--entity", "--from-tx", "--param"],
+                "ganbate brick crystallize",
+            )?;
+            ai_cli::brick_crystallize(project, scene, &a)
+        }
+        ["gbs", "apply", rest @ ..] => {
+            let [project, scene, script] = operands(rest, "gbs apply")?;
+            a.only(&["--dry-run"], "ganbate gbs apply")?;
+            ai_cli::gbs_apply(project, scene, script, a.switch("--dry-run"), stdin)
+        }
+        ["verify", rest @ ..] => {
+            let [project, scene] = operands(rest, "verify")?;
+            a.only(
+                &["--camera", "--size", "--contact-sheet", "--out"],
+                "ganbate verify",
+            )?;
+            ai_cli::verify_scene_cli(project, scene, &a)
         }
         ["render", rest @ ..] => {
             let [project, scene] = operands(rest, "render")?;

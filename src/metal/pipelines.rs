@@ -619,8 +619,8 @@ impl<'w> Gpu<'w> {
                         }
                         _ => unreachable!("matched texture kinds above"),
                     }
-                    let (key, mips, layers) =
-                        view_for(view, res, &desc, storage).map_err(|m| format!("{}: {m}", at()))?;
+                    let (key, mips, layers) = view_for(view, res, &desc, storage)
+                        .map_err(|m| format!("{}: {m}", at()))?;
                     let obj = self.view(id, key)?;
                     Bound::Texture {
                         id,

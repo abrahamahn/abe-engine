@@ -1048,13 +1048,7 @@ fn turn(ba: &SolverBody, bb: &SolverBody, va: &mut SolverVel, vb: &mut SolverVel
 /// false when a velocity is not a number, or so large that its square is not (beyond 1.8e19:
 /// only numbers past what `f32` carries, such as a saturated impulse on a light body, give one).
 #[inline]
-fn write_back(
-    vels: &mut [SolverVel],
-    a: usize,
-    va: SolverVel,
-    b: usize,
-    vb: SolverVel,
-) -> bool {
+fn write_back(vels: &mut [SolverVel], a: usize, va: SolverVel, b: usize, vb: SolverVel) -> bool {
     let usable = |v: Vec3| v.length_squared().is_finite();
     if !(usable(va.v) && usable(va.w) && usable(vb.v) && usable(vb.w)) {
         return false;

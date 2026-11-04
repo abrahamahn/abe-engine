@@ -648,8 +648,7 @@ fn carry_impulses_into(
             claimed.push(false);
         }
     }
-    let mut filled =
-        SmallBuf::<[bool; MAX_MANIFOLD_POINTS], 8>::new([false; MAX_MANIFOLD_POINTS]);
+    let mut filled = SmallBuf::<[bool; MAX_MANIFOLD_POINTS], 8>::new([false; MAX_MANIFOLD_POINTS]);
     for _ in 0..out.len() {
         filled.push([false; MAX_MANIFOLD_POINTS]);
     }
@@ -662,7 +661,11 @@ fn carry_impulses_into(
     let filled_slice = filled.as_mut_slice();
     // Feature ids: the same feature with a compatible surface normal, once.
     for (cm, done) in out.iter_mut().zip(filled_slice.iter_mut()) {
-        for (i, done) in done.iter_mut().enumerate().take(usize::from(cm.manifold.count)) {
+        for (i, done) in done
+            .iter_mut()
+            .enumerate()
+            .take(usize::from(cm.manifold.count))
+        {
             let id = cm.cache[i].id;
             if id == 0 {
                 continue;
@@ -710,7 +713,7 @@ fn carry_impulses_into(
             .then(x.2.cmp(&y.2))
             .then(x.3.cmp(&y.3))
     });
-    for &( _, nm, i, o) in pairs.as_slice() {
+    for &(_, nm, i, o) in pairs.as_slice() {
         if claimed_slice[o] || filled_slice[nm][i] {
             continue;
         }
@@ -1051,8 +1054,7 @@ impl PhysicsWorld {
         } else if desc.kind == BodyKind::Kinematic {
             self.kinematic_count += 1;
         }
-        let awake_moving =
-            self.bodies[index as usize].awake && self.bodies[index as usize].moves();
+        let awake_moving = self.bodies[index as usize].awake && self.bodies[index as usize].moves();
         self.set_awake_bit(index, awake_moving);
         Ok(id)
     }
@@ -1101,7 +1103,10 @@ impl PhysicsWorld {
     }
 
     pub fn awake_body_count(&self) -> usize {
-        self.awake_words.iter().map(|w| w.count_ones() as usize).sum()
+        self.awake_words
+            .iter()
+            .map(|w| w.count_ones() as usize)
+            .sum()
     }
 
     pub(crate) fn body(&self, id: BodyId) -> Option<&Body> {
@@ -2255,81 +2260,82 @@ impl PhysicsWorld {
 
         // Contact constraints.
         scratch.constraints.clear();
-        let build_contact_constraint = |w: &PhysicsWorld,
-                                        k: usize,
-                                        slot: &[usize],
-                                        solver_bodies: &[SolverBody],
-                                        solver_vels: &[SolverVel],
-                                        constraints: &mut Vec<ContactConstraint>| {
-            let c = &w.contacts[k];
-            if !c.touching || c.sensor {
-                return;
-            }
-            let (ca, cb) = (&w.colliders[c.a as usize], &w.colliders[c.b as usize]);
-            let ia = slot[ca.body as usize];
-            let ib = slot[cb.body as usize];
-            if ia == 0 && ib == 0 {
-                return;
-            }
-            let ba = &w.bodies[ca.body as usize];
-            let bb = &w.bodies[cb.body as usize];
-            let fa = BodyFrame {
-                center: ba.center,
-                rotation: ba.rotation,
-                local_center: ba.local_center,
-                index: ia,
-            };
-            let fb = BodyFrame {
-                center: bb.center,
-                rotation: bb.rotation,
-                local_center: bb.local_center,
-                index: ib,
-            };
-            let friction = (ca.friction * cb.friction).sqrt();
-            let restitution = ca.restitution.max(cb.restitution);
-            let either_static = solver_bodies[ia].inv_mass == Vec3::ZERO
-                || solver_bodies[ib].inv_mass == Vec3::ZERO;
-            for (mi, m) in c.manifolds.iter().enumerate() {
-                if m.manifold.count == 0 {
-                    continue;
+        let build_contact_constraint =
+            |w: &PhysicsWorld,
+             k: usize,
+             slot: &[usize],
+             solver_bodies: &[SolverBody],
+             solver_vels: &[SolverVel],
+             constraints: &mut Vec<ContactConstraint>| {
+                let c = &w.contacts[k];
+                if !c.touching || c.sensor {
+                    return;
                 }
-                let n = m.manifold.normal;
-                let (t1, t2) = n.orthonormal_basis();
-                let mut cc = ContactConstraint {
-                    a: ia,
-                    b: ib,
-                    normal: n,
-                    tangents: [t1, t2],
-                    friction,
-                    restitution,
-                    softness: if either_static {
-                        ctx.static_softness
-                    } else {
-                        ctx.contact_softness
-                    },
-                    points: [ConstraintPoint::default(); 4],
-                    count: usize::from(m.manifold.count),
-                    source: (k as u32, mi as u32),
-                    rounding: (ca.shape.radius(), cb.shape.radius()),
+                let (ca, cb) = (&w.colliders[c.a as usize], &w.colliders[c.b as usize]);
+                let ia = slot[ca.body as usize];
+                let ib = slot[cb.body as usize];
+                if ia == 0 && ib == 0 {
+                    return;
+                }
+                let ba = &w.bodies[ca.body as usize];
+                let bb = &w.bodies[cb.body as usize];
+                let fa = BodyFrame {
+                    center: ba.center,
+                    rotation: ba.rotation,
+                    local_center: ba.local_center,
+                    index: ia,
                 };
-                for i in 0..usize::from(m.manifold.count) {
-                    let p = m.manifold.points[i];
-                    let cache = m.cache[i];
-                    cc.points[i] = solver::prepare_point(
-                        &cc,
-                        solver_bodies,
-                        solver_vels,
-                        &fa,
-                        &fb,
-                        p.point,
-                        p.separation,
-                        cache.normal_impulse,
-                        cache.friction_impulse,
-                    );
+                let fb = BodyFrame {
+                    center: bb.center,
+                    rotation: bb.rotation,
+                    local_center: bb.local_center,
+                    index: ib,
+                };
+                let friction = (ca.friction * cb.friction).sqrt();
+                let restitution = ca.restitution.max(cb.restitution);
+                let either_static = solver_bodies[ia].inv_mass == Vec3::ZERO
+                    || solver_bodies[ib].inv_mass == Vec3::ZERO;
+                for (mi, m) in c.manifolds.iter().enumerate() {
+                    if m.manifold.count == 0 {
+                        continue;
+                    }
+                    let n = m.manifold.normal;
+                    let (t1, t2) = n.orthonormal_basis();
+                    let mut cc = ContactConstraint {
+                        a: ia,
+                        b: ib,
+                        normal: n,
+                        tangents: [t1, t2],
+                        friction,
+                        restitution,
+                        softness: if either_static {
+                            ctx.static_softness
+                        } else {
+                            ctx.contact_softness
+                        },
+                        points: [ConstraintPoint::default(); 4],
+                        count: usize::from(m.manifold.count),
+                        source: (k as u32, mi as u32),
+                        rounding: (ca.shape.radius(), cb.shape.radius()),
+                    };
+                    for i in 0..usize::from(m.manifold.count) {
+                        let p = m.manifold.points[i];
+                        let cache = m.cache[i];
+                        cc.points[i] = solver::prepare_point(
+                            &cc,
+                            solver_bodies,
+                            solver_vels,
+                            &fa,
+                            &fb,
+                            p.point,
+                            p.separation,
+                            cache.normal_impulse,
+                            cache.friction_impulse,
+                        );
+                    }
+                    constraints.push(cc);
                 }
-                constraints.push(cc);
-            }
-        };
+            };
 
         if scratch.members.len().saturating_mul(8) < self.contacts.len() {
             scratch.active_indices.clear();
@@ -2367,50 +2373,45 @@ impl PhysicsWorld {
 
         // Joint constraints.
         scratch.joint_constraints.clear();
-        let build_joint_constraint = |w: &PhysicsWorld,
-                                      j: usize,
-                                      slot: &[usize],
-                                      solver_bodies: &[SolverBody],
-                                      joint_constraints: &mut Vec<(u32, JointConstraint)>| {
-            let slot_j = &w.joints[j];
-            if !slot_j.alive {
-                return;
-            }
-            let (Some(a), Some(b)) = (
-                w.body_index(slot_j.desc.body_a),
-                w.body_index(slot_j.desc.body_b),
-            ) else {
-                return;
+        let build_joint_constraint =
+            |w: &PhysicsWorld,
+             j: usize,
+             slot: &[usize],
+             solver_bodies: &[SolverBody],
+             joint_constraints: &mut Vec<(u32, JointConstraint)>| {
+                let slot_j = &w.joints[j];
+                if !slot_j.alive {
+                    return;
+                }
+                let (Some(a), Some(b)) = (
+                    w.body_index(slot_j.desc.body_a),
+                    w.body_index(slot_j.desc.body_b),
+                ) else {
+                    return;
+                };
+                let ia = slot[a];
+                let ib = slot[b];
+                if ia == 0 && ib == 0 {
+                    return;
+                }
+                let ba = &w.bodies[a];
+                let bb = &w.bodies[b];
+                let fa = BodyFrame {
+                    center: ba.center,
+                    rotation: ba.rotation,
+                    local_center: ba.local_center,
+                    index: ia,
+                };
+                let fb = BodyFrame {
+                    center: bb.center,
+                    rotation: bb.rotation,
+                    local_center: bb.local_center,
+                    index: ib,
+                };
+                let jc =
+                    joint::prepare(&slot_j.desc, &fa, &fb, solver_bodies, &ctx, slot_j.impulses);
+                joint_constraints.push((j as u32, jc));
             };
-            let ia = slot[a];
-            let ib = slot[b];
-            if ia == 0 && ib == 0 {
-                return;
-            }
-            let ba = &w.bodies[a];
-            let bb = &w.bodies[b];
-            let fa = BodyFrame {
-                center: ba.center,
-                rotation: ba.rotation,
-                local_center: ba.local_center,
-                index: ia,
-            };
-            let fb = BodyFrame {
-                center: bb.center,
-                rotation: bb.rotation,
-                local_center: bb.local_center,
-                index: ib,
-            };
-            let jc = joint::prepare(
-                &slot_j.desc,
-                &fa,
-                &fb,
-                solver_bodies,
-                &ctx,
-                slot_j.impulses,
-            );
-            joint_constraints.push((j as u32, jc));
-        };
 
         if scratch.members.len().saturating_mul(8) < self.joints.len() {
             scratch.active_indices.clear();

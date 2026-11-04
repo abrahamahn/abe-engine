@@ -2325,7 +2325,8 @@ fn poly_poly(pa: &Poly, pb: &Poly, rel: &Frame, spec: f32) -> Option<Manifold> {
                     }
                 }
             } else {
-                let pairs = (0..count_a).map(|k| if every_a { 2 * k } else { usize::from(kept[k]) });
+                let pairs =
+                    (0..count_a).map(|k| if every_a { 2 * k } else { usize::from(kept[k]) });
                 for i in pairs {
                     let (ha, ta) = (pa.edges[i], pa.edges[i + 1]);
                     let a = pa.faces[ha.face as usize].normal;
@@ -2771,12 +2772,7 @@ fn visit_triangles(
 
 /// Whether a convex shape crosses the other shape's surface. Mesh triangles face the query
 /// shape from either side and a mere touch has zero separation.
-pub(crate) fn overlaps(
-    convex: &Shape,
-    iso: &Iso,
-    other: &Shape,
-    at: &Iso,
-) -> bool {
+pub(crate) fn overlaps(convex: &Shape, iso: &Iso, other: &Shape, at: &Iso) -> bool {
     let Some(g) = StaticGeometry::of(other) else {
         let mut buf: [Manifold; MAX_MESH_MANIFOLDS] = Default::default();
         let len = collide_stack(convex, iso, other, at, 0.0, &mut buf);
@@ -3075,7 +3071,10 @@ mod tests {
         let hull = ConvexHull::cuboid(h);
         let b = BoxPoly::new(h);
         assert_eq!(hull.edges.as_slice(), &CUBOID_EDGES[..]);
-        assert_eq!(hull.vertex_edge_offsets.as_slice(), &CUBOID_VERTEX_OFFSETS[..]);
+        assert_eq!(
+            hull.vertex_edge_offsets.as_slice(),
+            &CUBOID_VERTEX_OFFSETS[..]
+        );
         assert_eq!(hull.vertex_edges.as_slice(), &CUBOID_VERTEX_EDGES[..]);
         assert_eq!(hull.vertices.as_slice(), &b.vertices[..]);
         for (f, face) in hull.faces.iter().enumerate() {

@@ -474,7 +474,11 @@ mod tests {
         let mut bits = 0u32;
         while bits <= one_bits {
             let l = f32::from_bits(bits);
-            assert_eq!(linear_to_srgb_fast(l), linear_to_srgb_ref(l), "bits={bits:#x}");
+            assert_eq!(
+                linear_to_srgb_fast(l),
+                linear_to_srgb_ref(l),
+                "bits={bits:#x}"
+            );
             bits = bits.saturating_add(step);
         }
         for i in 0..=1_000_000u32 {

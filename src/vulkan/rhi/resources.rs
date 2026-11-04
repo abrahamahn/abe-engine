@@ -70,12 +70,16 @@ impl<'w> Gpu<'w> {
         }
     }
 
-    fn pick_memory_type(&self, type_bits: u32, required: u32, preferred: u32) -> Result<(u32, bool)> {
+    fn pick_memory_type(
+        &self,
+        type_bits: u32,
+        required: u32,
+        preferred: u32,
+    ) -> Result<(u32, bool)> {
         let types = &self.memory.memoryTypes[..self.memory.memoryTypeCount as usize];
         let find = |flags: u32| {
-            (0..types.len()).find(|&i| {
-                type_bits & (1 << i) != 0 && types[i].propertyFlags & flags == flags
-            })
+            (0..types.len())
+                .find(|&i| type_bits & (1 << i) != 0 && types[i].propertyFlags & flags == flags)
         };
         let index = find(required | preferred)
             .or_else(|| find(required))
@@ -240,7 +244,12 @@ impl<'w> Gpu<'w> {
     }
 
     /// Creates a buffer bound to suballocated (or dedicated) memory and returns its mapped pointer.
-    fn raw_buffer(&mut self, size: u64, usage: u32, memory: Memory) -> Result<(u64, Alloc, *mut u8)> {
+    fn raw_buffer(
+        &mut self,
+        size: u64,
+        usage: u32,
+        memory: Memory,
+    ) -> Result<(u64, Alloc, *mut u8)> {
         let mut ci = VkBufferCreateInfo::new();
         ci.size = size;
         ci.usage = usage;

@@ -13,10 +13,14 @@ import { orbitBasis } from './cameras.js';
 import * as M from './math.js';
 
 export const ASSET_DRAG_MIME = 'application/x-ganbate-asset';
-export const KIND_ORDER = Object.freeze(['scene', 'prefab', 'model', 'look', 'material', 'texture', 'sound']);
+export const KIND_ORDER = Object.freeze([
+  'scene', 'prefab', 'model', 'look', 'data', 'material', 'texture', 'sound',
+  'soundbank', 'character', 'seq', 'vfx',
+]);
 
 const SUFFIXES = [
-  '.scene.json', '.prefab.json', '.material.json', '.look.json',
+  '.scene.json', '.prefab.json', '.material.json', '.data.json', '.look.json',
+  '.soundbank.json', '.character.json', '.seq.json', '.vfx.json',
   '.glb', '.png', '.jpg', '.jpeg', '.webp', '.wav', '.ogg',
 ];
 
@@ -353,6 +357,26 @@ function kindGraphic(kind) {
       return svgEl('svg', base,
         svgEl('circle', { cx: 16, cy: 14, r: 5 }),
         svgEl('path', { d: 'M16 5v2.2M9.5 7.8l1.6 1.6M22.5 7.8l-1.6 1.6M5 23h22M8 26.5h16' }));
+    case 'data':
+      return svgEl('svg', base,
+        svgEl('rect', { x: 6, y: 5, width: 20, height: 22, rx: 2.5 }),
+        svgEl('path', { d: 'M10.5 11h11M10.5 16h11M10.5 21h7' }));
+    case 'soundbank':
+      return svgEl('svg', base,
+        svgEl('rect', { x: 5, y: 6, width: 22, height: 20, rx: 3 }),
+        svgEl('path', { d: 'M9 19v-6M13 21V11M17 18v-4M21 20v-8' }));
+    case 'character':
+      return svgEl('svg', base,
+        svgEl('circle', { cx: 16, cy: 8.5, r: 3.2 }),
+        svgEl('path', { d: 'M9 15h14M16 11.7V21M16 21l-4 6M16 21l4 6' }));
+    case 'seq':
+      return svgEl('svg', base,
+        svgEl('rect', { x: 4, y: 6, width: 24, height: 20, rx: 2.5 }),
+        svgEl('path', { d: 'M8 12h8M14 16h10M10 20h7M13 6v20' }));
+    case 'vfx':
+      return svgEl('svg', base,
+        svgEl('path', { d: 'M16 5l2.4 6.6L25 14l-6.6 2.4L16 23l-2.4-6.6L7 14l6.6-2.4L16 5z' }),
+        svgEl('circle', { cx: 24, cy: 23, r: 1.6 }));
     case 'material':
       return svgEl('svg', base,
         svgEl('circle', { cx: 16, cy: 16, r: 10 }),
@@ -398,6 +422,8 @@ export function createAssetLibrary({
   getContext,
   onOpenDoc,
   onInspectLook,
+  onInspectData,
+  onOpenWorkbenchDoc,
   onImportModel,
   onPlaceAsset,
   onMoveAsset,
@@ -696,6 +722,14 @@ export function createAssetLibrary({
     }, fav ? '★' : '☆');
   }
 
+  const WORKBENCH_BY_KIND = {
+    material: 'material',
+    soundbank: 'audio',
+    character: 'character',
+    seq: 'sequencer',
+    vfx: 'vfx',
+  };
+
   function primaryAction(asset, doc) {
     if (asset.kind === 'scene' || asset.kind === 'prefab') {
       return () => {
@@ -707,6 +741,19 @@ export function createAssetLibrary({
       return () => {
         recordRecent(asset.id);
         onInspectLook(asset.id);
+      };
+    }
+    if (asset.kind === 'data') {
+      return () => {
+        recordRecent(asset.id);
+        onInspectData?.(asset.id);
+      };
+    }
+    if (WORKBENCH_BY_KIND[asset.kind] && onOpenWorkbenchDoc) {
+      const wb = WORKBENCH_BY_KIND[asset.kind];
+      return () => {
+        recordRecent(asset.id);
+        onOpenWorkbenchDoc(wb, asset.id);
       };
     }
     if (asset.kind === 'model') {
@@ -937,6 +984,19 @@ export function createAssetLibrary({
         class: 'mini',
         onclick: (ev) => { ev.stopPropagation(); recordRecent(asset.id); onInspectLook(asset.id); },
       }, t('editLook')));
+    } else if (asset.kind === 'data') {
+      actions.append(el('button', {
+        type: 'button',
+        class: 'mini',
+        onclick: (ev) => { ev.stopPropagation(); recordRecent(asset.id); onInspectData?.(asset.id); },
+      }, t('editData')));
+    } else if (WORKBENCH_BY_KIND[asset.kind] && onOpenWorkbenchDoc) {
+      const wb = WORKBENCH_BY_KIND[asset.kind];
+      actions.append(el('button', {
+        type: 'button',
+        class: 'mini',
+        onclick: (ev) => { ev.stopPropagation(); recordRecent(asset.id); onOpenWorkbenchDoc(wb, asset.id); },
+      }, asset.kind === 'material' ? t('editMaterial') : t('open')));
     } else if (asset.kind === 'model') {
       actions.append(
         makeModelStudioChip(asset),
@@ -994,6 +1054,11 @@ export function createAssetLibrary({
       item(t('open'), () => { recordRecent(asset.id); onOpenDoc(asset.id); }, { shortcut: 'Enter' });
     } else if (asset.kind === 'look') {
       item(t('editLook'), () => { recordRecent(asset.id); onInspectLook(asset.id); }, { shortcut: 'Enter' });
+    } else if (asset.kind === 'data') {
+      item(t('editData'), () => { recordRecent(asset.id); onInspectData?.(asset.id); }, { shortcut: 'Enter' });
+    } else if (WORKBENCH_BY_KIND[asset.kind] && onOpenWorkbenchDoc) {
+      const wb = WORKBENCH_BY_KIND[asset.kind];
+      item(t('open'), () => { recordRecent(asset.id); onOpenWorkbenchDoc(wb, asset.id); }, { shortcut: 'Enter' });
     } else if (asset.kind === 'sound') {
       item(ui.playingId === asset.id ? t('stopSound') : t('previewSound'), () => toggleSound(asset));
     }
@@ -1005,6 +1070,9 @@ export function createAssetLibrary({
     if (asset.kind === 'model') {
       item(trOr('openModelStudio', 'Open in 3D Studio'), () => openInModelStudio(asset));
       item(t('importAsScene'), () => { recordRecent(asset.id); onImportModel(asset); });
+      if (onOpenWorkbenchDoc) {
+        item(t('openModelStudio'), () => { recordRecent(asset.id); onOpenWorkbenchDoc('model', asset.id); });
+      }
     }
 
     menu.append(el('div', { class: 'menu-sep' }));
@@ -1133,7 +1201,7 @@ export function createAssetLibrary({
         nav.append(el('div', {
           class: 'folder-row missing-draft',
           title: doc.path,
-          onclick: () => (doc.kind === 'look' ? onInspectLook(doc.id) : onOpenDoc(doc.id)),
+          onclick: () => (doc.kind === 'look' ? onInspectLook(doc.id) : doc.kind === 'data' ? onInspectData?.(doc.id) : onOpenDoc(doc.id)),
         },
           el('span', { class: 'folder-twisty' }, '!'),
           el('span', { class: 'folder-name' }, assetBasename(doc.path)),
@@ -1384,6 +1452,26 @@ export function createAssetLibrary({
         class: 'mini',
         onclick: () => { recordRecent(selected.id); onInspectLook(selected.id); },
       }, t('editLook')));
+    } else if (selected.kind === 'data') {
+      actions.append(el('button', {
+        type: 'button',
+        class: 'mini',
+        onclick: () => { recordRecent(selected.id); onInspectData?.(selected.id); },
+      }, t('editData')));
+    } else if (WORKBENCH_BY_KIND[selected.kind] && onOpenWorkbenchDoc) {
+      const wb = WORKBENCH_BY_KIND[selected.kind];
+      actions.append(el('button', {
+        type: 'button',
+        class: 'mini',
+        onclick: () => { recordRecent(selected.id); onOpenWorkbenchDoc(wb, selected.id); },
+      }, selected.kind === 'material' ? t('editMaterial') : t('open')));
+    }
+    if (selected.kind === 'model' && onOpenWorkbenchDoc) {
+      actions.append(el('button', {
+        type: 'button',
+        class: 'mini',
+        onclick: () => { recordRecent(selected.id); onOpenWorkbenchDoc('model', selected.id); },
+      }, t('openModelStudio')));
     }
     if (selected.kind === 'model') {
       actions.append(el('button', {
@@ -1442,7 +1530,7 @@ export function createAssetLibrary({
           : ref.entityName
             ? `${docBase} · ${ref.entityName}`
             : docBase;
-        const canJump = !!ref.doc && (ref.docKind === 'scene' || ref.docKind === 'prefab');
+        const canJump = !!ref.doc && (ref.docKind === 'scene' || ref.docKind === 'prefab' || ref.docKind === 'data');
         refBox.append(el('button', {
           type: 'button',
           class: 'where-used-item',
@@ -1461,7 +1549,7 @@ export function createAssetLibrary({
   }
 
   function draw() {
-    const { assets, drafts, project, doc, inspectedLook, looks } = getContext();
+    const { assets, drafts, project, doc, inspectedLook, looks, inspectedData, datas, openDocs } = getContext();
     const list = document.getElementById('assets-list');
     if (!list) return;
 
@@ -1599,7 +1687,7 @@ export function createAssetLibrary({
             el('button', {
               type: 'button',
               class: 'mini',
-              onclick: () => (draft.kind === 'look' ? onInspectLook(draft.id) : onOpenDoc(draft.id)),
+              onclick: () => (draft.kind === 'look' ? onInspectLook(draft.id) : draft.kind === 'data' ? onInspectData?.(draft.id) : onOpenDoc(draft.id)),
             }, t('open')),
           ),
         );
@@ -1637,9 +1725,12 @@ export function createAssetLibrary({
       const folder = assetFolder(a.path);
       const sizeText = a.bytes > 0 ? formatBytes(a.bytes) : '';
       const subText = folder && sizeText ? `${folder} · ${sizeText}` : (folder || sizeText || '·');
-      const isRequested = a.id === inspectedLook || a.path === requested;
+      const isRequested = a.id === inspectedLook || a.id === inspectedData || a.path === requested;
       const isOpenDoc = doc?.id === a.id;
-      const isDirty = (isOpenDoc && doc?.dirty) || (a.kind === 'look' && looks.get(a.id)?.dirty);
+      const isDirty = (isOpenDoc && doc?.dirty)
+        || (a.kind === 'look' && looks.get(a.id)?.dirty)
+        || (a.kind === 'data' && datas?.get(a.id)?.dirty)
+        || Boolean(openDocs?.get(a.id)?.dirty);
       const classes = [
         'asset',
         `kind-${a.kind}`,

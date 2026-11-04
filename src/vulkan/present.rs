@@ -453,11 +453,7 @@ impl<'a> Chain<'a> {
                     slot.capacity = capacity;
                     stats.vertex_allocations += 1;
                 }
-                core::ptr::copy_nonoverlapping(
-                    vertices.as_ptr().cast::<u8>(),
-                    slot.mapped,
-                    bytes,
-                );
+                core::ptr::copy_nonoverlapping(vertices.as_ptr().cast::<u8>(), slot.mapped, bytes);
             }
             let mut index = 0;
             let acquire = vkAcquireNextImageKHR(

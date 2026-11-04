@@ -37,7 +37,11 @@ impl Aabb {
 /// Jim Arvo's 9-multiply method (9 multiplies instead of transforming all 8 corners = 96 multiplies).
 #[inline]
 pub fn transform_aabb(local: &Aabb, world_col_major: &[f32; 16]) -> Aabb {
-    let mut min = [world_col_major[12], world_col_major[13], world_col_major[14]];
+    let mut min = [
+        world_col_major[12],
+        world_col_major[13],
+        world_col_major[14],
+    ];
     let mut max = min;
     for col in 0..3 {
         let lo = local.min[col];
@@ -1026,7 +1030,10 @@ pub fn par_cull_frustum_into(
     });
 
     let mut stats = CullStats::default();
-    let total_vis: usize = chunk_scratch[..num_chunks].iter().map(|(v, _)| v.len()).sum();
+    let total_vis: usize = chunk_scratch[..num_chunks]
+        .iter()
+        .map(|(v, _)| v.len())
+        .sum();
     out_visible.reserve(total_vis);
     for (v, s) in &chunk_scratch[..num_chunks] {
         out_visible.extend_from_slice(v);
@@ -1046,15 +1053,7 @@ pub fn par_cull_frustum(
 ) -> (Vec<(u32, u16)>, CullStats) {
     let mut scratch = Vec::new();
     let mut out = Vec::new();
-    let stats = par_cull_frustum_into(
-        pool,
-        frustum,
-        cfg,
-        batches,
-        count,
-        &mut scratch,
-        &mut out,
-    );
+    let stats = par_cull_frustum_into(pool, frustum, cfg, batches, count, &mut scratch, &mut out);
     (out, stats)
 }
 
@@ -1164,9 +1163,21 @@ mod tests {
         let mut ref_min = [f32::INFINITY; 3];
         let mut ref_max = [f32::NEG_INFINITY; 3];
         for mask in 0..8 {
-            let x = if mask & 1 == 0 { local.min[0] } else { local.max[0] };
-            let y = if mask & 2 == 0 { local.min[1] } else { local.max[1] };
-            let z = if mask & 4 == 0 { local.min[2] } else { local.max[2] };
+            let x = if mask & 1 == 0 {
+                local.min[0]
+            } else {
+                local.max[0]
+            };
+            let y = if mask & 2 == 0 {
+                local.min[1]
+            } else {
+                local.max[1]
+            };
+            let z = if mask & 4 == 0 {
+                local.min[2]
+            } else {
+                local.max[2]
+            };
             for r in 0..3 {
                 let p = m[r] * x + m[4 + r] * y + m[8 + r] * z + m[12 + r];
                 ref_min[r] = ref_min[r].min(p);
@@ -1222,7 +1233,10 @@ mod tests {
             let cy = (next_f32() - 0.5) * 120.0;
             let cz = -next_f32() * 280.0 + 20.0;
             let e = 0.02 + next_f32() * 3.0;
-            aabbs.push(Aabb::new([cx - e, cy - e, cz - e], [cx + e, cy + e, cz + e]));
+            aabbs.push(Aabb::new(
+                [cx - e, cy - e, cz - e],
+                [cx + e, cy + e, cz + e],
+            ));
         }
 
         let mut soa = Vec::new();

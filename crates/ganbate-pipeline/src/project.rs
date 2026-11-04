@@ -1,7 +1,7 @@
 //! A project folder: its manifest (`ganbate.project.json`) and the index of its assets by id.
 //!
-//! Engine documents (`*.scene.json`, `*.prefab.json`, `*.material.json`) carry their own `id`.
-//! Every other asset file (models, images, sounds, Look files) has a sidecar
+//! Engine documents (`*.scene.json`, `*.prefab.json`, `*.material.json`, `*.data.json`) carry
+//! their own `id`. Every other asset file (models, images, sounds, Look files) has a sidecar
 //! `<file>.meta.json` holding its id, kind and import settings; `scan` writes a missing
 //! sidecar with a fresh id when asked to. Two files claiming one id are an error naming both.
 use std::collections::BTreeMap;
@@ -25,6 +25,7 @@ pub enum Kind {
     Texture,
     Look,
     Sound,
+    Data,
 }
 
 impl Kind {
@@ -37,11 +38,15 @@ impl Kind {
             Kind::Texture => "texture",
             Kind::Look => "look",
             Kind::Sound => "sound",
+            Kind::Data => "data",
         }
     }
     /// Whether files of this kind are engine documents with their own id.
     pub fn self_identified(self) -> bool {
-        matches!(self, Kind::Scene | Kind::Prefab | Kind::Material)
+        matches!(
+            self,
+            Kind::Scene | Kind::Prefab | Kind::Material | Kind::Data
+        )
     }
     /// The kind a file name implies, if it is an asset at all.
     pub fn of_file(name: &str) -> Option<Kind> {
@@ -53,6 +58,7 @@ impl Kind {
             (".scene.json", Kind::Scene),
             (".prefab.json", Kind::Prefab),
             (".material.json", Kind::Material),
+            (".data.json", Kind::Data),
             (".look.json", Kind::Look),
             (".glb", Kind::Model),
             (".png", Kind::Texture),
@@ -1131,5 +1137,39 @@ pub(crate) mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn data_documents_are_self_identified_and_scanned_without_sidecars() {
+        assert_eq!(Kind::Data.name(), "data");
+        assert!(Kind::Data.self_identified());
+        assert_eq!(Kind::of_file("hud.data.json"), Some(Kind::Data));
+        assert_eq!(Kind::of_file("HUD.DATA.JSON"), Some(Kind::Data));
+        assert_eq!(Kind::of_file("hud.data.json.meta.json"), None);
+
+        let t = TempDir::new("data-doc");
+        let mut ids = Ids::seeded(17);
+        let mut p = Project::create(&t.0, "Observatory", &mut ids).unwrap();
+        let id = ids.asset();
+        let doc = json::parse(
+            format!(
+                r#"{{"ganbate":"data","version":1,"id":"{id}","schema":"hud.anchors","name":"Observatory HUD","values":{{}}}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        p.write_document("content/data/hud.data.json", Kind::Data, &doc)
+            .unwrap();
+        assert!(t.0.join("content/data/hud.data.json").is_file());
+        assert!(!t.0.join("content/data/hud.data.json.meta.json").exists());
+
+        let mut reopened = Project::open(&t.0).unwrap();
+        let report = reopened.scan(Some(&mut ids)).unwrap();
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert!(report.created.is_empty(), "{:?}", report.created);
+        let entry = reopened.entry(&id).expect("scanned data document");
+        assert_eq!(entry.kind, Kind::Data);
+        assert_eq!(entry.path, "content/data/hud.data.json");
+        assert_eq!(reopened.read_document(&id).unwrap(), doc);
     }
 }

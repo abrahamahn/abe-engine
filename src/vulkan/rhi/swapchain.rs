@@ -433,7 +433,12 @@ impl<'w> Gpu<'w> {
             })();
             self.scope = scope;
             scope_res?;
-            self.execute(slot, cmd, &mut plan, Some((self.subs[slot].acquire, finished)))
+            self.execute(
+                slot,
+                cmd,
+                &mut plan,
+                Some((self.subs[slot].acquire, finished)),
+            )
         })();
         self.plan = plan;
         exec_res?;

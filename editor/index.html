@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ganbate Editor</title>
+<title>Ganbate Studio</title>
 <link rel="stylesheet" href="/editor/studio.css">
 </head>
 <body>
@@ -39,6 +39,31 @@
   <label class="time"><span data-i18n="time">Time</span> <input id="time" type="range" min="0" max="24" step="0.1" value="17.5"> <span id="time-label">17.5 h</span></label>
   <button id="recook" data-i18n="refresh" data-i18n-title="refreshTip">Refresh</button>
   <button id="simulate" data-i18n="simulate" data-i18n-title="simulateTip">Simulate</button>
+  <span id="pie-toolbar" class="pie-toolbar" hidden>
+    <span class="sep"></span>
+    <span class="view-toggle" role="group">
+      <button type="button" id="view-mode-scene" class="mini on" data-i18n="viewScene">Scene</button>
+      <button type="button" id="view-mode-pie" class="mini" data-i18n="viewPie">Game (PIE)</button>
+      <button type="button" id="view-mode-matrix" class="mini" data-i18n="viewMatrix">Device Matrix</button>
+    </span>
+    <select id="pie-preset" aria-label="PIE preset" hidden></select>
+    <select id="pie-device" aria-label="PIE device" hidden></select>
+    <button type="button" id="pie-inspect-ui" class="mini" hidden data-i18n="pieInspectUi" data-i18n-title="pieInspectUiTip">Inspect UI</button>
+  </span>
+  <details id="live-release-menu" class="live-release-menu" hidden>
+    <summary><span data-i18n="liveRelease">Live Release</span> <span id="live-release-badge" class="live-badge" data-state="local">Local</span></summary>
+    <div class="live-release-popover">
+      <div id="live-release-summary" class="live-release-summary"></div>
+      <input id="live-release-note" type="text" data-i18n-placeholder="liveNotePlaceholder" placeholder="Release note (optional)…">
+      <div class="live-release-actions">
+        <button type="button" id="live-stage" data-i18n="liveStage">Stage Draft</button>
+        <button type="button" id="live-publish" class="live-primary" data-i18n="livePublish">Publish Live (Skip Deploy)</button>
+        <button type="button" id="live-pull" data-i18n="livePull">Pull Live to Project</button>
+        <button type="button" id="live-discard" data-i18n="liveDiscard">Discard Draft</button>
+        <button type="button" id="live-refresh" data-i18n="liveRefresh">Refresh Status</button>
+      </div>
+    </div>
+  </details>
   <span class="grow"></span>
   <select id="project-tools" aria-label="Project tools" hidden><option value="" data-i18n="projectTools">Project tools</option></select>
   <span id="fps"></span>
@@ -46,7 +71,33 @@
   <button id="language" class="mini" data-i18n="language">한국어</button>
   <span id="connection" data-i18n="connecting">connecting</span>
 </header>
-<main>
+<nav id="workspace-bar" aria-label="Studio Workbenches and AI IDE">
+  <div id="workspace-tabs" role="tablist"></div>
+  <div id="ai-ide-bar">
+    <span id="ai-selection-pill" class="ai-selection-pill" data-i18n="aiSelectionNone">@selection: scene</span>
+    <input id="ai-gbs-input" type="text" autocomplete="off" spellcheck="false" data-i18n-placeholder="aiGbsPlaceholder" placeholder=".gbs command (e.g. spawn Beacon at 0 1 0; snap Beacon ground)…">
+    <button type="button" id="ai-gbs-apply" class="mini" data-i18n="aiApply" data-i18n-title="aiApplyTip">Apply .gbs</button>
+    <details id="ai-verify-menu" class="ai-verify-menu">
+      <summary id="ai-verify-summary" data-i18n-title="aiVerifyTip"><span data-i18n="aiVerify">Verify</span> <span id="ai-verify-badge" class="ai-verify-badge" data-state="idle">—</span></summary>
+      <div id="ai-verify-popover" class="ai-verify-popover">
+        <div class="ai-verify-head">
+          <button type="button" id="ai-verify-run" class="mini on" data-i18n="aiVerify">Verify</button>
+          <span id="ai-verify-meta" class="meta"></span>
+        </div>
+        <div id="ai-verify-results" class="ai-verify-results"></div>
+      </div>
+    </details>
+    <details id="ai-catalog-menu" class="ai-verify-menu">
+      <summary data-i18n-title="aiCatalogTip"><span data-i18n="aiCatalog">Catalog</span></summary>
+      <div id="ai-catalog-popover" class="ai-verify-popover">
+        <input id="ai-catalog-search" type="search" placeholder="Search bricks & assets…">
+        <div id="ai-catalog-results" class="ai-verify-results"></div>
+      </div>
+    </details>
+    <button type="button" id="ai-crystallize-btn" class="mini" data-i18n="aiCrystallize" data-i18n-title="aiCrystallizeTip">Crystallize</button>
+  </div>
+</nav>
+<main id="world-workspace">
   <section id="left">
     <div class="panel" id="outliner">
       <h2><span data-i18n="outliner">Outliner</span>
@@ -65,12 +116,13 @@
     <canvas id="overlay"></canvas>
     <div id="frame-guide" hidden aria-hidden="true"></div>
     <div id="viewport-drop-hint" hidden aria-hidden="true"></div>
-  </section></div>
+  </section><section id="pie-stage" hidden></section><section id="pie-matrix" hidden></section><div id="layout-rig-overlay" hidden></div></div>
   <section id="right" class="panel">
     <h2 data-i18n="inspector">Inspector</h2>
     <div id="inspector-body" tabindex="-1"></div>
   </section>
 </main>
+<section id="workbench-deck" hidden></section>
 <div id="dock-resizer" role="separator" aria-orientation="horizontal"></div>
 <footer id="bottom-dock">
   <section class="panel" id="assets">
@@ -103,6 +155,7 @@
         <button id="new-scene" type="button" class="mini" data-i18n="newScene" data-i18n-title="newSceneTip">+ Scene</button>
         <button id="new-prefab" type="button" class="mini" data-i18n="newPrefab" data-i18n-title="newPrefabTip">+ Prefab</button>
         <button id="new-look" type="button" class="mini" data-i18n="newLook" data-i18n-title="newLookFile">+ Look</button>
+        <button id="new-data" type="button" class="mini" data-i18n="newData" data-i18n-title="newDataTip">+ Data</button>
         <button id="toggle-console" type="button" class="mini on" data-i18n="console" data-i18n-title="toggleConsole">Console</button>
       </div>
     </header>
@@ -123,6 +176,24 @@
   </section>
 </footer>
 <script type="module" src="/editor/studio.js"></script>
+<dialog id="new-data-dialog" aria-labelledby="new-data-title">
+  <form id="new-data-form" method="dialog">
+    <h3 id="new-data-title" data-i18n="newDataTitle">New Data Document</h3>
+    <label><span data-i18n="dataSchema">Schema</span>
+      <select id="new-data-schema" required></select>
+    </label>
+    <label><span data-i18n="name">Name</span>
+      <input id="new-data-name" type="text" required>
+    </label>
+    <label><span data-i18n="dataPath">File path</span>
+      <input id="new-data-path" type="text" required>
+    </label>
+    <div class="dialog-actions">
+      <button type="button" id="new-data-cancel" data-i18n="cancel">Cancel</button>
+      <button type="submit" id="new-data-submit" class="on" data-i18n="createDoc">Create</button>
+    </div>
+  </form>
+</dialog>
 <dialog id="project-tool-panel" aria-labelledby="project-tool-title">
   <header><strong id="project-tool-title"></strong>
     <a id="project-tool-external" target="_blank" rel="noopener noreferrer" data-i18n="openSeparately">Open separately</a>

@@ -697,7 +697,11 @@ impl<'w> Gpu<'w> {
         let mut overflow_entries = Vec::new();
         let (layout_id, set_layout, entry_count) = {
             let p = self.pipeline(pipeline)?;
-            match p.groups.get(group as usize).filter(|g| !g.entries.is_empty()) {
+            match p
+                .groups
+                .get(group as usize)
+                .filter(|g| !g.entries.is_empty())
+            {
                 Some(g) => {
                     if g.entries.len() <= inline_entries.len() {
                         inline_entries[..g.entries.len()].copy_from_slice(&g.entries);
@@ -846,8 +850,8 @@ impl<'w> Gpu<'w> {
                         }
                         _ => unreachable!("matched texture kinds above"),
                     }
-                    let (key, mips, layers) =
-                        view_for(view, res, &desc, storage).map_err(|m| format!("{}: {m}", at()))?;
+                    let (key, mips, layers) = view_for(view, res, &desc, storage)
+                        .map_err(|m| format!("{}: {m}", at()))?;
                     let image_view = self.view(id, key)?;
                     let (layout, access) = if storage {
                         (track::GENERAL, access::SHADER_WRITE)
