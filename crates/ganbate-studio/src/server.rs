@@ -503,10 +503,28 @@ impl Host {
         if p == "/" {
             return http::serve_file(&self.config.editor, "index.html");
         }
+        if p == "/api/project/xray-catalog" {
+            let resp = http::serve_inside(
+                &self.root.join("public/ganbate-studio"),
+                "code-surface-catalog.json",
+                &self.real_root,
+            );
+            if resp.status == 404 {
+                return Response::json(
+                    404,
+                    r#"{"error":"not_found","message":"code-surface-catalog.json not generated yet"}"#
+                        .into(),
+                );
+            }
+            return resp;
+        }
         if let Some(rest) = p.strip_prefix("/editor/") {
             return http::serve_file(&self.config.editor, rest);
         }
         if let Some(rest) = p.strip_prefix("/engine/") {
+            return http::serve_file(&self.config.engine, rest);
+        }
+        if let Some(rest) = p.strip_prefix("/web/") {
             return http::serve_file(&self.config.engine, rest);
         }
         if let Some(rest) = p.strip_prefix("/cooked/") {
@@ -514,6 +532,26 @@ impl Host {
         }
         if let Some(rest) = p.strip_prefix("/project/") {
             return http::serve_inside(&self.root, rest, &self.real_root);
+        }
+        if let Some(rest) = p.strip_prefix("/games/") {
+            return http::serve_inside(&self.root.join("public/games"), rest, &self.real_root);
+        }
+        if let Some(rest) = p.strip_prefix("/dev-assets/") {
+            return http::serve_inside(&self.root.join("public/dev-assets"), rest, &self.real_root);
+        }
+        if let Some(rest) = p.strip_prefix("/ganbate-studio/") {
+            let resp = http::serve_inside(
+                &self.root.join("public/ganbate-studio"),
+                rest,
+                &self.real_root,
+            );
+            if resp.status != 404 {
+                return resp;
+            }
+            return http::serve_file(&self.config.editor, rest);
+        }
+        if let Some(rest) = p.strip_prefix("/content/") {
+            return http::serve_inside(&self.root.join("content"), rest, &self.real_root);
         }
         Response::text(404, "not found")
     }

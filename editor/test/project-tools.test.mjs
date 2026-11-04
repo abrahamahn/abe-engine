@@ -31,11 +31,14 @@ test('CloudStudioHost allows explicit same-origin docked tools with ?embed=studi
     origin: 'same-origin',
     tools: [
       { id: 'motion-lab', label: 'Motion Lab', path: '/ganbate-editor/motion' },
+      { id: 'layout-tuner', label: 'Layout Tuner', path: '/ganbate-editor/layout-tuner', open: 'embed' },
       { id: 'ops', label: 'Operations', path: '/ganbate-editor/operations', open: 'tab' },
     ],
   };
   const resolved = resolveProjectTools(cloudManifest, 'https://ganbate.example', null, { allowSameOrigin: true });
   assert.equal(resolved[0].embedHref, 'https://ganbate.example/ganbate-editor/motion?embed=studio');
-  assert.equal(resolved[1].href, 'https://ganbate.example/ganbate-editor/operations');
+  assert.equal(resolved[1].open, 'embed');
+  assert.equal(resolved[1].embedHref, 'https://ganbate.example/ganbate-editor/layout-tuner?embed=studio');
+  assert.equal(resolved[2].href, 'https://ganbate.example/ganbate-editor/operations');
   assert.equal(withEmbedStudioParam('https://ganbate.example/tool?embed=custom'), 'https://ganbate.example/tool?embed=custom');
 });

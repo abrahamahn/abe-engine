@@ -54,7 +54,7 @@ export function resolveProjectTools(manifest, studioOrigin, override, options = 
     }
     const url = new URL(tool.path, requested.origin);
     if (url.origin !== requested.origin) throw new Error('Project tool leaves its configured origin.');
-    if (tool.open !== undefined && tool.open !== 'panel' && tool.open !== 'tab') {
+    if (tool.open !== undefined && tool.open !== 'panel' && tool.open !== 'embed' && tool.open !== 'tab') {
       throw new Error('Invalid project tool target.');
     }
     const open = tool.open ?? 'panel';
@@ -62,7 +62,7 @@ export function resolveProjectTools(manifest, studioOrigin, override, options = 
       id: slugifyToolId(tool, idx),
       label: tool.label,
       href: url.href,
-      embedHref: open === 'panel' ? withEmbedStudioParam(url.href) : url.href,
+      embedHref: open === 'panel' || open === 'embed' ? withEmbedStudioParam(url.href) : url.href,
       open,
     };
   });
@@ -121,7 +121,7 @@ export function projectToolsPanel(onError, options = {}) {
       if (select) select.length = 1;
       tabs?.replaceChildren();
       for (const tool of resolvedTools) {
-        if (tool.open === 'panel') {
+        if (tool.open === 'panel' || tool.open === 'embed') {
           select?.add(new Option(tool.label, tool.href));
           continue;
         }

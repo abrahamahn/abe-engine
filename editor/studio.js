@@ -265,7 +265,9 @@ function onMessage(msg) {
       // After a reconnect, the document that was open (or being opened) opens again.
       const params = new URLSearchParams(location.search);
       const requested = params.get('asset');
-      const requestedTab = params.get('tab');
+      const rawHash = location.hash.replace(/^#/, '').trim();
+      const hashTab = rawHash.startsWith('tab=') ? rawHash.slice(4) : rawHash;
+      const requestedTab = params.get('tab') || hashTab || null;
       const asset = state.assets.find((a) => a.path === requested);
       if (state.wanted) state.host.send({ type: 'open', doc: state.wanted });
       else if (asset && (asset.kind === 'scene' || asset.kind === 'prefab')) openDoc(asset.id);
@@ -275,7 +277,7 @@ function onMessage(msg) {
       else if (asset?.kind === 'look') inspectLook(asset.id);
       else if (asset?.kind === 'data') inspectData(asset.id);
       if (asset) assetLibrary.revealAsset(asset.id);
-      if (requestedTab && requestedTab !== state.activeWorkbench) {
+      if (requestedTab && normalizeWorkbenchId(requestedTab) !== state.activeWorkbench) {
         void activateWorkbench(requestedTab);
       } else {
         drawWorkspaceTabs();
@@ -1588,8 +1590,18 @@ state.assetLibrary = assetLibrary;
 const loadProjectTools = projectToolsPanel((msg) => log(2, msg), {
   allowSameOrigin: () => state.host?.kind === 'cloud',
   onToolsLoaded: (tools) => {
-    state.projectWorkbenches = tools.filter((tool) => tool.open === 'panel');
+    state.projectWorkbenches = tools.filter((tool) => tool.open === 'panel' || tool.open === 'embed');
     drawWorkspaceTabs();
+    const params = new URLSearchParams(location.search);
+    const rawHash = location.hash.replace(/^#/, '').trim();
+    const hashTab = rawHash.startsWith('tab=') ? rawHash.slice(4) : rawHash;
+    const requestedTab = params.get('tab') || hashTab || null;
+    if (requestedTab && state.activeWorkbench === 'world') {
+      const normalized = normalizeWorkbenchId(requestedTab);
+      if (normalized.startsWith('project:')) {
+        void activateWorkbench(normalized);
+      }
+    }
   },
 });
 
@@ -1687,7 +1699,7 @@ const ENGINE_WORKBENCHES = [
     id: 'material',
     labelKey: 'wb_material',
     modulePath: './material-studio.js',
-    cssPath: './material-studio.css',
+    cssPath: null,
     exportName: 'mountMaterialStudio',
     documentSuffixes: ['.material.json'],
   },
@@ -1728,10 +1740,40 @@ const ENGINE_WORKBENCHES = [
     id: 'profiler',
     labelKey: 'wb_profiler',
     modulePath: './telemetry-profiler.js',
-    cssPath: './telemetry-profiler.css',
+    cssPath: null,
     exportName: 'mountTelemetryProfiler',
   },
+  {
+    id: 'code-xray',
+    labelKey: 'wb_code_xray',
+    modulePath: './code-xray.js',
+    cssPath: './code-xray.css',
+    optionalCss: true,
+    exportName: 'mountCodeXray',
+  },
 ];
+
+const WORKBENCH_ID_ALIASES = Object.freeze({
+  'model-studio': 'model',
+  'material-studio': 'material',
+  'character-studio': 'character',
+  'sequencer-studio': 'sequencer',
+  'vfx-studio': 'vfx',
+  'audio-daw': 'audio',
+  'telemetry-profiler': 'profiler',
+  xray: 'code-xray',
+  'project-xray': 'code-xray',
+});
+
+function normalizeWorkbenchId(rawId) {
+  const clean = typeof rawId === 'string' ? rawId.trim() : '';
+  if (!clean) return 'world';
+  if (WORKBENCH_ID_ALIASES[clean]) return WORKBENCH_ID_ALIASES[clean];
+  if (!clean.startsWith('project:') && state.projectWorkbenches.some((tItem) => tItem.id === clean)) {
+    return `project:${clean}`;
+  }
+  return clean;
+}
 
 const customWorkbenches = new Map(); // id -> descriptor
 const mountedWorkbenches = new Map(); // id -> { pane, instance, cssLoaded }
@@ -1828,17 +1870,27 @@ function notifyWorkbenchDoc(doc) {
   }
 }
 
-function ensureWorkbenchStylesheet(relCssPath) {
+function ensureWorkbenchStylesheet(relCssPath, optional = false) {
   if (!relCssPath) return;
   const href = new URL(relCssPath, import.meta.url).href;
   if (loadedStylesheets.has(href)) return;
-  loadedStylesheets.add(href);
-  const link = el('link', { rel: 'stylesheet', href });
-  link.onerror = () => {
-    loadedStylesheets.delete(href);
-    link.remove();
+  const appendLink = () => {
+    if (loadedStylesheets.has(href)) return;
+    loadedStylesheets.add(href);
+    const link = el('link', { rel: 'stylesheet', href });
+    link.onerror = () => {
+      loadedStylesheets.delete(href);
+      link.remove();
+    };
+    document.head.append(link);
   };
-  document.head.append(link);
+  if (optional && typeof fetch === 'function') {
+    void fetch(href, { method: 'HEAD' }).then((res) => {
+      if (res.ok) appendLink();
+    }).catch(() => { /* optional stylesheet not yet present */ });
+    return;
+  }
+  appendLink();
 }
 
 const studioApi = {
@@ -1988,6 +2040,54 @@ const studioApi = {
     element: $('#viewport'),
     engine: state.engine,
     getStats: () => buildViewportStats(),
+    frameBounds: (bounds) => frameBounds(bounds),
+    setCameraPose: (pose = {}) => {
+      if (!pose || typeof pose !== 'object') return;
+      state.cameraFollow = null;
+      if (Array.isArray(pose.target) && pose.target.length >= 3) {
+        state.view.target = [Number(pose.target[0]) || 0, Number(pose.target[1]) || 0, Number(pose.target[2]) || 0];
+      }
+      if (Array.isArray(pose.eye) && pose.eye.length >= 3) {
+        const dx = (Number(pose.eye[0]) || 0) - state.view.target[0];
+        const dy = (Number(pose.eye[1]) || 0) - state.view.target[1];
+        const dz = (Number(pose.eye[2]) || 0) - state.view.target[2];
+        const dist = Math.hypot(dx, dy, dz);
+        if (dist > 1e-4) {
+          state.view.distance = Math.max(0.05, Math.min(2000, dist));
+          state.view.pitch = Math.max(-1.55, Math.min(1.55, Math.asin(Math.max(-1, Math.min(1, dy / dist)))));
+          state.view.yaw = Math.atan2(dx, dz);
+        }
+      } else {
+        if (Number.isFinite(pose.distance)) state.view.distance = Math.max(0.05, Math.min(2000, Number(pose.distance)));
+        if (Number.isFinite(pose.yaw)) state.view.yaw = Number(pose.yaw);
+        if (Number.isFinite(pose.pitch)) state.view.pitch = Math.max(-1.55, Math.min(1.55, Number(pose.pitch)));
+      }
+      if (Number.isFinite(pose.fov) && pose.fov >= 1 && pose.fov <= 170) {
+        state.view.fov = Number(pose.fov);
+        const fovInput = $('#viewport-fov');
+        if (fovInput) fovInput.value = String(pose.fov);
+      }
+    },
+    setLightingPreset: (preset = {}) => {
+      if (typeof preset === 'string') {
+        if (preset === 'night' || preset === 'evening') setTime(19.5);
+        else if (preset === 'golden_hour') setTime(17.5);
+        else if (preset === 'studio' || preset === 'studio_neutral' || preset === 'day') setTime(13.0);
+        return;
+      }
+      if (!preset || typeof preset !== 'object') return;
+      if (Number.isFinite(preset.time)) setTime(Number(preset.time));
+      if (typeof preset.weather === 'string' && preset.weather) {
+        state.weather = preset.weather;
+        pieViewport.notifyEnvironmentChanged();
+      }
+      if (state.engine && (Number.isFinite(preset.exposure) || preset.look)) {
+        const patch = preset.look && typeof preset.look === 'object'
+          ? preset.look
+          : { shading: { exposure: Number(preset.exposure) } };
+        try { state.engine.setLook(patch); } catch { /* ignore */ }
+      }
+    },
     setTime: (hours) => setTime(hours),
     setWeather: (preset) => {
       state.weather = preset;
@@ -2014,11 +2114,12 @@ const studioApi = {
   activateWorkbench: (workbenchId, options) => activateWorkbench(workbenchId, options),
   registerWorkbench: (descriptor) => {
     if (!descriptor || typeof descriptor.id !== 'string' || !descriptor.id.trim()) return;
-    customWorkbenches.set(descriptor.id.trim(), descriptor);
-    if (mountedWorkbenches.has(descriptor.id.trim())) {
-      const prev = mountedWorkbenches.get(descriptor.id.trim());
+    const id = normalizeWorkbenchId(descriptor.id);
+    customWorkbenches.set(id, { ...descriptor, id });
+    if (mountedWorkbenches.has(id)) {
+      const prev = mountedWorkbenches.get(id);
       prev.pane?.remove();
-      mountedWorkbenches.delete(descriptor.id.trim());
+      mountedWorkbenches.delete(id);
     }
     drawWorkspaceTabs();
   },
@@ -2026,7 +2127,16 @@ const studioApi = {
     const num = level === 'error' || level === 2 ? 2 : level === 'warn' || level === 1 ? 1 : 0;
     log(num, String(message));
   },
-  log: (level, message) => log(level, String(message)),
+  log: (first, second) => {
+    const levelNames = new Set(['info', 'warn', 'error']);
+    if (typeof first === 'string' && !levelNames.has(first) && (typeof second === 'string' || typeof second === 'number' || second === undefined)) {
+      const num = second === 'error' || second === 2 ? 2 : second === 'warn' || second === 1 ? 1 : 0;
+      log(num, first);
+      return;
+    }
+    const num = first === 'error' || first === 2 ? 2 : first === 'warn' || first === 1 ? 1 : 0;
+    log(num, String(second ?? ''));
+  },
   t: (key, ...args) => t(key, ...args) ?? key,
   getLocale: () => (lang() === 'ko' ? 'ko' : 'en'),
 };
@@ -2081,7 +2191,7 @@ async function mountWorkbenchPane(wb) {
   const pane = el('div', { class: 'workbench-pane', 'data-workbench-pane': wb.id });
   deck.append(pane);
 
-  if (wb.cssPath) ensureWorkbenchStylesheet(wb.cssPath);
+  if (wb.cssPath) ensureWorkbenchStylesheet(wb.cssPath, Boolean(wb.optionalCss));
 
   let mountFn = typeof wb.mount === 'function' ? wb.mount : null;
   if (!mountFn && (wb.moduleUrl || wb.modulePath)) {
@@ -2090,8 +2200,11 @@ async function mountWorkbenchPane(wb) {
     const mod = await import(resolvedUrl).catch(() => null);
     if (mod) {
       mountFn = (wb.exportName && typeof mod[wb.exportName] === 'function' && mod[wb.exportName])
+        || (typeof mod.mountCodeXray === 'function' && mod.mountCodeXray)
+        || (typeof mod.mountCodeXRay === 'function' && mod.mountCodeXRay)
         || (typeof mod.mount === 'function' && mod.mount)
         || (typeof mod.default === 'function' && mod.default)
+        || customWorkbenches.get(wb.id)?.mount
         || null;
     }
   }
@@ -2109,9 +2222,10 @@ async function mountWorkbenchPane(wb) {
       ));
     }
   } else {
+    const specLabel = wb.modulePath || wb.moduleUrl || wb.id;
     pane.replaceChildren(el('div', { class: 'workbench-placeholder' },
       el('strong', {}, wb.label || (wb.labelKey ? t(wb.labelKey) : wb.id)),
-      el('span', {}, 'Workbench module ready for Wave 2 engine integration.'),
+      el('span', {}, t('wbUnavailableHint', specLabel)),
     ));
   }
 
@@ -2120,7 +2234,8 @@ async function mountWorkbenchPane(wb) {
   return record;
 }
 
-async function activateWorkbench(workbenchId, options = {}) {
+async function activateWorkbench(rawWorkbenchId, options = {}) {
+  const workbenchId = normalizeWorkbenchId(rawWorkbenchId);
   const prevId = state.activeWorkbench;
   if (prevId && prevId !== workbenchId && mountedWorkbenches.has(prevId)) {
     try { mountedWorkbenches.get(prevId).instance?.onDeactivate?.(); } catch { /* ignore */ }

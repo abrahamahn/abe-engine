@@ -44,6 +44,7 @@ fn interface() -> (PathBuf, PathBuf) {
     std::fs::write(editor.join("studio.js"), b"// the editor").unwrap();
     let engine = temp("engine");
     std::fs::write(engine.join("ganbate.js"), b"export {};").unwrap();
+    std::fs::write(engine.join("character-customization.mjs"), b"export {};").unwrap();
     (editor, engine)
 }
 
@@ -894,4 +895,67 @@ fn running_out_of_descriptors_neither_spins_nor_stops_the_host() {
     } else {
         eprintln!("prlimit is not available: the recovery half was not checked");
     }
+}
+
+#[test]
+fn xray_catalog_and_project_public_assets_are_served_inside_project_root() {
+    let host = start(None);
+    let port = host.port;
+
+    // Before code-surface-catalog.json exists, /api/project/xray-catalog returns a clean 404 JSON payload.
+    let (status_missing, head_missing, body_missing) = request(
+        port,
+        "/api/project/xray-catalog",
+        &format!("Host: 127.0.0.1:{port}\r\n"),
+    );
+    assert_eq!(status_missing, 404);
+    assert!(head_missing.contains("Content-Type: application/json; charset=utf-8"));
+    let parsed_missing = json::parse(&body_missing).expect("404 JSON body");
+    assert_eq!(
+        parsed_missing.get("error").and_then(|v| v.string().ok()),
+        Some("not_found")
+    );
+
+    // Populate public/ganbate-studio/code-surface-catalog.json and public static asset folders.
+    let studio_pub = host.root.join("public/ganbate-studio");
+    let games_pub = host.root.join("public/games/rooms");
+    let dev_assets_pub = host.root.join("public/dev-assets");
+    std::fs::create_dir_all(&studio_pub).unwrap();
+    std::fs::create_dir_all(&games_pub).unwrap();
+    std::fs::create_dir_all(&dev_assets_pub).unwrap();
+    let catalog_bytes = br#"{"schema":"ganbate.code-xray/1","surfaces":[{"id":"world"}]}"#;
+    std::fs::write(studio_pub.join("code-surface-catalog.json"), catalog_bytes).unwrap();
+    std::fs::write(games_pub.join("stage.glb"), b"glTF-stage").unwrap();
+    std::fs::write(dev_assets_pub.join("prop.glb"), b"glTF-prop").unwrap();
+
+    let (status_ok, head_ok, body_ok) = request(
+        port,
+        "/api/project/xray-catalog",
+        &format!("Host: 127.0.0.1:{port}\r\n"),
+    );
+    assert_eq!(status_ok, 200);
+    assert!(head_ok.contains("Content-Type: application/json; charset=utf-8"));
+    assert_eq!(body_ok, catalog_bytes);
+
+    assert_eq!(
+        get(port, "/ganbate-studio/code-surface-catalog.json"),
+        (200, catalog_bytes.to_vec())
+    );
+    assert_eq!(
+        get(port, "/games/rooms/stage.glb"),
+        (200, b"glTF-stage".to_vec())
+    );
+    assert_eq!(
+        get(port, "/dev-assets/prop.glb"),
+        (200, b"glTF-prop".to_vec())
+    );
+    assert_eq!(get(port, "/content/note.glb"), (200, b"glTF".to_vec()));
+    assert_eq!(
+        get(port, "/web/character-customization.mjs").0,
+        200
+    );
+
+    // Path traversal and hidden files remain strictly refused.
+    assert_eq!(get(port, "/games/../../etc/passwd").0, 403);
+    assert_eq!(get(port, "/dev-assets/.hidden/secret.glb").0, 403);
 }
