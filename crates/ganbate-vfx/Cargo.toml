@@ -8,5 +8,3 @@ description = "Deterministic data-driven 3D particle and VFX simulator for Ganba
 
 [dependencies]
 ganbate-core = { path = "../ganbate-core" }
-
-[workspace]

@@ -8,5 +8,3 @@ description = "Deterministic multi-track cinematic and gameplay sequencer for Ga
 
 [dependencies]
 ganbate-core = { path = "../ganbate-core" }
-
-[workspace]

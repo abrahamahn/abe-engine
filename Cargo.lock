@@ -68,6 +68,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ganbate-seq"
+version = "0.2.0"
+dependencies = [
+ "ganbate-core",
+]
+
+[[package]]
 name = "ganbate-shader"
 version = "0.2.0"
 
@@ -80,6 +87,13 @@ dependencies = [
  "ganbate-engine",
  "ganbate-pipeline",
  "ganbate-scene",
+]
+
+[[package]]
+name = "ganbate-vfx"
+version = "0.2.0"
+dependencies = [
+ "ganbate-core",
 ]
 
 [[package]]
