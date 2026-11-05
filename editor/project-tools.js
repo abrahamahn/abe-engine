@@ -141,6 +141,253 @@ export function resolveTableLayoutTools(tools = []) {
   return { layoutTuner, graphicsLayoutTuner };
 }
 
+/**
+ * Resolves the companion gameplay editors (`motion-tuner`, `action-sequencer`, `god-mode`,
+ * and `audio-mixer`) from any `/ganbate-editor/*` manifest tool origin (applying
+ * `normalizeLoopbackOrigin` when `studioOrigin` is provided).
+ */
+export function resolveGameplayTools(tools = [], studioOrigin = null, options = {}) {
+  if (!Array.isArray(tools) || !tools.length) {
+    return {
+      motionTuner: null,
+      actionSequencer: null,
+      godMode: null,
+      audioMixer: null,
+    };
+  }
+  const pathnameOf = (tool) => {
+    try {
+      return new URL(tool.href).pathname.replace(/\/+$/, '');
+    } catch {
+      return '';
+    }
+  };
+  const normalizeToolHrefOrigin = (rawOrigin) => {
+    if (!studioOrigin) return rawOrigin;
+    try {
+      const parsed = webOrigin(rawOrigin);
+      return normalizeLoopbackOrigin(parsed, studioOrigin, {
+        allowSameOrigin: Boolean(options?.allowSameOrigin),
+        explicitOverride: Boolean(options?.explicitOverride),
+      }).origin;
+    } catch {
+      return rawOrigin;
+    }
+  };
+  const ensureDockedEntry = (matched) => {
+    if (!matched) return null;
+    try {
+      const parsed = new URL(matched.href);
+      const origin = normalizeToolHrefOrigin(parsed.origin);
+      const rebuiltHref = new URL(`${parsed.pathname}${parsed.search}${parsed.hash}`, origin).href;
+      return {
+        ...matched,
+        href: rebuiltHref,
+        embedHref: withEmbedStudioParam(rebuiltHref),
+        open: matched.open === 'panel' || matched.open === 'embed' ? matched.open : 'embed',
+      };
+    } catch {
+      return matched;
+    }
+  };
+
+  let motionTuner = ensureDockedEntry(tools.find((tool) => {
+    const pathname = pathnameOf(tool);
+    return tool.id === 'motion-tuner'
+      || pathname === '/ganbate-editor/motion-tuner'
+      || pathname.endsWith('/motion-tuner');
+  }) || null);
+
+  let actionSequencer = ensureDockedEntry(tools.find((tool) => {
+    const pathname = pathnameOf(tool);
+    return tool.id === 'action-sequencer'
+      || pathname === '/ganbate-editor/action-sequencer'
+      || pathname.endsWith('/action-sequencer');
+  }) || null);
+
+  let godMode = ensureDockedEntry(tools.find((tool) => {
+    const pathname = pathnameOf(tool);
+    return tool.id === 'god-mode'
+      || pathname === '/ganbate-editor/god-mode'
+      || pathname.endsWith('/god-mode');
+  }) || null);
+
+  let audioMixer = ensureDockedEntry(tools.find((tool) => {
+    const pathname = pathnameOf(tool);
+    return tool.id === 'audio-mixer'
+      || pathname === '/ganbate-editor/audio-mixer'
+      || pathname.endsWith('/audio-mixer');
+  }) || null);
+
+  const editorAnchor = motionTuner
+    || actionSequencer
+    || godMode
+    || audioMixer
+    || tools.find((tool) => pathnameOf(tool).startsWith('/ganbate-editor'))
+    || null;
+
+  if (editorAnchor) {
+    try {
+      const origin = normalizeToolHrefOrigin(new URL(editorAnchor.href).origin);
+      if (!motionTuner) {
+        const href = new URL('/ganbate-editor/motion-tuner', origin).href;
+        motionTuner = {
+          id: 'motion-tuner',
+          label: '🃏 Card & Chip Motion',
+          href,
+          embedHref: withEmbedStudioParam(href),
+          open: 'embed',
+        };
+      }
+      if (!actionSequencer) {
+        const href = new URL('/ganbate-editor/action-sequencer', origin).href;
+        actionSequencer = {
+          id: 'action-sequencer',
+          label: '🎬 Hand Choreography',
+          href,
+          embedHref: withEmbedStudioParam(href),
+          open: 'embed',
+        };
+      }
+      if (!godMode) {
+        const href = new URL('/ganbate-editor/god-mode', origin).href;
+        godMode = {
+          id: 'god-mode',
+          label: '🧪 Crowded-Hand Lab',
+          href,
+          embedHref: withEmbedStudioParam(href),
+          open: 'embed',
+        };
+      }
+      if (!audioMixer) {
+        const href = new URL('/ganbate-editor/audio-mixer', origin).href;
+        audioMixer = {
+          id: 'audio-mixer',
+          label: '🎚️ Game Foley Mixer',
+          href,
+          embedHref: withEmbedStudioParam(href),
+          open: 'embed',
+        };
+      }
+    } catch {
+      // Keep explicit matches only if URL parsing fails.
+    }
+  }
+
+  return {
+    motionTuner,
+    actionSequencer,
+    godMode,
+    audioMixer,
+  };
+}
+
+/**
+ * Renders the top-right 1-click Gameplay Editor pill switchers inside `#workbench-deck`:
+ * - `[data-role="gameplay-sequencer-switcher"]` for `sequencer`, `action-sequencer`, `motion-tuner`, and `god-mode`.
+ * - `[data-role="gameplay-audio-switcher"]` for `audio` and `audio-mixer`.
+ */
+export function createGameplaySwitcher({ el, t, getContext, onSelectTarget }) {
+  const ensureHost = () => {
+    let host = document.getElementById('gameplay-workbench-switcher');
+    if (!host) {
+      const deck = document.getElementById('workbench-deck');
+      if (!deck) return null;
+      host = el('div', {
+        id: 'gameplay-workbench-switcher',
+        class: 'gameplay-workbench-switcher',
+        hidden: true,
+      });
+      deck.append(host);
+    }
+    return host;
+  };
+
+  function classifyActiveTarget(activeWorkbench, gameplayTools) {
+    if (activeWorkbench === 'sequencer') {
+      return { family: 'sequencer', activeKey: 'sequencer' };
+    }
+    if (
+      activeWorkbench === 'project:action-sequencer'
+      || (gameplayTools?.actionSequencer && activeWorkbench === `project:${gameplayTools.actionSequencer.id}`)
+    ) {
+      return { family: 'sequencer', activeKey: 'action-sequencer' };
+    }
+    if (
+      activeWorkbench === 'project:motion-tuner'
+      || (gameplayTools?.motionTuner && activeWorkbench === `project:${gameplayTools.motionTuner.id}`)
+    ) {
+      return { family: 'sequencer', activeKey: 'motion-tuner' };
+    }
+    if (
+      activeWorkbench === 'project:god-mode'
+      || (gameplayTools?.godMode && activeWorkbench === `project:${gameplayTools.godMode.id}`)
+    ) {
+      return { family: 'sequencer', activeKey: 'god-mode' };
+    }
+    if (activeWorkbench === 'audio') {
+      return { family: 'audio', activeKey: 'audio' };
+    }
+    if (
+      activeWorkbench === 'project:audio-mixer'
+      || (gameplayTools?.audioMixer && activeWorkbench === `project:${gameplayTools.audioMixer.id}`)
+    ) {
+      return { family: 'audio', activeKey: 'audio-mixer' };
+    }
+    return { family: null, activeKey: null };
+  }
+
+  function makePill(targetKey, labelKey, tipKey, isActive) {
+    return el('button', {
+      type: 'button',
+      class: `mini layout-rig-pill gameplay-switcher-pill${isActive ? ' on' : ''}`,
+      'aria-pressed': String(isActive),
+      'data-gameplay-tool': targetKey,
+      title: t(tipKey),
+      onclick: (ev) => {
+        ev?.stopPropagation?.();
+        onSelectTarget?.(targetKey);
+      },
+    }, t(labelKey));
+  }
+
+  function draw() {
+    const host = ensureHost();
+    if (!host) return;
+    const { activeWorkbench, gameplayTools } = getContext();
+    const { family, activeKey } = classifyActiveTarget(activeWorkbench, gameplayTools);
+
+    if (family === 'sequencer') {
+      host.hidden = false;
+      host.replaceChildren(
+        el('div', { class: 'gameplay-switcher-bar', 'data-role': 'gameplay-sequencer-switcher' },
+          makePill('action-sequencer', 'gpHandChoreo', 'gpHandChoreoTip', activeKey === 'action-sequencer'),
+          makePill('motion-tuner', 'gpCardChipMotion', 'gpCardChipMotionTip', activeKey === 'motion-tuner'),
+          makePill('god-mode', 'gpCrowdedHandLab', 'gpCrowdedHandLabTip', activeKey === 'god-mode'),
+          makePill('sequencer', 'gpEngineSequencer', 'gpEngineSequencerTip', activeKey === 'sequencer'),
+        ),
+      );
+      return;
+    }
+
+    if (family === 'audio') {
+      host.hidden = false;
+      host.replaceChildren(
+        el('div', { class: 'gameplay-switcher-bar', 'data-role': 'gameplay-audio-switcher' },
+          makePill('audio-mixer', 'gpGameFoleyMixer', 'gpGameFoleyMixerTip', activeKey === 'audio-mixer'),
+          makePill('audio', 'gpEngineAudioDaw', 'gpEngineAudioDawTip', activeKey === 'audio'),
+        ),
+      );
+      return;
+    }
+
+    host.hidden = true;
+    host.replaceChildren();
+  }
+
+  return { draw };
+}
+
 function slugifyToolId(tool, idx) {
   if (typeof tool.id === 'string' && tool.id.trim()) {
     return tool.id.trim().replace(/[^a-zA-Z0-9_-]/g, '-');

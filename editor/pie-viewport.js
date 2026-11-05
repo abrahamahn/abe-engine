@@ -3,6 +3,7 @@
 // pairing cookie never leaks to the game origin.
 import { projectAssetUrl } from './asset-library.js';
 import { buildDataValueOps, materializeDataValues } from './data-inspector.js';
+import { normalizeLoopbackOrigin, normalizeLoopbackQueryOverride } from './project-tools.js';
 
 export const DEFAULT_PIE_DEVICES = Object.freeze([
   { id: 'phone-portrait', label: 'Phone · 390×844', width: 390, height: 844 },
@@ -10,6 +11,45 @@ export const DEFAULT_PIE_DEVICES = Object.freeze([
   { id: 'phone-landscape', label: 'Landscape · 844×390', width: 844, height: 390 },
   { id: 'tablet', label: 'Tablet · 1024×768', width: 1024, height: 768 },
 ]);
+
+export const BUILTIN_GAMEPLAY_PRESETS = Object.freeze([
+  { id: 'holdem-play', label: "Hold'em (/play)", path: '/play' },
+  { id: 'blackjack-play', label: 'Blackjack (/play/blackjack)', path: '/play/blackjack' },
+  { id: 'baccarat-play', label: 'Baccarat (/play/baccarat)', path: '/play/baccarat' },
+  {
+    id: 'living-stage-review',
+    label: '3D Stage Review (/ganbate-stage-review.html)',
+    path: '/ganbate-stage-review.html?living=1&room=1&hud=turn',
+  },
+]);
+
+export function createDefaultGameManifest(origin = 'http://127.0.0.1:5173') {
+  return {
+    version: 1,
+    origin,
+    entry: '/play',
+    presets: BUILTIN_GAMEPLAY_PRESETS.map((preset) => ({ ...preset })),
+  };
+}
+
+function mergeBuiltinGameplayPresets(basePresets, gameOrigin) {
+  const merged = [...basePresets];
+  const seenIds = new Set(merged.map((p) => p.id));
+  const seenPaths = new Set(merged.map((p) => p.path));
+  for (const builtin of BUILTIN_GAMEPLAY_PRESETS) {
+    if (seenIds.has(builtin.id) || seenPaths.has(builtin.path)) continue;
+    const safe = safeOriginPath(builtin.path, gameOrigin, 'preset');
+    merged.push({
+      id: builtin.id,
+      label: builtin.label,
+      path: safe.path,
+      href: safe.href,
+    });
+    seenIds.add(builtin.id);
+    seenPaths.add(builtin.path);
+  }
+  return merged;
+}
 
 function webOrigin(value) {
   const url = new URL(value);
@@ -44,18 +84,23 @@ function safeOriginPath(rawPath, origin, what) {
 }
 
 export function resolveGameWorkspace(manifest, studioOrigin, override, options = {}) {
-  if (!manifest || typeof manifest !== 'object' || manifest.version !== 1) {
+  const effectiveManifest = (!manifest && options?.fallback)
+    ? createDefaultGameManifest(options.fallbackOrigin || 'http://127.0.0.1:5173')
+    : manifest;
+  if (!effectiveManifest || typeof effectiveManifest !== 'object' || effectiveManifest.version !== 1) {
     throw new Error('Invalid studio-game.json manifest.');
   }
   const allowSameOrigin = options?.allowSameOrigin === true;
-  const rawOrigin = manifest.origin === 'same-origin' && allowSameOrigin
+  const rawOrigin = effectiveManifest.origin === 'same-origin' && allowSameOrigin
     ? new URL('/', studioOrigin).origin
-    : manifest.origin;
+    : effectiveManifest.origin;
   const configured = webOrigin(rawOrigin);
-  const requested = override && configured.local ? webOrigin(override) : configured;
-  if (override && configured.local && !requested.local) {
+  const explicitOverride = Boolean(override);
+  const candidate = explicitOverride && configured.local ? webOrigin(override) : configured;
+  if (explicitOverride && configured.local && !candidate.local) {
     throw new Error('A local game origin override must stay local.');
   }
+  const requested = normalizeLoopbackOrigin(candidate, studioOrigin, { allowSameOrigin, explicitOverride });
   // Cookies are host-scoped, not port-scoped. Studio's HttpOnly pairing cookie belongs only to Studio.
   if (
     !allowSameOrigin &&
@@ -65,11 +110,11 @@ export function resolveGameWorkspace(manifest, studioOrigin, override, options =
     throw new Error('Use different hostnames for Studio and the game, e.g. localhost and 127.0.0.1.');
   }
 
-  const entryRaw = manifest.entry ?? '/?studioPie=1';
+  const entryRaw = effectiveManifest.entry ?? '/?studioPie=1';
   const entry = safeOriginPath(entryRaw, requested.origin, 'entry');
 
-  const presets = Array.isArray(manifest.presets) && manifest.presets.length
-    ? manifest.presets.map((preset, idx) => {
+  const basePresets = Array.isArray(effectiveManifest.presets) && effectiveManifest.presets.length
+    ? effectiveManifest.presets.map((preset, idx) => {
         if (!preset || typeof preset !== 'object' || typeof preset.label !== 'string' || !preset.label.trim()) {
           throw new Error('Invalid PIE preset label.');
         }
@@ -83,8 +128,12 @@ export function resolveGameWorkspace(manifest, studioOrigin, override, options =
       })
     : [{ id: 'default', label: 'Main Stage', path: entry.path, href: entry.href }];
 
-  const devices = Array.isArray(manifest.devices) && manifest.devices.length
-    ? manifest.devices.map((dev, idx) => {
+  const presets = options?.includeBuiltinPresets === false
+    ? basePresets
+    : mergeBuiltinGameplayPresets(basePresets, requested.origin);
+
+  const devices = Array.isArray(effectiveManifest.devices) && effectiveManifest.devices.length
+    ? effectiveManifest.devices.map((dev, idx) => {
         const width = Math.round(Number(dev?.width));
         const height = Math.round(Number(dev?.height));
         if (!Number.isFinite(width) || !Number.isFinite(height) || width < 120 || height < 120 || width > 7680 || height > 7680) {
@@ -100,8 +149,8 @@ export function resolveGameWorkspace(manifest, studioOrigin, override, options =
     : DEFAULT_PIE_DEVICES.map((d) => ({ ...d }));
 
   let liveRelease = null;
-  if (manifest.liveRelease && typeof manifest.liveRelease === 'object') {
-    const lr = manifest.liveRelease;
+  if (effectiveManifest.liveRelease && typeof effectiveManifest.liveRelease === 'object') {
+    const lr = effectiveManifest.liveRelease;
     liveRelease = {
       statusPath: lr.statusPath ? safeOriginPath(lr.statusPath, requested.origin, 'liveRelease.statusPath').href : null,
       bundlePath: lr.bundlePath ? safeOriginPath(lr.bundlePath, requested.origin, 'liveRelease.bundlePath').href : null,
@@ -133,7 +182,9 @@ export function createPieViewport({
   log,
 }) {
   let workspace = null;
+  let fallbackOrigin = null;
   let mode = 'scene'; // 'scene' | 'pie' | 'matrix'
+  let splitPlay = false;
   let activePresetId = 'default';
   let activeDeviceId = 'responsive';
   let uiPick = false;
@@ -153,6 +204,28 @@ export function createPieViewport({
   const matrixEl = () => document.getElementById('pie-matrix');
   const sceneViewportEl = () => document.getElementById('viewport');
   const previewFrameEl = () => document.getElementById('preview-frame');
+  const studioOriginHref = () => globalThis.location?.origin || 'http://localhost:7480';
+
+  function ensureActiveWorkspace() {
+    if (workspace) return workspace;
+    if (!fallbackOrigin) return null;
+    try {
+      const allowSameOrigin = Boolean(getContext?.()?.allowSameOrigin);
+      workspace = resolveGameWorkspace(null, studioOriginHref(), null, {
+        fallback: true,
+        fallbackOrigin,
+        allowSameOrigin,
+      });
+      if (!workspace.presets.some((p) => p.id === activePresetId)) {
+        activePresetId = workspace.presets[0]?.id || 'default';
+      }
+      onWorkspaceLoaded?.(workspace);
+      return workspace;
+    } catch (err) {
+      log?.(2, String(err.message || err));
+      return null;
+    }
+  }
 
   function activePresetHref() {
     if (!workspace) return '';
@@ -162,7 +235,7 @@ export function createPieViewport({
 
   function mountedIframes() {
     const out = [];
-    if (mode === 'pie' && singleFrame?.iframe?.contentWindow) {
+    if ((mode === 'pie' || splitPlay) && singleFrame?.iframe?.contentWindow) {
       out.push(singleFrame.iframe);
     } else if (mode === 'matrix') {
       for (const entry of matrixFrames) {
@@ -330,7 +403,7 @@ export function createPieViewport({
 
   function updateFrameScales() {
     if (!workspace) return;
-    if (mode === 'pie' && singleFrame) {
+    if ((mode === 'pie' || splitPlay) && singleFrame) {
       const stage = stageEl();
       if (activeDeviceId === 'responsive') {
         fitShellIntoBox(stage, singleFrame.shell, 0, 0);
@@ -416,53 +489,83 @@ export function createPieViewport({
   function syncToolbarUi() {
     const bar = pieToolbar();
     if (!bar) return;
-    bar.hidden = !workspace;
-    if (!workspace) return;
+    const available = Boolean(workspace || fallbackOrigin);
+    bar.hidden = !available;
+    if (!available) return;
 
     const sceneBtn = document.getElementById('view-mode-scene');
     const pieBtn = document.getElementById('view-mode-pie');
     const matrixBtn = document.getElementById('view-mode-matrix');
-    sceneBtn?.classList.toggle('on', mode === 'scene');
-    pieBtn?.classList.toggle('on', mode === 'pie');
-    matrixBtn?.classList.toggle('on', mode === 'matrix');
+    const splitBtn = document.getElementById('pie-split-toggle');
+    sceneBtn?.classList.toggle('on', mode === 'scene' && !splitPlay);
+    pieBtn?.classList.toggle('on', mode === 'pie' && !splitPlay);
+    matrixBtn?.classList.toggle('on', mode === 'matrix' && !splitPlay);
+    if (splitBtn) {
+      splitBtn.hidden = false;
+      splitBtn.classList.toggle('on', splitPlay);
+      splitBtn.setAttribute('aria-pressed', String(splitPlay));
+    }
 
+    const showPieControls = Boolean(workspace && (mode !== 'scene' || splitPlay));
     const presetSel = document.getElementById('pie-preset');
     if (presetSel) {
-      presetSel.hidden = mode === 'scene';
-      presetSel.replaceChildren(
-        ...workspace.presets.map((p) => el('option', { value: p.id, selected: p.id === activePresetId }, p.label)),
-      );
+      presetSel.hidden = !showPieControls;
+      if (workspace) {
+        presetSel.replaceChildren(
+          ...workspace.presets.map((p) => el('option', { value: p.id, selected: p.id === activePresetId }, p.label)),
+        );
+      }
     }
 
     const deviceSel = document.getElementById('pie-device');
     if (deviceSel) {
-      deviceSel.hidden = mode !== 'pie';
-      deviceSel.replaceChildren(
-        el('option', { value: 'responsive', selected: activeDeviceId === 'responsive' }, t('pieResponsive')),
-        ...workspace.devices.map((d) => el('option', { value: d.id, selected: d.id === activeDeviceId }, d.label)),
-      );
+      deviceSel.hidden = !(workspace && (mode === 'pie' || splitPlay));
+      if (workspace) {
+        deviceSel.replaceChildren(
+          el('option', { value: 'responsive', selected: activeDeviceId === 'responsive' }, t('pieResponsive')),
+          ...workspace.devices.map((d) => el('option', { value: d.id, selected: d.id === activeDeviceId }, d.label)),
+        );
+      }
     }
 
     const inspectBtn = document.getElementById('pie-inspect-ui');
     if (inspectBtn) {
-      inspectBtn.hidden = mode === 'scene';
+      inspectBtn.hidden = !showPieControls;
       inspectBtn.classList.toggle('on', uiPick);
       inspectBtn.setAttribute('aria-pressed', String(uiPick));
     }
   }
 
-  function setMode(nextMode) {
-    if (!workspace && nextMode !== 'scene') return;
-    mode = nextMode;
+  function syncStageVisibility() {
     const vp = sceneViewportEl();
     const stage = stageEl();
     const matrix = matrixEl();
     const frame = previewFrameEl();
-    if (vp) vp.hidden = mode !== 'scene';
-    if (stage) stage.hidden = mode !== 'pie';
-    if (matrix) matrix.hidden = mode !== 'matrix';
-    frame?.classList.toggle('pie-active', mode !== 'scene');
+    const workbenchActive = Boolean(document.body?.classList?.contains('workbench-active'));
 
+    document.body?.classList?.toggle('pie-split-active', splitPlay);
+    frame?.classList?.toggle('pie-split-active', splitPlay);
+
+    if (splitPlay) {
+      if (vp) vp.hidden = workbenchActive;
+      if (stage) stage.hidden = false;
+      if (matrix) matrix.hidden = true;
+      frame?.classList?.add('pie-active');
+    } else {
+      if (vp) vp.hidden = mode !== 'scene';
+      if (stage) stage.hidden = mode !== 'pie';
+      if (matrix) matrix.hidden = mode !== 'matrix';
+      frame?.classList?.toggle('pie-active', mode !== 'scene');
+    }
+  }
+
+  function setMode(nextMode) {
+    if (nextMode !== 'scene' && !ensureActiveWorkspace()) return;
+    if (splitPlay) {
+      splitPlay = false;
+    }
+    mode = nextMode;
+    syncStageVisibility();
     syncToolbarUi();
     if (mode === 'pie') {
       void preloadProjectDocs().then(() => {
@@ -478,6 +581,53 @@ export function createPieViewport({
       mountMatrixStage();
     }
     onModeChanged?.(mode);
+  }
+
+  function setSplitPlay(next) {
+    const want = Boolean(next);
+    if (want) {
+      if (!ensureActiveWorkspace()) return false;
+      if (mode !== 'scene') {
+        mode = 'scene';
+      }
+      splitPlay = true;
+      syncStageVisibility();
+      syncToolbarUi();
+      void preloadProjectDocs().then(() => {
+        if (splitPlay || mode === 'pie') {
+          mountSingleStage();
+          broadcastToFrames(buildSyncPayload());
+        }
+      });
+      mountSingleStage();
+      onModeChanged?.(mode);
+      return true;
+    }
+    if (!splitPlay) return false;
+    splitPlay = false;
+    syncStageVisibility();
+    syncToolbarUi();
+    onModeChanged?.(mode);
+    return false;
+  }
+
+  function toggleSplitPlay() {
+    return setSplitPlay(!splitPlay);
+  }
+
+  function setFallbackOrigin(origin) {
+    fallbackOrigin = typeof origin === 'string' && origin.trim() ? origin.trim() : null;
+    syncToolbarUi();
+  }
+
+  function setPreset(presetId) {
+    if (!ensureActiveWorkspace()) return false;
+    if (!workspace.presets.some((p) => p.id === presetId)) return false;
+    activePresetId = presetId;
+    if (mode === 'pie' || splitPlay) mountSingleStage();
+    else if (mode === 'matrix') mountMatrixStage();
+    syncToolbarUi();
+    return true;
   }
 
   function resolveDocIdByIdOrSchema(docId, schemaName) {
@@ -516,7 +666,7 @@ export function createPieViewport({
                 href: safe.href,
               };
             });
-            workspace.presets = dynamic;
+            workspace.presets = mergeBuiltinGameplayPresets(dynamic, workspace.origin);
             syncToolbarUi();
           } catch (err) {
             log?.(1, String(err.message || err));
@@ -564,25 +714,28 @@ export function createPieViewport({
 
   async function loadWorkspaces(project, advertisedWorkspaces, directManifest = null) {
     const gen = ++loadGeneration;
-    const params = new URLSearchParams(location.search);
-    const override = params.get('gameOrigin') || params.get('toolOrigin');
+    const originHref = studioOriginHref();
+    const params = new URLSearchParams(globalThis.location?.search || '');
+    const rawOverride = params.get('gameOrigin') || params.get('toolOrigin');
     const allowSameOrigin = Boolean(getContext().allowSameOrigin);
+    const override = normalizeLoopbackQueryOverride(rawOverride, originHref, { allowSameOrigin });
 
     if (directManifest && typeof directManifest === 'object') {
       try {
-        workspace = resolveGameWorkspace(directManifest, location.origin, override, { allowSameOrigin });
+        workspace = resolveGameWorkspace(directManifest, originHref, override, { allowSameOrigin });
         if (!workspace.presets.some((p) => p.id === activePresetId)) {
           activePresetId = workspace.presets[0]?.id || 'default';
         }
         void preloadProjectDocs().then(() => {
-          if (mode !== 'scene') broadcastToFrames(buildSyncPayload());
+          if (mode !== 'scene' || splitPlay) broadcastToFrames(buildSyncPayload());
         });
-        if (mode === 'pie') mountSingleStage();
+        if (mode === 'pie' || splitPlay) mountSingleStage();
         else if (mode === 'matrix') mountMatrixStage();
         syncToolbarUi();
         onWorkspaceLoaded?.(workspace);
       } catch (err) {
         workspace = null;
+        if (splitPlay) setSplitPlay(false);
         if (mode !== 'scene') setMode('scene');
         syncToolbarUi();
         onWorkspaceLoaded?.(null);
@@ -599,6 +752,7 @@ export function createPieViewport({
 
     if (!paths.length) {
       workspace = null;
+      if (splitPlay) setSplitPlay(false);
       if (mode !== 'scene') setMode('scene');
       syncToolbarUi();
       onWorkspaceLoaded?.(null);
@@ -612,21 +766,7 @@ export function createPieViewport({
         if (res.status === 404) continue;
         if (!res.ok) throw new Error(`Could not load ${relPath}`);
         const rawManifest = await res.json();
-        let effectiveOverride = override;
-        if (!effectiveOverride && !allowSameOrigin && typeof rawManifest?.origin === 'string') {
-          try {
-            const mUrl = new URL(rawManifest.origin);
-            const sHost = new URL(location.origin).hostname.replace(/\.$/, '');
-            const mHost = mUrl.hostname.replace(/\.$/, '');
-            if (sHost === mHost && (mHost === 'localhost' || mHost === '127.0.0.1')) {
-              mUrl.hostname = mHost === 'localhost' ? '127.0.0.1' : 'localhost';
-              effectiveOverride = mUrl.origin;
-            }
-          } catch {
-            /* let resolveGameWorkspace validate */
-          }
-        }
-        resolved = resolveGameWorkspace(rawManifest, location.origin, effectiveOverride, { allowSameOrigin });
+        resolved = resolveGameWorkspace(rawManifest, originHref, override, { allowSameOrigin });
         break;
       }
       if (gen !== loadGeneration) return;
@@ -636,18 +776,20 @@ export function createPieViewport({
           activePresetId = workspace.presets[0]?.id || 'default';
         }
         void preloadProjectDocs().then(() => {
-          if (mode !== 'scene') broadcastToFrames(buildSyncPayload());
+          if (mode !== 'scene' || splitPlay) broadcastToFrames(buildSyncPayload());
         });
-        if (mode === 'pie') mountSingleStage();
+        if (mode === 'pie' || splitPlay) mountSingleStage();
         else if (mode === 'matrix') mountMatrixStage();
-      } else if (mode !== 'scene') {
-        setMode('scene');
+      } else {
+        if (splitPlay) setSplitPlay(false);
+        if (mode !== 'scene') setMode('scene');
       }
       syncToolbarUi();
       onWorkspaceLoaded?.(workspace);
     } catch (err) {
       if (gen !== loadGeneration) return;
       workspace = null;
+      if (splitPlay) setSplitPlay(false);
       if (mode !== 'scene') setMode('scene');
       syncToolbarUi();
       onWorkspaceLoaded?.(null);
@@ -662,7 +804,7 @@ export function createPieViewport({
     } else if (doc.kind === 'look' && doc.root) {
       preloadedLooks.set(doc.id, { id: doc.id, path: doc.path, root: structuredClone(doc.root) });
     }
-    if (!workspace || mode === 'scene') return;
+    if (!workspace || (mode === 'scene' && !splitPlay)) return;
     const { kinds } = getContext();
     const schemaName = doc.root?.schema || null;
     const effectiveValues = doc.kind === 'data'
@@ -685,12 +827,12 @@ export function createPieViewport({
   }
 
   function notifyEnvironmentChanged() {
-    if (!workspace || mode === 'scene') return;
+    if (!workspace || (mode === 'scene' && !splitPlay)) return;
     broadcastToFrames(buildSyncPayload());
   }
 
   function sendClock({ playing, time, speed }) {
-    if (!workspace || mode === 'scene') return;
+    if (!workspace || (mode === 'scene' && !splitPlay)) return;
     broadcastToFrames({
       ganbateStudio: 1,
       type: 'studio:clock',
@@ -701,7 +843,7 @@ export function createPieViewport({
   }
 
   function sendCue({ cueId, track, payload }) {
-    if (!workspace || mode === 'scene') return;
+    if (!workspace || (mode === 'scene' && !splitPlay)) return;
     broadcastToFrames({
       ganbateStudio: 1,
       type: 'studio:cue',
@@ -714,7 +856,7 @@ export function createPieViewport({
   function setUiPick(next) {
     uiPick = !!next;
     syncToolbarUi();
-    if (!workspace || mode === 'scene') return;
+    if (!workspace || (mode === 'scene' && !splitPlay)) return;
     broadcastToFrames({
       ganbateStudio: 1,
       type: 'studio:ui-pick',
@@ -724,27 +866,28 @@ export function createPieViewport({
 
   /** Bounding client rect of the active layout target (single PIE frame or 3D `#viewport`). */
   function activeLayoutTargetElement() {
-    if (mode === 'pie' && singleFrame?.shell) return singleFrame.shell;
+    if (mode === 'pie' && !splitPlay && singleFrame?.shell) return singleFrame.shell;
     if (mode === 'scene') return sceneViewportEl();
     return null;
   }
 
   function setupEvents() {
-    window.addEventListener('message', handleWindowMessage);
+    globalThis.window?.addEventListener?.('message', handleWindowMessage);
 
     document.getElementById('view-mode-scene')?.addEventListener('click', () => setMode('scene'));
     document.getElementById('view-mode-pie')?.addEventListener('click', () => setMode('pie'));
     document.getElementById('view-mode-matrix')?.addEventListener('click', () => setMode('matrix'));
+    document.getElementById('pie-split-toggle')?.addEventListener('click', () => toggleSplitPlay());
 
     document.getElementById('pie-preset')?.addEventListener('change', (ev) => {
       activePresetId = ev.target.value;
-      if (mode === 'pie') mountSingleStage();
+      if (mode === 'pie' || splitPlay) mountSingleStage();
       else if (mode === 'matrix') mountMatrixStage();
     });
 
     document.getElementById('pie-device')?.addEventListener('change', (ev) => {
       activeDeviceId = ev.target.value;
-      if (mode === 'pie') mountSingleStage();
+      if (mode === 'pie' || splitPlay) mountSingleStage();
     });
 
     document.getElementById('pie-inspect-ui')?.addEventListener('click', () => {
@@ -756,7 +899,7 @@ export function createPieViewport({
       const frame = previewFrameEl();
       if (frame) resizeObserver.observe(frame);
     }
-    window.addEventListener('resize', updateFrameScales);
+    globalThis.window?.addEventListener?.('resize', updateFrameScales);
   }
 
   /** Converts relative `game:edit-data` ops into `Document` ops on `doc.root`. */
@@ -801,6 +944,13 @@ export function createPieViewport({
     setUiPick,
     setMode,
     getMode: () => mode,
+    isSplitPlay: () => splitPlay,
+    setSplitPlay,
+    toggleSplitPlay,
+    setFallbackOrigin,
+    setPreset,
+    getActivePresetId: () => activePresetId,
+    syncStageVisibility,
     getWorkspace: () => workspace,
     activeLayoutTargetElement,
     translateRelativeGameOps,

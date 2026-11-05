@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   normalizeLoopbackQueryOverride,
+  resolveGameplayTools,
   resolveProjectTools,
   resolveTableLayoutTools,
   withEmbedStudioParam,
@@ -68,6 +69,32 @@ test('resolveTableLayoutTools discovers layout-tuner and companion graphics-layo
     pair.graphicsLayoutTuner?.embedHref,
     'http://127.0.0.1:5173/ganbate-editor/graphics-layout-tuner?embed=studio',
   );
+});
+
+test('resolveGameplayTools resolves motion-tuner, action-sequencer, god-mode, and audio-mixer with loopback normalization', () => {
+  const localhostManifest = {
+    version: 1,
+    origin: 'http://localhost:5173',
+    tools: [
+      { label: 'Table layouts', path: '/ganbate-editor/layout-tuner' },
+      { label: 'Sound & Foley', path: '/ganbate-editor/audio-mixer' },
+    ],
+  };
+  const tools = resolveProjectTools(localhostManifest, 'http://localhost:7480');
+  const gp = resolveGameplayTools(tools);
+  assert.equal(gp.motionTuner?.embedHref, 'http://127.0.0.1:5173/ganbate-editor/motion-tuner?embed=studio');
+  assert.equal(gp.actionSequencer?.embedHref, 'http://127.0.0.1:5173/ganbate-editor/action-sequencer?embed=studio');
+  assert.equal(gp.godMode?.embedHref, 'http://127.0.0.1:5173/ganbate-editor/god-mode?embed=studio');
+  assert.equal(gp.audioMixer?.id, 'sound-foley');
+  assert.equal(gp.audioMixer?.embedHref, 'http://127.0.0.1:5173/ganbate-editor/audio-mixer?embed=studio');
+
+  // Direct studioOrigin normalization on raw un-normalized tool list when Studio runs on 127.0.0.1:7480.
+  const rawTools = [{ id: 'layout-tuner', label: 'Table layouts', href: 'http://127.0.0.1:5173/ganbate-editor/layout-tuner' }];
+  const normalizedOnIpv4 = resolveGameplayTools(rawTools, 'http://127.0.0.1:7480');
+  assert.equal(normalizedOnIpv4.motionTuner?.embedHref, 'http://localhost:5173/ganbate-editor/motion-tuner?embed=studio');
+  assert.equal(normalizedOnIpv4.actionSequencer?.embedHref, 'http://localhost:5173/ganbate-editor/action-sequencer?embed=studio');
+  assert.equal(normalizedOnIpv4.godMode?.embedHref, 'http://localhost:5173/ganbate-editor/god-mode?embed=studio');
+  assert.equal(normalizedOnIpv4.audioMixer?.embedHref, 'http://localhost:5173/ganbate-editor/audio-mixer?embed=studio');
 });
 
 test('a workspace needing a top-level game session can declare a link', () => {

@@ -24,7 +24,12 @@ import {
 } from './asset-library.js';
 import { t, label, lang, setLang, translate } from './i18n.js';
 
-import { projectToolsPanel, resolveTableLayoutTools } from './project-tools.js';
+import {
+  createGameplaySwitcher,
+  projectToolsPanel,
+  resolveGameplayTools,
+  resolveTableLayoutTools,
+} from './project-tools.js';
 import { mountAiCopilot, UX_TIERS } from './ai-copilot.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -1662,8 +1667,17 @@ const loadProjectTools = projectToolsPanel((msg) => log(2, msg), {
   allowSameOrigin: () => state.host?.kind === 'cloud',
   onToolsLoaded: (tools) => {
     state.projectWorkbenches = tools.filter((tool) => tool.open === 'panel' || tool.open === 'embed');
+    const gpAnchor = tools.find((tool) => {
+      try {
+        return new URL(tool.href).pathname.startsWith('/ganbate-editor');
+      } catch {
+        return false;
+      }
+    });
+    pieViewport?.setFallbackOrigin(gpAnchor ? new URL(gpAnchor.href).origin : null);
     drawWorkspaceTabs();
     layoutRig?.draw();
+    gameplaySwitcher?.draw();
     const params = new URLSearchParams(location.search);
     const rawHash = location.hash.replace(/^#/, '').trim();
     const hashTab = rawHash.startsWith('tab=') ? rawHash.slice(4) : rawHash;
@@ -1732,13 +1746,31 @@ const pieViewport = createPieViewport({
     if (entity(entityId)) select(entityId);
   },
   onModeChanged: () => {
+    markViewportDirty(4, 200);
     layoutRig.draw();
   },
   onWorkspaceLoaded: (ws) => {
     livePublish.setWorkspace(ws);
+    gameplaySwitcher?.draw();
   },
   log: (lvl, text) => log(lvl, text),
 });
+
+function currentGameplayTools() {
+  if (state.projectWorkbenches.length) {
+    const resolved = resolveGameplayTools(state.projectWorkbenches);
+    if (resolved.motionTuner || resolved.actionSequencer || resolved.godMode || resolved.audioMixer) {
+      return resolved;
+    }
+  }
+  const wsOrigin = pieViewport?.getWorkspace?.()?.origin;
+  if (wsOrigin) {
+    return resolveGameplayTools([
+      { id: 'ganbate-editor-anchor', label: 'Ganbate Editor', href: `${wsOrigin}/ganbate-editor/motion-tuner` },
+    ]);
+  }
+  return { motionTuner: null, actionSequencer: null, godMode: null, audioMixer: null };
+}
 
 async function openDockedTableLayoutTool(toolKey) {
   const tableTools = resolveTableLayoutTools(state.projectWorkbenches);
@@ -1752,6 +1784,41 @@ async function openDockedTableLayoutTool(toolKey) {
   await activateWorkbench(`project:${target.id}`);
   return true;
 }
+
+async function openDockedGameplayTool(toolKey) {
+  if (toolKey === 'sequencer' || toolKey === 'audio') {
+    await activateWorkbench(toolKey);
+    return true;
+  }
+  const gameplayTools = currentGameplayTools();
+  const target = toolKey === 'action-sequencer'
+    ? gameplayTools.actionSequencer
+    : toolKey === 'motion-tuner'
+      ? gameplayTools.motionTuner
+      : toolKey === 'god-mode'
+        ? gameplayTools.godMode
+        : toolKey === 'audio-mixer'
+          ? gameplayTools.audioMixer
+          : null;
+  if (!target) {
+    log(1, `${toolKey} is not configured in project-tools.json.`);
+    return false;
+  }
+  await activateWorkbench(`project:${target.id}`);
+  return true;
+}
+
+const gameplaySwitcher = createGameplaySwitcher({
+  el,
+  t,
+  getContext: () => ({
+    activeWorkbench: state.activeWorkbench,
+    gameplayTools: currentGameplayTools(),
+  }),
+  onSelectTarget: (targetKey) => {
+    void openDockedGameplayTool(targetKey);
+  },
+});
 
 const layoutRig = createLayoutRig({
   el,
@@ -1875,6 +1942,19 @@ function normalizeWorkbenchId(rawId) {
     }
     if (clean === 'graphics-layout-tuner' && tableTools.graphicsLayoutTuner) {
       return `project:${tableTools.graphicsLayoutTuner.id}`;
+    }
+    const gameplayTools = currentGameplayTools();
+    if (clean === 'motion-tuner' && gameplayTools.motionTuner) {
+      return `project:${gameplayTools.motionTuner.id}`;
+    }
+    if (clean === 'action-sequencer' && gameplayTools.actionSequencer) {
+      return `project:${gameplayTools.actionSequencer.id}`;
+    }
+    if (clean === 'god-mode' && gameplayTools.godMode) {
+      return `project:${gameplayTools.godMode.id}`;
+    }
+    if (clean === 'audio-mixer' && gameplayTools.audioMixer) {
+      return `project:${gameplayTools.audioMixer.id}`;
     }
   }
   return clean;
@@ -2358,6 +2438,8 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
     state.activeWorkbench = workbenchId;
     document.body.classList.remove('workbench-active');
     if (deck) deck.hidden = true;
+    gameplaySwitcher.draw();
+    pieViewport.syncStageVisibility();
     markViewportDirty(6, 300);
     if (workbenchId === 'layout-rig') {
       const targetAsset = options.doc
@@ -2375,16 +2457,24 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
 
   state.activeWorkbench = workbenchId;
   document.body.classList.add('workbench-active');
+  pieViewport.syncStageVisibility();
   layoutRig.draw();
   if (deck) deck.hidden = false;
-  for (const child of deck ? [...deck.children] : []) child.hidden = true;
+  for (const child of deck ? [...deck.children] : []) {
+    if (child.id !== 'gameplay-workbench-switcher') child.hidden = true;
+  }
 
   if (workbenchId.startsWith('project:')) {
     const toolId = workbenchId.slice('project:'.length);
     const tableTools = resolveTableLayoutTools(state.projectWorkbenches);
+    const gameplayTools = currentGameplayTools();
     const tool = state.projectWorkbenches.find((item) => item.id === toolId)
       || (toolId === 'layout-tuner' || tableTools.layoutTuner?.id === toolId ? tableTools.layoutTuner : null)
-      || (toolId === 'graphics-layout-tuner' || tableTools.graphicsLayoutTuner?.id === toolId ? tableTools.graphicsLayoutTuner : null);
+      || (toolId === 'graphics-layout-tuner' || tableTools.graphicsLayoutTuner?.id === toolId ? tableTools.graphicsLayoutTuner : null)
+      || (toolId === 'motion-tuner' || gameplayTools.motionTuner?.id === toolId ? gameplayTools.motionTuner : null)
+      || (toolId === 'action-sequencer' || gameplayTools.actionSequencer?.id === toolId ? gameplayTools.actionSequencer : null)
+      || (toolId === 'god-mode' || gameplayTools.godMode?.id === toolId ? gameplayTools.godMode : null)
+      || (toolId === 'audio-mixer' || gameplayTools.audioMixer?.id === toolId ? gameplayTools.audioMixer : null);
     if (!tool) {
       await activateWorkbench('world');
       return;
@@ -2439,6 +2529,7 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
       mountedWorkbenches.set(canonicalPaneId, rec);
     }
     if (rec?.pane) rec.pane.hidden = false;
+    gameplaySwitcher.draw();
     drawWorkspaceTabs();
     drawToolbar();
     scheduleSelectionSync();
@@ -2473,6 +2564,7 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
   }
   try { rec?.instance?.onActivate?.(); } catch { /* ignore */ }
 
+  gameplaySwitcher.draw();
   drawWorkspaceTabs();
   drawToolbar();
   scheduleSelectionSync();
@@ -2795,6 +2887,7 @@ function setupAiIdeBar() {
 
 state.pieViewport = pieViewport;
 state.layoutRig = layoutRig;
+state.gameplaySwitcher = gameplaySwitcher;
 state.livePublish = livePublish;
 state.inspectData = inspectData;
 state.activateWorkbench = activateWorkbench;
@@ -3489,6 +3582,7 @@ async function main() {
     drawAssets();
     pieViewport.syncToolbarUi();
     layoutRig.draw();
+    gameplaySwitcher.draw();
     livePublish.renderStatus();
     updateSelectionPill();
     emitStudioEvent('locale', lang());

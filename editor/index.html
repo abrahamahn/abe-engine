@@ -47,6 +47,7 @@
       <button type="button" id="view-mode-pie" class="mini" data-i18n="viewPie">Game (PIE)</button>
       <button type="button" id="view-mode-matrix" class="mini" data-i18n="viewMatrix">Device Matrix</button>
     </span>
+    <button type="button" id="pie-split-toggle" data-role="pie-split-toggle" class="mini pie-split-btn" aria-pressed="false" data-i18n="pieSplitPlay" data-i18n-title="pieSplitPlayTip">⚡ Split Play</button>
     <select id="pie-preset" aria-label="PIE preset" hidden></select>
     <select id="pie-device" aria-label="PIE device" hidden></select>
     <button type="button" id="pie-inspect-ui" class="mini" hidden data-i18n="pieInspectUi" data-i18n-title="pieInspectUiTip">Inspect UI</button>
@@ -137,7 +138,7 @@
     <div id="inspector-body" tabindex="-1"></div>
   </section>
 </main>
-<section id="workbench-deck" hidden></section>
+<section id="workbench-deck" hidden><div id="gameplay-workbench-switcher" class="gameplay-workbench-switcher" hidden></div></section>
 <div id="dock-resizer" role="separator" aria-orientation="horizontal"></div>
 <footer id="bottom-dock">
   <section class="panel" id="assets">
