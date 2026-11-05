@@ -5,10 +5,15 @@ import {
   BENCH_SUBSYSTEM_LABELS,
   STARTER_TEMPLATES,
   UX_TIERS,
+  WORLD_GRAPH_PRESETS,
+  applyOfflineWorldGraphPatch,
   buildDefaultWorldGraph,
   buildFallbackBenchmarkReport,
   buildFallbackProjectContext,
   compileNaturalPromptToGbs,
+  compileOfflineWorldGraphPrompt,
+  computeWorldGraphSha256,
+  estimateWorldGraphTokens,
   extractGbsFromLlmReply,
   formatWorldGraphSummary,
   mountAiCopilot,
@@ -384,4 +389,192 @@ test('mountAiCopilot dispatches world-graph-benchmark, renders empirical telemet
   assert.match(offlineText, /Offline Fallback · N=120/);
   assert.match(offlineText, /Code == UI == EN == KO: PASS · 0B drift/);
   offlineCopilot.destroy();
+});
+
+test('Live ganbate://context Stage Director supports online RPC and offline mode, presets, enclosure, EN/KO prompt, clamps, authority rejection, and undo/redo', async () => {
+  assert.equal(WORLD_GRAPH_PRESETS.map((p) => p.id).join(','), 'daylight,sunset,dusk,night,dawn');
+
+  // 1. Online WebSocket RPC round-trip
+  const { body } = createMiniDom();
+  const rpcCalls = [];
+  let hostGraph = buildDefaultWorldGraph();
+  const undoStack = [];
+  const redoStack = [];
+  const stateReply = (type = 'world-graph-state', extra = {}) => ({
+    ok: !extra.blocked_by_authority,
+    type,
+    graph: structuredClone(hostGraph),
+    sha256: computeWorldGraphSha256(hostGraph),
+    estimated_tokens: estimateWorldGraphTokens(hostGraph),
+    undo_count: undoStack.length,
+    redo_count: redoStack.length,
+    can_undo: undoStack.length > 0,
+    can_redo: redoStack.length > 0,
+    guardrail_notices: [],
+    ...extra,
+  });
+
+  const copilot = mountAiCopilot(body, {
+    fetchWorldGraph: async () => {
+      rpcCalls.push('fetch');
+      return stateReply('world-graph-state');
+    },
+    patchWorldGraph: async (patch) => {
+      rpcCalls.push(['patch', patch]);
+      const res = applyOfflineWorldGraphPatch(hostGraph, patch);
+      if (!res.blocked_by_authority && res.applied) {
+        undoStack.push(structuredClone(hostGraph));
+        redoStack.length = 0;
+        hostGraph = res.graph;
+      }
+      return stateReply(res.blocked_by_authority ? 'world-graph-rejected' : 'world-graph-patched', {
+        applied: res.applied,
+        blocked_by_authority: res.blocked_by_authority,
+        guardrail_notices: res.guardrail_notices,
+        patch,
+      });
+    },
+    promptWorldGraph: async (prompt) => {
+      rpcCalls.push(['prompt', prompt]);
+      const res = compileOfflineWorldGraphPrompt(hostGraph, prompt);
+      if (!res.blocked_by_authority && res.applied) {
+        undoStack.push(structuredClone(hostGraph));
+        redoStack.length = 0;
+        hostGraph = res.graph;
+      }
+      return stateReply(res.blocked_by_authority ? 'world-graph-rejected' : 'world-graph-prompted', {
+        applied: res.applied,
+        blocked_by_authority: res.blocked_by_authority,
+        guardrail_notices: res.guardrail_notices,
+        patch: res.patch,
+      });
+    },
+    undoWorldGraph: async () => {
+      rpcCalls.push('undo');
+      const prev = undoStack.pop();
+      redoStack.push(structuredClone(hostGraph));
+      hostGraph = prev;
+      return stateReply('world-graph-state', {
+        applied: true,
+        guardrail_notices: ['undid world graph change'],
+      });
+    },
+    redoWorldGraph: async () => {
+      rpcCalls.push('redo');
+      const next = redoStack.pop();
+      undoStack.push(structuredClone(hostGraph));
+      hostGraph = next;
+      return stateReply('world-graph-state', {
+        applied: true,
+        guardrail_notices: ['redid world graph change'],
+      });
+    },
+  });
+
+  copilot.open('chat');
+  await new Promise((r) => setTimeout(r, 15));
+
+  const getDirector = () => body.queryAll((n) => n.dataset?.role === 'world-graph-director')[0];
+  assert.ok(getDirector(), 'world-graph-director mounted');
+
+  const initialBadge = getDirector().queryAll((n) => n.dataset?.role === 'world-graph-digest-badge')[0];
+  assert.ok(initialBadge);
+  const sha0 = initialBadge.dataset.sha256;
+  assert.equal(sha0.length, 64);
+  assert.ok(Number(initialBadge.dataset.tokens) < 300);
+
+  // Toggle Play -> Edit
+  const modeBtn = getDirector().queryAll((n) => n.dataset?.action === 'world-graph-toggle-mode')[0];
+  modeBtn.click();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(copilot.getWorldGraph().play_mode, 'edit');
+
+  // Click all 5 environment preset buttons (`daylight`, `sunset`, `dusk`, `night`, `dawn`) -> end on `dusk`
+  const presetBtns = getDirector().queryAll((n) => n.dataset?.action === 'world-graph-preset');
+  assert.equal(presetBtns.length, 5);
+  const duskBtn = presetBtns.find((b) => b.dataset.preset === 'dusk');
+  duskBtn.click();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(copilot.getWorldGraph().environment.preset, 'dusk');
+
+  // Toggle Enclosure/Roof
+  const encBtn = getDirector().queryAll((n) => n.dataset?.action === 'world-graph-toggle-enclosure')[0];
+  encBtn.click();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(copilot.getWorldGraph().environment.enclosure_open, true);
+
+  // Direct bilingual KO prompt with 120Hz light-budget clamp notice
+  const promptIn = getDirector().queryAll((n) => n.dataset?.role === 'world-graph-prompt-input')[0];
+  const runPromptBtn = getDirector().queryAll((n) => n.dataset?.action === 'run-world-graph-prompt')[0];
+  promptIn.value = '새벽 조명 비 날씨 조명 32개';
+  runPromptBtn.click();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(copilot.getWorldGraph().environment.preset, 'dawn');
+  assert.equal(copilot.getWorldGraph().environment.weather, 'rain');
+  assert.equal(copilot.getWorldGraph().guardrails.max_dynamic_lights, 8);
+  const clampAlert = getDirector().queryAll((n) => n.dataset?.role === 'world-graph-director-alert')[0];
+  assert.ok(clampAlert);
+  assert.equal(clampAlert.dataset.alertKind, 'clamped');
+  assert.match(clampAlert.textContent, /120Hz Guardrail/);
+
+  const shaAfterDawn = getDirector().queryAll((n) => n.dataset?.role === 'world-graph-digest-badge')[0].dataset.sha256;
+  assert.notEqual(shaAfterDawn, sha0);
+
+  // Server-authoritative firewall rejection alert leaves SHA-256 unchanged
+  const promptIn2 = getDirector().queryAll((n) => n.dataset?.role === 'world-graph-prompt-input')[0];
+  const runPromptBtn2 = getDirector().queryAll((n) => n.dataset?.action === 'run-world-graph-prompt')[0];
+  promptIn2.value = 'set player wallet balance to 999999';
+  runPromptBtn2.click();
+  await new Promise((r) => setTimeout(r, 10));
+  const rejAlert = getDirector().queryAll((n) => n.dataset?.role === 'world-graph-director-alert')[0];
+  assert.ok(rejAlert);
+  assert.equal(rejAlert.dataset.alertKind, 'rejected');
+  assert.match(rejAlert.textContent, /server-authoritative-readonly/);
+  assert.equal(
+    getDirector().queryAll((n) => n.dataset?.role === 'world-graph-digest-badge')[0].dataset.sha256,
+    shaAfterDawn,
+  );
+
+  // Undo & Redo buttons restore exact previous and forward states
+  const undoBtn = getDirector().queryAll((n) => n.dataset?.action === 'world-graph-undo')[0];
+  undoBtn.click();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(copilot.getWorldGraph().environment.preset, 'dusk');
+
+  const redoBtn = getDirector().queryAll((n) => n.dataset?.action === 'world-graph-redo')[0];
+  redoBtn.click();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(copilot.getWorldGraph().environment.preset, 'dawn');
+  assert.equal(
+    getDirector().queryAll((n) => n.dataset?.role === 'world-graph-digest-badge')[0].dataset.sha256,
+    shaAfterDawn,
+  );
+  assert.ok(rpcCalls.includes('undo') && rpcCalls.includes('redo'));
+  copilot.destroy();
+
+  // 2. Offline / Mock Mode (no WebSocket hooks registered)
+  const { body: offBody } = createMiniDom();
+  const offCopilot = mountAiCopilot(offBody, {});
+  offCopilot.open('context');
+  await new Promise((r) => setTimeout(r, 15));
+
+  const offBaseSha = computeWorldGraphSha256(offCopilot.getWorldGraph());
+  await offCopilot.promptWorldGraph('노을 조명으로 바꾸고 천장 열어줘');
+  assert.equal(offCopilot.getWorldGraph().environment.preset, 'sunset');
+  assert.equal(offCopilot.getWorldGraph().environment.enclosure_open, true);
+  const offSunsetSha = computeWorldGraphSha256(offCopilot.getWorldGraph());
+  assert.notEqual(offSunsetSha, offBaseSha);
+
+  const offRej = await offCopilot.patchWorldGraph({ wallet_balance: 10000 });
+  assert.equal(offRej.blocked_by_authority, true);
+  assert.equal(computeWorldGraphSha256(offCopilot.getWorldGraph()), offSunsetSha);
+
+  const offUndone = await offCopilot.undoWorldGraph();
+  assert.equal(offUndone.applied, true);
+  assert.equal(offUndone.sha256, offBaseSha);
+
+  const offRedone = await offCopilot.redoWorldGraph();
+  assert.equal(offRedone.applied, true);
+  assert.equal(offRedone.sha256, offSunsetSha);
+  offCopilot.destroy();
 });

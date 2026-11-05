@@ -1602,13 +1602,19 @@ async function boot(options) {
   };
   const host = gpu.api === 'webgl2' ? createGlHost(gpu, hostOptions) : createHost(gpu, hostOptions);
   onPhase('Loading the engine', 0);
-  const wasmResponse = await fetch(options.wasm);
-  if (!wasmResponse.ok) throw new Error(`${options.wasm}: HTTP ${wasmResponse.status}`);
   let instance;
-  try {
-    ({ instance } = await WebAssembly.instantiateStreaming(wasmResponse.clone(), host.imports));
-  } catch (_) {
-    ({ instance } = await WebAssembly.instantiate(await wasmResponse.arrayBuffer(), host.imports));
+  if (options.wasm && typeof options.wasm === 'object' && options.wasm.exports) {
+    instance = options.wasm;
+  } else if (options.wasm instanceof ArrayBuffer || ArrayBuffer.isView(options.wasm)) {
+    ({ instance } = await WebAssembly.instantiate(options.wasm, host.imports));
+  } else {
+    const wasmResponse = await fetch(options.wasm);
+    if (!wasmResponse.ok) throw new Error(`${options.wasm}: HTTP ${wasmResponse.status}`);
+    try {
+      ({ instance } = await WebAssembly.instantiateStreaming(wasmResponse.clone(), host.imports));
+    } catch (_) {
+      ({ instance } = await WebAssembly.instantiate(await wasmResponse.arrayBuffer(), host.imports));
+    }
   }
   host.attach(instance);
   return { gpu, host, x: instance.exports, errors, fail };
@@ -1859,13 +1865,44 @@ function pixelsOf(source) {
 }
 
 /**
+ * Maps a `quality` mode (`'realtime' | 'still' | 'hybrid' | 'low-cost' | boolean`) to the C-ABI
+ * preset code (`0` = realtime, `1` = still, `2` = hybrid stage, `3` = low-cost fast-path), or
+ * `null` when unrecognized.
+ */
+export function qualityCodeFromMode(mode) {
+  if (mode === true || mode === 'still') return 1;
+  if (mode === false || mode === 'realtime') return 0;
+  if (mode === 'hybrid' || mode === 'hybrid-stage' || mode === 'hybrid_stage') return 2;
+  if (mode === 'low-cost' || mode === 'low_cost' || mode === 'lowcost') return 3;
+  return null;
+}
+
+/**
+ * Resolves startup `quality` / legacy `still` options for `createEngine` into a C-ABI preset code
+ * (`0` = realtime, `1` = still, `2` = hybrid stage, `3` = low-cost fast-path).
+ */
+export function resolveQualityCode(quality, still) {
+  const explicit = qualityCodeFromMode(quality);
+  if (explicit !== null) return explicit;
+  return still === true ? 1 : 0;
+}
+
+function resolveStereoEyeCode(eye) {
+  if (eye === undefined || eye === 'mono' || eye === 0) return 0;
+  if (eye === 'left' || eye === -1) return -1;
+  if (eye === 'right' || eye === 1) return 1;
+  return null;
+}
+
+/**
  * Library mode: the engine as a renderer that a host page (a game with its own interface)
  * drives. Resolves with an engine object; its methods throw with the engine's message when a
  * call fails. Handles (textures, meshes, materials, instances) are nonzero numbers.
  *
  * `options`: canvas; wasm (URL of ganbate_web.wasm); api ('auto', 'webgpu' or 'webgl2');
  * world (URL, ArrayBuffer or Uint8Array of a cooked `.gbew`; omit for a scene of props only);
- * look (Look file as an object or JSON text; optional); quality ('realtime' or 'still');
+ * look (Look file as an object or JSON text; optional);
+ * quality ('realtime' | 'still' | 'hybrid' | 'low-cost' | boolean; legacy `still?: boolean` also supported);
  * onLog(level, text); onPhase(text, progress).
  *
  * The page sizes the canvas (canvas.width/height in device pixels; `fitCanvas(dpr)` helps) and
@@ -1974,7 +2011,7 @@ export async function createEngine(options) {
   const lookBytes = text(lookText);
   const [lookPtr] = place(lookBytes);
   (options.onPhase || (() => {}))('Compiling shaders and uploading', 1);
-  ok('start', x.ganbate_rt_start(0, 0, lookPtr, lookBytes.length, options.quality === 'still' ? 1 : 0));
+  ok('start', x.ganbate_rt_start(0, 0, lookPtr, lookBytes.length, resolveQualityCode(options.quality, options.still)));
 
   let inFlight = 0;
   let stopped = false;
@@ -2030,14 +2067,43 @@ export async function createEngine(options) {
       dst[16] = f ? 1 : 0;
       ok('setView', x.ganbate_rt_set_view(p));
     },
-    /** Selects stereo XR eye (`0` mono, `-1` left eye, `+1` right eye) with IPD in metres (`0.050..=0.078`, default `0.063`). */
-    setStereoEye(eye = 0, ipdMetres = 0.063) {
-      ok('setStereoEye', x.ganbate_rt_set_stereo_eye(eye | 0, ipdMetres));
+    /** Switches the renderer quality preset dynamically at runtime (`'realtime' | 'still' | 'hybrid' | 'low-cost'`). */
+    setQuality(mode) {
+      if (typeof x.ganbate_rt_set_quality !== 'function') return false;
+      const code = qualityCodeFromMode(mode);
+      if (code === null) return false;
+      return Boolean(x.ganbate_rt_set_quality(code));
     },
-    /** Parallel-axis left/right stereo view pair derived from the current camera and IPD. */
+    /** Latest per-frame draw, cull, cache, and pass-skip telemetry, or `null` if unavailable. */
+    frameStats() {
+      if (typeof x.ganbate_rt_frame_stats !== 'function') return null;
+      const p = reserve(36);
+      if (!x.ganbate_rt_frame_stats(p)) return null;
+      const w = new Uint32Array(x.memory.buffer, p, 9);
+      return {
+        worldDrawsTotal: w[0],
+        worldDrawsSubmitted: w[1],
+        worldDrawsCulled: w[2],
+        shadowStaticCached: w[3] !== 0,
+        shadowWorldDraws: w[4],
+        groundCached: w[5] !== 0,
+        reflectionDrawn: w[6] !== 0,
+        ssaoDrawn: w[7] !== 0,
+        fusedTonemap: w[8] !== 0,
+      };
+    },
+    /** Selects stereo XR eye (`'mono' | 'left' | 'right'` or `-1 | 0 | 1`) with IPD in metres (`0.050..=0.078`, default `0.063`). */
+    setStereoEye(eye = 'mono', ipdMetres = 0.063) {
+      if (typeof x.ganbate_rt_set_stereo_eye !== 'function') return false;
+      const code = resolveStereoEyeCode(eye);
+      if (code === null || !Number.isFinite(ipdMetres)) return false;
+      return Boolean(x.ganbate_rt_set_stereo_eye(code, ipdMetres));
+    },
+    /** Parallel-axis left/right stereo view pair derived from the current camera and IPD, or `null` if unavailable. */
     stereoViews() {
+      if (typeof x.ganbate_rt_stereo_views !== 'function') return null;
       const p = out(16).byteOffset;
-      ok('stereoViews', x.ganbate_rt_stereo_views(p));
+      if (!x.ganbate_rt_stereo_views(p)) return null;
       const v = Array.from(new Float32Array(x.memory.buffer, p, 16));
       return {
         left: { eye: v.slice(0, 3), target: v.slice(3, 6) },
@@ -2046,21 +2112,36 @@ export async function createEngine(options) {
         ipdMetres: v[15],
       };
     },
-    /** Records a completed frame duration (`dtMs`, ms) into the 120Hz (`8.333ms`) governor and returns its quality budget. */
-    recordFrameBudget(dtMs) {
+    /** Records a completed frame duration (`dtMs`, ms) into the 120Hz (`8.333ms`) governor and returns its snapshot, or `null` if unavailable. */
+    governorRecord(dtMs) {
+      if (typeof x.ganbate_rt_governor_record !== 'function') return null;
       const p = out(6).byteOffset;
-      ok('recordFrameBudget', x.ganbate_rt_governor_record(dtMs, p));
+      if (!x.ganbate_rt_governor_record(dtMs, p)) return null;
       return readBudget(p);
     },
-    /** Queries the current 120Hz (`8.333ms`) governor quality budget without recording a frame sample. */
-    frameBudget() {
+    /** Queries the current 120Hz (`8.333ms`) governor snapshot without recording a frame sample, or `null` if unavailable. */
+    governorQuery() {
+      if (typeof x.ganbate_rt_governor_query !== 'function') return null;
       const p = out(6).byteOffset;
-      ok('frameBudget', x.ganbate_rt_governor_query(p));
+      if (!x.ganbate_rt_governor_query(p)) return null;
       return readBudget(p);
     },
     /** Resets the 120Hz governor rolling window and restores top quality tier (`3`). */
+    governorReset() {
+      if (typeof x.ganbate_rt_governor_reset !== 'function') return false;
+      return Boolean(x.ganbate_rt_governor_reset());
+    },
+    /** Legacy alias for `governorRecord(dtMs)`. */
+    recordFrameBudget(dtMs) {
+      return engine.governorRecord(dtMs);
+    },
+    /** Legacy alias for `governorQuery()`. */
+    frameBudget() {
+      return engine.governorQuery();
+    },
+    /** Legacy alias for `governorReset()`. */
     resetFrameGovernor() {
-      ok('resetFrameGovernor', x.ganbate_rt_governor_reset());
+      return engine.governorReset();
     },
     /** Time of day in hours and the animation clock in seconds. */
     setClock(hours, seconds = 0) { ok('setClock', x.ganbate_rt_set_clock(hours, seconds)); },

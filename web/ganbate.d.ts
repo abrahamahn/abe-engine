@@ -4,21 +4,25 @@
 // engine method throws an Error carrying the engine's message when a call fails.
 
 export type GanbateApi = 'auto' | 'webgpu' | 'webgl2';
+export type GanbateQualityMode = 'realtime' | 'still' | 'hybrid' | 'low-cost';
 export type Vec3 = readonly [number, number, number];
 export type Rgba = readonly [number, number, number, number?];
 export type Matrix4 = ArrayLike<number>;
 
 export interface CreateEngineOptions {
   readonly canvas: HTMLCanvasElement;
-  /** URL of ganbate_web.wasm. */
-  readonly wasm: string;
+  /** URL, bytes, or pre-instantiated WebAssembly.Instance of ganbate_web.wasm. */
+  readonly wasm: string | ArrayBuffer | ArrayBufferView | WebAssembly.Instance;
   /** WebGPU where the browser has it, otherwise WebGL 2 (`auto`, the default). */
   readonly api?: GanbateApi;
   /** A cooked `.gbew` world: URL or bytes. Omit for a scene of props only. */
   readonly world?: string | ArrayBuffer | Uint8Array;
   /** A Look file, as an object or JSON text. */
   readonly look?: object | string;
-  readonly quality?: 'realtime' | 'still';
+  /** Rendering quality preset (`'realtime' | 'still' | 'hybrid' | 'low-cost'`) or boolean (`true` = `'still'`). */
+  readonly quality?: GanbateQualityMode | boolean;
+  /** Legacy boolean alias for `quality: 'still'`. */
+  readonly still?: boolean;
   /** 0 info, 1 warning, 2 error. */
   readonly onLog?: (level: number, text: string) => void;
   /** Loading phases with progress 0..1. */
@@ -49,7 +53,20 @@ export interface GanbateFocus {
   readonly blur?: number;
 }
 
+export type GanbateStereoEyeName = 'mono' | 'left' | 'right';
 export type GanbateStereoEye = -1 | 0 | 1;
+
+export interface GanbateFrameStats {
+  readonly worldDrawsTotal: number;
+  readonly worldDrawsSubmitted: number;
+  readonly worldDrawsCulled: number;
+  readonly shadowStaticCached: boolean;
+  readonly shadowWorldDraws: number;
+  readonly groundCached: boolean;
+  readonly reflectionDrawn: boolean;
+  readonly ssaoDrawn: boolean;
+  readonly fusedTonemap: boolean;
+}
 
 export interface GanbateStereoViews {
   readonly left: { readonly eye: [number, number, number]; readonly target: [number, number, number] };
@@ -58,7 +75,7 @@ export interface GanbateStereoViews {
   readonly ipdMetres: number;
 }
 
-export interface GanbateQualityBudget {
+export interface GanbateGovernorSnapshot {
   readonly resolutionScale: number;
   readonly maxDynamicLights: number;
   readonly ambientParticles: boolean;
@@ -66,6 +83,8 @@ export interface GanbateQualityBudget {
   readonly tier: number;
   readonly rollingMeanMs: number;
 }
+
+export type GanbateQualityBudget = GanbateGovernorSnapshot;
 
 /** RGBA8 pixels, or a canvas, image bitmap or loaded image. */
 export type GanbateImageSource =
@@ -201,16 +220,26 @@ export interface GanbateEngine {
   size(): { width: number; height: number };
   setLook(look: object | string): void;
   setView(view: GanbateView): void;
-  /** Selects stereo XR eye (`0` mono, `-1` left eye, `+1` right eye) with IPD in metres (`0.050..=0.078`, default `0.063`). */
-  setStereoEye(eye?: GanbateStereoEye, ipdMetres?: number): void;
-  /** Parallel-axis left/right stereo view pair derived from the current camera and IPD. */
-  stereoViews(): GanbateStereoViews;
-  /** Records a frame duration (`dtMs`, ms) into the `120Hz` (`8.333ms`) governor and returns its quality budget. */
-  recordFrameBudget(dtMs: number): GanbateQualityBudget;
-  /** Queries the current `120Hz` (`8.333ms`) governor quality budget without recording a frame sample. */
-  frameBudget(): GanbateQualityBudget;
+  /** Switches the renderer quality preset dynamically at runtime. */
+  setQuality(mode: GanbateQualityMode): boolean;
+  /** Latest per-frame draw, cull, cache, and pass-skip telemetry, or `null` if unavailable. */
+  frameStats(): GanbateFrameStats | null;
+  /** Selects stereo XR eye (`'mono' | 'left' | 'right'` or `-1 | 0 | 1`) with IPD in metres (`0.050..=0.078`, default `0.063`). */
+  setStereoEye(eye?: GanbateStereoEyeName | GanbateStereoEye, ipdMetres?: number): boolean;
+  /** Parallel-axis left/right stereo view pair derived from the current camera and IPD, or `null` if unavailable. */
+  stereoViews(): GanbateStereoViews | null;
+  /** Records a completed frame duration (`dtMs`, ms) into the `120Hz` (`8.333ms`) governor and returns its snapshot, or `null` if unavailable. */
+  governorRecord(dtMs: number): GanbateGovernorSnapshot | null;
+  /** Queries the current `120Hz` (`8.333ms`) governor snapshot without recording a frame sample, or `null` if unavailable. */
+  governorQuery(): GanbateGovernorSnapshot | null;
   /** Resets the `120Hz` governor rolling window and restores top quality tier (`3`). */
-  resetFrameGovernor(): void;
+  governorReset(): boolean;
+  /** Legacy alias for `governorRecord(dtMs)`. */
+  recordFrameBudget(dtMs: number): GanbateGovernorSnapshot | null;
+  /** Legacy alias for `governorQuery()`. */
+  frameBudget(): GanbateGovernorSnapshot | null;
+  /** Legacy alias for `governorReset()`. */
+  resetFrameGovernor(): boolean;
   /** Time of day in hours and the animation clock in seconds. */
   setClock(hours: number, seconds?: number): void;
   /** The world's lamps `boost` times as bright as the hour lights them, glow and light alike (1: as it does). */

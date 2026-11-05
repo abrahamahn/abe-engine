@@ -145,6 +145,27 @@ impl Quality {
             light_shadow_size: 512,
         }
     }
+
+    /// Ultra-lean fast-path budget tuned for 120 Hz desktop, mobile WebGPU, and 90 Hz stereo VR
+    /// stages: skips planar water reflections, SSAO, Kuwahara painterly filtering, FXAA, weather
+    /// particles, and procedural grass while shrinking shadow/ground/world caches and bloom mips.
+    pub fn low_cost() -> Self {
+        Self {
+            shadow_size: 512,
+            reflection_scale: 0.0,
+            ao_scale: 0.25,
+            ao_samples: 0,
+            tile_size: 32,
+            bloom_levels: 2,
+            painterly: false,
+            fxaa: false,
+            particles: false,
+            ground_size: 256,
+            world_size: 512,
+            grass: 0.0,
+            light_shadow_size: 256,
+        }
+    }
 }
 
 /// Per-frame visibility, cache, and pass-skip telemetry recorded by [`Renderer::encode`].
@@ -1018,9 +1039,10 @@ impl Renderer {
                 ],
             )?);
         }
+        let shadow_size = quality.shadow_size.max(16);
         let shadow_map = device.create_texture(&TextureDesc {
-            width: quality.shadow_size,
-            height: quality.shadow_size,
+            width: shadow_size,
+            height: shadow_size,
             layers: 4,
             mips: 1,
             format: Format::Depth32Float,
@@ -1137,6 +1159,10 @@ impl Renderer {
         self.ground_cached_vp = None;
         self.lut_dirty = true;
         self.restyle_props();
+    }
+    /// Current per-frame rendering quality budget.
+    pub fn quality(&self) -> Quality {
+        self.quality
     }
     /// Visibility, cache, and pass-skip telemetry recorded during the most recent [`Renderer::encode`].
     pub fn last_frame_stats(&self) -> FrameStats {
@@ -1380,17 +1406,8 @@ impl Renderer {
         })
     }
 
-    /// Recreate size-dependent targets (e.g. after a window resize).
-    pub fn resize(&mut self, device: &mut Device<'_>, size: (u32, u32)) -> Result<()> {
-        if size == (self.targets.width, self.targets.height) {
-            return Ok(());
-        }
-        self.reset_prop_slots(device);
-        let old = std::mem::replace(
-            &mut self.targets,
-            Self::create_targets(device, &self.quality, self.output, size)?,
-        );
-        for s in std::mem::take(&mut self.slots) {
+    fn destroy_slots(device: &mut Device<'_>, slots: Vec<Slot>) {
+        for s in slots {
             for g in s
                 .scene
                 .into_iter()
@@ -1407,6 +1424,9 @@ impl Renderer {
                 device.destroy_buffer(b);
             }
         }
+    }
+
+    fn destroy_targets(device: &mut Device<'_>, old: Targets) {
         for t in [
             old.hdr,
             old.aux,
@@ -1428,6 +1448,149 @@ impl Renderer {
         if let Some(b) = old.readback {
             device.destroy_buffer(b);
         }
+    }
+
+    /// Recreate size-dependent targets (e.g. after a window resize).
+    pub fn resize(&mut self, device: &mut Device<'_>, size: (u32, u32)) -> Result<()> {
+        if size == (self.targets.width, self.targets.height) {
+            return Ok(());
+        }
+        let new_targets = Self::create_targets(device, &self.quality, self.output, size)?;
+        self.reset_prop_slots(device);
+        Self::destroy_slots(device, std::mem::take(&mut self.slots));
+        let old = std::mem::replace(&mut self.targets, new_targets);
+        Self::destroy_targets(device, old);
+        let slots = match self.output {
+            Output::Still => 1,
+            Output::Surface(_) => 2,
+        };
+        for _ in 0..slots {
+            let s = self.create_slot(device)?;
+            self.slots.push(s);
+        }
+        Ok(())
+    }
+
+    /// Reconfigure quality-dependent targets, shadow maps, and ground/world caches at runtime
+    /// without losing uploaded world geometry, props, skinned models, lights, or [`Look`] state.
+    pub fn set_quality(&mut self, device: &mut Device<'_>, quality: Quality) -> Result<()> {
+        if quality == self.quality {
+            return Ok(());
+        }
+        let size = (self.targets.width, self.targets.height);
+        let new_targets = Self::create_targets(device, &quality, self.output, size)?;
+
+        let old_shadow_size = self.quality.shadow_size.max(16);
+        let new_shadow_size = quality.shadow_size.max(16);
+        let new_shadow_map = if new_shadow_size != old_shadow_size {
+            Some(device.create_texture(&TextureDesc {
+                width: new_shadow_size,
+                height: new_shadow_size,
+                layers: 4,
+                mips: 1,
+                format: Format::Depth32Float,
+                usage: TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED,
+            })?)
+        } else {
+            None
+        };
+
+        let old_light_shadow_size = self.quality.light_shadow_size.max(16);
+        let new_light_shadow_size = quality.light_shadow_size.max(16);
+        let new_light_shadow_map = if new_light_shadow_size != old_light_shadow_size {
+            Some(device.create_texture(&TextureDesc {
+                width: new_light_shadow_size,
+                height: new_light_shadow_size,
+                layers: super::lights::MAX_SHADOWED_LIGHTS as u32,
+                mips: 1,
+                format: Format::Depth32Float,
+                usage: TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED,
+            })?)
+        } else {
+            None
+        };
+
+        let old_ground_size = self.quality.ground_size.max(64);
+        let new_ground_size = quality.ground_size.max(64);
+        let new_ground = if new_ground_size != old_ground_size {
+            let depth = device.create_texture(&TextureDesc {
+                width: new_ground_size,
+                height: new_ground_size,
+                layers: 1,
+                mips: 1,
+                format: Format::Depth32Float,
+                usage: TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED,
+            })?;
+            let mask = device.create_texture(&TextureDesc {
+                width: new_ground_size,
+                height: new_ground_size,
+                layers: 1,
+                mips: 1,
+                format: GROUND_FORMAT,
+                usage: TextureUsage::COLOR_TARGET | TextureUsage::SAMPLED,
+            })?;
+            Some((depth, mask))
+        } else {
+            None
+        };
+
+        let old_world_size = self.quality.world_size.max(64);
+        let new_world_size = quality.world_size.max(64);
+        let new_world = if new_world_size != old_world_size {
+            let depth = device.create_texture(&TextureDesc {
+                width: new_world_size,
+                height: new_world_size,
+                layers: 1,
+                mips: 1,
+                format: Format::Depth32Float,
+                usage: TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED,
+            })?;
+            let mask = device.create_texture(&TextureDesc {
+                width: new_world_size,
+                height: new_world_size,
+                layers: 1,
+                mips: 1,
+                format: GROUND_FORMAT,
+                usage: TextureUsage::COLOR_TARGET | TextureUsage::SAMPLED,
+            })?;
+            Some((depth, mask))
+        } else {
+            None
+        };
+
+        self.reset_prop_slots(device);
+        Self::destroy_slots(device, std::mem::take(&mut self.slots));
+        let old_targets = std::mem::replace(&mut self.targets, new_targets);
+        Self::destroy_targets(device, old_targets);
+
+        if let Some(shadow_map) = new_shadow_map {
+            let old = std::mem::replace(&mut self.shadow_map, shadow_map);
+            device.destroy_texture(old);
+            self.shadow_layers_ready = false;
+            self.static_shadows_vp = None;
+        }
+        if let Some(light_shadow_map) = new_light_shadow_map {
+            let old = std::mem::replace(&mut self.light_shadow_map, light_shadow_map);
+            device.destroy_texture(old);
+            self.light_shadows_ready = false;
+        }
+        if let Some((depth, mask)) = new_ground {
+            let old_depth = std::mem::replace(&mut self.ground_depth, depth);
+            let old_mask = std::mem::replace(&mut self.ground_mask, mask);
+            device.destroy_texture(old_depth);
+            device.destroy_texture(old_mask);
+            self.ground_cached_vp = None;
+        }
+        if let Some((depth, mask)) = new_world {
+            let old_depth = std::mem::replace(&mut self.world_depth, depth);
+            let old_mask = std::mem::replace(&mut self.world_mask, mask);
+            device.destroy_texture(old_depth);
+            device.destroy_texture(old_mask);
+            self.world = world_view(&self.scene, new_world_size);
+            self.world_drawn = false;
+        }
+
+        self.quality = quality;
         let slots = match self.output {
             Output::Still => 1,
             Output::Surface(_) => 2,
@@ -2023,7 +2186,8 @@ impl Renderer {
         let cas = self.cascades(view, env);
         let ground = self.ground_view(view);
         let lamps_on = env.lamp_level > 0.001;
-        let water_visible = self.look.water_reflection > 0.001
+        let water_visible = self.quality.reflection_scale > 0.0
+            && self.look.water_reflection > 0.001
             && (self.has_water_props()
                 || self
                     .scene
@@ -2789,6 +2953,198 @@ mod tests {
             .render_still(&mut device, &view, &env, 1)
             .expect("aces ev11.5");
         assert!(avg_luma(&aces_ev11) > avg_luma(&agx_ev13));
+
+        let errs = device.validation_errors();
+        assert!(errs.is_empty(), "validation errors: {errs:?}");
+        renderer.destroy_props(&mut device);
+    }
+
+    #[test]
+    fn low_cost_quality_invariants_and_budget_ordering() {
+        let low = Quality::low_cost();
+        let hybrid = Quality::hybrid_stage();
+        let realtime = Quality::realtime();
+        let still = Quality::still();
+
+        assert_eq!(low.shadow_size, 512);
+        assert_eq!(low.reflection_scale, 0.0);
+        assert_eq!(low.ao_scale, 0.25);
+        assert_eq!(low.ao_samples, 0);
+        assert_eq!(low.tile_size, 32);
+        assert_eq!(low.bloom_levels, 2);
+        assert!(!low.painterly);
+        assert!(!low.fxaa);
+        assert!(!low.particles);
+        assert_eq!(low.ground_size, 256);
+        assert_eq!(low.world_size, 512);
+        assert_eq!(low.grass, 0.0);
+        assert_eq!(low.light_shadow_size, 256);
+
+        assert!(low.shadow_size < hybrid.shadow_size && hybrid.shadow_size < realtime.shadow_size);
+        assert!(low.reflection_scale < hybrid.reflection_scale);
+        assert!(hybrid.reflection_scale < realtime.reflection_scale);
+        assert!(
+            low.bloom_levels < hybrid.bloom_levels && hybrid.bloom_levels < realtime.bloom_levels
+        );
+        assert!(low.ground_size < hybrid.ground_size && hybrid.ground_size <= realtime.ground_size);
+        assert!(low.world_size < hybrid.world_size && hybrid.world_size <= realtime.world_size);
+        assert!(low.grass < hybrid.grass && hybrid.grass < realtime.grass);
+        assert!(
+            low.light_shadow_size < hybrid.light_shadow_size
+                && hybrid.light_shadow_size < realtime.light_shadow_size
+                && realtime.light_shadow_size < still.light_shadow_size
+        );
+    }
+
+    #[test]
+    fn set_quality_switches_dynamically_skips_water_reflection_and_preserves_props() {
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut world = World::default();
+        world.materials.push(Material {
+            name: "stone".into(),
+            base_color: [0.5, 0.5, 0.52, 1.0],
+            roughness: 0.7,
+            metallic: 0.0,
+            alpha: AlphaMode::Opaque,
+            shading: Shading::Standard,
+            ..Material::default()
+        });
+        world.materials.push(Material {
+            name: "pond".into(),
+            base_color: [0.12, 0.34, 0.42, 0.85],
+            roughness: 0.08,
+            metallic: 0.0,
+            alpha: AlphaMode::Opaque,
+            shading: Shading::Water,
+            ..Material::default()
+        });
+        world.meshes.push(make_quad_mesh(-0.4, 5.0));
+        let mut water_mesh = make_quad_mesh(0.0, 4.0);
+        water_mesh.material = Some(1);
+        world.meshes.push(water_mesh);
+        world.instances.push(Instance {
+            mesh: 0,
+            transform: Transform(math::IDENTITY),
+        });
+        world.instances.push(Instance {
+            mesh: 1,
+            transform: Transform(math::IDENTITY),
+        });
+
+        let look = Look::default();
+        let mut renderer = Renderer::new(
+            &mut device,
+            &world,
+            look.clone(),
+            Quality::realtime(),
+            (64, 64),
+            Output::Still,
+        )
+        .expect("create realtime renderer");
+        assert_eq!(renderer.quality(), Quality::realtime());
+
+        let (sp, sn, suv, sidx) = sphere_prop_data();
+        let prop_mesh = renderer
+            .create_prop_mesh(
+                &mut device,
+                &MeshData {
+                    positions: &sp,
+                    normals: &sn,
+                    uvs: &suv,
+                    indices: &sidx,
+                },
+            )
+            .expect("prop mesh");
+        let prop_mat = renderer
+            .create_prop_material(
+                &mut device,
+                &MaterialDesc {
+                    name: "buoy".into(),
+                    base_color: [0.85, 0.32, 0.16, 1.0],
+                    roughness: 0.3,
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("prop material");
+        let mut prop_xf = math::IDENTITY;
+        prop_xf[13] = 0.8;
+        let _prop_inst = renderer
+            .create_prop_instance(prop_mesh, prop_mat, &prop_xf)
+            .expect("prop instance");
+
+        let view = View {
+            name: "pond".into(),
+            eye: [0.0, 2.0, 4.2],
+            target: [0.0, 0.2, 0.0],
+            fov: 48.0,
+            ..View::default()
+        };
+        let env = Environment::resolve(
+            &TimeOfDay {
+                hours: 15.0,
+                ..TimeOfDay::default()
+            },
+            &Weather::default(),
+            &look.palette,
+            1.0,
+        );
+
+        let rt_px = renderer
+            .render_still(&mut device, &view, &env, 1)
+            .expect("render realtime");
+        let rt_stats = renderer.last_frame_stats();
+        assert!(rt_stats.reflection_drawn, "realtime draws water reflection");
+        assert!(rt_stats.ssao_drawn, "realtime draws SSAO");
+        assert!(
+            !rt_stats.fused_tonemap,
+            "realtime uses painterly post chain"
+        );
+
+        renderer
+            .set_quality(&mut device, Quality::low_cost())
+            .expect("switch to low_cost");
+        assert_eq!(renderer.quality(), Quality::low_cost());
+        // No-op re-apply of identical quality must succeed immediately.
+        renderer
+            .set_quality(&mut device, Quality::low_cost())
+            .expect("idempotent low_cost");
+
+        let lc_px = renderer
+            .render_still(&mut device, &view, &env, 1)
+            .expect("render low_cost");
+        let lc_stats = renderer.last_frame_stats();
+        assert!(
+            !lc_stats.reflection_drawn,
+            "low_cost skips water reflection when reflection_scale == 0.0"
+        );
+        assert!(!lc_stats.ssao_drawn, "low_cost skips SSAO");
+        assert!(lc_stats.fused_tonemap, "low_cost uses fused LUT tonemap");
+
+        renderer
+            .set_quality(&mut device, Quality::hybrid_stage())
+            .expect("switch to hybrid_stage");
+        assert_eq!(renderer.quality(), Quality::hybrid_stage());
+        let hy_px = renderer
+            .render_still(&mut device, &view, &env, 1)
+            .expect("render hybrid_stage");
+        let hy_stats = renderer.last_frame_stats();
+        assert!(
+            hy_stats.reflection_drawn,
+            "hybrid_stage restores water reflection when water is visible"
+        );
+        assert!(!hy_stats.ssao_drawn);
+        assert!(hy_stats.fused_tonemap);
+
+        for px in [&rt_px, &lc_px, &hy_px] {
+            let luma = px
+                .chunks_exact(4)
+                .map(|c| 0.2126 * c[0] as f64 + 0.7152 * c[1] as f64 + 0.0722 * c[2] as f64)
+                .sum::<f64>()
+                / (px.len() / 4) as f64;
+            assert!(luma > 5.0);
+        }
 
         let errs = device.validation_errors();
         assert!(errs.is_empty(), "validation errors: {errs:?}");

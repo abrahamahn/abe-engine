@@ -525,6 +525,332 @@ export function formatWorldGraphSummary(graph) {
   return `${wg.uri || 'ganbate://context'} · ${hz}Hz (${ms}ms) · ${mode} · ${preset} ${clock} · ${weather}${openTag}`;
 }
 
+export const WORLD_GRAPH_PRESETS = Object.freeze([
+  { id: 'daylight', label: 'Daylight', hours: 13.0 },
+  { id: 'sunset', label: 'Sunset', hours: 18.25 },
+  { id: 'dusk', label: 'Dusk', hours: 19.25 },
+  { id: 'night', label: 'Night', hours: 22.5 },
+  { id: 'dawn', label: 'Dawn', hours: 6.5 },
+]);
+
+const SHA256_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+function sha256HexSync(text) {
+  const bytes = new TextEncoder().encode(String(text));
+  const bitLen = bytes.length * 8;
+  const totalLen = ((bytes.length + 9 + 63) >> 6) << 6;
+  const msg = new Uint8Array(totalLen);
+  msg.set(bytes);
+  msg[bytes.length] = 0x80;
+  const dv = new DataView(msg.buffer);
+  dv.setUint32(totalLen - 8, Math.floor(bitLen / 0x100000000), false);
+  dv.setUint32(totalLen - 4, bitLen >>> 0, false);
+
+  let h0 = 0x6a09e667; let h1 = 0xbb67ae85; let h2 = 0x3c6ef372; let h3 = 0xa54ff53a;
+  let h4 = 0x510e527f; let h5 = 0x9b05688c; let h6 = 0x1f83d9ab; let h7 = 0x5be0cd19;
+  const w = new Uint32Array(64);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+
+  for (let off = 0; off < totalLen; off += 64) {
+    for (let i = 0; i < 16; i += 1) w[i] = dv.getUint32(off + i * 4, false);
+    for (let i = 16; i < 64; i += 1) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let a = h0; let b = h1; let c = h2; let d = h3;
+    let e = h4; let f = h5; let g = h6; let h = h7;
+    for (let i = 0; i < 64; i += 1) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0;
+      d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + h) >>> 0;
+  }
+  return [h0, h1, h2, h3, h4, h5, h6, h7].map((v) => v.toString(16).padStart(8, '0')).join('');
+}
+
+export function canonicalWorldGraphJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((v) => canonicalWorldGraphJson(v)).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalWorldGraphJson(value[k])}`).join(',')}}`;
+}
+
+export function computeWorldGraphSha256(graph) {
+  const wg = graph && typeof graph === 'object' ? graph : buildDefaultWorldGraph();
+  return sha256HexSync(canonicalWorldGraphJson(wg));
+}
+
+export function estimateWorldGraphTokens(graph) {
+  const wg = graph && typeof graph === 'object' ? graph : buildDefaultWorldGraph();
+  return Math.ceil(canonicalWorldGraphJson(wg).length / 4);
+}
+
+const OFFLINE_FORBIDDEN_PATCH_KEY = /(wallet|balance|credit|ledger|payout|odds|rng|seed|secret|private_key|auth_token|outcome|cheat|rig|bypass)/i;
+const OFFLINE_FORBIDDEN_PROMPT = /\b(rng|seed|balance|wallet|credits?|payout|odds|outcome|cheat|rig|bypass|override\s+authority|disable\s+guardrail)\b|(잔액|시드|난수|결과\s*조작|확률\s*조작|승패\s*조작|강제\s*승리|무조건\s*승리|권한\s*해제)/i;
+
+function hasForbiddenPatchKeys(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const [k, v] of Object.entries(obj)) {
+    if (OFFLINE_FORBIDDEN_PATCH_KEY.test(k)) return k;
+    if (k === 'authority_mode' && v !== 'server-authoritative-readonly') return 'authority_mode';
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const sub = hasForbiddenPatchKeys(v);
+      if (sub) return `${k}.${sub}`;
+    }
+  }
+  return null;
+}
+
+export function applyOfflineWorldGraphPatch(currentGraph, patch) {
+  const base = structuredClone(currentGraph || buildDefaultWorldGraph());
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+    return {
+      ok: false,
+      applied: false,
+      blocked_by_authority: false,
+      guardrail_notices: ['world graph patch expected a JSON object'],
+      patch: {},
+      graph: base,
+      sha256: computeWorldGraphSha256(base),
+      estimated_tokens: estimateWorldGraphTokens(base),
+    };
+  }
+  const badKey = hasForbiddenPatchKeys(patch);
+  if (badKey) {
+    return {
+      ok: false,
+      applied: false,
+      blocked_by_authority: true,
+      guardrail_notices: [
+        `blocked by server-authoritative-readonly policy: forbidden mutation on "${badKey}"`,
+      ],
+      patch,
+      graph: base,
+      sha256: computeWorldGraphSha256(base),
+      estimated_tokens: estimateWorldGraphTokens(base),
+    };
+  }
+
+  const next = structuredClone(base);
+  const notices = [];
+  if (patch.play_mode === 'play' || patch.play_mode === 'edit') {
+    next.play_mode = patch.play_mode;
+  }
+  if (patch.environment && typeof patch.environment === 'object') {
+    const e = patch.environment;
+    if (typeof e.preset === 'string' && e.preset.trim()) next.environment.preset = e.preset.trim().slice(0, 32);
+    if (typeof e.weather === 'string' && e.weather.trim()) next.environment.weather = e.weather.trim().slice(0, 32);
+    if (typeof e.ambient_particles === 'boolean') next.environment.ambient_particles = e.ambient_particles;
+    if (typeof e.enclosure_open === 'boolean') next.environment.enclosure_open = e.enclosure_open;
+    if (typeof e.time_hours === 'number' && Number.isFinite(e.time_hours)) {
+      if (e.time_hours < 0 || e.time_hours > 24) {
+        const clamped = Math.min(24, Math.max(0, e.time_hours));
+        notices.push(`clamped environment.time_hours from ${e.time_hours} to ${clamped}`);
+        next.environment.time_hours = clamped;
+      } else {
+        next.environment.time_hours = e.time_hours;
+      }
+    }
+    if (typeof e.light_boost === 'number' && Number.isFinite(e.light_boost)) {
+      if (e.light_boost < 0 || e.light_boost > 2.0) {
+        const clamped = Math.min(2.0, Math.max(0, e.light_boost));
+        notices.push(`clamped environment.light_boost from ${e.light_boost.toFixed(2)} to ${clamped.toFixed(2)} (allowed 0.00..=2.00)`);
+        next.environment.light_boost = clamped;
+      } else {
+        next.environment.light_boost = e.light_boost;
+      }
+    }
+  }
+  if (patch.guardrails && typeof patch.guardrails === 'object') {
+    const g = patch.guardrails;
+    if (typeof g.target_hz === 'number' && Number.isFinite(g.target_hz)) {
+      const hz = Math.round(g.target_hz);
+      if (hz < 120) {
+        notices.push(`enforced guardrails.target_hz=120Hz minimum (requested ${hz}Hz)`);
+        next.guardrails.target_hz = 120;
+      } else if (hz > 240) {
+        notices.push(`capped guardrails.target_hz from ${hz}Hz to 240Hz`);
+        next.guardrails.target_hz = 240;
+      } else {
+        next.guardrails.target_hz = hz;
+      }
+    }
+    if (typeof g.frame_budget_ms === 'number' && Number.isFinite(g.frame_budget_ms)) {
+      if (g.frame_budget_ms > 8.33) {
+        notices.push(`capped guardrails.frame_budget_ms from ${g.frame_budget_ms.toFixed(2)}ms to 8.33ms (120Hz budget)`);
+        next.guardrails.frame_budget_ms = 8.33;
+      } else if (g.frame_budget_ms < 4.0) {
+        notices.push(`clamped guardrails.frame_budget_ms from ${g.frame_budget_ms.toFixed(2)}ms to 4.00ms`);
+        next.guardrails.frame_budget_ms = 4.0;
+      } else {
+        next.guardrails.frame_budget_ms = g.frame_budget_ms;
+      }
+    }
+    if (typeof g.max_dynamic_lights === 'number' && Number.isFinite(g.max_dynamic_lights)) {
+      const lights = Math.max(0, Math.round(g.max_dynamic_lights));
+      if (lights > 8) {
+        notices.push(`capped guardrails.max_dynamic_lights from ${lights} to 8 (8.33ms 120Hz budget)`);
+        next.guardrails.max_dynamic_lights = 8;
+      } else {
+        next.guardrails.max_dynamic_lights = lights;
+      }
+    }
+    if (typeof g.max_draw_calls === 'number' && Number.isFinite(g.max_draw_calls)) {
+      const draws = Math.round(g.max_draw_calls);
+      if (draws > 96) {
+        notices.push(`capped guardrails.max_draw_calls from ${draws} to 96 (8.33ms 120Hz budget)`);
+        next.guardrails.max_draw_calls = 96;
+      } else if (draws < 1) {
+        notices.push('clamped guardrails.max_draw_calls from 0 to 1');
+        next.guardrails.max_draw_calls = 1;
+      } else {
+        next.guardrails.max_draw_calls = draws;
+      }
+    }
+  }
+  if (patch.camera && typeof patch.camera === 'object') {
+    const c = patch.camera;
+    if (typeof c.preset === 'string' && c.preset.trim()) next.camera.preset = c.preset.trim().slice(0, 32);
+    if (typeof c.fov_y_deg === 'number' && Number.isFinite(c.fov_y_deg)) {
+      if (c.fov_y_deg < 28 || c.fov_y_deg > 95) {
+        const clamped = Math.min(95, Math.max(28, c.fov_y_deg));
+        notices.push(`clamped camera.fov_y_deg from ${c.fov_y_deg} to ${clamped}`);
+        next.camera.fov_y_deg = clamped;
+      } else {
+        next.camera.fov_y_deg = c.fov_y_deg;
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    applied: true,
+    blocked_by_authority: false,
+    guardrail_notices: notices,
+    patch,
+    graph: next,
+    sha256: computeWorldGraphSha256(next),
+    estimated_tokens: estimateWorldGraphTokens(next),
+  };
+}
+
+export function compileOfflineWorldGraphPrompt(currentGraph, prompt) {
+  const base = structuredClone(currentGraph || buildDefaultWorldGraph());
+  const text = String(prompt || '').trim();
+  if (!text) {
+    return {
+      ok: true,
+      applied: false,
+      blocked_by_authority: false,
+      guardrail_notices: [],
+      patch: {},
+      graph: base,
+      sha256: computeWorldGraphSha256(base),
+      estimated_tokens: estimateWorldGraphTokens(base),
+    };
+  }
+  if (OFFLINE_FORBIDDEN_PROMPT.test(text)) {
+    return {
+      ok: false,
+      applied: false,
+      blocked_by_authority: true,
+      guardrail_notices: [
+        'blocked by server-authoritative-readonly policy: authoritative state, balances, and RNG cannot be modified',
+      ],
+      patch: {},
+      graph: base,
+      sha256: computeWorldGraphSha256(base),
+      estimated_tokens: estimateWorldGraphTokens(base),
+    };
+  }
+
+  const patch = {};
+  const env = {};
+  const guardrails = {};
+
+  if (/\b(pause|freeze|edit\s+mode)\b|(일시\s*정지|편집\s*모드)/i.test(text)) {
+    patch.play_mode = 'edit';
+  } else if (/\b(resume|unpause|play\s+mode)\b|(플레이\s*모드|실행\s*모드|다시\s*시작|재생)/i.test(text)) {
+    patch.play_mode = 'play';
+  }
+
+  if (/\bdusk\b|황혼/i.test(text)) {
+    env.preset = 'dusk';
+    env.time_hours = 19.25;
+  } else if (/\bsunset\b|golden\s*hour|노을|석양|해질녘/i.test(text)) {
+    env.preset = 'sunset';
+    env.time_hours = 18.25;
+  } else if (/\b(night|midnight|moonlight)\b|(밤|야간|자정|달빛)/i.test(text)) {
+    env.preset = 'night';
+    env.time_hours = 22.5;
+  } else if (/\b(dawn|sunrise|morning)\b|(새벽|일출|아침)/i.test(text)) {
+    env.preset = 'dawn';
+    env.time_hours = 6.5;
+  } else if (/\b(daylight|noon|midday|sunny)\b|(정오|한낮|낮\s*조명|맑은\s*낮)/i.test(text)) {
+    env.preset = 'daylight';
+    env.time_hours = 13.0;
+  }
+
+  if (/\bstorm\b|폭풍/i.test(text)) env.weather = 'storm';
+  else if (/\brain\b|비/i.test(text)) env.weather = 'rain';
+  else if (/\bmist\b|\bfog\b|안개/i.test(text)) env.weather = 'mist';
+  else if (/\bpetals\b|꽃잎|벚꽃/i.test(text)) env.weather = 'petals';
+  else if (/\bclear\b|맑음/i.test(text)) env.weather = 'clear';
+
+  if (/\b(open)\b.*\b(roof|ceiling|enclosure|sky)\b|(지붕|천장).*(열어|개방)|개방형/i.test(text) || /\bopen\s+(enclosure|roof|ceiling)\b/i.test(text)) {
+    env.enclosure_open = true;
+  } else if (/\b(close)\b.*\b(roof|ceiling|enclosure)\b|(지붕|천장).*(닫아|폐쇄)/i.test(text)) {
+    env.enclosure_open = false;
+  }
+
+  const lightsMatch = text.match(/(\d+)\s*(?:dynamic\s*)?lights?\b|조명\s*(\d+)\s*개/i);
+  if (lightsMatch) {
+    guardrails.max_dynamic_lights = Number(lightsMatch[1] || lightsMatch[2]);
+  }
+  const hzMatch = text.match(/(\d+)\s*(?:hz|fps)\b/i);
+  if (hzMatch) {
+    guardrails.target_hz = Number(hzMatch[1]);
+  }
+  const boostMatch = text.match(/light[_\s-]*boost\s*(?:to|=)?\s*([0-9]+(?:\.[0-9]+)?)|밝기\s*([0-9]+(?:\.[0-9]+)?)\s*배/i);
+  if (boostMatch) {
+    env.light_boost = Number(boostMatch[1] || boostMatch[2]);
+  }
+
+  if (Object.keys(env).length) patch.environment = env;
+  if (Object.keys(guardrails).length) patch.guardrails = guardrails;
+
+  if (!Object.keys(patch).length) {
+    return {
+      ok: true,
+      applied: false,
+      blocked_by_authority: false,
+      guardrail_notices: ['no recognized world-graph directives in prompt'],
+      patch: {},
+      graph: base,
+      sha256: computeWorldGraphSha256(base),
+      estimated_tokens: estimateWorldGraphTokens(base),
+    };
+  }
+  return applyOfflineWorldGraphPatch(base, patch);
+}
+
 export const BENCH_SUBSYSTEM_LABELS = Object.freeze({
   world_graph_roundtrip: 'Round-Trip',
   tri_modal_prompt_compile_and_patch: 'Prompt+Patch',
@@ -737,6 +1063,14 @@ export function mountAiCopilot(container, hooks = {}) {
   let contextCache = null;
   let worldGraphCache = null;
   let worldGraphNotices = [];
+  let worldGraphSha256 = '';
+  let worldGraphTokens = 0;
+  let worldGraphUndoCount = 0;
+  let worldGraphRedoCount = 0;
+  let worldGraphAlert = null;
+  const offlineUndoStack = [];
+  const offlineRedoStack = [];
+  let directorPromptDraft = '';
   let worldGraphBenchCache = null;
   let worldGraphBenchRunning = false;
   let lastCopiedLatex = '';
@@ -787,19 +1121,380 @@ export function mountAiCopilot(container, hooks = {}) {
 
   function applyWorldGraphPayload(payload, rerender = false) {
     if (!payload || typeof payload !== 'object') return false;
+    const isRejected = payload.blocked_by_authority === true || payload.type === 'world-graph-rejected';
     const nextGraph = payload.graph && typeof payload.graph === 'object'
       ? payload.graph
       : (payload.uri === 'ganbate://context' || payload.schema === 'ganbate.semantic-world-graph.v1'
           ? payload
           : null);
-    if (!nextGraph) return false;
-    worldGraphCache = nextGraph;
+    if (!nextGraph && !isRejected) return false;
+    if (nextGraph) {
+      worldGraphCache = nextGraph;
+      worldGraphSha256 = typeof payload.sha256 === 'string' && payload.sha256.length >= 12
+        ? payload.sha256
+        : computeWorldGraphSha256(nextGraph);
+      worldGraphTokens = Number.isFinite(Number(payload.estimated_tokens)) && Number(payload.estimated_tokens) > 0
+        ? Math.trunc(Number(payload.estimated_tokens))
+        : estimateWorldGraphTokens(nextGraph);
+    }
+    if (typeof payload.undo_count === 'number') {
+      worldGraphUndoCount = Math.max(0, Math.trunc(payload.undo_count));
+    } else if (typeof payload.can_undo === 'boolean' && !payload.can_undo) {
+      worldGraphUndoCount = 0;
+    }
+    if (typeof payload.redo_count === 'number') {
+      worldGraphRedoCount = Math.max(0, Math.trunc(payload.redo_count));
+    } else if (typeof payload.can_redo === 'boolean' && !payload.can_redo) {
+      worldGraphRedoCount = 0;
+    }
     if (Array.isArray(payload.guardrail_notices)) {
       worldGraphNotices = payload.guardrail_notices.slice();
+    }
+    if (isRejected) {
+      const reason = worldGraphNotices.length
+        ? worldGraphNotices.join(' · ')
+        : 'Blocked by server-authoritative-readonly security guardrail';
+      worldGraphAlert = {
+        kind: 'rejected',
+        text: `[server-authoritative-readonly] ${reason}`,
+      };
+    } else if (Array.isArray(payload.guardrail_notices) && payload.guardrail_notices.length) {
+      worldGraphAlert = {
+        kind: 'clamped',
+        text: `[120Hz Guardrail] ${payload.guardrail_notices.join(' · ')}`,
+      };
+    } else if (payload.type && payload.type !== 'world-graph-state') {
+      worldGraphAlert = null;
     }
     syncWorldGraphBanner();
     if (rerender) renderBody();
     return true;
+  }
+
+  function pushOfflineUndoSnapshot(prevGraph) {
+    if (offlineUndoStack.length >= 128) offlineUndoStack.shift();
+    offlineUndoStack.push(structuredClone(prevGraph));
+    offlineRedoStack.length = 0;
+    worldGraphUndoCount = offlineUndoStack.length;
+    worldGraphRedoCount = 0;
+  }
+
+  async function dispatchWorldGraphPatch(patch) {
+    const current = worldGraphCache || buildDefaultWorldGraph();
+    let reply = null;
+    if (typeof hooks.patchWorldGraph === 'function') {
+      try {
+        reply = await hooks.patchWorldGraph(patch);
+      } catch {
+        reply = null;
+      }
+    }
+    if (!reply) {
+      const prevCanon = canonicalWorldGraphJson(current);
+      const offline = applyOfflineWorldGraphPatch(current, patch);
+      if (!offline.blocked_by_authority && offline.applied && canonicalWorldGraphJson(offline.graph) !== prevCanon) {
+        pushOfflineUndoSnapshot(current);
+      }
+      reply = {
+        ...offline,
+        type: offline.blocked_by_authority ? 'world-graph-rejected' : 'world-graph-patched',
+        undo_count: offlineUndoStack.length,
+        redo_count: offlineRedoStack.length,
+        can_undo: offlineUndoStack.length > 0,
+        can_redo: offlineRedoStack.length > 0,
+      };
+    }
+    applyWorldGraphPayload(reply, !root.hidden);
+    if (!reply.blocked_by_authority && reply.applied && typeof reply.graph?.environment?.time_hours === 'number') {
+      hooks.setTimeOfDay?.(
+        reply.graph.environment.time_hours,
+        reply.graph.environment.preset || null,
+      );
+    }
+    return reply;
+  }
+
+  async function dispatchWorldGraphPrompt(rawPrompt) {
+    const clean = String(rawPrompt || '').trim();
+    if (!clean) return null;
+    const current = worldGraphCache || buildDefaultWorldGraph();
+    let reply = null;
+    if (typeof hooks.promptWorldGraph === 'function') {
+      try {
+        reply = await hooks.promptWorldGraph(clean);
+      } catch {
+        reply = null;
+      }
+    }
+    if (!reply) {
+      const prevCanon = canonicalWorldGraphJson(current);
+      const offline = compileOfflineWorldGraphPrompt(current, clean);
+      if (!offline.blocked_by_authority && offline.applied && canonicalWorldGraphJson(offline.graph) !== prevCanon) {
+        pushOfflineUndoSnapshot(current);
+      }
+      reply = {
+        ...offline,
+        type: offline.blocked_by_authority ? 'world-graph-rejected' : 'world-graph-prompted',
+        undo_count: offlineUndoStack.length,
+        redo_count: offlineRedoStack.length,
+        can_undo: offlineUndoStack.length > 0,
+        can_redo: offlineRedoStack.length > 0,
+      };
+    }
+    applyWorldGraphPayload(reply, !root.hidden);
+    if (!reply.blocked_by_authority && reply.applied && typeof reply.graph?.environment?.time_hours === 'number') {
+      hooks.setTimeOfDay?.(
+        reply.graph.environment.time_hours,
+        reply.graph.environment.preset || null,
+      );
+    }
+    return reply;
+  }
+
+  async function dispatchWorldGraphUndo() {
+    let reply = null;
+    if (typeof hooks.undoWorldGraph === 'function') {
+      try {
+        reply = await hooks.undoWorldGraph();
+      } catch {
+        reply = null;
+      }
+    }
+    if (!reply) {
+      const current = worldGraphCache || buildDefaultWorldGraph();
+      if (!offlineUndoStack.length) {
+        return {
+          ok: true,
+          applied: false,
+          type: 'world-graph-state',
+          graph: current,
+          sha256: computeWorldGraphSha256(current),
+          estimated_tokens: estimateWorldGraphTokens(current),
+          undo_count: 0,
+          redo_count: offlineRedoStack.length,
+          can_undo: false,
+          can_redo: offlineRedoStack.length > 0,
+          guardrail_notices: [],
+        };
+      }
+      const prev = offlineUndoStack.pop();
+      offlineRedoStack.push(structuredClone(current));
+      reply = {
+        ok: true,
+        applied: true,
+        type: 'world-graph-state',
+        graph: prev,
+        sha256: computeWorldGraphSha256(prev),
+        estimated_tokens: estimateWorldGraphTokens(prev),
+        undo_count: offlineUndoStack.length,
+        redo_count: offlineRedoStack.length,
+        can_undo: offlineUndoStack.length > 0,
+        can_redo: offlineRedoStack.length > 0,
+        guardrail_notices: ['undid world graph change'],
+      };
+    }
+    applyWorldGraphPayload(reply, !root.hidden);
+    if (reply.applied && typeof reply.graph?.environment?.time_hours === 'number') {
+      hooks.setTimeOfDay?.(
+        reply.graph.environment.time_hours,
+        reply.graph.environment.preset || null,
+      );
+    }
+    return reply;
+  }
+
+  async function dispatchWorldGraphRedo() {
+    let reply = null;
+    if (typeof hooks.redoWorldGraph === 'function') {
+      try {
+        reply = await hooks.redoWorldGraph();
+      } catch {
+        reply = null;
+      }
+    }
+    if (!reply) {
+      const current = worldGraphCache || buildDefaultWorldGraph();
+      if (!offlineRedoStack.length) {
+        return {
+          ok: true,
+          applied: false,
+          type: 'world-graph-state',
+          graph: current,
+          sha256: computeWorldGraphSha256(current),
+          estimated_tokens: estimateWorldGraphTokens(current),
+          undo_count: offlineUndoStack.length,
+          redo_count: 0,
+          can_undo: offlineUndoStack.length > 0,
+          can_redo: false,
+          guardrail_notices: [],
+        };
+      }
+      const next = offlineRedoStack.pop();
+      offlineUndoStack.push(structuredClone(current));
+      reply = {
+        ok: true,
+        applied: true,
+        type: 'world-graph-state',
+        graph: next,
+        sha256: computeWorldGraphSha256(next),
+        estimated_tokens: estimateWorldGraphTokens(next),
+        undo_count: offlineUndoStack.length,
+        redo_count: offlineRedoStack.length,
+        can_undo: offlineUndoStack.length > 0,
+        can_redo: offlineRedoStack.length > 0,
+        guardrail_notices: ['redid world graph change'],
+      };
+    }
+    applyWorldGraphPayload(reply, !root.hidden);
+    if (reply.applied && typeof reply.graph?.environment?.time_hours === 'number') {
+      hooks.setTimeOfDay?.(
+        reply.graph.environment.time_hours,
+        reply.graph.environment.preset || null,
+      );
+    }
+    return reply;
+  }
+
+  function createStageDirectorCard() {
+    const wg = worldGraphCache || buildDefaultWorldGraph();
+    const sha = worldGraphSha256 || computeWorldGraphSha256(wg);
+    const tok = worldGraphTokens > 0 ? worldGraphTokens : estimateWorldGraphTokens(wg);
+    const mode = wg.play_mode === 'edit' ? 'edit' : 'play';
+    const isOpen = Boolean(wg.environment?.enclosure_open);
+    const activePreset = wg.environment?.preset || 'daylight';
+
+    const card = domEl(doc, 'div', 'gb-copilot-card gb-wg-director');
+    card.dataset.role = 'world-graph-director';
+
+    const hdr = domEl(doc, 'h4');
+    const digestBadge = domEl(
+      doc,
+      'span',
+      'gb-copilot-badge mono',
+      `${tok} tok (<300) · sha256:${sha.slice(0, 12)}`,
+    );
+    digestBadge.dataset.role = 'world-graph-digest-badge';
+    digestBadge.dataset.sha256 = sha;
+    digestBadge.dataset.tokens = String(tok);
+    hdr.append(
+      domEl(doc, 'span', '', 'Live ganbate://context Stage Director'),
+      digestBadge,
+    );
+
+    const primaryRow = domEl(doc, 'div', 'gb-wg-director-row');
+    const modeBtn = domEl(
+      doc,
+      'button',
+      mode === 'edit' ? 'mini on' : 'mini',
+      mode === 'edit' ? '⏸ Play ↔ Edit (Edit)' : '▶ Play ↔ Edit (Play)',
+    );
+    modeBtn.type = 'button';
+    modeBtn.dataset.action = 'world-graph-toggle-mode';
+    modeBtn.addEventListener('click', () => {
+      void dispatchWorldGraphPatch({ play_mode: mode === 'play' ? 'edit' : 'play' });
+    });
+
+    const encBtn = domEl(
+      doc,
+      'button',
+      isOpen ? 'mini on' : 'mini',
+      isOpen ? '🏛 Roof: Open' : '🏛 Roof: Closed',
+    );
+    encBtn.type = 'button';
+    encBtn.dataset.action = 'world-graph-toggle-enclosure';
+    encBtn.addEventListener('click', () => {
+      void dispatchWorldGraphPatch({ environment: { enclosure_open: !isOpen } });
+    });
+
+    const undoBtn = domEl(
+      doc,
+      'button',
+      'mini',
+      `↶ Undo (${worldGraphUndoCount})`,
+    );
+    undoBtn.type = 'button';
+    undoBtn.dataset.action = 'world-graph-undo';
+    undoBtn.disabled = worldGraphUndoCount === 0 && typeof hooks.undoWorldGraph !== 'function';
+    undoBtn.addEventListener('click', () => {
+      void dispatchWorldGraphUndo();
+    });
+
+    const redoBtn = domEl(
+      doc,
+      'button',
+      'mini',
+      `↷ Redo (${worldGraphRedoCount})`,
+    );
+    redoBtn.type = 'button';
+    redoBtn.dataset.action = 'world-graph-redo';
+    redoBtn.disabled = worldGraphRedoCount === 0 && typeof hooks.redoWorldGraph !== 'function';
+    redoBtn.addEventListener('click', () => {
+      void dispatchWorldGraphRedo();
+    });
+
+    primaryRow.append(modeBtn, encBtn, undoBtn, redoBtn);
+
+    const presetRow = domEl(doc, 'div', 'gb-wg-presets');
+    for (const p of WORLD_GRAPH_PRESETS) {
+      const pBtn = domEl(
+        doc,
+        'button',
+        activePreset === p.id ? 'mini on' : 'mini',
+        p.label,
+      );
+      pBtn.type = 'button';
+      pBtn.dataset.action = 'world-graph-preset';
+      pBtn.dataset.preset = p.id;
+      pBtn.addEventListener('click', () => {
+        void dispatchWorldGraphPatch({
+          environment: { preset: p.id, time_hours: p.hours },
+        });
+      });
+      presetRow.append(pBtn);
+    }
+
+    const promptRow = domEl(doc, 'div', 'gb-wg-prompt-row');
+    const wgInput = domEl(doc, 'input');
+    wgInput.type = 'text';
+    wgInput.dataset.role = 'world-graph-prompt-input';
+    wgInput.placeholder = 'EN/KO World Graph prompt (e.g. "석양 조명 + 지붕 열어줘" or "dusk rain")…';
+    wgInput.value = directorPromptDraft;
+    wgInput.addEventListener('input', () => {
+      directorPromptDraft = wgInput.value;
+    });
+    const wgRunBtn = domEl(doc, 'button', 'mini on', 'Run');
+    wgRunBtn.type = 'button';
+    wgRunBtn.dataset.action = 'run-world-graph-prompt';
+    const submitDirectorPrompt = () => {
+      const textVal = wgInput.value;
+      directorPromptDraft = '';
+      wgInput.value = '';
+      void dispatchWorldGraphPrompt(textVal);
+    };
+    wgRunBtn.addEventListener('click', submitDirectorPrompt);
+    wgInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault?.();
+        submitDirectorPrompt();
+      }
+    });
+    promptRow.append(wgInput, wgRunBtn);
+
+    card.append(hdr, primaryRow, presetRow, promptRow);
+
+    if (worldGraphAlert) {
+      const alertEl = domEl(
+        doc,
+        'div',
+        `gb-wg-alert ${worldGraphAlert.kind}`,
+        worldGraphAlert.text,
+      );
+      alertEl.dataset.role = 'world-graph-director-alert';
+      alertEl.dataset.alertKind = worldGraphAlert.kind;
+      card.append(alertEl);
+    }
+
+    return card;
   }
 
   syncWorldGraphBanner();
@@ -865,6 +1560,8 @@ export function mountAiCopilot(container, hooks = {}) {
     }
     if (!worldGraphCache) {
       worldGraphCache = buildDefaultWorldGraph();
+      worldGraphSha256 = computeWorldGraphSha256(worldGraphCache);
+      worldGraphTokens = estimateWorldGraphTokens(worldGraphCache);
       syncWorldGraphBanner();
     }
   }
@@ -1041,6 +1738,8 @@ export function mountAiCopilot(container, hooks = {}) {
   });
 
   function renderChatTab() {
+    body.append(createStageDirectorCard());
+
     const sampleCard = domEl(doc, 'div', 'gb-copilot-card');
     sampleCard.append(
       domEl(doc, 'h4', '', '1-Click Prompt Starters'),
@@ -1238,6 +1937,8 @@ export function mountAiCopilot(container, hooks = {}) {
   }
 
   function renderContextTab() {
+    body.append(createStageDirectorCard());
+
     const wg = worldGraphCache || buildDefaultWorldGraph();
     const wgJson = JSON.stringify(wg, null, 2);
     const wgTokens = Math.ceil(wgJson.length / 4);
@@ -1534,6 +2235,10 @@ export function mountAiCopilot(container, hooks = {}) {
       else api.close();
     },
     executePrompt,
+    patchWorldGraph: dispatchWorldGraphPatch,
+    promptWorldGraph: dispatchWorldGraphPrompt,
+    undoWorldGraph: dispatchWorldGraphUndo,
+    redoWorldGraph: dispatchWorldGraphRedo,
     updateWorldGraph: (payload) => applyWorldGraphPayload(payload, !root.hidden),
     getWorldGraph: () => worldGraphCache || buildDefaultWorldGraph(),
     runWorldGraphBenchmark,

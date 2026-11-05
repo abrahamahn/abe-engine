@@ -535,6 +535,7 @@ function onMessage(msg) {
     case 'brick-crystallized':
       break;
     case 'world-graph-updated':
+    case 'world-graph-state':
     case 'world-graph-result':
     case 'world-graph-patched':
     case 'world-graph-prompted':
@@ -555,6 +556,9 @@ function onMessage(msg) {
         }
         state.aiCopilot?.updateWorldGraph?.(msg);
       }
+      break;
+    case 'world-graph-rejected':
+      state.aiCopilot?.updateWorldGraph?.(msg);
       break;
     case 'world-graph-benchmark-result':
       state.aiCopilot?.updateBenchmarkResult?.(msg);
@@ -2637,6 +2641,18 @@ function setupAiIdeBar() {
     patchWorldGraph: async (patch) => {
       if (!state.host?.open || state.host.kind === 'cloud') return null;
       const reply = await state.host.request({ type: 'world-graph-patch', patch });
+      if (reply?.type === 'error') return { ok: false, error: reply.message };
+      return reply;
+    },
+    undoWorldGraph: async () => {
+      if (!state.host?.open || state.host.kind === 'cloud') return null;
+      const reply = await state.host.request({ type: 'world-graph-undo' });
+      if (reply?.type === 'error') return { ok: false, error: reply.message };
+      return reply;
+    },
+    redoWorldGraph: async () => {
+      if (!state.host?.open || state.host.kind === 'cloud') return null;
+      const reply = await state.host.request({ type: 'world-graph-redo' });
       if (reply?.type === 'error') return { ok: false, error: reply.message };
       return reply;
     },

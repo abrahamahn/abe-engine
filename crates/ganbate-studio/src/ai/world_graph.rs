@@ -539,6 +539,20 @@ impl SemanticWorldGraph {
         json::to_compact(&self.to_json_value())
     }
 
+    /// Computes both the deterministic SHA-256 hex digest and estimated token count in a single
+    /// canonical JSON serialization pass.
+    pub fn canonical_sha256_and_tokens(&self) -> Result<(String, usize), String> {
+        let canonical = self.to_canonical_json()?;
+        let tokens = canonical.len().div_ceil(4);
+        let digest = ganbate_core::digest::sha256(canonical.as_bytes());
+        Ok((ganbate_core::digest::hex(&digest), tokens))
+    }
+
+    /// Deterministic SHA-256 hex digest over [`Self::to_canonical_json`].
+    pub fn canonical_sha256_hex(&self) -> Result<String, String> {
+        self.canonical_sha256_and_tokens().map(|(sha, _)| sha)
+    }
+
     /// Estimated LLM token count (`~4 chars/token` on canonical JSON).
     pub fn estimated_tokens(&self) -> usize {
         self.to_canonical_json()
@@ -1017,6 +1031,10 @@ impl WorldGraphMutationOutcome {
                 .map(|n| Value::String(n.clone()))
                 .collect(),
         );
+        let (sha, tok) = self
+            .graph
+            .canonical_sha256_and_tokens()
+            .unwrap_or_else(|_| (String::new(), 0));
         Value::Object(BTreeMap::from([
             ("ok".into(), Value::Bool(!self.blocked_by_authority)),
             ("uri".into(), Value::String(WORLD_GRAPH_URI.into())),
@@ -1027,19 +1045,22 @@ impl WorldGraphMutationOutcome {
             ),
             ("guardrail_notices".into(), notices_arr),
             ("patch".into(), self.patch.clone()),
-            (
-                "estimated_tokens".into(),
-                Value::Number(self.graph.estimated_tokens() as f64),
-            ),
+            ("sha256".into(), Value::String(sha)),
+            ("estimated_tokens".into(), Value::Number(tok as f64)),
             ("graph".into(), self.graph.to_json_value()),
         ]))
     }
 }
 
 fn make_broadcast_event(graph: &SemanticWorldGraph, patch: &Value, notices: &[String]) -> Value {
+    let (sha, tok) = graph
+        .canonical_sha256_and_tokens()
+        .unwrap_or_else(|_| (String::new(), 0));
     Value::Object(BTreeMap::from([
         ("type".into(), Value::String("world-graph-updated".into())),
         ("uri".into(), Value::String(WORLD_GRAPH_URI.into())),
+        ("sha256".into(), Value::String(sha)),
+        ("estimated_tokens".into(), Value::Number(tok as f64)),
         ("patch".into(), patch.clone()),
         (
             "guardrail_notices".into(),

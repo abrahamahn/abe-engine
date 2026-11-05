@@ -110,6 +110,9 @@ pub struct Studio {
     active_client: Option<ClientId>,
     /// Entities touched by the latest in-memory transaction per document (for `brick crystallize --from-tx`).
     last_tx_entities: BTreeMap<String, Vec<String>>,
+    /// Session-scoped undo/redo stacks for `world.semantic.json` (`ganbate://context`).
+    world_graph_undo: Vec<crate::ai::world_graph::SemanticWorldGraph>,
+    world_graph_redo: Vec<crate::ai::world_graph::SemanticWorldGraph>,
     /// Where cooked previews are written (inside the project's `.ganbate` folder).
     cache_rel: String,
     /// The project folder with every symlink resolved: whatever the host reads or writes in
@@ -329,6 +332,8 @@ impl Studio {
             selections: BTreeMap::new(),
             active_client: None,
             last_tx_entities: BTreeMap::new(),
+            world_graph_undo: Vec::new(),
+            world_graph_redo: Vec::new(),
             cache_rel: ".ganbate/cooked".into(),
             real_root,
             previews: BTreeMap::new(),
@@ -1456,7 +1461,7 @@ impl Studio {
                     Value::Object(m) => m,
                     _ => BTreeMap::new(),
                 };
-                payload.insert("type".into(), s("world-graph-result"));
+                payload.insert("type".into(), s("world-graph-state"));
                 if let Some(r) = msg.get("req") {
                     payload.insert("req".into(), r.clone());
                 }
@@ -1470,7 +1475,15 @@ impl Studio {
                     Value::Object(m) => m,
                     _ => BTreeMap::new(),
                 };
-                reply.insert("type".into(), s("world-graph-patched"));
+                let blocked = reply.get("blocked_by_authority") == Some(&Value::Bool(true));
+                reply.insert(
+                    "type".into(),
+                    s(if blocked {
+                        "world-graph-rejected"
+                    } else {
+                        "world-graph-patched"
+                    }),
+                );
                 if let Some(r) = msg.get("req") {
                     reply.insert("req".into(), r.clone());
                 }
@@ -1488,7 +1501,43 @@ impl Studio {
                     Value::Object(m) => m,
                     _ => BTreeMap::new(),
                 };
-                reply.insert("type".into(), s("world-graph-prompted"));
+                let blocked = reply.get("blocked_by_authority") == Some(&Value::Bool(true));
+                reply.insert(
+                    "type".into(),
+                    s(if blocked {
+                        "world-graph-rejected"
+                    } else {
+                        "world-graph-prompted"
+                    }),
+                );
+                if let Some(r) = msg.get("req") {
+                    reply.insert("req".into(), r.clone());
+                }
+                outbox.push((from, Value::Object(reply)));
+                Ok(outbox)
+            }
+            "world-graph-undo" => {
+                let mut outbox = Vec::new();
+                let res = self.world_graph_undo(&mut outbox)?;
+                let mut reply = match res {
+                    Value::Object(m) => m,
+                    _ => BTreeMap::new(),
+                };
+                reply.insert("type".into(), s("world-graph-state"));
+                if let Some(r) = msg.get("req") {
+                    reply.insert("req".into(), r.clone());
+                }
+                outbox.push((from, Value::Object(reply)));
+                Ok(outbox)
+            }
+            "world-graph-redo" => {
+                let mut outbox = Vec::new();
+                let res = self.world_graph_redo(&mut outbox)?;
+                let mut reply = match res {
+                    Value::Object(m) => m,
+                    _ => BTreeMap::new(),
+                };
+                reply.insert("type".into(), s("world-graph-state"));
                 if let Some(r) = msg.get("req") {
                     reply.insert("req".into(), r.clone());
                 }
@@ -2572,17 +2621,76 @@ cam frame <subject|@selection|all> [azimuth=<deg>] [elevation=<deg>]";
     /// Returns the structured `world_graph_fetch` payload for `ganbate://context`.
     pub fn world_graph_fetch(&mut self) -> Result<Value, String> {
         let (graph, notices) = self.world_graph_read_or_init()?;
-        Ok(obj(vec![
+        let mut payload = obj(vec![
             ("ok", Value::Bool(true)),
             ("uri", s(crate::ai::world_graph::WORLD_GRAPH_URI)),
             ("path", s(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)),
-            ("estimated_tokens", n(graph.estimated_tokens() as u64)),
             (
                 "guardrail_notices",
                 Value::Array(notices.into_iter().map(|m| s(&m)).collect()),
             ),
             ("graph", graph.to_json_value()),
-        ]))
+        ]);
+        self.enrich_world_graph_payload(&mut payload, &graph)?;
+        Ok(payload)
+    }
+
+    fn enrich_world_graph_payload(
+        &self,
+        val: &mut Value,
+        graph: &crate::ai::world_graph::SemanticWorldGraph,
+    ) -> Result<(), String> {
+        if let Value::Object(map) = val {
+            let needs_digest = map
+                .get("sha256")
+                .and_then(|v| v.string().ok())
+                .is_none_or(|h| h.len() != 64)
+                || !map.contains_key("estimated_tokens");
+            if needs_digest {
+                let (sha, tok) = graph.canonical_sha256_and_tokens()?;
+                map.insert("sha256".into(), s(&sha));
+                map.insert("estimated_tokens".into(), n(tok as u64));
+            }
+            map.insert("undo_count".into(), n(self.world_graph_undo.len() as u64));
+            map.insert("redo_count".into(), n(self.world_graph_redo.len() as u64));
+            map.insert(
+                "can_undo".into(),
+                Value::Bool(!self.world_graph_undo.is_empty()),
+            );
+            map.insert(
+                "can_redo".into(),
+                Value::Bool(!self.world_graph_redo.is_empty()),
+            );
+        }
+        Ok(())
+    }
+
+    fn push_world_graph_undo(&mut self, previous: crate::ai::world_graph::SemanticWorldGraph) {
+        if self.world_graph_undo.len() >= HISTORY_LIMIT {
+            self.world_graph_undo.remove(0);
+        }
+        self.world_graph_undo.push(previous);
+        self.world_graph_redo.clear();
+    }
+
+    fn broadcast_world_graph_state(
+        &self,
+        graph: &crate::ai::world_graph::SemanticWorldGraph,
+        notice: &str,
+        outbox: &mut Outbox,
+    ) -> Result<(), String> {
+        let mut ev = obj(vec![
+            ("type", s("world-graph-updated")),
+            ("uri", s(crate::ai::world_graph::WORLD_GRAPH_URI)),
+            ("patch", graph.to_json_value()),
+            ("guardrail_notices", Value::Array(vec![s(notice)])),
+            ("graph", graph.to_json_value()),
+        ]);
+        self.enrich_world_graph_payload(&mut ev, graph)?;
+        for &cid in self.clients.keys() {
+            outbox.push((cid, ev.clone()));
+        }
+        Ok(())
     }
 
     /// Applies a JSON patch to `world.semantic.json` under `120Hz` and server-authority guardrails,
@@ -2597,9 +2705,18 @@ cam frame <subject|@selection|all> [azimuth=<deg>] [elevation=<deg>]";
         if !outcome.blocked_by_authority && outcome.applied {
             self.inside(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)?;
             let _ = crate::ai::world_graph::save_world_graph(&self.project.root, &outcome.graph)?;
-            outbox.extend(outcome.build_outbox(self.clients.keys().copied()));
+            if outcome.graph != current {
+                self.push_world_graph_undo(current);
+            }
+            let mut broadcast = outcome.build_outbox(self.clients.keys().copied());
+            for (_, msg) in &mut broadcast {
+                self.enrich_world_graph_payload(msg, &outcome.graph)?;
+            }
+            outbox.extend(broadcast);
         }
-        Ok(outcome.to_json_value())
+        let mut val = outcome.to_json_value();
+        self.enrich_world_graph_payload(&mut val, &outcome.graph)?;
+        Ok(val)
     }
 
     /// Compiles a bilingual (EN/KO) natural-language prompt against `world.semantic.json` under
@@ -2611,14 +2728,98 @@ cam frame <subject|@selection|all> [azimuth=<deg>] [elevation=<deg>]";
     ) -> Result<Value, String> {
         let (current, _) = self.world_graph_read_or_init()?;
         let recipients: Vec<ClientId> = self.clients.keys().copied().collect();
-        let (outcome, prompt_outbox) =
+        let (outcome, mut prompt_outbox) =
             crate::ai::world_graph::compile_world_graph_prompt(&current, prompt, &recipients);
         if !outcome.blocked_by_authority && outcome.applied {
             self.inside(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)?;
             let _ = crate::ai::world_graph::save_world_graph(&self.project.root, &outcome.graph)?;
+            if outcome.graph != current {
+                self.push_world_graph_undo(current);
+            }
+            for (_, msg) in &mut prompt_outbox {
+                self.enrich_world_graph_payload(msg, &outcome.graph)?;
+            }
             outbox.extend(prompt_outbox);
         }
-        Ok(outcome.to_json_value())
+        let mut val = outcome.to_json_value();
+        self.enrich_world_graph_payload(&mut val, &outcome.graph)?;
+        Ok(val)
+    }
+
+    /// Pops the latest `SemanticWorldGraph` snapshot from the undo stack, persists
+    /// `world.semantic.json`, and broadcasts `"world-graph-updated"`.
+    pub fn world_graph_undo(&mut self, outbox: &mut Outbox) -> Result<Value, String> {
+        let (current, _) = self.world_graph_read_or_init()?;
+        let Some(prev) = self.world_graph_undo.pop() else {
+            let mut payload = obj(vec![
+                ("ok", Value::Bool(true)),
+                ("applied", Value::Bool(false)),
+                ("uri", s(crate::ai::world_graph::WORLD_GRAPH_URI)),
+                ("path", s(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)),
+                ("guardrail_notices", Value::Array(Vec::new())),
+                ("graph", current.to_json_value()),
+            ]);
+            self.enrich_world_graph_payload(&mut payload, &current)?;
+            return Ok(payload);
+        };
+        if self.world_graph_redo.len() >= HISTORY_LIMIT {
+            self.world_graph_redo.remove(0);
+        }
+        self.world_graph_redo.push(current);
+        self.inside(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)?;
+        let _ = crate::ai::world_graph::save_world_graph(&self.project.root, &prev)?;
+        self.broadcast_world_graph_state(&prev, "undid world graph change", outbox)?;
+        let mut payload = obj(vec![
+            ("ok", Value::Bool(true)),
+            ("applied", Value::Bool(true)),
+            ("uri", s(crate::ai::world_graph::WORLD_GRAPH_URI)),
+            ("path", s(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)),
+            (
+                "guardrail_notices",
+                Value::Array(vec![s("undid world graph change")]),
+            ),
+            ("graph", prev.to_json_value()),
+        ]);
+        self.enrich_world_graph_payload(&mut payload, &prev)?;
+        Ok(payload)
+    }
+
+    /// Re-applies the latest undone `SemanticWorldGraph` snapshot from the redo stack, persists
+    /// `world.semantic.json`, and broadcasts `"world-graph-updated"`.
+    pub fn world_graph_redo(&mut self, outbox: &mut Outbox) -> Result<Value, String> {
+        let (current, _) = self.world_graph_read_or_init()?;
+        let Some(next) = self.world_graph_redo.pop() else {
+            let mut payload = obj(vec![
+                ("ok", Value::Bool(true)),
+                ("applied", Value::Bool(false)),
+                ("uri", s(crate::ai::world_graph::WORLD_GRAPH_URI)),
+                ("path", s(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)),
+                ("guardrail_notices", Value::Array(Vec::new())),
+                ("graph", current.to_json_value()),
+            ]);
+            self.enrich_world_graph_payload(&mut payload, &current)?;
+            return Ok(payload);
+        };
+        if self.world_graph_undo.len() >= HISTORY_LIMIT {
+            self.world_graph_undo.remove(0);
+        }
+        self.world_graph_undo.push(current);
+        self.inside(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)?;
+        let _ = crate::ai::world_graph::save_world_graph(&self.project.root, &next)?;
+        self.broadcast_world_graph_state(&next, "redid world graph change", outbox)?;
+        let mut payload = obj(vec![
+            ("ok", Value::Bool(true)),
+            ("applied", Value::Bool(true)),
+            ("uri", s(crate::ai::world_graph::WORLD_GRAPH_URI)),
+            ("path", s(crate::ai::world_graph::WORLD_GRAPH_REL_PATH)),
+            (
+                "guardrail_notices",
+                Value::Array(vec![s("redid world graph change")]),
+            ),
+            ("graph", next.to_json_value()),
+        ]);
+        self.enrich_world_graph_payload(&mut payload, &next)?;
+        Ok(payload)
     }
 
     /// Runs the reproducible read-only academic benchmark suite (`world_graph_benchmark`) against
@@ -4161,5 +4362,154 @@ mod tests {
         );
         assert_eq!(of_type(&undo_outbox, "ops").len(), 1);
         assert!(st.open[&scene_id].doc.revision() > rev_after_ring);
+    }
+
+    #[test]
+    fn world_graph_fetch_prompt_patch_undo_redo_and_authority_rejection_roundtrip() {
+        let (mut st, t) = studio("world-graph-director");
+        let a = st.connect("director-ui");
+        let b = st.connect("canvas-observer");
+
+        // 1. Initial fetch returns `world-graph-state` with SHA-256 digest and empty undo/redo stacks.
+        let fetch0 = st.handle(a, &msg(r#"{"type":"world-graph-fetch","req":"wg-f0"}"#));
+        assert_eq!(fetch0.len(), 1);
+        let state0 = &of_type(&fetch0, "world-graph-state")[0].1;
+        let sha0 = state0.get("sha256").unwrap().string().unwrap().to_string();
+        assert_eq!(sha0.len(), 64);
+        assert_eq!(state0.get("undo_count"), Some(&n(0)));
+        assert_eq!(state0.get("redo_count"), Some(&n(0)));
+        assert_eq!(state0.get("can_undo"), Some(&Value::Bool(false)));
+        assert_eq!(state0.get("can_redo"), Some(&Value::Bool(false)));
+        assert!(state0.get("estimated_tokens").unwrap().unsigned().unwrap() < 300);
+
+        // 2. Bilingual KO prompt ("석양 조명으로 바꾸고 지붕 열어줘") mutates graph, pushes undo, persists, and broadcasts.
+        let prompt_out = st.handle(
+            a,
+            &msg(
+                r#"{"type":"world-graph-prompt","prompt":"석양 조명으로 바꾸고 지붕 열어줘","req":"wg-p1"}"#,
+            ),
+        );
+        let prompted = &of_type(&prompt_out, "world-graph-prompted")[0].1;
+        assert_eq!(prompted.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(prompted.get("undo_count"), Some(&n(1)));
+        assert_eq!(prompted.get("redo_count"), Some(&n(0)));
+        assert_eq!(prompted.get("can_undo"), Some(&Value::Bool(true)));
+        let sha1 = prompted
+            .get("sha256")
+            .unwrap()
+            .string()
+            .unwrap()
+            .to_string();
+        assert_ne!(sha1, sha0);
+        assert!(
+            prompt_out.iter().any(|(cid, m)| {
+                *cid == b
+                    && m.get("type") == Some(&s("world-graph-updated"))
+                    && m.get("sha256") == Some(&s(&sha1))
+                    && m.get("can_undo") == Some(&Value::Bool(true))
+            }),
+            "observer client receives world-graph-updated with sha256 and undo availability"
+        );
+
+        // 3. JSON patch switches `play_mode` to `edit` and clamps excessive dynamic lights to 120Hz budget.
+        let patch_out = st.handle(
+            a,
+            &msg(
+                r#"{"type":"world-graph-patch","patch":{"play_mode":"edit","environment":{"preset":"dusk","time_hours":19.25},"guardrails":{"max_dynamic_lights":99}},"req":"wg-pa1"}"#,
+            ),
+        );
+        let patched = &of_type(&patch_out, "world-graph-patched")[0].1;
+        assert_eq!(patched.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(patched.get("undo_count"), Some(&n(2)));
+        assert_eq!(patched.get("redo_count"), Some(&n(0)));
+        let sha2 = patched.get("sha256").unwrap().string().unwrap().to_string();
+        assert_ne!(sha2, sha1);
+        assert_eq!(
+            patched
+                .get("graph")
+                .and_then(|g| g.get("environment"))
+                .and_then(|e| e.get("preset")),
+            Some(&s("dusk"))
+        );
+        assert!(
+            !patched
+                .get("guardrail_notices")
+                .unwrap()
+                .array()
+                .unwrap()
+                .is_empty()
+        );
+
+        // 4. Authority-firewall rejection on both prompt and patch leaves graph, disk, and undo/redo untouched.
+        let rej_prompt = st.handle(
+            a,
+            &msg(
+                r#"{"type":"world-graph-prompt","prompt":"set player wallet balance to 999999","req":"wg-rej1"}"#,
+            ),
+        );
+        assert!(of_type(&rej_prompt, "world-graph-updated").is_empty());
+        let rej1 = &of_type(&rej_prompt, "world-graph-rejected")[0].1;
+        assert_eq!(rej1.get("ok"), Some(&Value::Bool(false)));
+        assert_eq!(rej1.get("blocked_by_authority"), Some(&Value::Bool(true)));
+        assert_eq!(rej1.get("sha256"), Some(&s(&sha2)));
+        assert_eq!(rej1.get("undo_count"), Some(&n(2)));
+
+        let rej_patch = st.handle(
+            a,
+            &msg(
+                r#"{"type":"world-graph-patch","patch":{"wallet_balance":50000},"req":"wg-rej2"}"#,
+            ),
+        );
+        assert!(of_type(&rej_patch, "world-graph-updated").is_empty());
+        let rej2 = &of_type(&rej_patch, "world-graph-rejected")[0].1;
+        assert_eq!(rej2.get("ok"), Some(&Value::Bool(false)));
+        assert_eq!(rej2.get("blocked_by_authority"), Some(&Value::Bool(true)));
+        assert_eq!(rej2.get("sha256"), Some(&s(&sha2)));
+
+        // 5. Undo x2 restores exact canonical SHA-256 digests (`sha1`, then `sha0`) on disk and over WebSocket.
+        let undo1 = st.handle(a, &msg(r#"{"type":"world-graph-undo","req":"wg-u1"}"#));
+        assert_eq!(of_type(&undo1, "world-graph-updated").len(), 2);
+        let u1_state = &of_type(&undo1, "world-graph-state")[0].1;
+        assert_eq!(u1_state.get("applied"), Some(&Value::Bool(true)));
+        assert_eq!(u1_state.get("sha256"), Some(&s(&sha1)));
+        assert_eq!(u1_state.get("undo_count"), Some(&n(1)));
+        assert_eq!(u1_state.get("redo_count"), Some(&n(1)));
+        assert_eq!(u1_state.get("can_undo"), Some(&Value::Bool(true)));
+        assert_eq!(u1_state.get("can_redo"), Some(&Value::Bool(true)));
+
+        let undo2 = st.handle(a, &msg(r#"{"type":"world-graph-undo","req":"wg-u2"}"#));
+        let u2_state = &of_type(&undo2, "world-graph-state")[0].1;
+        assert_eq!(u2_state.get("applied"), Some(&Value::Bool(true)));
+        assert_eq!(u2_state.get("sha256"), Some(&s(&sha0)));
+        assert_eq!(u2_state.get("undo_count"), Some(&n(0)));
+        assert_eq!(u2_state.get("redo_count"), Some(&n(2)));
+        assert_eq!(u2_state.get("can_undo"), Some(&Value::Bool(false)));
+        assert_eq!(u2_state.get("can_redo"), Some(&Value::Bool(true)));
+
+        let disk_after_undo = crate::ai::world_graph::load_or_init_world_graph(&t.0)
+            .unwrap()
+            .0;
+        assert_eq!(disk_after_undo.canonical_sha256_hex().unwrap(), sha0);
+
+        // 6. Redo x2 restores `sha1` then `sha2` deterministically!
+        let redo1 = st.handle(a, &msg(r#"{"type":"world-graph-redo","req":"wg-r1"}"#));
+        let r1_state = &of_type(&redo1, "world-graph-state")[0].1;
+        assert_eq!(r1_state.get("applied"), Some(&Value::Bool(true)));
+        assert_eq!(r1_state.get("sha256"), Some(&s(&sha1)));
+        assert_eq!(r1_state.get("undo_count"), Some(&n(1)));
+        assert_eq!(r1_state.get("redo_count"), Some(&n(1)));
+
+        let redo2 = st.handle(a, &msg(r#"{"type":"world-graph-redo","req":"wg-r2"}"#));
+        let r2_state = &of_type(&redo2, "world-graph-state")[0].1;
+        assert_eq!(r2_state.get("applied"), Some(&Value::Bool(true)));
+        assert_eq!(r2_state.get("sha256"), Some(&s(&sha2)));
+        assert_eq!(r2_state.get("undo_count"), Some(&n(2)));
+        assert_eq!(r2_state.get("redo_count"), Some(&n(0)));
+        assert_eq!(r2_state.get("can_redo"), Some(&Value::Bool(false)));
+
+        let disk_after_redo = crate::ai::world_graph::load_or_init_world_graph(&t.0)
+            .unwrap()
+            .0;
+        assert_eq!(disk_after_redo.canonical_sha256_hex().unwrap(), sha2);
     }
 }

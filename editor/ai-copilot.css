@@ -413,3 +413,66 @@ body[data-ux-tier="creator"] .frame-options {
   color: var(--dim);
   font-weight: 600;
 }
+
+.gb-wg-director {
+  border-color: rgba(232, 180, 74, 0.35);
+  background: linear-gradient(180deg, rgba(232, 180, 74, 0.06), rgba(12, 15, 21, 0.92));
+}
+
+.gb-wg-director-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.gb-wg-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+.gb-wg-prompt-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.gb-wg-prompt-row input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 5px 8px;
+  font-size: 11.5px;
+  font-family: inherit;
+}
+
+.gb-wg-alert {
+  padding: 5px 8px;
+  border-radius: 5px;
+  font-size: 11px;
+  line-height: 1.35;
+  border: 1px solid var(--line);
+}
+
+.gb-wg-alert.rejected {
+  background: rgba(239, 68, 68, 0.14);
+  border-color: rgba(239, 68, 68, 0.45);
+  color: #fca5a5;
+}
+
+.gb-wg-alert.clamped {
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.45);
+  color: #fde68a;
+}
+
+.gb-copilot-badge.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+}
+

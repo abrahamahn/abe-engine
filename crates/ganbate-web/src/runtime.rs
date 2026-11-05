@@ -19,8 +19,8 @@ use ganbate_engine::anim::{
 use ganbate_engine::assets::model::{self, Model};
 use ganbate_engine::gpu::Device;
 use ganbate_engine::render::{
-    Environment, Focus, LookFile, MaterialDesc, MeshData, Output, PROP_SHADER_PARAMS, PropInstance,
-    PropMaterial, PropMesh, PropTexture, Quality, Renderer, TimeOfDay, View, Weather,
+    Environment, Focus, FrameStats, LookFile, MaterialDesc, MeshData, Output, PROP_SHADER_PARAMS,
+    PropInstance, PropMaterial, PropMesh, PropTexture, Quality, Renderer, TimeOfDay, View, Weather,
 };
 use ganbate_engine::render::{GameLight, LightDesc, ModelId, ModelInstance, SpotCone};
 use ganbate_engine::world::World;
@@ -70,6 +70,30 @@ fn governor_snapshot_floats(gov: &FrameBudgetGovernor, budget: QualityBudget) ->
         f32::from(budget.shadow_tier),
         f32::from(gov.tier()),
         gov.rolling_mean_ms(),
+    ]
+}
+
+fn quality_from_code(code: u32) -> Quality {
+    match code {
+        0 => Quality::realtime(),
+        1 => Quality::still(),
+        2 => Quality::hybrid_stage(),
+        3 => Quality::low_cost(),
+        _ => Quality::realtime(),
+    }
+}
+
+fn frame_stats_words(stats: FrameStats) -> [u32; 9] {
+    [
+        stats.world_draws_total,
+        stats.world_draws_submitted,
+        stats.world_draws_culled,
+        u32::from(stats.shadow_static_cached),
+        stats.shadow_world_draws,
+        u32::from(stats.ground_cached),
+        u32::from(stats.reflection_drawn),
+        u32::from(stats.ssao_drawn),
+        u32::from(stats.fused_tonemap),
     ]
 }
 
@@ -147,7 +171,8 @@ fn matrix(v: &[f32]) -> Result<[f32; 16], String> {
 /// Starts the engine on the page's canvas with the `.gbew` world at `world` (ownership passes
 /// from `ganbate_alloc`; a zero length takes the world `ganbate_load_world` decoded, whose images the
 /// host may have decoded with `ganbate_world_set_image`, or none) and the Look file at `look`.
-/// `quality` 1 renders at still-image quality, 0 at real-time quality. Returns 1, or 0 after
+/// `quality` selects the rendering preset (`0` = realtime, `1` = still, `2` = hybrid stage,
+/// `3` = low-cost fast-path; unknown codes fall back to realtime). Returns 1, or 0 after
 /// logging why not.
 ///
 /// # Safety
@@ -207,11 +232,7 @@ fn start(world: &World, look: &[u8], quality: u32) -> Result<Runtime, String> {
         LookFile::parse(look).map_err(|e| format!("Look file: {e}"))?
     };
     let mut device = Device::for_canvas()?;
-    let quality = if quality == 1 {
-        Quality::still()
-    } else {
-        Quality::realtime()
-    };
+    let quality = quality_from_code(quality);
     let (w, h) = device.surface_size();
     let format = device.surface_format();
     let renderer = Renderer::new(
@@ -492,6 +513,41 @@ pub extern "C" fn ganbate_rt_render() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn ganbate_rt_frames() -> u32 {
     RT.with(|cell| cell.borrow().as_ref().map_or(0, |rt| rt.frames))
+}
+
+/// Switches the renderer's quality preset at runtime (`0` = realtime, `1` = still,
+/// `2` = hybrid stage, `3` = low-cost fast-path; unknown codes fall back to realtime).
+/// Returns `1` on success, `0` on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_set_quality(quality: u32) -> u32 {
+    with(0, |rt| {
+        let preset = quality_from_code(quality);
+        rt.renderer.set_quality(&mut rt.device, preset)?;
+        Ok(1)
+    })
+}
+
+/// Writes the latest [`FrameStats`] recorded by `Renderer::encode` as 9 little-endian `u32`
+/// words (`36` bytes) at `out`:
+/// `[world_draws_total, world_draws_submitted, world_draws_culled, shadow_static_cached, shadow_world_draws, ground_cached, reflection_drawn, ssao_drawn, fused_tonemap]`.
+///
+/// # Safety
+/// `out` must address 36 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ganbate_rt_frame_stats(out: *mut u8) -> u32 {
+    with(0, |rt| {
+        if out.is_null() {
+            return Err("frame_stats: null output buffer".into());
+        }
+        let words = frame_stats_words(rt.renderer.last_frame_stats());
+        let mut buf = [0u8; 36];
+        for (i, w) in words.iter().enumerate() {
+            buf[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        // SAFETY: the caller passes 36 writable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), out, 36) };
+        Ok(1)
+    })
 }
 
 /// Writes the size the renderer draws at (device pixels) as two words at `out`.
@@ -1682,4 +1738,35 @@ pub unsafe extern "C" fn ganbate_rt_model_owner(prop: u32, out: *mut u8) -> u32 
         unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), out, 4) };
         Ok(i.raw())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quality_from_code_maps_all_presets_and_preserves_realtime_fallback() {
+        assert_eq!(quality_from_code(0), Quality::realtime());
+        assert_eq!(quality_from_code(1), Quality::still());
+        assert_eq!(quality_from_code(2), Quality::hybrid_stage());
+        assert_eq!(quality_from_code(3), Quality::low_cost());
+        assert_eq!(quality_from_code(4), Quality::realtime());
+        assert_eq!(quality_from_code(u32::MAX), Quality::realtime());
+    }
+
+    #[test]
+    fn frame_stats_words_packs_nine_little_endian_words_exact() {
+        let stats = FrameStats {
+            world_draws_total: 42,
+            world_draws_submitted: 27,
+            world_draws_culled: 15,
+            shadow_static_cached: true,
+            shadow_world_draws: 11,
+            ground_cached: false,
+            reflection_drawn: false,
+            ssao_drawn: true,
+            fused_tonemap: true,
+        };
+        assert_eq!(frame_stats_words(stats), [42, 27, 15, 1, 11, 0, 0, 1, 1]);
+    }
 }
