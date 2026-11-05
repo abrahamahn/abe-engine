@@ -612,6 +612,132 @@ pub struct Pick {
     pub point: V3,
 }
 
+fn normalize_pick_ray(origin: [f32; 3], dir: [f32; 3]) -> Option<(V3, V3)> {
+    if !origin.iter().chain(&dir).all(|v| v.is_finite()) {
+        return None;
+    }
+    let len_sq = math::dot(dir, dir);
+    if !len_sq.is_finite() || len_sq < 1e-12 {
+        return None;
+    }
+    let inv = 1.0 / len_sq.sqrt();
+    let unit_dir = math::scale(dir, inv);
+    unit_dir
+        .iter()
+        .all(|v| v.is_finite())
+        .then_some((origin, unit_dir))
+}
+
+impl Props {
+    fn pick_along_ray(&self, origin: [f32; 3], dir: [f32; 3], layers: u32) -> Option<Pick> {
+        let (origin, dir) = normalize_pick_ray(origin, dir)?;
+        if layers == 0 {
+            return None;
+        }
+        // (on top, order, distance) of the best hit so far.
+        let mut best: Option<(Pick, bool, f32)> = None;
+        let better = |top: bool, order: f32, dist: f32, b: &Option<(Pick, bool, f32)>| match b {
+            None => true,
+            Some((p, btop, border)) => match (top, *btop) {
+                (true, false) => true,
+                (false, true) => false,
+                (true, true) => order > *border || (order == *border && dist < p.distance),
+                (false, false) => dist < p.distance,
+            },
+        };
+        for (id, inst) in self.instances.iter() {
+            if !inst.visible || inst.pick & layers == 0 {
+                continue;
+            }
+            let (Some(mesh), Some(mat)) = (
+                self.meshes.get(inst.mesh.0),
+                self.materials.get(inst.material.0),
+            ) else {
+                continue;
+            };
+            let top = mat.desc.overlay && !mat.desc.depth_test;
+            let order = mat.desc.order;
+            // Into model space: the ray's origin and direction through the inverse transform.
+            let Some(inv) = math::invert(&inst.model) else {
+                continue;
+            };
+            let o = math::transform_point(&inv, origin);
+            let tip = math::transform_point(&inv, math::add(origin, dir));
+            let d = math::sub(tip, o);
+            // A skinned prop is tested where its joints have moved it, as it is drawn.
+            let skinned = self.skinned_positions(mesh, &inst.joints);
+            let (positions, (min, max)) = match &skinned {
+                Some(p) => (&p[..], bounds(p)),
+                None => (&mesh.positions[..], (mesh.min, mesh.max)),
+            };
+            let Some(enter) = ray_box(o, d, min, max) else {
+                continue;
+            };
+            if !better(top, order, enter, &best) {
+                continue;
+            }
+            let mut hit: Option<f32> = None;
+            for t in mesh.triangles.chunks_exact(3) {
+                let (a, b, c) = (
+                    positions[t[0] as usize],
+                    positions[t[1] as usize],
+                    positions[t[2] as usize],
+                );
+                if let Some(s) = ray_triangle(o, d, a, b, c)
+                    && hit.is_none_or(|h| s < h)
+                {
+                    hit = Some(s);
+                }
+            }
+            // `d` is the unit world direction mapped into model space, so `s` is in world metres.
+            if let Some(s) = hit
+                && better(top, order, s, &best)
+            {
+                let pick = Pick {
+                    instance: PropInstance(id),
+                    distance: s,
+                    point: math::add(origin, math::scale(dir, s)),
+                };
+                best = Some((pick, top, order));
+            }
+        }
+        best.map(|b| b.0)
+    }
+
+    /// A skinned mesh's vertices moved by `joints` as the vertex stages move them, or `None`
+    /// when it is not skinned or `joints` cannot move it.
+    fn skinned_positions(&self, mesh: &MeshEntry, joints: &[M4]) -> Option<Vec<V3>> {
+        let skin = mesh.skin?;
+        if joints.len() <= usize::from(skin.max_joint) {
+            return None;
+        }
+        let records = self
+            .skin_records
+            .get(skin.first as usize..(skin.first + skin.count) as usize)?;
+        let moved = mesh
+            .positions
+            .iter()
+            .zip(records.chunks_exact(2))
+            .map(|(&p, r)| {
+                let (j, w) = (r[0], r[1]);
+                if w.iter().sum::<f32>() < 1e-6 {
+                    return p;
+                }
+                let mut out = [0.0f32; 3];
+                for k in 0..4 {
+                    if let Some(m) = joints.get(j[k] as usize)
+                        && w[k] != 0.0
+                    {
+                        out = math::add(out, math::scale(math::transform_point(m, p), w[k]));
+                    }
+                }
+                out
+            })
+            .collect();
+        Some(moved)
+    }
+}
+
 impl Renderer {
     fn prop_texture_id(&self, t: Option<PropTexture>, fallback: TextureId) -> Result<TextureId> {
         match t {
@@ -1259,74 +1385,15 @@ impl Renderer {
         layers: u32,
     ) -> Option<Pick> {
         let (origin, dir) = self.pick_ray(view, size, (x, y));
-        // (on top, order, distance) of the best hit so far.
-        let mut best: Option<(Pick, bool, f32)> = None;
-        let better = |top: bool, order: f32, dist: f32, b: &Option<(Pick, bool, f32)>| match b {
-            None => true,
-            Some((p, btop, border)) => match (top, *btop) {
-                (true, false) => true,
-                (false, true) => false,
-                (true, true) => order > *border || (order == *border && dist < p.distance),
-                (false, false) => dist < p.distance,
-            },
-        };
-        for (id, inst) in self.props.instances.iter() {
-            if !inst.visible || inst.pick & layers == 0 {
-                continue;
-            }
-            let (Some(mesh), Some(mat)) = (
-                self.props.meshes.get(inst.mesh.0),
-                self.props.materials.get(inst.material.0),
-            ) else {
-                continue;
-            };
-            let top = mat.desc.overlay && !mat.desc.depth_test;
-            let order = mat.desc.order;
-            // Into model space: the ray's origin and direction through the inverse transform.
-            let Some(inv) = math::invert(&inst.model) else {
-                continue;
-            };
-            let o = math::transform_point(&inv, origin);
-            let tip = math::transform_point(&inv, math::add(origin, dir));
-            let d = math::sub(tip, o);
-            // A skinned prop is tested where its joints have moved it, as it is drawn.
-            let skinned = self.skinned_positions(mesh, &inst.joints);
-            let (positions, (min, max)) = match &skinned {
-                Some(p) => (&p[..], bounds(p)),
-                None => (&mesh.positions[..], (mesh.min, mesh.max)),
-            };
-            let Some(enter) = ray_box(o, d, min, max) else {
-                continue;
-            };
-            if !better(top, order, enter, &best) {
-                continue;
-            }
-            let mut hit: Option<f32> = None;
-            for t in mesh.triangles.chunks_exact(3) {
-                let (a, b, c) = (
-                    positions[t[0] as usize],
-                    positions[t[1] as usize],
-                    positions[t[2] as usize],
-                );
-                if let Some(s) = ray_triangle(o, d, a, b, c)
-                    && hit.is_none_or(|h| s < h)
-                {
-                    hit = Some(s);
-                }
-            }
-            // `d` is the unit world direction mapped into model space, so `s` is in world metres.
-            if let Some(s) = hit
-                && better(top, order, s, &best)
-            {
-                let pick = Pick {
-                    instance: PropInstance(id),
-                    distance: s,
-                    point: math::add(origin, math::scale(dir, s)),
-                };
-                best = Some((pick, top, order));
-            }
-        }
-        best.map(|b| b.0)
+        self.pick_along_ray(origin, dir, layers)
+    }
+
+    /// The visible prop along a world-space ray `(origin, dir)` on one of the pick `layers`,
+    /// tested against its triangles with the same overlay/order/nearest priority as
+    /// [`Renderer::pick`]. Returns `None` if `origin` or `dir` contains non-finite values or
+    /// `|dir|^2 < 1e-12`.
+    pub fn pick_along_ray(&self, origin: [f32; 3], dir: [f32; 3], layers: u32) -> Option<Pick> {
+        self.props.pick_along_ray(origin, dir, layers)
     }
 
     /// The ray from the eye through pixel (`x`, `y`) of a `size` image of `view`: its origin
@@ -1352,8 +1419,16 @@ impl Renderer {
     /// skipped. Props are picked with [`Renderer::pick`].
     pub fn pick_world(&self, view: &View, size: (u32, u32), at: (f32, f32)) -> Option<WorldPick> {
         let (origin, dir) = self.pick_ray(view, size, at);
+        self.pick_world_along_ray(origin, dir)
+    }
+
+    /// The cooked world's instance along a world-space ray `(origin, dir)`, tested against its
+    /// triangles where they are drawn now: the nearest hit. Hidden instances are skipped, and
+    /// non-finite or near-zero (`|dir|^2 < 1e-12`) rays return `None`.
+    pub fn pick_world_along_ray(&self, origin: [f32; 3], dir: [f32; 3]) -> Option<WorldPick> {
+        let (origin, unit_dir) = normalize_pick_ray(origin, dir)?;
         self.scene
-            .pick(origin, dir)
+            .pick(origin, unit_dir)
             .map(|(instance, distance, point)| WorldPick {
                 instance,
                 distance,
@@ -1400,40 +1475,6 @@ impl Renderer {
         position: V3,
     ) -> Result<()> {
         self.scene.set_light(device, index, position)
-    }
-
-    /// A skinned mesh's vertices moved by `joints` as the vertex stages move them, or `None`
-    /// when it is not skinned or `joints` cannot move it.
-    fn skinned_positions(&self, mesh: &MeshEntry, joints: &[M4]) -> Option<Vec<V3>> {
-        let skin = mesh.skin?;
-        if joints.len() <= usize::from(skin.max_joint) {
-            return None;
-        }
-        let records = self
-            .props
-            .skin_records
-            .get(skin.first as usize..(skin.first + skin.count) as usize)?;
-        let moved = mesh
-            .positions
-            .iter()
-            .zip(records.chunks_exact(2))
-            .map(|(&p, r)| {
-                let (j, w) = (r[0], r[1]);
-                if w.iter().sum::<f32>() < 1e-6 {
-                    return p;
-                }
-                let mut out = [0.0f32; 3];
-                for k in 0..4 {
-                    if let Some(m) = joints.get(j[k] as usize)
-                        && w[k] != 0.0
-                    {
-                        out = math::add(out, math::scale(math::transform_point(m, p), w[k]));
-                    }
-                }
-                out
-            })
-            .collect();
-        Some(moved)
     }
 
     /// Where a world point lands in a `size` image of `view`: pixel x and y (top-left origin)
@@ -2046,5 +2087,323 @@ mod tests {
                 String::from_utf8_lossy(bad)
             );
         }
+    }
+
+    fn dummy_material_entry(desc: MaterialDesc) -> MaterialEntry {
+        MaterialEntry {
+            desc,
+            data: MaterialData {
+                base_color: [1.0; 4],
+                emissive: [0.0; 4],
+                params: [0.0; 4],
+                flags: [0.0; 4],
+                base: None,
+                normal: None,
+                emission: None,
+            },
+            group: BindGroupId::from_raw(1),
+            shadow_group: None,
+            detail: [0.0; 16],
+        }
+    }
+
+    fn z_quad_mesh_entry(half: f32) -> MeshEntry {
+        let positions = vec![
+            [-half, -half, 0.0],
+            [half, -half, 0.0],
+            [half, half, 0.0],
+            [-half, half, 0.0],
+        ];
+        let (min, max) = bounds(&positions);
+        MeshEntry {
+            vertices: BufferId::from_raw(1),
+            indices: BufferId::from_raw(2),
+            index_count: 6,
+            positions,
+            uvs: vec![[0.0, 0.0]; 4],
+            triangles: vec![0, 1, 2, 0, 2, 3],
+            min,
+            max,
+            skin: None,
+        }
+    }
+
+    fn translation_matrix(x: f32, y: f32, z: f32) -> M4 {
+        let mut m = math::IDENTITY;
+        m[12] = x;
+        m[13] = y;
+        m[14] = z;
+        m
+    }
+
+    #[test]
+    fn pick_along_ray_normalizes_filters_layers_and_rejects_invalid_rays() {
+        let mut props = Props::default();
+        let mesh = PropMesh(props.meshes.insert(z_quad_mesh_entry(1.0)).unwrap());
+        let opaque_mat = PropMaterial(
+            props
+                .materials
+                .insert(dummy_material_entry(MaterialDesc {
+                    name: "panel".into(),
+                    ..MaterialDesc::default()
+                }))
+                .unwrap(),
+        );
+        let overlay_mat = PropMaterial(
+            props
+                .materials
+                .insert(dummy_material_entry(MaterialDesc {
+                    name: "reticle".into(),
+                    overlay: true,
+                    depth_test: false,
+                    order: 2.0,
+                    ..MaterialDesc::default()
+                }))
+                .unwrap(),
+        );
+
+        let near_model = translation_matrix(0.0, 0.0, -2.5);
+        let near_inst = PropInstance(
+            props
+                .instances
+                .insert(InstanceEntry {
+                    mesh,
+                    material: opaque_mat,
+                    model: near_model,
+                    normal: normal_matrix(&near_model),
+                    tint: [1.0; 4],
+                    visible: true,
+                    pick: 0b0001,
+                    joints: Vec::new(),
+                })
+                .unwrap(),
+        );
+
+        let far_model = translation_matrix(0.0, 0.0, -6.0);
+        let far_inst = PropInstance(
+            props
+                .instances
+                .insert(InstanceEntry {
+                    mesh,
+                    material: opaque_mat,
+                    model: far_model,
+                    normal: normal_matrix(&far_model),
+                    tint: [1.0; 4],
+                    visible: true,
+                    pick: 0b0010,
+                    joints: Vec::new(),
+                })
+                .unwrap(),
+        );
+
+        // Unnormalized ray direction `[0, 0, -5]` must normalize cleanly and report world-metre distance `5.5`.
+        let hit = props
+            .pick_along_ray([0.25, -0.5, 3.0], [0.0, 0.0, -5.0], u32::MAX)
+            .expect("hit near prop");
+        assert_eq!(hit.instance, near_inst);
+        assert!(hit.distance.is_finite() && (hit.distance - 5.5).abs() < 1e-5);
+        assert!(hit.point.iter().all(|v| v.is_finite()));
+        assert!((hit.point[0] - 0.25).abs() < 1e-5);
+        assert!((hit.point[1] + 0.5).abs() < 1e-5);
+        assert!((hit.point[2] + 2.5).abs() < 1e-5);
+
+        // Layer mask filtering selects only matching layer bits and returns `None` on disjoint/zero masks.
+        let layer2_hit = props
+            .pick_along_ray([0.0, 0.0, 3.0], [0.0, 0.0, -1.0], 0b0010)
+            .expect("hit layer 2 prop");
+        assert_eq!(layer2_hit.instance, far_inst);
+        assert!((layer2_hit.distance - 9.0).abs() < 1e-5);
+        assert!(
+            props
+                .pick_along_ray([0.0, 0.0, 3.0], [0.0, 0.0, -1.0], 0b0100)
+                .is_none()
+        );
+        assert!(
+            props
+                .pick_along_ray([0.0, 0.0, 3.0], [0.0, 0.0, -1.0], 0)
+                .is_none()
+        );
+
+        // Overlay drawn on top (`overlay && !depth_test`) wins even when placed behind an opaque prop.
+        let overlay_model = translation_matrix(0.0, 0.0, -8.0);
+        let overlay_inst = PropInstance(
+            props
+                .instances
+                .insert(InstanceEntry {
+                    mesh,
+                    material: overlay_mat,
+                    model: overlay_model,
+                    normal: normal_matrix(&overlay_model),
+                    tint: [1.0; 4],
+                    visible: true,
+                    pick: 0b0100,
+                    joints: Vec::new(),
+                })
+                .unwrap(),
+        );
+        let top_hit = props
+            .pick_along_ray([0.0, 0.0, 3.0], [0.0, 0.0, -1.0], u32::MAX)
+            .expect("overlay wins");
+        assert_eq!(top_hit.instance, overlay_inst);
+        assert!((top_hit.distance - 11.0).abs() < 1e-5);
+
+        // NaN, Inf, and zero / near-zero (`len_sq < 1e-12`) rays must all return `None`.
+        for (bad_origin, bad_dir) in [
+            ([f32::NAN, 0.0, 3.0], [0.0, 0.0, -1.0]),
+            ([0.0, f32::INFINITY, 3.0], [0.0, 0.0, -1.0]),
+            ([0.0, 0.0, f32::NEG_INFINITY], [0.0, 0.0, -1.0]),
+            ([0.0, 0.0, 3.0], [f32::NAN, 0.0, -1.0]),
+            ([0.0, 0.0, 3.0], [0.0, f32::INFINITY, -1.0]),
+            ([0.0, 0.0, 3.0], [0.0, 0.0, 0.0]),
+            ([0.0, 0.0, 3.0], [1e-7, -1e-7, 1e-7]),
+        ] {
+            assert!(
+                props
+                    .pick_along_ray(bad_origin, bad_dir, u32::MAX)
+                    .is_none(),
+                "expected None for origin={bad_origin:?}, dir={bad_dir:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_pick_ray_and_world_ray_delegate_cleanly() {
+        use crate::render::{Look, Output, Quality};
+        use crate::world::{AlphaMode, Instance, Material, Mesh, Transform, World};
+        use ganbate_core::Vec3;
+
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+
+        let mut world = World::default();
+        world.materials.push(Material {
+            name: "wall".into(),
+            base_color: [0.6, 0.6, 0.65, 1.0],
+            roughness: 0.7,
+            metallic: 0.0,
+            alpha: AlphaMode::Opaque,
+            shading: Shading::Standard,
+            ..Material::default()
+        });
+        world.meshes.push(Mesh {
+            positions: vec![
+                Vec3(-2.0, -2.0, 0.0),
+                Vec3(2.0, -2.0, 0.0),
+                Vec3(2.0, 2.0, 0.0),
+                Vec3(-2.0, 2.0, 0.0),
+            ],
+            normals: vec![Vec3(0.0, 0.0, 1.0); 4],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            color: [1.0, 1.0, 1.0],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            material: Some(0),
+        });
+        world.instances.push(Instance {
+            mesh: 0,
+            transform: Transform(translation_matrix(0.0, 0.0, -4.0)),
+        });
+
+        let mut renderer = Renderer::new(
+            &mut device,
+            &world,
+            Look::default(),
+            Quality::low_cost(),
+            (100, 100),
+            Output::Still,
+        )
+        .expect("headless renderer");
+
+        let prop_mesh = renderer
+            .create_prop_mesh(
+                &mut device,
+                &MeshData {
+                    positions: &[
+                        [-0.5, -0.5, 0.0],
+                        [0.5, -0.5, 0.0],
+                        [0.5, 0.5, 0.0],
+                        [-0.5, 0.5, 0.0],
+                    ],
+                    normals: &[[0.0, 0.0, 1.0]; 4],
+                    uvs: &[[0.0, 0.0]; 4],
+                    indices: &[0, 1, 2, 0, 2, 3],
+                },
+            )
+            .expect("prop mesh");
+        let prop_mat = renderer
+            .create_prop_material(&mut device, &MaterialDesc::default())
+            .expect("prop material");
+        let prop_inst = renderer
+            .create_prop_instance(prop_mesh, prop_mat, &translation_matrix(0.0, 0.0, -1.5))
+            .expect("prop instance");
+        renderer
+            .set_prop_instance_pick(prop_inst, 0b0010)
+            .expect("set pick mask");
+
+        // World ray picking with unnormalized ray hits cooked instance 0 at z = -4 (distance 7.0 from z = 3).
+        let world_hit = renderer
+            .pick_world_along_ray([0.5, -0.25, 3.0], [0.0, 0.0, -3.0])
+            .expect("world ray hit");
+        assert_eq!(world_hit.instance, 0);
+        assert!(world_hit.distance.is_finite() && (world_hit.distance - 7.0).abs() < 1e-5);
+        assert!((world_hit.point[0] - 0.5).abs() < 1e-5);
+        assert!((world_hit.point[1] + 0.25).abs() < 1e-5);
+        assert!((world_hit.point[2] + 4.0).abs() < 1e-5);
+
+        // Prop ray picking respects layer mask and matches centre-screen camera `pick`.
+        assert!(
+            renderer
+                .pick_along_ray([0.0, 0.0, 3.0], [0.0, 0.0, -2.0], 0b0001)
+                .is_none()
+        );
+        let ray_prop = renderer
+            .pick_along_ray([0.0, 0.0, 3.0], [0.0, 0.0, -2.0], 0b0010)
+            .expect("prop ray hit");
+        assert_eq!(ray_prop.instance, prop_inst);
+        assert!((ray_prop.distance - 4.5).abs() < 1e-5);
+
+        let view = View {
+            name: "centre".into(),
+            eye: [0.0, 0.0, 3.0],
+            target: [0.0, 0.0, 0.0],
+            fov: 50.0,
+            ..View::default()
+        };
+        let screen_prop = renderer
+            .pick(&view, (100, 100), (50.0, 50.0), 0b0010)
+            .expect("screen prop hit");
+        assert_eq!(screen_prop.instance, ray_prop.instance);
+        assert!((screen_prop.distance - ray_prop.distance).abs() < 1e-4);
+
+        let screen_world = renderer
+            .pick_world(&view, (100, 100), (50.0, 50.0))
+            .expect("screen world hit");
+        assert_eq!(screen_world.instance, 0);
+        assert!((screen_world.distance - 7.0).abs() < 1e-4);
+
+        // Degenerate / non-finite rays return None on both Renderer ray methods.
+        for bad_dir in [
+            [0.0, 0.0, 0.0],
+            [f32::NAN, 0.0, -1.0],
+            [0.0, f32::INFINITY, -1.0],
+        ] {
+            assert!(
+                renderer
+                    .pick_along_ray([0.0, 0.0, 3.0], bad_dir, u32::MAX)
+                    .is_none()
+            );
+            assert!(
+                renderer
+                    .pick_world_along_ray([0.0, 0.0, 3.0], bad_dir)
+                    .is_none()
+            );
+        }
+        assert!(
+            renderer
+                .pick_world_along_ray([f32::NEG_INFINITY, 0.0, 3.0], [0.0, 0.0, -1.0])
+                .is_none()
+        );
+
+        renderer.destroy_props(&mut device);
     }
 }

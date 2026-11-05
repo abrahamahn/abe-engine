@@ -626,6 +626,7 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     frameTexture() { return surfaceTexture; },
     /** Telemetry for cached GPURenderBundle passes. */
     bundleStats: () => ({ cached: bundleCompiled, candidates: bundleEntries, replays: bundleReplays }),
+    setXrTarget: () => false,
   };
 }
 
@@ -1231,16 +1232,55 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
     }
   };
 
+  let xrTarget = null;
+  const setXrTarget = (target) => {
+    if (target == null) {
+      xrTarget = null;
+      return true;
+    }
+    if (
+      typeof target !== 'object'
+      || !Number.isFinite(target.x)
+      || !Number.isFinite(target.y)
+      || !Number.isFinite(target.width)
+      || !Number.isFinite(target.height)
+      || target.width <= 0
+      || target.height <= 0
+    ) {
+      return false;
+    }
+    xrTarget = {
+      framebuffer: target.framebuffer ?? null,
+      x: Math.round(target.x),
+      y: Math.round(target.y),
+      width: Math.round(target.width),
+      height: Math.round(target.height),
+    };
+    return true;
+  };
+
   const present = () => {
     const s = ensureSurface();
     if (!s) return;
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, readFbo);
     gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, s.tex, 0);
     gl.readBuffer(gl.COLOR_ATTACHMENT0);
-    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
     setFlag(gl.SCISSOR_TEST, false);
-    // Row 0 of the surface is the top of the image; GL's window origin is the bottom-left.
-    gl.blitFramebuffer(0, 0, s.w, s.h, 0, s.h, s.w, 0, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    gl.disable(gl.SCISSOR_TEST);
+    if (xrTarget) {
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, xrTarget.framebuffer);
+      const x0 = xrTarget.x;
+      const y0 = xrTarget.y;
+      const x1 = x0 + xrTarget.width;
+      const y1 = y0 + xrTarget.height;
+      const filter = (s.w === xrTarget.width && s.h === xrTarget.height) ? gl.NEAREST : gl.LINEAR;
+      gl.blitFramebuffer(0, 0, s.w, s.h, x0, y1, x1, y0, gl.COLOR_BUFFER_BIT, filter);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    } else {
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+      // Row 0 of the surface is the top of the image; GL's window origin is the bottom-left.
+      gl.blitFramebuffer(0, 0, s.w, s.h, 0, s.h, s.w, 0, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    }
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
   };
 
@@ -1435,6 +1475,7 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
     nextFrame() {},
     frameTexture() { return surface; },
     bundleStats: () => ({ cached: 0, candidates: 0, replays: 0 }),
+    setXrTarget,
     /** The canvas texture's pixels as RGBA rows, top row first. */
     readSurface() {
       const s = surface;
@@ -2112,6 +2153,14 @@ export async function createEngine(options) {
         ipdMetres: v[15],
       };
     },
+    /** Underlying WebGL 2 context on `'webgl2'` (for `gl.makeXRCompatible()` / `XRWebGLLayer`), or `null` on `'webgpu'`. */
+    glContext() {
+      return gpu.api === 'webgl2' ? gpu.gl : null;
+    },
+    /** Sets the active WebXR eye framebuffer and viewport on `'webgl2'` (`null` restores canvas blit); returns `false` on `'webgpu'`. */
+    setXrTarget(target = null) {
+      return Boolean(host.setXrTarget?.(target));
+    },
     /** Records a completed frame duration (`dtMs`, ms) into the 120Hz (`8.333ms`) governor and returns its snapshot, or `null` if unavailable. */
     governorRecord(dtMs) {
       if (typeof x.ganbate_rt_governor_record !== 'function') return null;
@@ -2303,6 +2352,22 @@ export async function createEngine(options) {
       const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
       return { instance, distance, point: [px, py, pz] };
     },
+    /** The visible prop along a 3D world-space ray `(origin, direction)` on one of `layers`:
+     * `{instance, distance, point}` or `null`. */
+    pickRay(origin, direction, layers = 0xFFFFFFFF) {
+      if (typeof x.ganbate_rt_pick_ray !== 'function') return null;
+      if (!origin || !direction || origin.length < 3 || direction.length < 3) return null;
+      const p = out(4).byteOffset;
+      const instance = x.ganbate_rt_pick_ray(
+        origin[0], origin[1], origin[2],
+        direction[0], direction[1], direction[2],
+        layers >>> 0,
+        p,
+      );
+      if (!instance) return null;
+      const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
+      return { instance, distance, point: [px, py, pz] };
+    },
     /** How many instances the cooked world has. */
     worldInstances() { return x.ganbate_rt_world_instances(); },
     /** World instance `index`'s matrix (16 numbers) and whether it is shown. */
@@ -2365,6 +2430,21 @@ export async function createEngine(options) {
       const { sx, sy } = cssScale();
       const p = out(4).byteOffset;
       const hit = x.ganbate_rt_pick_world(cssX / sx, cssY / sy, p);
+      if (!hit) return null;
+      const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
+      return { instance: hit - 1, distance, point: [px, py, pz] };
+    },
+    /** The cooked world's instance along a 3D world-space ray `(origin, direction)`:
+     * `{instance, distance, point}` or `null`. */
+    pickWorldRay(origin, direction) {
+      if (typeof x.ganbate_rt_pick_world_ray !== 'function') return null;
+      if (!origin || !direction || origin.length < 3 || direction.length < 3) return null;
+      const p = out(4).byteOffset;
+      const hit = x.ganbate_rt_pick_world_ray(
+        origin[0], origin[1], origin[2],
+        direction[0], direction[1], direction[2],
+        p,
+      );
       if (!hit) return null;
       const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
       return { instance: hit - 1, distance, point: [px, py, pz] };

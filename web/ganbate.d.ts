@@ -75,6 +75,26 @@ export interface GanbateStereoViews {
   readonly ipdMetres: number;
 }
 
+export interface GanbatePickHit {
+  instance: number;
+  distance: number;
+  point: [number, number, number];
+}
+
+export interface GanbateWorldPickHit {
+  instance: number;
+  distance: number;
+  point: [number, number, number];
+}
+
+export interface GanbateXrTarget {
+  readonly framebuffer: WebGLFramebuffer | null;
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
 export interface GanbateGovernorSnapshot {
   readonly resolutionScale: number;
   readonly maxDynamicLights: number;
@@ -228,6 +248,10 @@ export interface GanbateEngine {
   setStereoEye(eye?: GanbateStereoEyeName | GanbateStereoEye, ipdMetres?: number): boolean;
   /** Parallel-axis left/right stereo view pair derived from the current camera and IPD, or `null` if unavailable. */
   stereoViews(): GanbateStereoViews | null;
+  /** Underlying `WebGL2RenderingContext` on `'webgl2'` (for `gl.makeXRCompatible()` / `XRWebGLLayer`), or `null` on `'webgpu'`. */
+  glContext(): WebGL2RenderingContext | null;
+  /** Sets the active WebXR eye framebuffer and viewport on `'webgl2'` (`null` restores default canvas blit); returns `false` on `'webgpu'`. */
+  setXrTarget(target: GanbateXrTarget | null): boolean;
   /** Records a completed frame duration (`dtMs`, ms) into the `120Hz` (`8.333ms`) governor and returns its snapshot, or `null` if unavailable. */
   governorRecord(dtMs: number): GanbateGovernorSnapshot | null;
   /** Queries the current `120Hz` (`8.333ms`) governor snapshot without recording a frame sample, or `null` if unavailable. */
@@ -293,7 +317,9 @@ export interface GanbateEngine {
   /** Where a world point lands in CSS pixels of the canvas, with its depth; null behind the camera. */
   project(point: Vec3): { x: number; y: number; depth: number } | null;
   /** The visible prop under a CSS pixel on one of `layers`. */
-  pick(cssX: number, cssY: number, layers?: number): { instance: number; distance: number; point: [number, number, number] } | null;
+  pick(cssX: number, cssY: number, layers?: number): GanbatePickHit | null;
+  /** The visible prop along a 3D world-space ray `(origin, direction)` on one of `layers`. */
+  pickRay(origin: Vec3, direction: Vec3, layers?: number): GanbatePickHit | null;
 
   /** How many instances the cooked world has. */
   worldInstances(): number;
@@ -328,7 +354,9 @@ export interface GanbateEngine {
   /** The simulation's state hash as 16 hexadecimal digits (equal to a native run's), or null. */
   physicsHash(): string | null;
   /** The cooked world's instance under a CSS pixel of the canvas, or null. */
-  pickWorld(cssX: number, cssY: number): { instance: number; distance: number; point: [number, number, number] } | null;
+  pickWorld(cssX: number, cssY: number): GanbateWorldPickHit | null;
+  /** The cooked world's instance along a 3D world-space ray `(origin, direction)`, or null. */
+  pickWorldRay(origin: Vec3, direction: Vec3): GanbateWorldPickHit | null;
   /** The world's entity table, or null when it was cooked without one. */
   worldEntities(): GanbateEntityTable | null;
 

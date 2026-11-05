@@ -1122,6 +1122,71 @@ pub unsafe extern "C" fn ganbate_rt_pick(x: f32, y: f32, layers: u32, out: *mut 
     })
 }
 
+/// The visible prop along world-space ray `(ox, oy, oz)` -> `(dx, dy, dz)` on one of the pick
+/// `layers` (as `Renderer::pick_along_ray` chooses it): returns its instance and writes the
+/// distance in metres and the world point (4 floats) at `out`; returns 0 (without logging) when
+/// no prop is there or the ray is degenerate.
+///
+/// # Safety
+/// `out` must address 16 writable bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ganbate_rt_pick_ray(
+    ox: f32,
+    oy: f32,
+    oz: f32,
+    dx: f32,
+    dy: f32,
+    dz: f32,
+    layers: u32,
+    out: *mut u8,
+) -> u32 {
+    with(0, |rt| {
+        if out.is_null() {
+            return Ok(0);
+        }
+        let Some(hit) = rt
+            .renderer
+            .pick_along_ray([ox, oy, oz], [dx, dy, dz], layers)
+        else {
+            return Ok(0);
+        };
+        let p = hit.point;
+        // SAFETY: the caller passes 16 writable bytes.
+        unsafe { write_floats(out, &[hit.distance, p[0], p[1], p[2]]) };
+        Ok(hit.instance.raw())
+    })
+}
+
+/// The cooked world's instance along world-space ray `(ox, oy, oz)` -> `(dx, dy, dz)`: returns
+/// its index plus one and writes the distance in metres and the world point (4 floats) at `out`;
+/// returns 0 when no instance is there or the ray is degenerate.
+///
+/// # Safety
+/// `out` must address 16 writable bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ganbate_rt_pick_world_ray(
+    ox: f32,
+    oy: f32,
+    oz: f32,
+    dx: f32,
+    dy: f32,
+    dz: f32,
+    out: *mut u8,
+) -> u32 {
+    with(0, |rt| {
+        if out.is_null() {
+            return Ok(0);
+        }
+        let Some(hit) = rt.renderer.pick_world_along_ray([ox, oy, oz], [dx, dy, dz]) else {
+            return Ok(0);
+        };
+        let p = hit.point;
+        // SAFETY: the caller passes 16 writable bytes.
+        unsafe { write_floats(out, &[hit.distance, p[0], p[1], p[2]]) };
+        Ok(hit.instance as u32 + 1)
+    })
+}
+
 /// # Safety
 /// `out` must address `v.len() * 4` writable bytes.
 unsafe fn write_floats(out: *mut u8, v: &[f32]) {
