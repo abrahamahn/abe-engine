@@ -103,6 +103,7 @@ pub struct CameraState {
 
 const DEFAULT_CAMERA_POSITION: [f32; 3] = [0.0, 1.65, 3.2];
 const DEFAULT_CAMERA_TARGET: [f32; 3] = [0.0, 1.0, 0.0];
+pub const DEFAULT_SEAT_PRESET: &str = "6-max";
 
 impl Default for CameraState {
     fn default() -> Self {
@@ -112,6 +113,34 @@ impl Default for CameraState {
             target: DEFAULT_CAMERA_TARGET,
             fov_y_deg: 50.0,
         }
+    }
+}
+
+/// Spatial seat-ring layout preset for multi-seat table stages (`"2-max" | "6-max" | "9-max"`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableLayoutState {
+    pub seat_preset: String,
+}
+
+impl Default for TableLayoutState {
+    fn default() -> Self {
+        Self {
+            seat_preset: DEFAULT_SEAT_PRESET.into(),
+        }
+    }
+}
+
+/// Normalizes supported table seat-ring preset aliases to canonical `"2-max" | "6-max" | "9-max"`.
+pub fn normalize_seat_preset(raw: &str) -> Option<&'static str> {
+    let lower = raw.trim().to_lowercase();
+    match lower.as_str() {
+        "2-max" | "2max" | "2" | "heads-up" | "headsup" | "heads up" | "hu" | "2-seat"
+        | "2-player" | "2인" | "헤즈업" => Some("2-max"),
+        "6-max" | "6max" | "6" | "6-seat" | "6-player" | "6-handed" | "short-handed"
+        | "default" | "6인" => Some("6-max"),
+        "9-max" | "9max" | "9" | "full-ring" | "fullring" | "full ring" | "9-seat" | "9-player"
+        | "9-handed" | "9인" | "풀링" | "풀 링" => Some("9-max"),
+        _ => None,
     }
 }
 
@@ -188,6 +217,7 @@ pub struct SemanticWorldGraph {
     pub guardrails: WorldGuardrails,
     pub environment: EnvironmentState,
     pub camera: CameraState,
+    pub table: TableLayoutState,
     pub entities: Vec<StageEntity>,
 }
 
@@ -201,6 +231,7 @@ impl Default for SemanticWorldGraph {
             guardrails: WorldGuardrails::default(),
             environment: EnvironmentState::default(),
             camera: CameraState::default(),
+            table: TableLayoutState::default(),
             entities: vec![
                 StageEntity::default_with("primary_actor", "host", [0.0, 0.0, -1.2]),
                 StageEntity::default_with("stage_center", "surface", [0.0, 0.0, 0.0]),
@@ -378,6 +409,19 @@ impl SemanticWorldGraph {
             &mut notices,
         );
 
+        // Table seat-ring layout guardrails ("2-max" | "6-max" | "9-max").
+        if let Some(canonical_preset) = normalize_seat_preset(&self.table.seat_preset) {
+            if self.table.seat_preset != canonical_preset {
+                self.table.seat_preset = canonical_preset.into();
+            }
+        } else {
+            let invalid = self.table.seat_preset.clone();
+            self.table.seat_preset = DEFAULT_SEAT_PRESET.into();
+            notices.push(format!(
+                "reset unsupported table.seat_preset {invalid:?} to default \"{DEFAULT_SEAT_PRESET}\" (allowed: \"2-max\", \"6-max\", \"9-max\")"
+            ));
+        }
+
         // Stage entity guardrails.
         if self.entities.len() > MAX_STAGE_ENTITIES {
             let orig = self.entities.len();
@@ -506,6 +550,11 @@ impl SemanticWorldGraph {
             ),
         ]));
 
+        let table = Value::Object(BTreeMap::from([(
+            "seat_preset".into(),
+            Value::String(self.table.seat_preset.clone()),
+        )]));
+
         let entities = Value::Array(
             self.entities
                 .iter()
@@ -527,6 +576,7 @@ impl SemanticWorldGraph {
             ("guardrails".into(), guardrails),
             ("environment".into(), environment),
             ("camera".into(), camera),
+            ("table".into(), table),
             ("entities".into(), entities),
         ]))
     }
@@ -716,6 +766,15 @@ fn parse_merge_into(graph: &mut SemanticWorldGraph, patch: &Value) -> Result<(),
         }
         if let Some(fov) = cam.get("fov_y_deg") {
             graph.camera.fov_y_deg = read_f32_lossy(fov, "camera.fov_y_deg")?;
+        }
+    }
+
+    if let Some(tbl) = map.get("table") {
+        if !matches!(tbl, Value::Object(_)) {
+            return Err("table: expected object".into());
+        }
+        if let Some(sp) = tbl.get("seat_preset") {
+            graph.table.seat_preset = sp.string()?.to_string();
         }
     }
 
@@ -962,10 +1021,22 @@ pub fn detect_authority_violation_prompt(prompt: &str) -> Option<String> {
     }
 
     // 4. Cheat / Rig / Outcome tampering / Authority bypass (EN + KO)
+    let rig_count = words.iter().filter(|tok| tok.as_str() == "rig").count();
+    let benign_rig_pairs = ["layout", "anchor", "camera", "light", "table", "seat"]
+        .iter()
+        .map(|prefix| {
+            words
+                .windows(2)
+                .filter(|w| w[0] == *prefix && w[1] == "rig")
+                .count()
+        })
+        .sum::<usize>();
+    let suspicious_rig_word = rig_count > benign_rig_pairs;
+
     if has_word("cheat")
         || has_word("cheats")
         || has_word("cheating")
-        || has_word("rig")
+        || suspicious_rig_word
         || has_word("rigged")
         || has_word("rigging")
         || has_word("tamper")
@@ -1226,6 +1297,7 @@ pub fn compile_world_graph_prompt(
     let mut env_map: BTreeMap<String, Value> = BTreeMap::new();
     let mut cam_map: BTreeMap<String, Value> = BTreeMap::new();
     let mut guard_map: BTreeMap<String, Value> = BTreeMap::new();
+    let mut table_map: BTreeMap<String, Value> = BTreeMap::new();
     let mut ent_patches: Vec<Value> = Vec::new();
 
     // 1. Living Canvas Play <-> Edit state
@@ -1551,6 +1623,68 @@ pub fn compile_world_graph_prompt(
         }
     }
 
+    // 9. Table seat-ring spatial layout presets ("2-max" | "6-max" | "9-max", EN + KO)
+    if contains_any(&[
+        "2-max",
+        "2max",
+        "heads-up",
+        "headsup",
+        "heads up",
+        "2-seat",
+        "2 seat",
+        "2-player",
+        "2 player",
+        "헤즈업",
+        "2인 테이블",
+        "2인 배치",
+        "2인 좌석",
+        "2인 링",
+        "2인석",
+        "1대1 배치",
+        "일대일 배치",
+    ]) {
+        table_map.insert("seat_preset".into(), Value::String("2-max".into()));
+    } else if contains_any(&[
+        "9-max",
+        "9max",
+        "full-ring",
+        "full ring",
+        "9-seat",
+        "9 seat",
+        "9-player",
+        "9 player",
+        "9-handed",
+        "9인 테이블",
+        "9인 배치",
+        "9인 좌석",
+        "9인 링",
+        "9인석",
+        "풀링",
+        "풀 링",
+    ]) {
+        table_map.insert("seat_preset".into(), Value::String("9-max".into()));
+    } else if contains_any(&[
+        "6-max",
+        "6max",
+        "6-seat",
+        "6 seat",
+        "6-player",
+        "6 player",
+        "6-handed",
+        "short-handed",
+        "default table layout",
+        "reset table layout",
+        "6인 테이블",
+        "6인 배치",
+        "6인 좌석",
+        "6인 링",
+        "6인석",
+        "기본 테이블 배치",
+        "테이블 배치 초기화",
+    ]) {
+        table_map.insert("seat_preset".into(), Value::String("6-max".into()));
+    }
+
     if !guard_map.is_empty() {
         patch_map.insert("guardrails".into(), Value::Object(guard_map));
     }
@@ -1559,6 +1693,9 @@ pub fn compile_world_graph_prompt(
     }
     if !cam_map.is_empty() {
         patch_map.insert("camera".into(), Value::Object(cam_map));
+    }
+    if !table_map.is_empty() {
+        patch_map.insert("table".into(), Value::Object(table_map));
     }
     if !ent_patches.is_empty() {
         patch_map.insert("entities".into(), Value::Array(ent_patches));
@@ -1853,5 +1990,66 @@ mod tests {
         let (noop_out, noop_box) = compile_world_graph_prompt(&base, "   ", &[1]);
         assert!(!noop_out.applied && !noop_out.blocked_by_authority);
         assert!(noop_box.is_empty());
+    }
+
+    #[test]
+    fn table_seat_preset_compiles_bilingual_en_ko_prompts_isomorphically_and_clamps_invalid() {
+        let base = SemanticWorldGraph::default();
+        assert_eq!(base.table.seat_preset, "6-max");
+        let clients = [7u64];
+
+        // 9-max EN == KO SHA-256 isomorphism
+        let (en_9, box_9) = compile_world_graph_prompt(&base, "switch to 9-max layout", &clients);
+        let (ko_9, _) = compile_world_graph_prompt(&base, "9인 테이블 배치로 변경해줘", &clients);
+        assert!(en_9.applied && !en_9.blocked_by_authority);
+        assert_eq!(box_9.len(), 1);
+        assert_eq!(en_9.graph.table.seat_preset, "9-max");
+        assert_eq!(ko_9.graph.table.seat_preset, "9-max");
+        assert_eq!(
+            en_9.graph.canonical_sha256_hex().unwrap(),
+            ko_9.graph.canonical_sha256_hex().unwrap()
+        );
+
+        // 2-max / heads-up EN == KO SHA-256 isomorphism
+        let (en_hu, _) = compile_world_graph_prompt(&en_9.graph, "heads-up layout", &clients);
+        let (ko_hu, _) = compile_world_graph_prompt(&en_9.graph, "헤즈업 배치", &clients);
+        let (ko_2p, _) = compile_world_graph_prompt(&en_9.graph, "2인 테이블 배치", &clients);
+        assert_eq!(en_hu.graph.table.seat_preset, "2-max");
+        assert_eq!(
+            en_hu.graph.canonical_sha256_hex().unwrap(),
+            ko_hu.graph.canonical_sha256_hex().unwrap()
+        );
+        assert_eq!(
+            en_hu.graph.canonical_sha256_hex().unwrap(),
+            ko_2p.graph.canonical_sha256_hex().unwrap()
+        );
+
+        // 6-max EN == KO SHA-256 recovery to baseline + benign "layout rig" phrase allowed
+        let (en_6, _) = compile_world_graph_prompt(&en_hu.graph, "6-max layout rig", &clients);
+        let (ko_6, _) = compile_world_graph_prompt(&en_hu.graph, "6인 테이블 배치", &clients);
+        assert!(!en_6.blocked_by_authority);
+        assert_eq!(en_6.graph.table.seat_preset, "6-max");
+        assert_eq!(
+            en_6.graph.canonical_sha256_hex().unwrap(),
+            ko_6.graph.canonical_sha256_hex().unwrap()
+        );
+        assert_eq!(
+            en_6.graph.canonical_sha256_hex().unwrap(),
+            base.canonical_sha256_hex().unwrap()
+        );
+
+        // Unsupported seat_preset resets cleanly to "6-max" with a guardrail notice
+        let bad_patch = json::parse(br#"{"table":{"seat_preset":"12-max"}}"#).unwrap();
+        let clamped = apply_world_graph_patch(&en_9.graph, &bad_patch).unwrap();
+        assert!(clamped.applied && !clamped.blocked_by_authority);
+        assert_eq!(clamped.graph.table.seat_preset, "6-max");
+        assert!(
+            clamped
+                .guardrail_notices
+                .iter()
+                .any(|n| n.contains("table.seat_preset")),
+            "{:?}",
+            clamped.guardrail_notices
+        );
     }
 }

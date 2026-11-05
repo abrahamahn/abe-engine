@@ -357,6 +357,9 @@ fn verify_tri_modal_isomorphism() -> Result<IsomorphismProof, String> {
             "target": [0.0, 1.15, -0.4],
             "fov_y_deg": 38.0
         },
+        "table": {
+            "seat_preset": "9-max"
+        },
         "entities": [
             {
                 "id": "primary_actor",
@@ -400,6 +403,9 @@ fn verify_tri_modal_isomorphism() -> Result<IsomorphismProof, String> {
             "target": [0.0, 1.15, -0.4],
             "fov_y_deg": 38.0
         },
+        "table": {
+            "seat_preset": "9-max"
+        },
         "entities": [
             { "id": "primary_actor", "speed_scale": 1.5 },
             { "id": "stage_center", "speed_scale": 1.5 }
@@ -411,13 +417,14 @@ fn verify_tri_modal_isomorphism() -> Result<IsomorphismProof, String> {
     let sha256_ui = sha256_hex(ui_canonical.as_bytes());
 
     // Path C.1 (Natural-Language Prompt — English): compiled & applied to G_0.
-    let prompt_en = "pause into edit mode, set sunset lighting, open ceiling, mist weather, closeup camera, speed 1.5x";
+    let prompt_en = "pause into edit mode, set sunset lighting, open ceiling, mist weather, closeup camera, 9-max layout, speed 1.5x";
     let (en_outcome, _) = compile_world_graph_prompt(&g0, prompt_en, &[]);
     let en_canonical = en_outcome.graph.to_canonical_json()?;
     let sha256_prompt_en = sha256_hex(en_canonical.as_bytes());
 
     // Path C.2 (Natural-Language Prompt — Korean): compiled & applied to G_0.
-    let prompt_ko = "편집 모드로 일시정지하고 노을 조명, 천장 열어줘, 안개, 클로즈업, 1.5배속";
+    let prompt_ko =
+        "편집 모드로 일시정지하고 노을 조명, 천장 열어줘, 안개, 클로즈업, 9인 테이블 배치, 1.5배속";
     let (ko_outcome, _) = compile_world_graph_prompt(&g0, prompt_ko, &[]);
     let ko_canonical = ko_outcome.graph.to_canonical_json()?;
     let sha256_prompt_ko = sha256_hex(ko_canonical.as_bytes());
@@ -441,6 +448,9 @@ fn verify_tri_modal_isomorphism() -> Result<IsomorphismProof, String> {
             "target": [0.0, 1.0, 0.0],
             "fov_y_deg": 50.0
         },
+        "table": {
+            "seat_preset": "6-max"
+        },
         "entities": [
             { "id": "primary_actor", "speed_scale": 1.0 },
             { "id": "stage_center", "speed_scale": 1.0 }
@@ -451,7 +461,7 @@ fn verify_tri_modal_isomorphism() -> Result<IsomorphismProof, String> {
     let inv_canonical = inv_outcome.graph.to_canonical_json()?;
     let sha256_inverted = sha256_hex(inv_canonical.as_bytes());
 
-    let inv_prompt_en = "resume play mode, set daylight lighting time 15.5, close ceiling, clear weather, reset camera, normal speed";
+    let inv_prompt_en = "resume play mode, set daylight lighting time 15.5, close ceiling, clear weather, reset camera, 6-max layout, normal speed";
     let (inv_prompt_outcome, _) = compile_world_graph_prompt(&en_outcome.graph, inv_prompt_en, &[]);
     let inv_prompt_canonical = inv_prompt_outcome.graph.to_canonical_json()?;
     let sha256_inverted_prompt_en = sha256_hex(inv_prompt_canonical.as_bytes());

@@ -105,6 +105,8 @@ export function createLayoutRig({
   getTargetElement,
   onEditData,
   onFocusField,
+  onOpenDockedTool,
+  onActivateAnchorRig,
 }) {
   const manualOverrides = new Map(); // docId -> boolean
   let mirrorX = false;
@@ -169,6 +171,45 @@ export function createLayoutRig({
     return ops;
   }
 
+  function buildSwitcherPills() {
+    return el('span', { class: 'layout-rig-pills', 'data-role': 'layout-rig-switcher' },
+      el('button', {
+        type: 'button',
+        id: 'layout-rig-open-25d',
+        class: 'mini layout-rig-pill',
+        'data-layout-tool': 'layout-tuner',
+        title: t('layoutRig25dTableTip'),
+        onclick: (ev) => {
+          ev.stopPropagation();
+          onOpenDockedTool?.('layout-tuner');
+        },
+      }, t('layoutRig25dTable')),
+      el('button', {
+        type: 'button',
+        id: 'layout-rig-open-3d',
+        class: 'mini layout-rig-pill',
+        'data-layout-tool': 'graphics-layout-tuner',
+        title: t('layoutRig3dTableTip'),
+        onclick: (ev) => {
+          ev.stopPropagation();
+          onOpenDockedTool?.('graphics-layout-tuner');
+        },
+      }, t('layoutRig3dTable')),
+      el('button', {
+        type: 'button',
+        id: 'layout-rig-anchor-mode',
+        class: 'mini layout-rig-pill on',
+        'aria-pressed': 'true',
+        'data-layout-tool': 'anchor-rig',
+        title: t('layoutRigAnchorModeTip'),
+        onclick: (ev) => {
+          ev.stopPropagation();
+          onActivateAnchorRig?.();
+        },
+      }, t('layoutRigAnchorMode')),
+    );
+  }
+
   function draw() {
     const overlay = overlayEl();
     if (!overlay) return;
@@ -177,15 +218,21 @@ export function createLayoutRig({
       return;
     }
 
-    const { inspectedDataDoc, kinds, pieMode } = getContext();
+    const { inspectedDataDoc, kinds, pieMode, activeWorkbench, tableLayoutTools } = getContext();
     const schema = inspectedDataDoc?.root ? kinds?.[inspectedDataDoc.root.schema] : null;
-    if (!isActiveFor(inspectedDataDoc, schema) || pieMode === 'matrix') {
+    const hasAnchorDoc = isActiveFor(inspectedDataDoc, schema);
+    const inLayoutWorkbench = activeWorkbench === 'layout-rig';
+    const hasTableTools = Boolean(tableLayoutTools?.layoutTuner || tableLayoutTools?.graphicsLayoutTuner);
+
+    if (pieMode === 'matrix' || (!hasAnchorDoc && !inLayoutWorkbench)) {
       overlay.hidden = true;
       overlay.replaceChildren();
       return;
     }
 
-    const anchors = discoverLayoutAnchors(inspectedDataDoc.root.values, schema, { includeAllVec2: true });
+    const anchors = hasAnchorDoc
+      ? discoverLayoutAnchors(inspectedDataDoc.root.values, schema, { includeAllVec2: true })
+      : [];
     overlay.hidden = false;
     if (!syncOverlayBounds()) {
       overlay.style.inset = '0';
@@ -197,21 +244,34 @@ export function createLayoutRig({
     const guideX = el('div', { class: 'layout-rig-guide-x', 'aria-hidden': 'true' });
     const guideY = el('div', { class: 'layout-rig-guide-y', 'aria-hidden': 'true' });
 
-    const bar = el('div', { class: 'layout-rig-bar' },
-      el('span', { class: 'layout-rig-title' }, `${t('layoutRig')} · ${anchors.length}`),
-      el('button', {
-        type: 'button',
-        id: 'layout-rig-mirror',
-        class: `mini${mirrorX ? ' on' : ''}`,
-        'aria-pressed': String(mirrorX),
-        onclick: (ev) => {
-          ev.stopPropagation();
-          mirrorX = !mirrorX;
-          draw();
-        },
-      }, t('mirrorX')),
-      el('span', { class: 'layout-rig-hint' }, t('snapShiftHint')),
-    );
+    const showSwitcher = inLayoutWorkbench && (hasTableTools || !hasAnchorDoc);
+    const barChildren = [
+      el('span', { class: 'layout-rig-title' }, hasAnchorDoc ? `${t('layoutRig')} · ${anchors.length}` : t('layoutRig')),
+    ];
+    if (showSwitcher) {
+      barChildren.push(buildSwitcherPills());
+    }
+    if (hasAnchorDoc) {
+      barChildren.push(
+        el('button', {
+          type: 'button',
+          id: 'layout-rig-mirror',
+          class: `mini${mirrorX ? ' on' : ''}`,
+          'aria-pressed': String(mirrorX),
+          onclick: (ev) => {
+            ev.stopPropagation();
+            mirrorX = !mirrorX;
+            draw();
+          },
+        }, t('mirrorX')),
+        el('span', { class: 'layout-rig-hint' }, t('snapShiftHint')),
+      );
+    } else {
+      barChildren.push(
+        el('span', { class: 'layout-rig-hint' }, t('layoutRigSelectSchemaHint')),
+      );
+    }
+    const bar = el('div', { class: 'layout-rig-bar' }, ...barChildren);
 
     const handleNodes = new Map();
     for (const anchor of anchors) {

@@ -9,6 +9,63 @@ function webOrigin(value) {
   return { origin: url.origin, local };
 }
 
+/**
+ * Normalizes loopback origins (`127.0.0.1` alongside `localhost` / `[::1]`) when resolving
+ * manifest-configured project tools without an explicit override:
+ * - Prefers IPv4 `127.0.0.1` whenever Studio itself is on `localhost` or `[::1]` so `http://localhost:5173`
+ *   in `project-tools.json` reaches IPv4-bound dev servers on IPv6-first Linux hosts while maintaining
+ *   strict cross-hostname cookie isolation (`localhost` vs `127.0.0.1`).
+ * - Conversely swaps `127.0.0.1` / `[::1]` to `localhost` when Studio itself is opened on `127.0.0.1`.
+ */
+export function normalizeLoopbackOrigin(configured, studioOrigin, { allowSameOrigin = false, explicitOverride = false } = {}) {
+  if (!configured?.local || allowSameOrigin || explicitOverride) return configured;
+  const studioUrl = new URL(studioOrigin);
+  const toolUrl = new URL(configured.origin);
+  const studioHost = studioUrl.hostname.replace(/\.$/, '');
+  const toolHost = toolUrl.hostname.replace(/\.$/, '');
+  if (studioHost !== '127.0.0.1' && (toolHost === 'localhost' || toolHost === '[::1]')) {
+    toolUrl.hostname = '127.0.0.1';
+    return { origin: toolUrl.origin, local: true };
+  }
+  if (studioHost === '127.0.0.1' && (toolHost === '127.0.0.1' || toolHost === '[::1]')) {
+    toolUrl.hostname = 'localhost';
+    return { origin: toolUrl.origin, local: true };
+  }
+  return configured;
+}
+
+/**
+ * Normalizes a `?toolOrigin=` query override when both Studio and the tool run on local loopback
+ * on different ports, swapping `127.0.0.1` <-> `localhost` if needed to preserve Studio's
+ * cross-hostname cookie isolation without rejecting same-port host self-embedding.
+ */
+export function normalizeLoopbackQueryOverride(override, studioOrigin, { allowSameOrigin = false } = {}) {
+  if (!override || allowSameOrigin) return override;
+  try {
+    const parsed = webOrigin(override);
+    if (!parsed.local) return override;
+    const studioUrl = new URL(studioOrigin);
+    const toolUrl = new URL(parsed.origin);
+    // Never rewrite host self-embedding on the exact same port.
+    if (toolUrl.origin === studioUrl.origin || (toolUrl.port || '80') === (studioUrl.port || '80')) {
+      return override;
+    }
+    const studioHost = studioUrl.hostname.replace(/\.$/, '');
+    const toolHost = toolUrl.hostname.replace(/\.$/, '');
+    if (studioHost === toolHost) {
+      toolUrl.hostname = studioHost === '127.0.0.1' ? 'localhost' : '127.0.0.1';
+      return toolUrl.origin;
+    }
+    if (studioHost !== '127.0.0.1' && toolHost === '[::1]') {
+      toolUrl.hostname = '127.0.0.1';
+      return toolUrl.origin;
+    }
+  } catch {
+    return override;
+  }
+  return override;
+}
+
 /** Appends `?embed=studio` to a docked project tool URL so it renders chrome-less inside Studio. */
 export function withEmbedStudioParam(href) {
   const url = new URL(href);
@@ -16,6 +73,72 @@ export function withEmbedStudioParam(href) {
     url.searchParams.set('embed', 'studio');
   }
   return url.href;
+}
+
+/**
+ * Resolves the docked 2.5D (`layout-tuner`) and 3D (`graphics-layout-tuner`) Table Layout tools
+ * from resolved project tools, deriving the companion `/ganbate-editor/*` route on the same
+ * validated game origin when only one of the pair is listed in `project-tools.json`.
+ */
+export function resolveTableLayoutTools(tools = []) {
+  if (!Array.isArray(tools) || !tools.length) {
+    return { layoutTuner: null, graphicsLayoutTuner: null };
+  }
+  const pathnameOf = (tool) => {
+    try {
+      return new URL(tool.href).pathname.replace(/\/+$/, '');
+    } catch {
+      return '';
+    }
+  };
+  let layoutTuner = tools.find((tool) => {
+    const pathname = pathnameOf(tool);
+    return tool.id === 'layout-tuner'
+      || pathname === '/ganbate-editor/layout-tuner'
+      || pathname.endsWith('/layout-tuner');
+  }) || null;
+
+  let graphicsLayoutTuner = tools.find((tool) => {
+    const pathname = pathnameOf(tool);
+    return tool.id === 'graphics-layout-tuner'
+      || pathname === '/ganbate-editor/graphics-layout-tuner'
+      || pathname.endsWith('/graphics-layout-tuner');
+  }) || null;
+
+  const editorAnchor = layoutTuner
+    || graphicsLayoutTuner
+    || tools.find((tool) => pathnameOf(tool).startsWith('/ganbate-editor'))
+    || null;
+
+  if (editorAnchor) {
+    try {
+      const origin = new URL(editorAnchor.href).origin;
+      if (!layoutTuner) {
+        const href = new URL('/ganbate-editor/layout-tuner', origin).href;
+        layoutTuner = {
+          id: 'layout-tuner',
+          label: '2.5D Table Layout',
+          href,
+          embedHref: withEmbedStudioParam(href),
+          open: 'embed',
+        };
+      }
+      if (!graphicsLayoutTuner) {
+        const href = new URL('/ganbate-editor/graphics-layout-tuner', origin).href;
+        graphicsLayoutTuner = {
+          id: 'graphics-layout-tuner',
+          label: '3D Table Layout',
+          href,
+          embedHref: withEmbedStudioParam(href),
+          open: 'embed',
+        };
+      }
+    } catch {
+      // Keep explicit matches only if URL parsing fails.
+    }
+  }
+
+  return { layoutTuner, graphicsLayoutTuner };
 }
 
 function slugifyToolId(tool, idx) {
@@ -38,8 +161,10 @@ export function resolveProjectTools(manifest, studioOrigin, override, options = 
     ? new URL('/', studioOrigin).origin
     : manifest.origin;
   const configured = webOrigin(rawOrigin);
-  const requested = override && configured.local ? webOrigin(override) : configured;
-  if (override && configured.local && !requested.local) throw new Error('A local tool origin must stay local.');
+  const explicitOverride = Boolean(override);
+  const candidate = explicitOverride && configured.local ? webOrigin(override) : configured;
+  if (explicitOverride && configured.local && !candidate.local) throw new Error('A local tool origin must stay local.');
+  const requested = normalizeLoopbackOrigin(candidate, studioOrigin, { allowSameOrigin, explicitOverride });
   // Cookies are host-scoped, not port-scoped. A paired Studio's HttpOnly cookie belongs only to Studio.
   if (
     !allowSameOrigin &&
@@ -99,8 +224,9 @@ export function projectToolsPanel(onError, options = {}) {
   return async (project, advertisedCatalogs, directManifest = null) => {
     const current = ++projectLoad;
     try {
-      const override = new URLSearchParams(location.search).get('toolOrigin');
+      const rawOverride = new URLSearchParams(location.search).get('toolOrigin');
       const allowSameOrigin = Boolean(options.allowSameOrigin?.());
+      const override = normalizeLoopbackQueryOverride(rawOverride, location.origin, { allowSameOrigin });
       let resolvedTools = [];
       if (directManifest && typeof directManifest === 'object') {
         resolvedTools = resolveProjectTools(directManifest, location.origin, override, { allowSameOrigin });

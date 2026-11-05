@@ -24,7 +24,7 @@ import {
 } from './asset-library.js';
 import { t, label, lang, setLang, translate } from './i18n.js';
 
-import { projectToolsPanel } from './project-tools.js';
+import { projectToolsPanel, resolveTableLayoutTools } from './project-tools.js';
 import { mountAiCopilot, UX_TIERS } from './ai-copilot.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -1663,6 +1663,7 @@ const loadProjectTools = projectToolsPanel((msg) => log(2, msg), {
   onToolsLoaded: (tools) => {
     state.projectWorkbenches = tools.filter((tool) => tool.open === 'panel' || tool.open === 'embed');
     drawWorkspaceTabs();
+    layoutRig?.draw();
     const params = new URLSearchParams(location.search);
     const rawHash = location.hash.replace(/^#/, '').trim();
     const hashTab = rawHash.startsWith('tab=') ? rawHash.slice(4) : rawHash;
@@ -1739,6 +1740,19 @@ const pieViewport = createPieViewport({
   log: (lvl, text) => log(lvl, text),
 });
 
+async function openDockedTableLayoutTool(toolKey) {
+  const tableTools = resolveTableLayoutTools(state.projectWorkbenches);
+  const target = toolKey === 'graphics-layout-tuner'
+    ? tableTools.graphicsLayoutTuner
+    : tableTools.layoutTuner;
+  if (!target) {
+    log(1, `${t('layoutRig')}: ${toolKey} is not configured in project-tools.json.`);
+    return false;
+  }
+  await activateWorkbench(`project:${target.id}`);
+  return true;
+}
+
 const layoutRig = createLayoutRig({
   el,
   t,
@@ -1746,11 +1760,23 @@ const layoutRig = createLayoutRig({
     inspectedDataDoc: state.inspectedData ? state.datas.get(state.inspectedData) : null,
     kinds: state.kinds,
     pieMode: pieViewport.getMode(),
+    activeWorkbench: state.activeWorkbench,
+    tableLayoutTools: resolveTableLayoutTools(state.projectWorkbenches),
   }),
   getTargetElement: () => pieViewport.activeLayoutTargetElement(),
   onEditData: (lbl, ops, merge, docId) => edit(lbl, ops, merge, docId),
   onFocusField: (docId, path) => {
     if (state.inspectedData === docId) focusDataField($('#inspector-body'), path);
+  },
+  onOpenDockedTool: (toolKey) => {
+    void openDockedTableLayoutTool(toolKey);
+  },
+  onActivateAnchorRig: () => {
+    if (!state.inspectedData) {
+      const dataAsset = state.assets.find((a) => a.kind === 'data');
+      if (dataAsset) inspectData(dataAsset.id);
+    }
+    layoutRig.draw();
   },
 });
 
@@ -1839,8 +1865,17 @@ function normalizeWorkbenchId(rawId) {
   const clean = typeof rawId === 'string' ? rawId.trim() : '';
   if (!clean) return 'world';
   if (WORKBENCH_ID_ALIASES[clean]) return WORKBENCH_ID_ALIASES[clean];
-  if (!clean.startsWith('project:') && state.projectWorkbenches.some((tItem) => tItem.id === clean)) {
-    return `project:${clean}`;
+  if (!clean.startsWith('project:')) {
+    if (state.projectWorkbenches.some((tItem) => tItem.id === clean)) {
+      return `project:${clean}`;
+    }
+    const tableTools = resolveTableLayoutTools(state.projectWorkbenches);
+    if (clean === 'layout-tuner' && tableTools.layoutTuner) {
+      return `project:${tableTools.layoutTuner.id}`;
+    }
+    if (clean === 'graphics-layout-tuner' && tableTools.graphicsLayoutTuner) {
+      return `project:${tableTools.graphicsLayoutTuner.id}`;
+    }
   }
   return clean;
 }
@@ -2340,17 +2375,25 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
 
   state.activeWorkbench = workbenchId;
   document.body.classList.add('workbench-active');
+  layoutRig.draw();
   if (deck) deck.hidden = false;
   for (const child of deck ? [...deck.children] : []) child.hidden = true;
 
   if (workbenchId.startsWith('project:')) {
     const toolId = workbenchId.slice('project:'.length);
-    const tool = state.projectWorkbenches.find((item) => item.id === toolId);
+    const tableTools = resolveTableLayoutTools(state.projectWorkbenches);
+    const tool = state.projectWorkbenches.find((item) => item.id === toolId)
+      || (toolId === 'layout-tuner' || tableTools.layoutTuner?.id === toolId ? tableTools.layoutTuner : null)
+      || (toolId === 'graphics-layout-tuner' || tableTools.graphicsLayoutTuner?.id === toolId ? tableTools.graphicsLayoutTuner : null);
     if (!tool) {
       await activateWorkbench('world');
       return;
     }
-    let rec = mountedWorkbenches.get(workbenchId);
+    const canonicalPaneId = `project:${tool.id}`;
+    state.activeWorkbench = canonicalPaneId;
+    const is25dTableTool = Boolean(tableTools.layoutTuner && tool.href === tableTools.layoutTuner.href);
+    const is3dTableTool = Boolean(tableTools.graphicsLayoutTuner && tool.href === tableTools.graphicsLayoutTuner.href);
+    let rec = mountedWorkbenches.get(canonicalPaneId);
     if (!rec && deck) {
       const frame = el('iframe', {
         class: 'project-workbench-frame',
@@ -2359,10 +2402,41 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
         referrerpolicy: 'no-referrer',
         sandbox: 'allow-forms allow-scripts allow-same-origin allow-downloads allow-popups',
       });
-      const pane = el('div', { class: 'workbench-pane', 'data-workbench-pane': workbenchId }, frame);
+      const paneChildren = [];
+      if (is25dTableTool || is3dTableTool) {
+        paneChildren.push(
+          el('div', { class: 'layout-rig-docked-bar', 'data-role': 'layout-rig-docked-switcher' },
+            el('button', {
+              type: 'button',
+              class: `mini layout-rig-pill${is25dTableTool ? ' on' : ''}`,
+              'aria-pressed': String(is25dTableTool),
+              'data-layout-tool': 'layout-tuner',
+              title: t('layoutRig25dTableTip'),
+              onclick: () => { void openDockedTableLayoutTool('layout-tuner'); },
+            }, t('layoutRig25dTable')),
+            el('button', {
+              type: 'button',
+              class: `mini layout-rig-pill${is3dTableTool ? ' on' : ''}`,
+              'aria-pressed': String(is3dTableTool),
+              'data-layout-tool': 'graphics-layout-tuner',
+              title: t('layoutRig3dTableTip'),
+              onclick: () => { void openDockedTableLayoutTool('graphics-layout-tuner'); },
+            }, t('layoutRig3dTable')),
+            el('button', {
+              type: 'button',
+              class: 'mini layout-rig-pill',
+              'data-layout-tool': 'anchor-rig',
+              title: t('layoutRigAnchorModeTip'),
+              onclick: () => { void activateWorkbench('layout-rig'); },
+            }, t('layoutRigAnchorMode')),
+          ),
+        );
+      }
+      paneChildren.push(frame);
+      const pane = el('div', { class: 'workbench-pane', 'data-workbench-pane': canonicalPaneId }, ...paneChildren);
       deck.append(pane);
       rec = { pane, instance: null };
-      mountedWorkbenches.set(workbenchId, rec);
+      mountedWorkbenches.set(canonicalPaneId, rec);
     }
     if (rec?.pane) rec.pane.hidden = false;
     drawWorkspaceTabs();

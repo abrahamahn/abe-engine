@@ -477,6 +477,9 @@ export function buildDefaultWorldGraph() {
       target: [0, 1, 0],
       fov_y_deg: 50,
     },
+    table: {
+      seat_preset: '6-max',
+    },
     entities: [
       {
         id: 'primary_actor',
@@ -739,6 +742,21 @@ export function applyOfflineWorldGraphPatch(currentGraph, patch) {
     }
   }
 
+  if (patch.table && typeof patch.table === 'object' && typeof patch.table.seat_preset === 'string') {
+    const rawPreset = patch.table.seat_preset.trim().toLowerCase();
+    if (!next.table || typeof next.table !== 'object') next.table = { seat_preset: '6-max' };
+    if (['2-max', '2max', '2', 'heads-up', 'headsup', 'heads up', '2인', '헤즈업'].includes(rawPreset)) {
+      next.table.seat_preset = '2-max';
+    } else if (['6-max', '6max', '6', '6인', 'default'].includes(rawPreset)) {
+      next.table.seat_preset = '6-max';
+    } else if (['9-max', '9max', '9', 'full-ring', 'full ring', '9인', '풀링'].includes(rawPreset)) {
+      next.table.seat_preset = '9-max';
+    } else {
+      notices.push(`reset unsupported table.seat_preset "${patch.table.seat_preset}" to default "6-max"`);
+      next.table.seat_preset = '6-max';
+    }
+  }
+
   return {
     ok: true,
     applied: true,
@@ -766,7 +784,8 @@ export function compileOfflineWorldGraphPrompt(currentGraph, prompt) {
       estimated_tokens: estimateWorldGraphTokens(base),
     };
   }
-  if (OFFLINE_FORBIDDEN_PROMPT.test(text)) {
+  const sanitizedAuthorityProbe = text.replace(/\b(layout|anchor|camera|light|table|seat)\s+rig\b/gi, '$1');
+  if (OFFLINE_FORBIDDEN_PROMPT.test(sanitizedAuthorityProbe)) {
     return {
       ok: false,
       applied: false,
@@ -831,6 +850,14 @@ export function compileOfflineWorldGraphPrompt(currentGraph, prompt) {
   const boostMatch = text.match(/light[_\s-]*boost\s*(?:to|=)?\s*([0-9]+(?:\.[0-9]+)?)|밝기\s*([0-9]+(?:\.[0-9]+)?)\s*배/i);
   if (boostMatch) {
     env.light_boost = Number(boostMatch[1] || boostMatch[2]);
+  }
+
+  if (/\b(2-max|2max|heads-up|headsup|heads\s+up|2-seat|2-player)\b|(헤즈업|2인\s*테이블|2인\s*배치|2인\s*좌석|2인\s*링|2인석)/i.test(text)) {
+    patch.table = { seat_preset: '2-max' };
+  } else if (/\b(9-max|9max|full-ring|full\s+ring|9-seat|9-player|9-handed)\b|(9인\s*테이블|9인\s*배치|9인\s*좌석|9인\s*링|9인석|풀\s*링)/i.test(text)) {
+    patch.table = { seat_preset: '9-max' };
+  } else if (/\b(6-max|6max|6-seat|6-player|6-handed|short-handed|default\s+table\s+layout|reset\s+table\s+layout)\b|(6인\s*테이블|6인\s*배치|6인\s*좌석|6인\s*링|6인석|기본\s*테이블\s*배치)/i.test(text)) {
+    patch.table = { seat_preset: '6-max' };
   }
 
   if (Object.keys(env).length) patch.environment = env;

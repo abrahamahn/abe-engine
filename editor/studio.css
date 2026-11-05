@@ -929,10 +929,29 @@ select.add { margin-top: 12px; width: 100%; }
 .layout-rig-guide-x { position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: rgba(255, 255, 255, 0.14); pointer-events: none; }
 .layout-rig-guide-y { position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: rgba(255, 255, 255, 0.14); pointer-events: none; }
 .layout-rig-bar {
-  pointer-events: auto; position: absolute; top: 8px; left: 8px;
-  display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 999px;
-  background: rgba(20, 22, 28, 0.9); border: 1px solid var(--line); font-size: 11px; color: var(--text);
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  pointer-events: auto; position: absolute; top: 8px; left: 8px; max-width: calc(100% - 16px);
+  display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 4px 10px; border-radius: 999px;
+  background: rgba(20, 22, 28, 0.92); border: 1px solid var(--line); font-size: 11px; color: var(--text);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45); backdrop-filter: blur(6px);
+}
+.layout-rig-title { font-weight: 600; white-space: nowrap; }
+.layout-rig-pills {
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 2px;
+  border-left: 1px solid rgba(255, 255, 255, 0.12); padding-left: 6px;
+}
+.layout-rig-pill {
+  padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 500;
+  white-space: nowrap; cursor: pointer; transition: border-color 0.12s ease, background 0.12s ease;
+}
+.layout-rig-pill:hover { border-color: var(--accent); }
+.layout-rig-pill.on {
+  background: rgba(232, 180, 74, 0.2); border-color: var(--accent); color: #fff; font-weight: 600;
+}
+.layout-rig-docked-bar {
+  position: absolute; top: 8px; right: 12px; z-index: 8;
+  display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 999px;
+  background: rgba(16, 18, 24, 0.9); border: 1px solid var(--line);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55); backdrop-filter: blur(6px);
 }
 .layout-rig-hint { color: var(--dim); font-size: 10.5px; }
 .layout-rig-handle {

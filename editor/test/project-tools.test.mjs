@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { resolveProjectTools, withEmbedStudioParam } from '../project-tools.js';
+import {
+  normalizeLoopbackQueryOverride,
+  resolveProjectTools,
+  resolveTableLayoutTools,
+  withEmbedStudioParam,
+} from '../project-tools.js';
 
 const host = 'http://localhost:7480';
 const manifest = { version: 1, origin: 'http://127.0.0.1:5173', tools: [{ label: 'Level rules', path: '/tools/levels?view=all' }] };
@@ -17,6 +22,52 @@ test('rejects script and cross-origin paths, host self-embedding and nonlocal ov
   assert.throws(() => resolveProjectTools(manifest, host, host));
   assert.throws(() => resolveProjectTools(manifest, host, 'http://localhost:5173'));
   assert.throws(() => resolveProjectTools(manifest, host, 'https://example.test'));
+});
+
+test('normalizes localhost and 127.0.0.1 loopback origins cleanly while preserving cross-hostname isolation', () => {
+  const localhostManifest = {
+    version: 1,
+    origin: 'http://localhost:5173',
+    tools: [{ label: 'Table layouts', path: '/ganbate-editor/layout-tuner' }],
+  };
+  const onLocalhostStudio = resolveProjectTools(localhostManifest, 'http://localhost:7480');
+  assert.equal(onLocalhostStudio[0].href, 'http://127.0.0.1:5173/ganbate-editor/layout-tuner');
+  assert.equal(onLocalhostStudio[0].embedHref, 'http://127.0.0.1:5173/ganbate-editor/layout-tuner?embed=studio');
+
+  const onIpv6Studio = resolveProjectTools(localhostManifest, 'http://[::1]:7480');
+  assert.equal(onIpv6Studio[0].href, 'http://127.0.0.1:5173/ganbate-editor/layout-tuner');
+
+  const onIpv4Studio = resolveProjectTools(manifest, 'http://127.0.0.1:7480');
+  assert.equal(onIpv4Studio[0].href, 'http://localhost:5173/tools/levels?view=all');
+
+  assert.equal(
+    normalizeLoopbackQueryOverride('http://127.0.0.1:5173', 'http://127.0.0.1:7480'),
+    'http://localhost:5173',
+  );
+  assert.equal(
+    normalizeLoopbackQueryOverride('http://localhost:5173', 'http://localhost:7480'),
+    'http://127.0.0.1:5173',
+  );
+  // Same-port self-embedding must never be rewritten away.
+  assert.equal(
+    normalizeLoopbackQueryOverride('http://127.0.0.1:7480', 'http://127.0.0.1:7480'),
+    'http://127.0.0.1:7480',
+  );
+});
+
+test('resolveTableLayoutTools discovers layout-tuner and companion graphics-layout-tuner routes', () => {
+  const localhostManifest = {
+    version: 1,
+    origin: 'http://localhost:5173',
+    tools: [{ label: 'Table layouts', path: '/ganbate-editor/layout-tuner' }],
+  };
+  const tools = resolveProjectTools(localhostManifest, 'http://localhost:7480');
+  const pair = resolveTableLayoutTools(tools);
+  assert.equal(pair.layoutTuner?.embedHref, 'http://127.0.0.1:5173/ganbate-editor/layout-tuner?embed=studio');
+  assert.equal(
+    pair.graphicsLayoutTuner?.embedHref,
+    'http://127.0.0.1:5173/ganbate-editor/graphics-layout-tuner?embed=studio',
+  );
 });
 
 test('a workspace needing a top-level game session can declare a link', () => {
