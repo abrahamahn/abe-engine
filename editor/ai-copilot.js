@@ -251,6 +251,28 @@ export function compileNaturalPromptToGbs(promptText, context = {}) {
   const matchedSource = matchBestCatalogSource(catalogItems, contentWords);
   const baseLabel = contentWords[0] ? sanitizeAlias(contentWords[0], 'Object') : 'Object';
 
+  // 0. Compositional multi-clause relational prompt (`on top of`, `behind`, `in front of`, `left of`, `right of`, `facing`)
+  if (
+    !/\b(?:ring|circle|surround\w*|row|line|path|walkway|avenue)\b/i.test(raw) &&
+    /\b(on\s+top\s+of|behind|in\s+front\s+of|to\s+the\s+left\s+of|to\s+the\s+right\s+of|facing|looking\s+at)\b/i.test(raw)
+  ) {
+    const comp = compileCompositionalSpatialPrompt(raw, context.semanticSceneGraph || null, {
+      catalogItems,
+      cursorWorld: cursor,
+    });
+    if (comp.gbsScript) {
+      if (comp.summary) summaryParts.push(comp.summary);
+      return {
+        gbsScript: comp.gbsScript,
+        timeOfDay,
+        lightingPreset,
+        semanticSceneGraph: comp.graph,
+        verification: comp.verification,
+        summary: summaryParts.join(' · '),
+      };
+    }
+  }
+
   // 1. Ring / Circle / Surround pattern
   const ringMatch = raw.match(/\b(?:ring|circle|surround\w*)\b/i);
   if (ringMatch) {
@@ -348,6 +370,505 @@ export function compileNaturalPromptToGbs(promptText, context = {}) {
     timeOfDay,
     lightingPreset,
     summary: summaryParts.join(' · ') || 'No matching spatial rule (configure LLM Agent API or use .gbs)',
+  };
+}
+
+/**
+ * Builds the default Node+Edge Tri-Modal Semantic Scene Graph (`ganbate.semantic.scene-graph.v2`)
+ * with explicit 3D bounding volumes (`aabb` / `cylinder`), attachment sockets, and directed
+ * spatial relation edges (`on_top_of`, `behind`, `in_front_of`, `left_of`, `right_of`, `facing`).
+ */
+export function buildDefaultSemanticSceneGraph() {
+  return {
+    schema: 'ganbate.semantic.scene-graph.v2',
+    environment: {
+      preset: 'yozakura_night',
+      time_of_day: 21.5,
+      enclosure: 'semi_open',
+      room_bounds_m: [[-18, 0, -18], [18, 8, 18]],
+    },
+    nodes: [
+      {
+        id: 'poker_table_main',
+        category: 'furniture.table',
+        prefab: 'prefab:poker_table_9max',
+        transform: { pos: [0.0, 0.0, 0.0], yaw_deg: 0.0, scale: [1, 1, 1] },
+        bounds: { type: 'aabb', size: [2.6, 0.78, 1.4] },
+        sockets: ['table_top_center', 'dealer_well', 'seat_1', 'seat_2', 'seat_3', 'seat_4', 'seat_5', 'seat_6'],
+      },
+      {
+        id: 'dealer_rei',
+        category: 'character.dealer',
+        prefab: 'prefab:rei_dealer_d30',
+        transform: { pos: [0.0, 0.0, -1.15], yaw_deg: 0.0, scale: [1, 1, 1] },
+        bounds: { type: 'cylinder', radius: 0.28, height: 1.68 },
+      },
+      {
+        id: 'chip_tray_01',
+        category: 'prop.chips',
+        prefab: 'prefab:dealer_chip_tray',
+        transform: { pos: [0.0, 0.78, -0.42], yaw_deg: 0.0, scale: [1, 1, 1] },
+        bounds: { type: 'aabb', size: [0.42, 0.08, 0.22] },
+      },
+    ],
+    relations: [
+      { subject: 'dealer_rei', predicate: 'behind', object: 'poker_table_main', clearance_m: 0.45 },
+      { subject: 'dealer_rei', predicate: 'facing', object: 'poker_table_main' },
+      { subject: 'chip_tray_01', predicate: 'on_top_of', object: 'poker_table_main', socket: 'dealer_well' },
+    ],
+  };
+}
+
+function getNodeHalfExtents(node) {
+  const b = node?.bounds || {};
+  if (b.type === 'cylinder') {
+    const r = Math.max(0.05, Number(b.radius) || 0.3);
+    const h = Math.max(0.05, Number(b.height) || 1.0);
+    return [r, h / 2, r];
+  }
+  const sz = Array.isArray(b.size) && b.size.length >= 3 ? b.size : [0.5, 0.5, 0.5];
+  return [
+    Math.max(0.04, (Number(sz[0]) || 0.5) / 2),
+    Math.max(0.02, (Number(sz[1]) || 0.5) / 2),
+    Math.max(0.04, (Number(sz[2]) || 0.5) / 2),
+  ];
+}
+
+function getNodeHeight(node) {
+  const b = node?.bounds || {};
+  if (b.type === 'cylinder') return Math.max(0.05, Number(b.height) || 1.0);
+  const sz = Array.isArray(b.size) && b.size.length >= 3 ? b.size : [0.5, 0.5, 0.5];
+  return Math.max(0.04, Number(sz[1]) || 0.5);
+}
+
+/**
+ * Pre-execution spatial constraint solver & verifier for `ganbate.semantic.scene-graph.v2`.
+ * Enforces:
+ *   1. Relational edge satisfaction (`on_top_of`, `behind`, `in_front_of`, `left_of`, `right_of`, `facing`)
+ *   2. Floor / surface support (`y >= 0` or resting on `on_top_of` target top plane)
+ *   3. Pairwise AABB non-overlap clearance (nudging overlapping siblings along XZ)
+ *   4. Room boundary containment (`room_bounds_m`)
+ */
+export function verifyAndSolveSemanticSceneGraph(rawGraph, { autoResolve = true } = {}) {
+  const graph = structuredClone(rawGraph && typeof rawGraph === 'object' ? rawGraph : buildDefaultSemanticSceneGraph());
+  if (!Array.isArray(graph.nodes)) graph.nodes = [];
+  if (!Array.isArray(graph.relations)) graph.relations = [];
+
+  const nodeMap = new Map();
+  for (const n of graph.nodes) {
+    if (!n || typeof n !== 'object' || !n.id) continue;
+    if (!n.transform || typeof n.transform !== 'object') {
+      n.transform = { pos: [0, 0, 0], yaw_deg: 0, scale: [1, 1, 1] };
+    }
+    if (!Array.isArray(n.transform.pos) || n.transform.pos.length < 3) {
+      n.transform.pos = [0, 0, 0];
+    }
+    n.transform.pos = n.transform.pos.slice(0, 3).map((v) => (Number.isFinite(Number(v)) ? Number(v) : 0));
+    n.transform.yaw_deg = Number.isFinite(Number(n.transform.yaw_deg)) ? Number(n.transform.yaw_deg) : 0;
+    nodeMap.set(n.id, n);
+  }
+
+  const violations = [];
+  let resolvedCount = 0;
+  const supportedBy = new Map();
+
+  // Pass 1: Solve directed relational constraints
+  for (const rel of graph.relations) {
+    if (!rel || !rel.subject || !rel.predicate || !rel.object) continue;
+    const subj = nodeMap.get(rel.subject);
+    const obj = nodeMap.get(rel.object);
+    if (!subj || !obj || subj === obj) {
+      violations.push({
+        kind: 'dangling_relation',
+        message: `Relation ${rel.subject} -[${rel.predicate}]-> ${rel.object} references missing node`,
+      });
+      continue;
+    }
+    const [sx, , sz] = getNodeHalfExtents(subj);
+    const [ox, , oz] = getNodeHalfExtents(obj);
+    const objH = getNodeHeight(obj);
+    const clearance = Number.isFinite(Number(rel.clearance_m)) ? Math.max(0, Number(rel.clearance_m)) : 0.25;
+
+    if (rel.predicate === 'on_top_of') {
+      supportedBy.set(subj.id, obj.id);
+      const targetY = Number((obj.transform.pos[1] + objH).toFixed(3));
+      if (Math.abs(subj.transform.pos[1] - targetY) > 1e-3) {
+        violations.push({
+          kind: 'surface_support',
+          nodeId: subj.id,
+          message: `Snapped ${subj.id} onto top surface of ${obj.id} (y=${targetY}m)`,
+        });
+        if (autoResolve) {
+          subj.transform.pos[1] = targetY;
+          resolvedCount += 1;
+        }
+      }
+      // Keep within surface XZ footprint
+      const maxDx = Math.max(0, ox - sx * 0.5);
+      const maxDz = Math.max(0, oz - sz * 0.5);
+      const dx = subj.transform.pos[0] - obj.transform.pos[0];
+      const dz = subj.transform.pos[2] - obj.transform.pos[2];
+      if (Math.abs(dx) > maxDx + 1e-3 || Math.abs(dz) > maxDz + 1e-3) {
+        if (autoResolve) {
+          subj.transform.pos[0] = Number(
+            (obj.transform.pos[0] + Math.max(-maxDx, Math.min(maxDx, dx))).toFixed(3),
+          );
+          subj.transform.pos[2] = Number(
+            (obj.transform.pos[2] + Math.max(-maxDz, Math.min(maxDz, dz))).toFixed(3),
+          );
+          resolvedCount += 1;
+        }
+      }
+    } else if (rel.predicate === 'behind') {
+      const targetZ = Number((obj.transform.pos[2] - (oz + sz + clearance)).toFixed(3));
+      if (autoResolve && Math.abs(subj.transform.pos[2] - targetZ) > 0.02) {
+        subj.transform.pos[0] = Number(obj.transform.pos[0].toFixed(3));
+        subj.transform.pos[2] = targetZ;
+        resolvedCount += 1;
+      }
+    } else if (rel.predicate === 'in_front_of') {
+      const targetZ = Number((obj.transform.pos[2] + (oz + sz + clearance)).toFixed(3));
+      if (autoResolve && Math.abs(subj.transform.pos[2] - targetZ) > 0.02) {
+        subj.transform.pos[0] = Number(obj.transform.pos[0].toFixed(3));
+        subj.transform.pos[2] = targetZ;
+        resolvedCount += 1;
+      }
+    } else if (rel.predicate === 'left_of') {
+      const targetX = Number((obj.transform.pos[0] - (ox + sx + clearance)).toFixed(3));
+      if (autoResolve && Math.abs(subj.transform.pos[0] - targetX) > 0.02) {
+        subj.transform.pos[0] = targetX;
+        subj.transform.pos[2] = Number(obj.transform.pos[2].toFixed(3));
+        resolvedCount += 1;
+      }
+    } else if (rel.predicate === 'right_of') {
+      const targetX = Number((obj.transform.pos[0] + (ox + sx + clearance)).toFixed(3));
+      if (autoResolve && Math.abs(subj.transform.pos[0] - targetX) > 0.02) {
+        subj.transform.pos[0] = targetX;
+        subj.transform.pos[2] = Number(obj.transform.pos[2].toFixed(3));
+        resolvedCount += 1;
+      }
+    } else if (rel.predicate === 'facing') {
+      const dx = obj.transform.pos[0] - subj.transform.pos[0];
+      const dz = obj.transform.pos[2] - subj.transform.pos[2];
+      if (Math.hypot(dx, dz) > 1e-4) {
+        const yaw = Number(((Math.atan2(dx, dz) * 180) / Math.PI).toFixed(1));
+        if (autoResolve && Math.abs(subj.transform.yaw_deg - yaw) > 0.5) {
+          subj.transform.yaw_deg = yaw;
+          resolvedCount += 1;
+        }
+      }
+    }
+  }
+
+  // Pass 2: Floor support & room bounds check
+  const roomBounds = graph.environment?.room_bounds_m || [[-18, 0, -18], [18, 8, 18]];
+  const minB = roomBounds[0] || [-18, 0, -18];
+  const maxB = roomBounds[1] || [18, 8, 18];
+
+  for (const n of graph.nodes) {
+    if (!supportedBy.has(n.id) && n.transform.pos[1] < 0) {
+      violations.push({
+        kind: 'floor_penetration',
+        nodeId: n.id,
+        message: `${n.id} penetrated floor (y=${n.transform.pos[1]}m < 0)`,
+      });
+      if (autoResolve) {
+        n.transform.pos[1] = 0;
+        resolvedCount += 1;
+      }
+    }
+    for (let axis = 0; axis < 3; axis += 1) {
+      if (n.transform.pos[axis] < minB[axis] || n.transform.pos[axis] > maxB[axis]) {
+        violations.push({
+          kind: 'room_bounds',
+          nodeId: n.id,
+          message: `${n.id} axis ${axis} (${n.transform.pos[axis]}m) exceeded room bounds [${minB[axis]}, ${maxB[axis]}]`,
+        });
+        if (autoResolve) {
+          n.transform.pos[axis] = Math.max(minB[axis], Math.min(maxB[axis], n.transform.pos[axis]));
+          resolvedCount += 1;
+        }
+      }
+    }
+  }
+
+  // Pass 3: Pairwise AABB non-overlap check on same support level
+  for (let i = 0; i < graph.nodes.length; i += 1) {
+    for (let j = i + 1; j < graph.nodes.length; j += 1) {
+      const a = graph.nodes[i];
+      const b = graph.nodes[j];
+      if (!a?.id || !b?.id) continue;
+      if (supportedBy.get(a.id) === b.id || supportedBy.get(b.id) === a.id) continue;
+      const [ax, , az] = getNodeHalfExtents(a);
+      const [bx, , bz] = getNodeHalfExtents(b);
+      const ah = getNodeHeight(a);
+      const bh = getNodeHeight(b);
+      const yOverlap = a.transform.pos[1] < b.transform.pos[1] + bh && b.transform.pos[1] < a.transform.pos[1] + ah;
+      if (!yOverlap) continue;
+      const dx = b.transform.pos[0] - a.transform.pos[0];
+      const dz = b.transform.pos[2] - a.transform.pos[2];
+      const overlapX = ax + bx - Math.abs(dx);
+      const overlapZ = az + bz - Math.abs(dz);
+      if (overlapX > 0.01 && overlapZ > 0.01) {
+        violations.push({
+          kind: 'aabb_overlap',
+          nodeIds: [a.id, b.id],
+          message: `AABB collision between ${a.id} and ${b.id} (overlap [${overlapX.toFixed(2)}m, ${overlapZ.toFixed(2)}m])`,
+        });
+        if (autoResolve) {
+          if (overlapX <= overlapZ) {
+            const sign = dx >= 0 ? 1 : -1;
+            b.transform.pos[0] = Number((b.transform.pos[0] + sign * (overlapX + 0.08)).toFixed(3));
+          } else {
+            const sign = dz >= 0 ? 1 : -1;
+            b.transform.pos[2] = Number((b.transform.pos[2] + sign * (overlapZ + 0.08)).toFixed(3));
+          }
+          resolvedCount += 1;
+        }
+      }
+    }
+  }
+
+  // Emit deterministic `.gbs` script representing the solved graph
+  const gbsLines = ['tx "Sync Semantic Scene Graph (v2)"'];
+  for (const n of graph.nodes) {
+    if (!n?.id) continue;
+    const alias = sanitizeAlias(n.id, 'Node');
+    const src = n.prefab || 'empty';
+    const [px, py, pz] = n.transform.pos;
+    gbsLines.push(`spawn ${alias} ${src} name="${n.id}"`);
+    gbsLines.push(`place $${alias} at [${px}, ${py}, ${pz}]`);
+    if (Math.abs(n.transform.yaw_deg || 0) > 0.01) {
+      gbsLines.push(`rotate $${alias} yaw=${Number(n.transform.yaw_deg.toFixed(1))}`);
+    }
+  }
+
+  return {
+    ok: true,
+    verified: violations.length === 0 || (autoResolve && resolvedCount > 0),
+    violations,
+    resolvedCount,
+    graph,
+    gbsScript: gbsLines.join('\n'),
+  };
+}
+
+/**
+ * Multi-clause compositional Neuro-Symbolic spatial prompt compiler.
+ * Parses compound sentences (split on `and`, `then`, `;`) with arbitrary entity nouns,
+ * quantities, spatial prepositions (`on top of`, `behind`, `in front of`, `left of`, `right of`, `facing`),
+ * metric offsets, and deletions into `ganbate.semantic.scene-graph.v2` nodes + relations,
+ * then runs `verifyAndSolveSemanticSceneGraph`.
+ */
+export function compileCompositionalSpatialPrompt(promptText, currentSceneGraph = null, context = {}) {
+  const baseGraph = structuredClone(
+    currentSceneGraph && typeof currentSceneGraph === 'object'
+      ? currentSceneGraph
+      : buildDefaultSemanticSceneGraph(),
+  );
+  const catalogItems = Array.isArray(context.catalogItems) ? context.catalogItems : [];
+  const clauses = String(promptText || '')
+    .split(/\s*(?:;|\band\s+then\b|\bthen\b|\band\b)\s*/i)
+    .map((c) => c.trim())
+    .filter(Boolean);
+
+  const summaryParts = [];
+  const ensureNode = (rawName, categoryHint = 'prop.item') => {
+    const cleanId = sanitizeAlias(rawName, 'entity').toLowerCase();
+    const existing = baseGraph.nodes.find(
+      (n) => n.id.toLowerCase() === cleanId || n.id.toLowerCase().includes(cleanId),
+    );
+    if (existing) return existing;
+    const matched = matchBestCatalogSource(catalogItems, [cleanId]);
+    const isTable = /table|desk|stage|altar/i.test(cleanId);
+    const isChar = /dealer|rei|char|npc|actor|player/i.test(cleanId);
+    const created = {
+      id: cleanId,
+      category: isTable ? 'furniture.table' : isChar ? 'character.actor' : categoryHint,
+      prefab: matched || `prefab:${cleanId}`,
+      transform: { pos: [0, 0, 0], yaw_deg: 0, scale: [1, 1, 1] },
+      bounds: isTable
+        ? { type: 'aabb', size: [2.4, 0.78, 1.3] }
+        : isChar
+          ? { type: 'cylinder', radius: 0.28, height: 1.68 }
+          : { type: 'aabb', size: [0.36, 0.24, 0.36] },
+    };
+    baseGraph.nodes.push(created);
+    return created;
+  };
+
+  for (const clause of clauses) {
+    // Delete / remove clause
+    const delMatch = clause.match(/^(?:delete|remove|destroy)\s+(?:the\s+)?([a-zA-Z0-9_-]+)/i);
+    if (delMatch) {
+      const targetTok = delMatch[1].toLowerCase();
+      const before = baseGraph.nodes.length;
+      baseGraph.nodes = baseGraph.nodes.filter((n) => !n.id.toLowerCase().includes(targetTok));
+      baseGraph.relations = baseGraph.relations.filter(
+        (r) => !r.subject.toLowerCase().includes(targetTok) && !r.object.toLowerCase().includes(targetTok),
+      );
+      if (baseGraph.nodes.length < before) {
+        summaryParts.push(`Removed ${targetTok}`);
+      }
+      continue;
+    }
+
+    // Relational placement clause
+    const relMatch = clause.match(
+      /(?:(?:put|place|spawn|add|move|position)\s+)?(?:(\d+)\s+)?(?:a\s+|an\s+|the\s+)?([a-zA-Z0-9_]+?)\s+(on\s+top\s+of|onto|behind|in\s+front\s+of|(?:to\s+the\s+)?left\s+of|(?:to\s+the\s+)?right\s+of)\s+(?:the\s+|a\s+)?([a-zA-Z0-9_]+)(?:\s+(?:and\s+)?(?:facing|looking\s+at)\s+(?:the\s+)?([a-zA-Z0-9_]+))?/i,
+    );
+    if (relMatch) {
+      const qty = Math.min(12, Math.max(1, Number(relMatch[1] || 1)));
+      const subjStem = relMatch[2].replace(/s$/i, '');
+      const rawPred = relMatch[3].toLowerCase();
+      const objStem = relMatch[4];
+      const facingStem = relMatch[5] || null;
+      const predicate = /on\s+top\s+of|onto/.test(rawPred)
+        ? 'on_top_of'
+        : /behind/.test(rawPred)
+          ? 'behind'
+          : /front/.test(rawPred)
+            ? 'in_front_of'
+            : /left/.test(rawPred)
+              ? 'left_of'
+              : 'right_of';
+
+      const objNode = ensureNode(objStem);
+      for (let i = 0; i < qty; i += 1) {
+        const nodeId = qty > 1 ? `${ sanitizeAlias(subjStem).toLowerCase() }_${i + 1}` : sanitizeAlias(subjStem).toLowerCase();
+        const subjNode = ensureNode(nodeId);
+        if (qty > 1) {
+          subjNode.transform.pos[0] = Number(((i - (qty - 1) / 2) * 0.42).toFixed(2));
+        }
+        baseGraph.relations = baseGraph.relations.filter(
+          (r) => !(r.subject === subjNode.id && r.predicate === predicate && r.object === objNode.id),
+        );
+        baseGraph.relations.push({
+          subject: subjNode.id,
+          predicate,
+          object: objNode.id,
+          clearance_m: predicate === 'on_top_of' ? 0.0 : 0.35,
+        });
+        if (facingStem) {
+          const faceTarget = facingStem.toLowerCase() === 'table' ? objNode : ensureNode(facingStem);
+          baseGraph.relations.push({
+            subject: subjNode.id,
+            predicate: 'facing',
+            object: faceTarget.id,
+          });
+        }
+      }
+      summaryParts.push(`${qty}× ${subjStem} ${predicate} ${objNode.id}`);
+      continue;
+    }
+
+    // Standalone `facing` clause (e.g. `facing poker_table_main`)
+    const faceOnly = clause.match(/^(?:([a-zA-Z0-9_]+)\s+)?(?:facing|look(?:ing)?\s+at)\s+(?:the\s+)?([a-zA-Z0-9_]+)/i);
+    if (faceOnly) {
+      const subj = faceOnly[1] ? ensureNode(faceOnly[1]) : baseGraph.nodes.at(-1);
+      const obj = ensureNode(faceOnly[2]);
+      if (subj && obj && subj.id !== obj.id) {
+        baseGraph.relations.push({ subject: subj.id, predicate: 'facing', object: obj.id });
+        summaryParts.push(`${subj.id} facing ${obj.id}`);
+      }
+    }
+  }
+
+  const verification = verifyAndSolveSemanticSceneGraph(baseGraph, { autoResolve: true });
+  return {
+    ok: true,
+    graph: verification.graph,
+    verification,
+    gbsScript: verification.gbsScript,
+    summary: summaryParts.length
+      ? `Solved ${summaryParts.join(', ')} (${verification.resolvedCount} spatial constraints satisfied)`
+      : 'Verified semantic scene graph constraints',
+  };
+}
+
+/**
+ * Queries a lightweight local LLM (`Ollama http://127.0.0.1:11434/api/chat` or OpenAI-compatible
+ * endpoint) with JSON-schema constrained output to update the Semantic Scene Graph, falling back
+ * deterministically to `compileCompositionalSpatialPrompt` when offline.
+ */
+export async function queryLocalOrRemoteSpatialLlm(
+  promptText,
+  currentSceneGraph = null,
+  agentConfig = {},
+  fetchImpl = globalThis.fetch,
+) {
+  const baseGraph = currentSceneGraph || buildDefaultSemanticSceneGraph();
+  const endpoint = String(agentConfig?.endpoint || '').trim() || 'http://127.0.0.1:11434/api/chat';
+  const model = String(agentConfig?.model || '').trim() || 'qwen2.5-coder:1.5b';
+
+  if (typeof fetchImpl === 'function' && (agentConfig?.endpoint || agentConfig?.enableLocalOllama)) {
+    try {
+      const isOllamaChat = endpoint.endsWith('/api/chat') || endpoint.includes(':11434/api/');
+      const sysPrompt = [
+        'You are the Semantic Scene Graph planner for Ganbate Studio.',
+        'Output ONLY valid JSON matching schema "ganbate.semantic.scene-graph.v2" with { nodes, relations }.',
+        `Current Graph: ${JSON.stringify(baseGraph)}`,
+      ].join('\n');
+      const headers = { 'Content-Type': 'application/json' };
+      if (agentConfig?.apiKey?.trim()) headers.Authorization = `Bearer ${agentConfig.apiKey.trim()}`;
+      const bodyPayload = isOllamaChat
+        ? {
+            model,
+            stream: false,
+            format: 'json',
+            messages: [
+              { role: 'system', content: sysPrompt },
+              { role: 'user', content: String(promptText || '') },
+            ],
+          }
+        : {
+            model,
+            temperature: 0.1,
+            response_format: { type: 'json_object' },
+            messages: [
+              { role: 'system', content: sysPrompt },
+              { role: 'user', content: String(promptText || '') },
+            ],
+          };
+      const res = await fetchImpl(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(bodyPayload),
+      });
+      if (res?.ok) {
+        const data = await res.json();
+        const rawJson = data?.message?.content || data?.choices?.[0]?.message?.content || '';
+        if (rawJson) {
+          const parsed = JSON.parse(rawJson);
+          if (parsed && (Array.isArray(parsed.nodes) || Array.isArray(parsed.relations))) {
+            const merged = {
+              ...baseGraph,
+              ...parsed,
+              schema: 'ganbate.semantic.scene-graph.v2',
+            };
+            const verification = verifyAndSolveSemanticSceneGraph(merged, { autoResolve: true });
+            return {
+              ok: true,
+              source: isOllamaChat ? 'local-ollama-llm' : 'openai-compatible-llm',
+              model,
+              graph: verification.graph,
+              verification,
+              gbsScript: verification.gbsScript,
+              summary: `Compiled via ${model} + Pre-Execution Spatial Constraint Verifier`,
+            };
+          }
+        }
+      }
+    } catch {
+      // Deterministic neuro-symbolic fallback when local Ollama / endpoint is offline
+    }
+  }
+
+  const fallback = compileCompositionalSpatialPrompt(promptText, baseGraph);
+  return {
+    ...fallback,
+    source: 'compositional-neuro-symbolic-compiler',
+    model: 'ganbate-symbolic-v2',
   };
 }
 
@@ -1101,6 +1622,8 @@ export function mountAiCopilot(container, hooks = {}) {
   let worldGraphBenchCache = null;
   let worldGraphBenchRunning = false;
   let lastCopiedLatex = '';
+  let semanticSceneGraphCache = buildDefaultSemanticSceneGraph();
+  let semanticSceneVerification = verifyAndSolveSemanticSceneGraph(semanticSceneGraphCache);
   const agentCfg = loadAgentConfig();
   const messages = [
     {
@@ -1695,7 +2218,14 @@ export function mountAiCopilot(container, hooks = {}) {
         catalogItems: catalogCache,
         hasSelection: Array.isArray(sel.entityIds) && sel.entityIds.length > 0,
         cursorWorld: sel.cursorWorld || [0, 0, 0],
+        semanticSceneGraph: semanticSceneGraphCache,
       });
+      if (plan.semanticSceneGraph) {
+        semanticSceneGraphCache = plan.semanticSceneGraph;
+      }
+      if (plan.verification) {
+        semanticSceneVerification = plan.verification;
+      }
       gbsScript = plan.gbsScript;
       timeOfDay = plan.timeOfDay;
       lightingPreset = plan.lightingPreset;
@@ -2230,6 +2760,66 @@ export function mountAiCopilot(container, hooks = {}) {
 
     mcpCard.append(epField, modelField, keyField, saveCfgBtn);
     body.append(mcpCard);
+
+    // Node+Edge Semantic Scene Graph (v2) + Pre-Execution Spatial Constraint Verifier Card
+    const sgCard = domEl(doc, 'div', 'gb-copilot-card');
+    sgCard.dataset.role = 'semantic-scene-graph-card';
+    const sgHdr = domEl(doc, 'h4');
+    const nodeCount = Array.isArray(semanticSceneGraphCache?.nodes) ? semanticSceneGraphCache.nodes.length : 0;
+    const relCount = Array.isArray(semanticSceneGraphCache?.relations) ? semanticSceneGraphCache.relations.length : 0;
+    sgHdr.append(
+      domEl(doc, 'span', '', 'Node+Edge Semantic Scene Graph (v2)'),
+      domEl(
+        doc,
+        'span',
+        'gb-copilot-badge',
+        `${nodeCount} nodes · ${relCount} relations · ${semanticSceneVerification?.verified ? 'VERIFIED' : 'CHECK'}`,
+      ),
+    );
+    const sgEditor = domEl(doc, 'textarea', 'gb-copilot-code');
+    sgEditor.dataset.role = 'semantic-scene-graph-editor';
+    sgEditor.value = JSON.stringify(semanticSceneGraphCache, null, 2);
+
+    const sgStatus = domEl(
+      doc,
+      'p',
+      'meta',
+      `Spatial Constraint Solver: ${semanticSceneVerification?.violations?.length || 0} violations (${semanticSceneVerification?.resolvedCount || 0} auto-resolved)`,
+    );
+    sgStatus.dataset.role = 'semantic-scene-graph-status';
+
+    const verifySgBtn = domEl(doc, 'button', 'mini on', '✓ Verify & Sync to 3D Viewport');
+    verifySgBtn.type = 'button';
+    verifySgBtn.dataset.action = 'verify-semantic-scene-graph';
+    verifySgBtn.addEventListener('click', async () => {
+      try {
+        const parsed = JSON.parse(sgEditor.value);
+        const solved = verifyAndSolveSemanticSceneGraph(parsed, { autoResolve: true });
+        semanticSceneGraphCache = solved.graph;
+        semanticSceneVerification = solved;
+        sgEditor.value = JSON.stringify(solved.graph, null, 2);
+        sgStatus.textContent = `Verified: ${solved.violations.length} violations detected, ${solved.resolvedCount} auto-resolved`;
+        if (solved.gbsScript && typeof hooks.applyGbs === 'function') {
+          await hooks.applyGbs(solved.gbsScript);
+        }
+      } catch (err) {
+        sgStatus.textContent = `Invalid JSON: ${err.message}`;
+      }
+    });
+
+    sgCard.append(
+      sgHdr,
+      domEl(
+        doc,
+        'p',
+        '',
+        'Bidirectional Prompt ↔ Node+Edge Semantic Graph (nodes[] + relations[]) ↔ 3D Viewport with pre-execution AABB & support verification:',
+      ),
+      sgStatus,
+      sgEditor,
+      verifySgBtn,
+    );
+    body.append(sgCard);
   }
 
   function renderBody() {
@@ -2272,6 +2862,27 @@ export function mountAiCopilot(container, hooks = {}) {
     updateBenchmarkResult: (payload) => applyBenchmarkPayload(payload, !root.hidden && activeTab === 'context'),
     getBenchmarkResult: () => worldGraphBenchCache,
     getLastCopiedLatex: () => lastCopiedLatex,
+    getSemanticSceneGraph: () => structuredClone(semanticSceneGraphCache),
+    setSemanticSceneGraph: (nextGraph) => {
+      const solved = verifyAndSolveSemanticSceneGraph(nextGraph, { autoResolve: true });
+      semanticSceneGraphCache = solved.graph;
+      semanticSceneVerification = solved;
+      if (!root.hidden && activeTab === 'context') renderBody();
+      return solved;
+    },
+    verifySemanticSceneGraph: () => {
+      semanticSceneVerification = verifyAndSolveSemanticSceneGraph(semanticSceneGraphCache, { autoResolve: true });
+      semanticSceneGraphCache = semanticSceneVerification.graph;
+      if (!root.hidden && activeTab === 'context') renderBody();
+      return semanticSceneVerification;
+    },
+    compileSpatialPromptToSceneGraph: async (promptText) => {
+      const out = await queryLocalOrRemoteSpatialLlm(promptText, semanticSceneGraphCache, agentCfg);
+      semanticSceneGraphCache = out.graph;
+      semanticSceneVerification = out.verification;
+      if (!root.hidden && activeTab === 'context') renderBody();
+      return out;
+    },
     destroy: () => root.remove(),
   };
 

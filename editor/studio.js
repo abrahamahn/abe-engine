@@ -279,8 +279,8 @@ function onMessage(msg) {
         state.wanted = null;
       }
       if (state.wanted) state.host.send({ type: 'open', doc: state.wanted });
-      else if (asset && (asset.kind === 'scene' || asset.kind === 'prefab')) openDoc(asset.id);
-      else if (msg.project?.startup) openDoc(msg.project.startup);
+      else if (asset && (asset.kind === 'scene' || asset.kind === 'prefab')) openDoc(asset.id, { preserveWorkbench: Boolean(requestedTab) });
+      else if (msg.project?.startup) openDoc(msg.project.startup, { preserveWorkbench: Boolean(requestedTab) || state.activeWorkbench !== 'world' });
       if (state.inspectedData) watchData(state.inspectedData);
       else if (state.inspectedLook) watchLook(state.inspectedLook);
       else if (asset?.kind === 'look') inspectLook(asset.id);
@@ -532,7 +532,15 @@ function onMessage(msg) {
       // A new world replaces the simulated one; the simulation starts again only when asked.
       state.simulating = false;
       for (const w of msg.warnings || []) log(1, w);
-      loadWorld(msg).catch((e) => log(2, `viewport: ${e.message}`));
+      state.pendingCooked = msg;
+      if (state.activeWorkbench === 'world' || state.activeWorkbench === 'layout-rig' || state.activeWorkbench === 'material') {
+        if (state.host?.kind === 'cloud') {
+          drawCloudWorldPrompt();
+        } else {
+          state.pendingCooked = null;
+          loadWorld(msg).catch((e) => log(2, `viewport: ${e.message}`));
+        }
+      }
       break;
     case 'select':
       break;
@@ -602,10 +610,10 @@ function onMessage(msg) {
   }
 }
 
-function openDoc(id) {
+function openDoc(id, { preserveWorkbench = false } = {}) {
   state.inspectedLook = null;
   state.inspectedData = null;
-  if (state.activeWorkbench !== 'world' && state.activeWorkbench !== 'layout-rig') {
+  if (!preserveWorkbench && state.activeWorkbench !== 'world' && state.activeWorkbench !== 'layout-rig') {
     void activateWorkbench('world');
   }
   if (state.doc && state.doc.id !== id) {
@@ -743,8 +751,9 @@ function inspectData(id, focusPath = null) {
   scheduleSelectionSync();
 }
 function previewLook() {
-  const look = state.looks.get(previewLookId())?.root || {};
-  const env = lookAsset();
+  const lookId = previewLookId();
+  const look = state.looks.get(lookId)?.root || state.host?.getCachedDocRoot?.(lookId) || {};
+  const env = lookAsset() || state.doc?.root?.environment || null;
   // A scene may override the hour and preset while retaining the Look's weather parameters.
   const result = { ...look };
   if (env?.time !== undefined) result.time = { ...look.time, hours: env.time };
@@ -792,7 +801,40 @@ function setTime(hours) {
   pieViewport?.notifyEnvironmentChanged();
 }
 
+function drawCloudWorldPrompt() {
+  const host = $('#viewport');
+  if (!host || state.engine || !state.pendingCooked) {
+    $('#cloud-world-prompt')?.remove();
+    return;
+  }
+  if ($('#cloud-world-prompt')) return;
+  const promptEl = el('div', { id: 'cloud-world-prompt', class: 'cloud-world-prompt' },
+    el('strong', {}, 'Yozakura 3D Stage & World'),
+    el('span', {}, 'Scene entities, Look lighting, and Data schemas are active in the Outliner & Inspector.'),
+    el('div', { class: 'cloud-world-prompt-actions' },
+      el('button', {
+        type: 'button',
+        class: 'on',
+        onclick: () => { void activateWorkbench('project:layout-tuner'); },
+      }, 'Table Layouts (2.5D / 3D)'),
+      el('button', {
+        type: 'button',
+        onclick: () => {
+          const cookedToLoad = state.pendingCooked;
+          state.pendingCooked = null;
+          $('#cloud-world-prompt')?.remove();
+          if (cookedToLoad) {
+            loadWorld(cookedToLoad).catch((e) => log(2, `viewport: ${e.message}`));
+          }
+        },
+      }, 'Load 3D World Viewport'),
+    ),
+  );
+  host.append(promptEl);
+}
+
 async function loadWorld(cooked) {
+  $('#cloud-world-prompt')?.remove();
   // Cooks can arrive while an earlier one is still loading: only the newest load shows its
   // world, and every engine a newer load replaces or overtakes is destroyed.
   const gen = ++state.loadGen;
@@ -821,9 +863,11 @@ async function loadWorld(cooked) {
     wasm: wasmUrl,
     world: worldUrl,
     look,
+    ...(state.host?.kind === 'cloud' ? { quality: 'low-cost' } : {}),
     onLog: (level, text) => log(level, `engine: ${text}`),
   });
-  if (gen !== state.loadGen) {
+  if (gen !== state.loadGen || (state.activeWorkbench !== 'world' && state.activeWorkbench !== 'layout-rig' && state.activeWorkbench !== 'material')) {
+    state.pendingCooked = cooked;
     engine.destroy();
     return;
   }
@@ -1163,7 +1207,8 @@ function drawSimulateButton() {
 }
 
 function renderLoop(t) {
-  if ($('#project-tool-panel').open || $('#viewport').hidden || document.body.classList.contains('workbench-active')) {
+  const splitViewport = document.body.classList.contains('workbench-split-viewport');
+  if ($('#project-tool-panel').open || $('#viewport').hidden || (document.body.classList.contains('workbench-active') && !splitViewport)) {
     state.simClock = t;
     state.last = t;
     requestAnimationFrame(renderLoop);
@@ -1795,7 +1840,13 @@ function currentTableLayoutTools() {
   const studioOrigin = typeof location !== 'undefined' ? location.origin : null;
   if (allowSameOrigin && studioOrigin) {
     return resolveTableLayoutTools([
-      { id: 'studio-tool-anchor', label: 'Studio Tool', href: `${studioOrigin}/__studio-tool/layout-tuner` },
+      {
+        id: 'layout-tuner',
+        label: '2.5D Table Layout',
+        href: `${studioOrigin}/__studio-tool/layout-tuner`,
+        embedHref: `${studioOrigin}/__studio-tool/layout-tuner?embed=studio`,
+        open: 'embed',
+      },
     ]);
   }
   return { layoutTuner: null, graphicsLayoutTuner: null };
@@ -2311,6 +2362,7 @@ const studioApi = {
     setPreviewLook: (look) => {
       if (state.engine && look) {
         try { state.engine.setLook(look); } catch { /* ignore */ }
+        markViewportDirty(4, 200);
       }
     },
   }),
@@ -2365,6 +2417,38 @@ function allWorkbenchDescriptors() {
   return list;
 }
 
+function isEngineTabActiveForWorkbench(wbId, activeWorkbench) {
+  if (activeWorkbench === wbId) return true;
+  if (typeof activeWorkbench !== 'string' || !activeWorkbench.startsWith('project:')) return false;
+  const gameplayTools = currentGameplayTools();
+  if (wbId === 'sequencer') {
+    return (
+      activeWorkbench === 'project:action-sequencer'
+      || activeWorkbench === 'project:motion-tuner'
+      || activeWorkbench === 'project:god-mode'
+      || Boolean(gameplayTools.actionSequencer && activeWorkbench === `project:${gameplayTools.actionSequencer.id}`)
+      || Boolean(gameplayTools.motionTuner && activeWorkbench === `project:${gameplayTools.motionTuner.id}`)
+      || Boolean(gameplayTools.godMode && activeWorkbench === `project:${gameplayTools.godMode.id}`)
+    );
+  }
+  if (wbId === 'audio') {
+    return (
+      activeWorkbench === 'project:audio-mixer'
+      || Boolean(gameplayTools.audioMixer && activeWorkbench === `project:${gameplayTools.audioMixer.id}`)
+    );
+  }
+  if (wbId === 'layout-rig') {
+    const tableTools = currentTableLayoutTools();
+    return (
+      activeWorkbench === 'project:layout-tuner'
+      || activeWorkbench === 'project:graphics-layout-tuner'
+      || Boolean(tableTools.layoutTuner && activeWorkbench === `project:${tableTools.layoutTuner.id}`)
+      || Boolean(tableTools.graphicsLayoutTuner && activeWorkbench === `project:${tableTools.graphicsLayoutTuner.id}`)
+    );
+  }
+  return false;
+}
+
 function drawWorkspaceTabs() {
   const bar = $('#workspace-tabs');
   if (!bar) return;
@@ -2372,7 +2456,7 @@ function drawWorkspaceTabs() {
   const tierRule = UX_TIERS[tierId] || UX_TIERS.engineer;
   bar.replaceChildren();
   for (const wb of allWorkbenchDescriptors()) {
-    const active = state.activeWorkbench === wb.id;
+    const active = isEngineTabActiveForWorkbench(wb.id, state.activeWorkbench);
     const hiddenByTier = Boolean(
       tierRule.visibleEngineTabs && !tierRule.visibleEngineTabs.has(wb.id) && !active,
     );
@@ -2465,8 +2549,17 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
 
   if (workbenchId === 'world' || workbenchId === 'layout-rig') {
     state.activeWorkbench = workbenchId;
-    document.body.classList.remove('workbench-active');
+    document.body.classList.remove('workbench-active', 'workbench-split-viewport');
     if (deck) deck.hidden = true;
+    if (state.pendingCooked && state.pendingCooked.doc === state.doc?.id && !state.engine) {
+      if (state.host?.kind === 'cloud') {
+        drawCloudWorldPrompt();
+      } else {
+        const cookedToLoad = state.pendingCooked;
+        state.pendingCooked = null;
+        loadWorld(cookedToLoad).catch((e) => log(2, `viewport: ${e.message}`));
+      }
+    }
     gameplaySwitcher.draw();
     pieViewport.syncStageVisibility();
     markViewportDirty(6, 300);
@@ -2485,8 +2578,16 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
   }
 
   state.activeWorkbench = workbenchId;
+  if (workbenchId !== 'material') state.loadGen++;
   document.body.classList.add('workbench-active');
+  document.body.classList.toggle('workbench-split-viewport', workbenchId === 'material');
   pieViewport.syncStageVisibility();
+  if (workbenchId === 'material') {
+    if (state.pendingCooked && state.pendingCooked.doc === state.doc?.id && !state.engine) {
+      if (state.host?.kind === 'cloud') drawCloudWorldPrompt();
+    }
+    markViewportDirty(6, 300);
+  }
   layoutRig.draw();
   if (deck) deck.hidden = false;
   for (const child of deck ? [...deck.children] : []) {
@@ -2497,13 +2598,27 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
     const toolId = workbenchId.slice('project:'.length);
     const tableTools = currentTableLayoutTools();
     const gameplayTools = currentGameplayTools();
+    const bootstrapTools = Array.isArray(window.__GANBATE_CLOUD_BOOTSTRAP__?.cloudToolsManifest?.tools)
+      ? window.__GANBATE_CLOUD_BOOTSTRAP__.cloudToolsManifest.tools
+      : [];
+    const bootstrapMatch = bootstrapTools.find((item) => item?.id === toolId && item?.open === 'embed');
+    const fallbackCloudTool = state.host?.kind === 'cloud' && typeof location !== 'undefined' && toolId !== 'studio-tool-anchor'
+      ? {
+          id: toolId,
+          label: bootstrapMatch?.label || toolId,
+          href: `${location.origin}${bootstrapMatch?.path || `/__studio-tool/${toolId}`}`,
+          embedHref: `${location.origin}${bootstrapMatch?.path || `/__studio-tool/${toolId}`}?embed=studio`,
+          open: 'embed',
+        }
+      : null;
     const tool = state.projectWorkbenches.find((item) => item.id === toolId)
       || (toolId === 'layout-tuner' || tableTools.layoutTuner?.id === toolId ? tableTools.layoutTuner : null)
       || (toolId === 'graphics-layout-tuner' || tableTools.graphicsLayoutTuner?.id === toolId ? tableTools.graphicsLayoutTuner : null)
       || (toolId === 'motion-tuner' || gameplayTools.motionTuner?.id === toolId ? gameplayTools.motionTuner : null)
       || (toolId === 'action-sequencer' || gameplayTools.actionSequencer?.id === toolId ? gameplayTools.actionSequencer : null)
       || (toolId === 'god-mode' || gameplayTools.godMode?.id === toolId ? gameplayTools.godMode : null)
-      || (toolId === 'audio-mixer' || gameplayTools.audioMixer?.id === toolId ? gameplayTools.audioMixer : null);
+      || (toolId === 'audio-mixer' || gameplayTools.audioMixer?.id === toolId ? gameplayTools.audioMixer : null)
+      || fallbackCloudTool;
     if (!tool) {
       await activateWorkbench('world');
       return;
@@ -2514,10 +2629,11 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
     const is3dTableTool = Boolean(tableTools.graphicsLayoutTuner && tool.href === tableTools.graphicsLayoutTuner.href);
     let rec = mountedWorkbenches.get(canonicalPaneId);
     if (!rec && deck) {
+      const embedSrc = tool.embedHref || `${tool.href}${tool.href.includes('?') ? '&' : '?'}embed=studio`;
       const frame = el('iframe', {
         class: 'project-workbench-frame',
         title: tool.label,
-        src: tool.embedHref,
+        src: embedSrc,
         referrerpolicy: 'no-referrer',
         sandbox: 'allow-forms allow-scripts allow-same-origin allow-downloads allow-popups',
       });
@@ -3548,6 +3664,137 @@ function commands() {
       resizer.addEventListener('pointercancel', onUp);
     });
   }
+  const worldMain = $('#world-workspace');
+  const leftPane = $('#left');
+  const rightPane = $('#right');
+  const previewFrame = $('#preview-frame');
+  if (worldMain && leftPane && rightPane && previewFrame && !$('#left-resizer')) {
+    try {
+      const savedLeft = localStorage.getItem('ganbate.studio.leftWidth');
+      if (savedLeft && /^\d+px$/.test(savedLeft)) {
+        document.documentElement.style.setProperty('--left-width', savedLeft);
+      }
+      const savedRight = localStorage.getItem('ganbate.studio.rightWidth');
+      if (savedRight && /^\d+px$/.test(savedRight)) {
+        document.documentElement.style.setProperty('--right-width', savedRight);
+      }
+    } catch { /* ignore */ }
+    const leftResizer = el('div', {
+      id: 'left-resizer',
+      class: 'studio-col-resizer',
+      'data-testid': 'studio-left-resizer',
+      role: 'separator',
+      'aria-orientation': 'vertical',
+      title: 'Drag to resize Outliner / 3D Viewport width',
+    });
+    const rightResizer = el('div', {
+      id: 'right-resizer',
+      class: 'studio-col-resizer',
+      'data-testid': 'studio-right-resizer',
+      role: 'separator',
+      'aria-orientation': 'vertical',
+      title: 'Drag to resize 3D Viewport / Inspector width',
+    });
+    worldMain.insertBefore(leftResizer, previewFrame);
+    worldMain.insertBefore(rightResizer, rightPane);
+    worldMain.classList.add('has-col-resizers');
+    leftResizer.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      leftResizer.setPointerCapture(e.pointerId);
+      leftResizer.classList.add('dragging');
+      const onMove = (ev) => {
+        const rect = worldMain.getBoundingClientRect();
+        const maxW = Math.max(200, Math.round(rect.width * 0.45));
+        const w = Math.max(140, Math.min(maxW, Math.round(ev.clientX - rect.left)));
+        document.documentElement.style.setProperty('--left-width', `${w}px`);
+        markViewportDirty(2, 60);
+      };
+      const onUp = () => {
+        leftResizer.classList.remove('dragging');
+        leftResizer.removeEventListener('pointermove', onMove);
+        leftResizer.removeEventListener('pointerup', onUp);
+        leftResizer.removeEventListener('pointercancel', onUp);
+        const cur = document.documentElement.style.getPropertyValue('--left-width');
+        if (cur) {
+          try { localStorage.setItem('ganbate.studio.leftWidth', cur); } catch { /* ignore */ }
+        }
+      };
+      leftResizer.addEventListener('pointermove', onMove);
+      leftResizer.addEventListener('pointerup', onUp);
+      leftResizer.addEventListener('pointercancel', onUp);
+    });
+    rightResizer.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      rightResizer.setPointerCapture(e.pointerId);
+      rightResizer.classList.add('dragging');
+      const onMove = (ev) => {
+        const rect = worldMain.getBoundingClientRect();
+        const maxW = Math.max(220, Math.round(rect.width * 0.48));
+        const w = Math.max(160, Math.min(maxW, Math.round(rect.right - ev.clientX)));
+        document.documentElement.style.setProperty('--right-width', `${w}px`);
+        markViewportDirty(2, 60);
+      };
+      const onUp = () => {
+        rightResizer.classList.remove('dragging');
+        rightResizer.removeEventListener('pointermove', onMove);
+        rightResizer.removeEventListener('pointerup', onUp);
+        rightResizer.removeEventListener('pointercancel', onUp);
+        const cur = document.documentElement.style.getPropertyValue('--right-width');
+        if (cur) {
+          try { localStorage.setItem('ganbate.studio.rightWidth', cur); } catch { /* ignore */ }
+        }
+      };
+      rightResizer.addEventListener('pointermove', onMove);
+      rightResizer.addEventListener('pointerup', onUp);
+      rightResizer.addEventListener('pointercancel', onUp);
+    });
+  }
+  const consolePane = $('#console');
+  if (dock && consolePane && !$('#dock-col-resizer')) {
+    try {
+      const savedConsole = localStorage.getItem('ganbate.studio.consoleWidth');
+      if (savedConsole && /^\d+px$/.test(savedConsole)) {
+        document.documentElement.style.setProperty('--console-width', savedConsole);
+      }
+    } catch { /* ignore */ }
+    const dockColResizer = el('div', {
+      id: 'dock-col-resizer',
+      class: 'studio-col-resizer',
+      'data-testid': 'studio-dock-col-resizer',
+      role: 'separator',
+      'aria-orientation': 'vertical',
+      title: 'Drag to resize Content Browser / Console width',
+    });
+    dock.insertBefore(dockColResizer, consolePane);
+    dock.classList.add('has-col-resizers');
+    dockColResizer.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      dockColResizer.setPointerCapture(e.pointerId);
+      dockColResizer.classList.add('dragging');
+      const onMove = (ev) => {
+        const rect = dock.getBoundingClientRect();
+        const maxW = Math.max(220, Math.round(rect.width * 0.55));
+        const w = Math.max(160, Math.min(maxW, Math.round(rect.right - ev.clientX)));
+        document.documentElement.style.setProperty('--console-width', `${w}px`);
+      };
+      const onUp = () => {
+        dockColResizer.classList.remove('dragging');
+        dockColResizer.removeEventListener('pointermove', onMove);
+        dockColResizer.removeEventListener('pointerup', onUp);
+        dockColResizer.removeEventListener('pointercancel', onUp);
+        const cur = document.documentElement.style.getPropertyValue('--console-width');
+        if (cur) {
+          try { localStorage.setItem('ganbate.studio.consoleWidth', cur); } catch { /* ignore */ }
+        }
+      };
+      dockColResizer.addEventListener('pointermove', onMove);
+      dockColResizer.addEventListener('pointerup', onUp);
+      dockColResizer.addEventListener('pointercancel', onUp);
+    });
+  }
   $('#outliner-filter').oninput = drawOutliner;
   $('#time').oninput = (e) => setTime(Number(e.target.value));
   window.addEventListener('keydown', (e) => {
@@ -3622,6 +3869,10 @@ async function main() {
   inspectorEvents();
   requestAnimationFrame(renderLoop);
   const params = new URLSearchParams(location.search);
+  const initialTab = params.get('tab');
+  if (initialTab && initialTab !== 'world' && initialTab !== 'layout-rig') {
+    document.body.classList.add('workbench-active');
+  }
   const token = params.get('token');
   const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/ws${token ? `?token=${token}` : ''}`;
   state.host = createStudioHost(url, onMessage, (s) => {

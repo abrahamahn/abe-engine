@@ -66,6 +66,9 @@ function createFakeDocument() {
     click() {
       this.dispatchEvent('click');
     }
+    getBoundingClientRect() {
+      return { left: 0, top: 0, right: 600, bottom: 124, width: 600, height: 124 };
+    }
     append(...nodes) {
       for (const n of nodes) {
         if (n == null) continue;
@@ -463,5 +466,87 @@ test('hardware rotary knob and vertical fader support vertical drag, Shift 10x p
   assert.equal(loopBtn.getAttribute('aria-pressed'), 'false');
   loopBtn.click();
   assert.equal(container.queryByAttr('data-action', 'toggle-loop').getAttribute('aria-pressed'), 'true');
+  daw.destroy();
+});
+
+test('continuous multi-step mouse dragging on clips, resize/fade handles, contact line, slider bars, knobs, and faders preserves DOM identity mid-drag', () => {
+  const { doc, container } = createFakeDocument();
+  const daw = mountAudioDaw(container, {});
+
+  // 1. Timeline clip body move across multiple pointermove steps without detaching DOM node
+  const clipEl = container.queryByAttr('data-layer-id', 'lyr_contact');
+  assert.ok(clipEl, 'Contact foley clip bar rendered');
+  const origStart = daw.getState().root.events.evt_surface_hit.layers.lyr_contact.startMs;
+
+  clipEl.dispatchEvent('pointerdown', { clientX: 100, preventDefault() {} });
+  doc.dispatchEvent('pointermove', { clientX: 136 }); // +36px at 0.72 px/ms = +50ms
+  assert.equal(container.queryByAttr('data-layer-id', 'lyr_contact'), clipEl, 'clipEl stays mounted mid-drag');
+  assert.equal(daw.getState().root.events.evt_surface_hit.layers.lyr_contact.startMs, origStart + 50);
+
+  doc.dispatchEvent('pointermove', { clientX: 172 }); // +72px = +100ms
+  assert.equal(container.queryByAttr('data-layer-id', 'lyr_contact'), clipEl, 'clipEl stays mounted on 2nd move');
+  assert.equal(daw.getState().root.events.evt_surface_hit.layers.lyr_contact.startMs, origStart + 100);
+  doc.dispatchEvent('pointerup', {});
+  assert.equal(daw.getState().root.events.evt_surface_hit.layers.lyr_contact.startMs, origStart + 100);
+
+  // 2. Timeline clip right-edge resize handle drag
+  const clipAfterMove = container.queryByAttr('data-layer-id', 'lyr_contact');
+  const resizeRight = clipAfterMove.queryByAttr('data-clip-handle', 'right');
+  assert.ok(resizeRight, 'Right resize handle rendered on clip');
+  const origDur = daw.getState().root.events.evt_surface_hit.layers.lyr_contact.durationMs;
+
+  resizeRight.dispatchEvent('pointerdown', { clientX: 200, preventDefault() {} });
+  doc.dispatchEvent('pointermove', { clientX: 236 }); // +50ms
+  assert.equal(container.queryByAttr('data-layer-id', 'lyr_contact'), clipAfterMove, 'clip stays mounted during resize');
+  assert.equal(daw.getState().root.events.evt_surface_hit.layers.lyr_contact.durationMs, origDur + 50);
+  doc.dispatchEvent('pointerup', {});
+  assert.equal(daw.getState().root.events.evt_surface_hit.layers.lyr_contact.durationMs, origDur + 50);
+
+  // 3. Timeline clip fade-in handle drag
+  const clipAfterResize = container.queryByAttr('data-layer-id', 'lyr_contact');
+  const fadeInHandle = clipAfterResize.queryByAttr('data-clip-handle', 'fade-in');
+  assert.ok(fadeInHandle, 'Fade-in handle rendered on clip');
+  fadeInHandle.dispatchEvent('pointerdown', { clientX: 100, preventDefault() {} });
+  doc.dispatchEvent('pointermove', { clientX: 129 }); // +40ms
+  assert.equal(container.queryByAttr('data-layer-id', 'lyr_contact'), clipAfterResize);
+  assert.ok(daw.getState().root.events.evt_surface_hit.layers.lyr_contact.fadeInMs >= 40);
+  doc.dispatchEvent('pointerup', {});
+
+  // 4. Contact marker line direct drag across multiple pointermove steps
+  const contactLine = container.queryByAttr('data-role', 'contact-line');
+  assert.ok(contactLine, 'Contact marker line rendered');
+  contactLine.dispatchEvent('pointerdown', { clientX: 168 + 72, preventDefault() {} }); // 100ms
+  doc.dispatchEvent('pointermove', { clientX: 168 + 144 }); // 200ms
+  assert.equal(container.queryByAttr('data-role', 'contact-line'), contactLine, 'contactLine stays mounted mid-drag');
+  assert.equal(daw.getState().root.events.evt_surface_hit.contactMarkerMs, 200);
+  doc.dispatchEvent('pointerup', {});
+  assert.equal(daw.getState().root.events.evt_surface_hit.contactMarkerMs, 200);
+
+  // 5. DSP horizontal slider bar + EQ live curve update without DOM replacement mid-drag
+  // Switch inspector back to Master bus
+  const masterBusStrip = container.queryByAttr('data-bus-id', 'master');
+  masterBusStrip.queryByAttr('data-action', 'inspect-bus-master')?.click();
+  const midGainBar = container.queryByAttr('data-knob-bar', 'eq.midGainDb');
+  assert.ok(midGainBar, 'Draggable horizontal slider bar rendered for EQ Mid Gain');
+  midGainBar.dispatchEvent('pointerdown', { clientX: 50 });
+  midGainBar.value = '6';
+  midGainBar.dispatchEvent('input', { target: midGainBar });
+  assert.equal(container.queryByAttr('data-knob-bar', 'eq.midGainDb'), midGainBar, 'slider bar stays mounted mid-drag');
+  midGainBar.value = '9.5';
+  midGainBar.dispatchEvent('input', { target: midGainBar });
+  assert.equal(container.queryByAttr('data-knob-bar', 'eq.midGainDb'), midGainBar, 'slider bar stays mounted on 2nd input');
+  doc.dispatchEvent('pointerup', {});
+
+  // 6. Mixing Console vertical fader multi-step drag without DOM replacement mid-drag
+  const sfxFader = container.queryByAttr('data-fader-bus', 'sfx');
+  assert.ok(sfxFader, 'SFX vertical fader rendered');
+  sfxFader.dispatchEvent('pointerdown', { clientY: 60, shiftKey: false, preventDefault() {} });
+  doc.dispatchEvent('pointermove', { clientY: 40, shiftKey: false });
+  assert.equal(container.queryByAttr('data-fader-bus', 'sfx'), sfxFader, 'fader stays mounted mid-drag');
+  doc.dispatchEvent('pointermove', { clientY: 25, shiftKey: false });
+  assert.equal(container.queryByAttr('data-fader-bus', 'sfx'), sfxFader, 'fader stays mounted on 2nd move');
+  doc.dispatchEvent('pointerup', {});
+  assert.ok(daw.getState().root.buses.sfx.volume > 1.0);
+
   daw.destroy();
 });

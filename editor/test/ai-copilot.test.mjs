@@ -7,9 +7,11 @@ import {
   UX_TIERS,
   WORLD_GRAPH_PRESETS,
   applyOfflineWorldGraphPatch,
+  buildDefaultSemanticSceneGraph,
   buildDefaultWorldGraph,
   buildFallbackBenchmarkReport,
   buildFallbackProjectContext,
+  compileCompositionalSpatialPrompt,
   compileNaturalPromptToGbs,
   compileOfflineWorldGraphPrompt,
   computeWorldGraphSha256,
@@ -17,6 +19,8 @@ import {
   extractGbsFromLlmReply,
   formatWorldGraphSummary,
   mountAiCopilot,
+  queryLocalOrRemoteSpatialLlm,
+  verifyAndSolveSemanticSceneGraph,
 } from '../ai-copilot.js';
 
 function createMiniDom() {
@@ -577,4 +581,58 @@ test('Live ganbate://context Stage Director supports online RPC and offline mode
   assert.equal(offRedone.applied, true);
   assert.equal(offRedone.sha256, offSunsetSha);
   offCopilot.destroy();
+});
+
+test('Node+Edge Semantic Scene Graph (v2), Pre-Execution Spatial Constraint Verifier, and Local Ollama / Compositional Compiler work end-to-end', async () => {
+  const sg = buildDefaultSemanticSceneGraph();
+  assert.equal(sg.schema, 'ganbate.semantic.scene-graph.v2');
+  assert.equal(sg.nodes.length, 3);
+  assert.equal(sg.relations.length, 3);
+
+  const comp = compileCompositionalSpatialPrompt(
+    'Put 2 chip_stacks on top of poker_table_main and place dealer_rei behind poker_table_main facing the table',
+    sg,
+  );
+  assert.equal(comp.ok, true);
+  const stack1 = comp.graph.nodes.find((n) => n.id === 'chip_stack_1');
+  const stack2 = comp.graph.nodes.find((n) => n.id === 'chip_stack_2');
+  assert.ok(stack1 && stack2, 'spawned 2 chip_stack nodes');
+  assert.equal(stack1.transform.pos[1], 0.78, 'snapped onto poker_table_main top surface y=0.78m');
+  assert.equal(stack2.transform.pos[1], 0.78, 'snapped onto poker_table_main top surface y=0.78m');
+  assert.ok(Math.abs(stack1.transform.pos[0] - stack2.transform.pos[0]) >= 0.36, 'non-overlapping XZ separation');
+  assert.match(comp.gbsScript, /spawn chip_stack_1/);
+
+  // Test Local Ollama JSON-schema mocked response + pre-execution AABB & floor constraint verifier
+  const ollamaOut = await queryLocalOrRemoteSpatialLlm(
+    'Add a lantern on top of poker_table_main',
+    sg,
+    { enableLocalOllama: true, model: 'qwen2.5-coder:1.5b' },
+    async () => ({
+      ok: true,
+      json: async () => ({
+        message: {
+          content: JSON.stringify({
+            nodes: [
+              ...sg.nodes,
+              {
+                id: 'table_lantern',
+                category: 'prop.light',
+                prefab: 'prefab:lantern',
+                transform: { pos: [0, -0.5, 0], yaw_deg: 0, scale: [1, 1, 1] },
+                bounds: { type: 'aabb', size: [0.3, 0.4, 0.3] },
+              },
+            ],
+            relations: [
+              ...sg.relations,
+              { subject: 'table_lantern', predicate: 'on_top_of', object: 'poker_table_main' },
+            ],
+          }),
+        },
+      }),
+    }),
+  );
+  assert.equal(ollamaOut.source, 'local-ollama-llm');
+  const lantern = ollamaOut.graph.nodes.find((n) => n.id === 'table_lantern');
+  assert.equal(lantern.transform.pos[1], 0.78, 'verifier corrected y=-0.5 to table top y=0.78 before 3D execution');
+  assert.ok(verifyAndSolveSemanticSceneGraph(ollamaOut.graph).verified);
 });

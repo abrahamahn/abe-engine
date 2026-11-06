@@ -1667,13 +1667,8 @@ export function mountModelStudio(container, studioApi = {}) {
     });
   }
 
-  async function importCurrentStageModel() {
-    const p = state.primitive;
-    const bytes = state.sourceKind === 'primitive' ? buildPrimitiveGlb(p.kind, p) : state.rawBytes;
-    if (!bytes) return;
-    const cleanFolder = (p.targetFolder || 'content/models/graybox').replace(/^\/+|\/+$/g, '');
-    const stem = (p.name || `graybox_${p.kind}`).replace(/\.glb$/i, '').replace(/[^A-Za-z0-9_.-]+/g, '_');
-    const targetPath = `${cleanFolder}/${stem}.glb`;
+  async function importBytesToProject(targetPath, bytes, metaObj = state.meta) {
+    if (!bytes) return null;
     try {
       let importedId = null;
       if (typeof studioApi.importAsset === 'function') {
@@ -1687,7 +1682,7 @@ export function mountModelStudio(container, studioApi = {}) {
           type: 'asset-import',
           path: targetPath,
           dataBase64: b64,
-          meta: serializeModelMeta(state.meta),
+          meta: serializeModelMeta(metaObj),
         });
         importedId = res?.id || null;
       }
@@ -1696,14 +1691,78 @@ export function mountModelStudio(container, studioApi = {}) {
           type: 'asset-usage',
           op: 'meta-set',
           id: importedId,
-          meta: serializeModelMeta(state.meta),
+          meta: serializeModelMeta(metaObj),
         }).catch(() => {});
       }
       setStatus(`Imported ${targetPath}`, 'ok');
       studioApi.notify?.('info', `Imported ${targetPath}`);
       if (importedId) await inspectProjectAsset(importedId);
+      else renderLeftRail();
+      return importedId;
     } catch (err) {
       setStatus(`Import failed: ${err?.message || err}`, 'err');
+      return null;
+    }
+  }
+
+  async function createGrayboxModel() {
+    previewCurrentPrimitive();
+    const p = state.primitive;
+    const bytes = buildPrimitiveGlb(p.kind, p);
+    const cleanFolder = (p.targetFolder || 'content/models/graybox').replace(/^\/+|\/+$/g, '');
+    const stem = (p.name || `graybox_${p.kind}`).replace(/\.glb$/i, '').replace(/[^A-Za-z0-9_.-]+/g, '_');
+    const targetPath = `${cleanFolder}/${stem}.glb`;
+    await importBytesToProject(targetPath, bytes, state.meta);
+  }
+
+  async function importCurrentStageModel() {
+    if (state.sourceKind === 'primitive') {
+      await createGrayboxModel();
+      return;
+    }
+    const bytes = state.rawBytes;
+    if (!bytes) return;
+    const project = typeof studioApi.getProject === 'function' ? studioApi.getProject() : null;
+    const contentRoot = (project?.content?.[0] || 'content').replace(/^\/+|\/+$/g, '');
+    const rawName = state.selectedPath ? assetStem(state.selectedPath) : state.primitive.name;
+    const stem = (rawName || 'imported_model').replace(/\.glb$/i, '').replace(/[^A-Za-z0-9_.-]+/g, '_');
+    const targetPath = `${contentRoot}/models/${stem}.glb`;
+    await importBytesToProject(targetPath, bytes, state.meta);
+  }
+
+  async function handleLocalGlbFiles(fileList) {
+    const files = Array.from(fileList || []).filter((f) => f && typeof f.name === 'string');
+    if (!files.length) return;
+    const glbFiles = files.filter((f) => f.name.toLowerCase().endsWith('.glb'));
+    if (!glbFiles.length) {
+      setStatus('Please select or drop a binary .glb model file', 'err');
+      return;
+    }
+    const project = typeof studioApi.getProject === 'function' ? studioApi.getProject() : null;
+    const contentRoot = (project?.content?.[0] || 'content').replace(/^\/+|\/+$/g, '');
+    const canImportToHost = typeof studioApi.importAsset === 'function' || typeof studioApi.hostRequest === 'function';
+
+    for (const file of glbFiles) {
+      try {
+        const buf = typeof file.arrayBuffer === 'function' ? await file.arrayBuffer() : file.bytes;
+        if (!buf) continue;
+        const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+        const stem = (assetStem(file.name) || 'model').replace(/[^A-Za-z0-9_.-]+/g, '_');
+        const targetPath = `${contentRoot}/models/${stem}.glb`;
+        const defaultMeta = state.intake.normalizeOnIngest
+          ? { import: { pivot: 'bottom_center', scale: 1.0 } }
+          : { import: { pivot: 'origin', scale: 1.0 } };
+        const loaded = await loadBytesIntoStageAsync(u8, {
+          label: targetPath,
+          sourceKind: 'drop',
+          meta: defaultMeta,
+        });
+        if (loaded && canImportToHost) {
+          await importBytesToProject(targetPath, u8, state.meta);
+        }
+      } catch (err) {
+        setStatus(`Failed to read ${file.name}: ${err?.message || err}`, 'err');
+      }
     }
   }
 
@@ -1787,6 +1846,24 @@ export function mountModelStudio(container, studioApi = {}) {
 
   // ---- Build DOM Skeleton ---------------------------------------------------------------------
 
+  const fileInput = h('input', {
+    type: 'file',
+    accept: '.glb,model/gltf-binary',
+    multiple: 'multiple',
+    style: 'display:none',
+    onchange: async (ev) => {
+      const files = ev.target?.files;
+      if (files && files.length) {
+        await handleLocalGlbFiles(files);
+      }
+      if (ev.target) ev.target.value = '';
+    },
+  });
+
+  function triggerLocalGlbPicker() {
+    if (typeof fileInput.click === 'function') fileInput.click();
+  }
+
   const leftRail = h('aside', { class: 'ms-rail' });
   const toolbar = h('div', { class: 'ms-toolbar' });
   const canvas = h('canvas', { class: 'ms-canvas' });
@@ -1800,7 +1877,7 @@ export function mountModelStudio(container, studioApi = {}) {
   const statusBar = h('div', { class: 'ms-status' }, state.statusText);
   const rightInspector = h('aside', { class: 'ms-inspector' }, inspectorHeader, inspectorTabs, inspectorBody, statusBar);
 
-  const root = h('div', { class: 'ms-root', 'data-workbench': WORKBENCH_ID }, leftRail, stage, rightInspector);
+  const root = h('div', { class: 'ms-root', 'data-workbench': WORKBENCH_ID }, fileInput, leftRail, stage, rightInspector);
   container.replaceChildren ? container.replaceChildren(root) : (container.innerHTML = '', container.appendChild(root));
 
   function requestPaint() {
@@ -1905,14 +1982,23 @@ export function mountModelStudio(container, studioApi = {}) {
     const modelSection = h('div', { class: 'ms-section' },
       h('div', { class: 'ms-section-head' },
         h('span', {}, `Project Models (${state.models.length})`),
-        h('button', {
-          type: 'button',
-          class: 'ms-chip',
-          onclick: () => {
-            studioApi.rescanAssets?.();
-            renderLeftRail();
-          },
-        }, '↻'),
+        h('div', { style: 'display:flex;align-items:center;gap:4px' },
+          h('button', {
+            type: 'button',
+            class: 'ms-chip ms-btn-primary',
+            title: 'Upload a .glb model from your computer into content/models/',
+            onclick: triggerLocalGlbPicker,
+          }, '+ Upload .glb'),
+          h('button', {
+            type: 'button',
+            class: 'ms-chip',
+            title: 'Rescan project models',
+            onclick: () => {
+              studioApi.rescanAssets?.();
+              renderLeftRail();
+            },
+          }, '↻'),
+        ),
       ),
       h('div', { class: 'ms-list' },
         ...(state.models.length
@@ -1925,7 +2011,7 @@ export function mountModelStudio(container, studioApi = {}) {
               h('span', { class: 'ms-item-name' }, assetBasename(m.path)),
               h('span', { class: 'ms-item-sub' }, m.bytes ? formatBytes(m.bytes) : ''),
             ))
-          : [h('div', { class: 'ms-item-sub' }, 'No .glb models in content/ yet')]),
+          : [h('div', { class: 'ms-item-sub' }, 'No .glb models in content/ yet — click "+ Upload .glb" or drop a .glb file')]),
       ),
     );
 
@@ -1963,7 +2049,12 @@ export function mountModelStudio(container, studioApi = {}) {
       ),
       h('div', { class: 'ms-btn-row' },
         h('button', { type: 'button', class: 'ms-chip', onclick: previewCurrentPrimitive }, 'Preview'),
-        h('button', { type: 'button', class: 'ms-chip ms-btn-primary', onclick: importCurrentStageModel }, '+ Import .glb'),
+        h('button', {
+          type: 'button',
+          class: 'ms-chip ms-btn-primary',
+          title: 'Save this procedural graybox shape into content/models/graybox/',
+          onclick: createGrayboxModel,
+        }, '+ Create Graybox'),
       ),
     );
 
@@ -2366,19 +2457,16 @@ export function mountModelStudio(container, studioApi = {}) {
     requestPaint();
   }, { passive: false });
 
-  viewportWrap.addEventListener('dragover', (ev) => {
-    ev.preventDefault();
-    if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
-  });
-  viewportWrap.addEventListener('drop', async (ev) => {
-    ev.preventDefault();
-    const file = ev.dataTransfer?.files?.[0];
-    if (file && file.name.toLowerCase().endsWith('.glb')) {
-      const buf = await file.arrayBuffer();
-      state.primitive.name = assetStem(file.name) || 'dropped_model';
-      await loadBytesIntoStageAsync(buf, { label: file.name, sourceKind: 'drop' });
-    }
-  });
+  for (const dropZone of [viewportWrap, leftRail]) {
+    dropZone.addEventListener('dragover', (ev) => {
+      ev.preventDefault();
+      if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+    });
+    dropZone.addEventListener('drop', async (ev) => {
+      ev.preventDefault();
+      await handleLocalGlbFiles(ev.dataTransfer?.files);
+    });
+  }
 
   // Subscribe to Studio events when available
   if (typeof studioApi.on === 'function') {
@@ -2445,6 +2533,7 @@ export function mountModelStudio(container, studioApi = {}) {
       state.turntableOn = false;
     },
     inspectAsset: inspectProjectAsset,
+    uploadFiles: handleLocalGlbFiles,
     previewBytes(bytes, label = 'preview.glb') {
       return loadBytesIntoStage(bytes, { label, sourceKind: 'drop' });
     },

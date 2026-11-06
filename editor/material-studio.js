@@ -6,12 +6,42 @@
 export const REFERENCE_EV100 = 13.0;
 
 export const SURFACE_MODELS = Object.freeze([
-  { id: 'stylized_ramp', label: 'Stylized Ramp (Soft Cel)' },
-  { id: 'stylized_character', label: 'Stylized Character (Anime / Banded)' },
-  { id: 'standard_ggx', label: 'Standard GGX (Photoreal PBR)' },
-  { id: 'clearcoat', label: 'ClearCoat (Lacquer / Ceramic)' },
-  { id: 'charlie_cloth', label: 'Charlie Cloth (Velvet / Woven)' },
-  { id: 'subsurface_skin', label: 'Subsurface Skin (Organic / Jade)' },
+  {
+    id: 'stylized_ramp',
+    label: 'Stylized Ramp (Soft Cel)',
+    summary: 'Art-directed light-to-shadow ramp with controllable band center, softness, and silhouette rim light for stylized 3D environments.',
+    fields: ['rampCenter', 'rampSoftness', 'rimStrength'],
+  },
+  {
+    id: 'stylized_character',
+    label: 'Stylized Character (Anime / Banded)',
+    summary: 'Expressive character shader combining cel shadow banding, warm subsurface skin scatter, specular gloss, and rim lighting for 3D cast models.',
+    fields: ['rampCenter', 'rampSoftness', 'rimStrength', 'subsurface', 'subsurfaceColorHex', 'clearcoat', 'clearcoatRoughness'],
+  },
+  {
+    id: 'standard_ggx',
+    label: 'Standard GGX (Photoreal PBR)',
+    summary: 'Physically-based microfacet surface for metals, stone, wood, and painted props using Base Albedo, Roughness, Metallic, and Normal Strength.',
+    fields: [],
+  },
+  {
+    id: 'clearcoat',
+    label: 'ClearCoat (Lacquer / Ceramic)',
+    summary: 'Dual-layer surface with a glossy transparent varnish coat over a base material — ideal for lacquered table rails, polished wood, and ceramic tokens.',
+    fields: ['clearcoat', 'clearcoatRoughness'],
+  },
+  {
+    id: 'charlie_cloth',
+    label: 'Charlie Cloth (Velvet / Woven)',
+    summary: 'Micro-fiber sheen BRDF that produces soft grazing highlights across table baize/felt, velvet cushions, and woven garments.',
+    fields: ['sheen', 'sheenTint'],
+  },
+  {
+    id: 'subsurface_skin',
+    label: 'Subsurface Skin (Organic / Jade)',
+    summary: 'Translucent scattering surface where light wraps softly through skin, jade, wax, porcelain, or warm paper lanterns.',
+    fields: ['subsurface', 'subsurfaceColorHex'],
+  },
 ]);
 
 export const TONEMAP_MODES = Object.freeze([
@@ -24,6 +54,7 @@ export const MATERIAL_PRESETS = Object.freeze([
   {
     id: 'polished_lacquer',
     label: 'Polished Lacquer',
+    usage: 'Table Rails, Wood & Ceramic',
     name: 'polished_lacquer',
     surface: 'clearcoat',
     baseColorHex: '#7a1612',
@@ -41,6 +72,7 @@ export const MATERIAL_PRESETS = Object.freeze([
   {
     id: 'brushed_brass',
     label: 'Brushed Brass',
+    usage: 'Metal Trim, Coins & Lanterns',
     name: 'brushed_brass',
     surface: 'standard_ggx',
     baseColorHex: '#d8ad54',
@@ -58,6 +90,7 @@ export const MATERIAL_PRESETS = Object.freeze([
   {
     id: 'woven_velvet',
     label: 'Woven Velvet',
+    usage: 'Table Baize, Felt & Cloth',
     name: 'woven_velvet',
     surface: 'charlie_cloth',
     baseColorHex: '#233a66',
@@ -75,6 +108,7 @@ export const MATERIAL_PRESETS = Object.freeze([
   {
     id: 'subsurface_porcelain',
     label: 'Subsurface Porcelain',
+    usage: 'Skin, Jade & Paper Lanterns',
     name: 'subsurface_porcelain',
     surface: 'subsurface_skin',
     baseColorHex: '#ede3d5',
@@ -92,6 +126,7 @@ export const MATERIAL_PRESETS = Object.freeze([
   {
     id: 'cel_character',
     label: 'Cel Character',
+    usage: '3D Cast & Stylized Avatars',
     name: 'cel_character',
     surface: 'stylized_character',
     baseColorHex: '#e87a64',
@@ -109,6 +144,7 @@ export const MATERIAL_PRESETS = Object.freeze([
   {
     id: 'painterly_stone',
     label: 'Painterly Stone',
+    usage: 'Environment & Architecture',
     name: 'painterly_stone',
     surface: 'stylized_ramp',
     baseColorHex: '#7d8078',
@@ -128,7 +164,6 @@ export const MATERIAL_PRESETS = Object.freeze([
 const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 const mix = (a, b, t) => a + (b - a) * t;
 const mix3 = (a, b, t) => [mix(a[0], b[0], t), mix(a[1], b[1], t), mix(a[2], b[2], t)];
-const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 const norm3 = (v) => {
   const len = Math.hypot(v[0], v[1], v[2]) || 1;
   return [v[0] / len, v[1] / len, v[2] / len];
@@ -312,6 +347,8 @@ function prepareBrdfParams(rawState = {}) {
   };
 }
 
+const SCRATCH_MAPPED = [0, 0, 0];
+
 function evaluatePreparedBrdfPixel(nx, ny, nz, p, outBuf, offset) {
   const invLen = 1 / (Math.hypot(nx, ny, nz) || 1);
   const n0 = nx * invLen;
@@ -399,8 +436,6 @@ function evaluatePreparedBrdfPixel(nx, ny, nz, p, outBuf, offset) {
       }
     }
   }
-
-const SCRATCH_MAPPED = [0, 0, 0];
 
   tonemapRgbInto(
     (hdr[0] + p.emissive[0]) * p.exposure,
@@ -544,7 +579,7 @@ const LABELS = Object.freeze({
   materialStudioTitle: 'Material & Surface Lab',
   materialDoc: 'Material Asset',
   newMaterial: 'New Material',
-  presets: 'Surface Presets',
+  presets: 'Surface Presets (3D Game Surfaces)',
   surfaceModel: 'Surface Response (BRDF)',
   baseColor: 'Base Albedo',
   roughness: 'Roughness',
@@ -570,6 +605,208 @@ const LABELS = Object.freeze({
   save: 'Save',
 });
 
+const MATERIAL_STUDIO_CSS = `
+.ganbate-material-studio {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px 20px;
+  height: 100%;
+  overflow-y: auto;
+  background: #14161b;
+  color: var(--text, #d9dce3);
+}
+.ganbate-material-studio .material-studio-header {
+  margin: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line, #2c2f36);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ganbate-material-studio .material-studio-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ganbate-material-studio .material-studio-subtitle {
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--dim, #8a909c);
+}
+.ganbate-material-studio .material-studio-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.ganbate-material-studio .material-studio-card {
+  background: var(--panel, #1e2025);
+  border: 1px solid var(--line, #2c2f36);
+  border-radius: 7px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ganbate-material-studio .material-studio-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  padding-bottom: 6px;
+}
+.ganbate-material-studio .material-studio-card-head strong {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #f3f5f8;
+}
+.ganbate-material-studio .material-studio-badge {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(232, 180, 74, 0.14);
+  border: 1px solid rgba(232, 180, 74, 0.42);
+  color: var(--accent, #e8b44a);
+  font-weight: 600;
+}
+.ganbate-material-studio .material-studio-hero {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr);
+  gap: 12px;
+  align-items: stretch;
+}
+@media (max-width: 640px) {
+  .ganbate-material-studio .material-studio-hero {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.ganbate-material-studio .material-studio-preview-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px;
+  border-radius: 7px;
+  background: #0f1116;
+  border: 1px solid var(--line, #2c2f36);
+}
+.ganbate-material-studio .material-studio-ball {
+  width: 108px;
+  height: 108px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+.ganbate-material-studio .material-studio-ev {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--accent, #e8b44a);
+  white-space: nowrap;
+}
+.ganbate-material-studio .material-studio-light-pills {
+  display: flex;
+  gap: 3px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.ganbate-material-studio .material-studio-light-pills button.mini {
+  margin: 0;
+  font-size: 10.5px;
+  padding: 2px 5px;
+}
+.ganbate-material-studio .material-studio-presets {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+  gap: 6px;
+}
+.ganbate-material-studio .material-preset-btn {
+  margin: 0;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  border-radius: 6px;
+  background: #16181e;
+  border: 1px solid var(--line, #2c2f36);
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.ganbate-material-studio .material-preset-btn.on {
+  background: rgba(232, 180, 74, 0.14);
+  border-color: var(--accent, #e8b44a);
+  color: #fff;
+}
+.ganbate-material-studio .material-preset-top {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.ganbate-material-studio .material-preset-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  flex: none;
+}
+.ganbate-material-studio .material-preset-usage {
+  font-size: 10.5px;
+  color: var(--dim, #8a909c);
+  font-weight: 400;
+}
+.ganbate-material-studio .material-studio-guide {
+  padding: 7px 10px;
+  border-radius: 5px;
+  background: rgba(122, 162, 247, 0.08);
+  border: 1px solid rgba(122, 162, 247, 0.28);
+  font-size: 11.5px;
+  color: #c8d6f5;
+  line-height: 1.4;
+}
+.ganbate-material-studio .field {
+  display: grid;
+  grid-template-columns: 145px minmax(0, 1fr) 54px;
+  gap: 8px;
+  align-items: center;
+  margin: 2px 0;
+}
+.ganbate-material-studio .field.field-select,
+.ganbate-material-studio .field.field-color {
+  grid-template-columns: 145px minmax(0, 1fr);
+}
+.ganbate-material-studio .field.is-hidden {
+  display: none !important;
+}
+.ganbate-material-studio .field input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent, #e8b44a);
+}
+.ganbate-material-studio .material-studio-val {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--dim, #8a909c);
+  text-align: right;
+}
+.ganbate-material-studio .material-studio-scene-entities {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.ganbate-material-studio .material-studio-scene-entities button.mini {
+  margin: 0;
+}
+`;
+
 function makeEl(doc, tag, attrs = {}, ...children) {
   const node = doc.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -586,9 +823,17 @@ function makeEl(doc, tag, attrs = {}, ...children) {
   return node;
 }
 
+function ensureMaterialStudioStyles(ownerDoc) {
+  if (!ownerDoc?.head || typeof ownerDoc.querySelector !== 'function') return;
+  if (ownerDoc.querySelector('style[data-material-studio-style="1"]')) return;
+  const styleEl = makeEl(ownerDoc, 'style', { 'data-material-studio-style': '1' }, MATERIAL_STUDIO_CSS);
+  ownerDoc.head.append(styleEl);
+}
+
 export function mountMaterialStudio(container, studioApi = {}) {
   if (!container) throw new Error('mountMaterialStudio requires a container element.');
   const ownerDoc = container.ownerDocument || globalThis.document;
+  ensureMaterialStudioStyles(ownerDoc);
   const tr = (key) => {
     const fromHost = studioApi?.t?.(key);
     if (fromHost && fromHost !== key) return fromHost;
@@ -598,8 +843,11 @@ export function mountMaterialStudio(container, studioApi = {}) {
   let state = defaultLabState();
   let activeDocId = null;
   let activeDocPath = null;
+  let showAllChannels = false;
   const unsubs = [];
   const controls = new Map();
+  const fieldRows = new Map();
+  const presetBtns = new Map();
 
   const root = makeEl(ownerDoc, 'div', { class: 'ganbate-material-studio', 'data-workbench': 'material-studio' });
   const previewCanvas = makeEl(ownerDoc, 'canvas', {
@@ -610,6 +858,9 @@ export function mountMaterialStudio(container, studioApi = {}) {
   });
   const evReadout = makeEl(ownerDoc, 'span', { class: 'material-studio-ev', 'data-key': 'ev100-readout' });
   const docSelect = makeEl(ownerDoc, 'select', { 'aria-label': tr('materialDoc'), class: 'material-studio-doc-select' });
+  const activeTargetBadge = makeEl(ownerDoc, 'span', { class: 'material-studio-badge', 'data-key': 'target-badge' });
+  const surfaceGuideBox = makeEl(ownerDoc, 'div', { class: 'material-studio-guide', 'data-key': 'surface-guide' });
+  const sceneEntitiesRow = makeEl(ownerDoc, 'div', { class: 'material-studio-scene-entities', 'data-key': 'scene-entities' });
 
   function paintPreview() {
     const w = Number(previewCanvas.width) || 96;
@@ -629,8 +880,43 @@ export function mountMaterialStudio(container, studioApi = {}) {
     evReadout.textContent = `EV100 ${ev.toFixed(2)} (${scale.toFixed(2)}x)`;
   }
 
+  function syncContextualUi() {
+    const modelMeta = SURFACE_MODELS.find((m) => m.id === state.surface) || SURFACE_MODELS[0];
+    surfaceGuideBox.textContent = modelMeta.summary || '';
+    activeTargetBadge.textContent = activeDocPath
+      ? `Editing Asset: ${activeDocPath}`
+      : 'Live 3D Scene Look + Shader Preview';
+
+    const activeFields = new Set(modelMeta.fields || []);
+    const conditionalKeys = [
+      'clearcoat',
+      'clearcoatRoughness',
+      'sheen',
+      'sheenTint',
+      'subsurface',
+      'subsurfaceColorHex',
+      'rampCenter',
+      'rampSoftness',
+      'rimStrength',
+    ];
+    for (const key of conditionalKeys) {
+      const row = fieldRows.get(key);
+      if (!row) continue;
+      const visible = showAllChannels || activeFields.has(key);
+      row.hidden = !visible;
+      row.className = `field${key.endsWith('Hex') ? ' field-color' : ''}${visible ? '' : ' is-hidden'}`;
+    }
+
+    for (const [presetId, btn] of presetBtns.entries()) {
+      const p = MATERIAL_PRESETS.find((item) => item.id === presetId);
+      const isMatch = Boolean(p && p.surface === state.surface && p.baseColorHex === state.baseColorHex);
+      btn.className = `mini material-preset-btn${isMatch ? ' on' : ''}`;
+    }
+  }
+
   function pushLivePreviewAndEdit(label, merge = true) {
     paintPreview();
+    syncContextualUi();
     const vp = studioApi?.getViewport?.();
     if (vp?.setPreviewLook) {
       vp.setPreviewLook(buildLookPreviewPatch(state));
@@ -647,23 +933,64 @@ export function mountMaterialStudio(container, studioApi = {}) {
     for (const [key, binding] of controls.entries()) {
       binding.sync(state[key]);
     }
+    syncContextualUi();
     if (repaint) paintPreview();
+  }
+
+  function refreshSceneEntitiesBar() {
+    while (sceneEntitiesRow.firstChild) sceneEntitiesRow.removeChild(sceneEntitiesRow.firstChild);
+    const snap = studioApi?.getState?.();
+    const entities = snap?.activeDocument?.root?.entities;
+    if (!entities || typeof entities !== 'object') return;
+    const entries = Object.entries(entities).slice(0, 6);
+    if (!entries.length) return;
+    sceneEntitiesRow.append(makeEl(ownerDoc, 'span', { class: 'material-studio-subtitle' }, 'Focus 3D Scene Entity:'));
+    for (const [entityId, ent] of entries) {
+      const label = ent?.name || entityId;
+      sceneEntitiesRow.append(
+        makeEl(ownerDoc, 'button', {
+          type: 'button',
+          class: 'mini',
+          'data-scene-entity': entityId,
+          onclick: () => {
+            studioApi?.setSelection?.([entityId]);
+            const trs = ent?.components?.transform?.translation;
+            if (Array.isArray(trs) && trs.length >= 3) {
+              studioApi?.getViewport?.()?.setCameraPose?.({
+                target: [Number(trs[0]) || 0, Number(trs[1]) || 0, Number(trs[2]) || 0],
+                distance: 8,
+              });
+            }
+          },
+        }, label),
+      );
+    }
   }
 
   function refreshDocList() {
     const docs = studioApi?.listDocuments?.({ suffix: '.material.json' }) || [];
     while (docSelect.firstChild) docSelect.removeChild(docSelect.firstChild);
-    docSelect.append(makeEl(ownerDoc, 'option', { value: '' }, docs.length ? 'Select .material.json…' : 'Preview Only (Unsaved)'));
+    docSelect.append(
+      makeEl(
+        ownerDoc,
+        'option',
+        { value: '' },
+        docs.length ? 'Select .material.json asset…' : 'Live 3D Scene Preview (Click "New Material" to save asset)',
+      ),
+    );
     for (const d of docs) {
       docSelect.append(makeEl(ownerDoc, 'option', { value: d.id }, d.path || d.name || d.id));
     }
     if (activeDocId) docSelect.value = activeDocId;
+    refreshSceneEntitiesBar();
+    syncContextualUi();
   }
 
   async function selectDocument(idOrPath) {
     if (!idOrPath) {
       activeDocId = null;
       activeDocPath = null;
+      syncContextualUi();
       return;
     }
     const opened = await studioApi?.openDocument?.(idOrPath);
@@ -683,7 +1010,7 @@ export function mountMaterialStudio(container, studioApi = {}) {
 
   const btnNew = makeEl(ownerDoc, 'button', {
     type: 'button',
-    class: 'mini',
+    class: 'mini on',
     'data-action': 'create-material',
     onclick: async () => {
       if (typeof studioApi?.createDocument !== 'function') return;
@@ -742,18 +1069,55 @@ export function mountMaterialStudio(container, studioApi = {}) {
     },
   }, tr('save'));
 
+  const lightingPills = makeEl(
+    ownerDoc,
+    'div',
+    { class: 'material-studio-light-pills' },
+    [
+      { id: 'day', label: 'Day 13:00' },
+      { id: 'golden_hour', label: 'Sunset 17:30' },
+      { id: 'night', label: 'Night 19:30' },
+    ].map((lt) =>
+      makeEl(ownerDoc, 'button', {
+        type: 'button',
+        class: 'mini',
+        'data-lighting-preset': lt.id,
+        onclick: () => {
+          studioApi?.getViewport?.()?.setLightingPreset?.(lt.id);
+        },
+      }, lt.label),
+    ),
+  );
+
   const presetRow = makeEl(
     ownerDoc,
     'div',
     { class: 'material-studio-presets' },
-    MATERIAL_PRESETS.map((preset) =>
-      makeEl(ownerDoc, 'button', {
-        type: 'button',
-        class: 'mini material-preset-btn',
-        'data-preset': preset.id,
-        onclick: () => applyPreset(preset.id),
-      }, preset.label),
-    ),
+    MATERIAL_PRESETS.map((preset) => {
+      const btn = makeEl(
+        ownerDoc,
+        'button',
+        {
+          type: 'button',
+          class: 'mini material-preset-btn',
+          'data-preset': preset.id,
+          onclick: () => applyPreset(preset.id),
+        },
+        makeEl(
+          ownerDoc,
+          'span',
+          { class: 'material-preset-top' },
+          makeEl(ownerDoc, 'span', {
+            class: 'material-preset-swatch',
+            style: `background:${preset.baseColorHex}`,
+          }),
+          preset.label,
+        ),
+        makeEl(ownerDoc, 'span', { class: 'material-preset-usage' }, preset.usage || ''),
+      );
+      presetBtns.set(preset.id, btn);
+      return btn;
+    }),
   );
 
   function addSelect(key, labelKey, options) {
@@ -772,7 +1136,9 @@ export function mountMaterialStudio(container, studioApi = {}) {
       options.map((o) => makeEl(ownerDoc, 'option', { value: o.id }, o.label)),
     );
     controls.set(key, { sync: (v) => { sel.value = String(v ?? ''); } });
-    return makeEl(ownerDoc, 'div', { class: 'field' }, makeEl(ownerDoc, 'label', { for: id }, tr(labelKey)), sel);
+    const row = makeEl(ownerDoc, 'div', { class: 'field field-select' }, makeEl(ownerDoc, 'label', { for: id }, tr(labelKey)), sel);
+    fieldRows.set(key, row);
+    return row;
   }
 
   function addSlider(key, labelKey, min, max, step) {
@@ -798,7 +1164,9 @@ export function mountMaterialStudio(container, studioApi = {}) {
         valSpan.textContent = n.toFixed(2);
       },
     });
-    return makeEl(ownerDoc, 'div', { class: 'field' }, makeEl(ownerDoc, 'label', { for: id }, tr(labelKey)), input, valSpan);
+    const row = makeEl(ownerDoc, 'div', { class: 'field' }, makeEl(ownerDoc, 'label', { for: id }, tr(labelKey)), input, valSpan);
+    fieldRows.set(key, row);
+    return row;
   }
 
   function addColor(key, labelKey) {
@@ -813,7 +1181,9 @@ export function mountMaterialStudio(container, studioApi = {}) {
       },
     });
     controls.set(key, { sync: (v) => { input.value = typeof v === 'string' ? v : '#cccccc'; } });
-    return makeEl(ownerDoc, 'div', { class: 'field' }, makeEl(ownerDoc, 'label', { for: id }, tr(labelKey)), input);
+    const row = makeEl(ownerDoc, 'div', { class: 'field field-color' }, makeEl(ownerDoc, 'label', { for: id }, tr(labelKey)), input);
+    fieldRows.set(key, row);
+    return row;
   }
 
   const shutterId = 'ms-shutterInv';
@@ -840,35 +1210,70 @@ export function mountMaterialStudio(container, studioApi = {}) {
     },
   });
 
+  const btnToggleAllChannels = makeEl(ownerDoc, 'button', {
+    type: 'button',
+    class: 'mini',
+    'data-action': 'toggle-all-channels',
+    onclick: () => {
+      showAllChannels = !showAllChannels;
+      btnToggleAllChannels.textContent = showAllChannels ? 'Filter by Surface Model' : 'Show All Channels';
+      syncContextualUi();
+    },
+  }, 'Show All Channels');
+
   root.append(
     makeEl(ownerDoc, 'div', { class: 'component material-studio-header' },
-      makeEl(ownerDoc, 'strong', {}, tr('materialStudioTitle')),
-      makeEl(ownerDoc, 'div', { class: 'material-studio-actions' }, btnNew, btnUndo, btnRedo, btnSave),
+      makeEl(ownerDoc, 'div', { class: 'material-studio-title-group' },
+        makeEl(ownerDoc, 'strong', {}, tr('materialStudioTitle')),
+        makeEl(ownerDoc, 'span', { class: 'material-studio-subtitle' },
+          'Tune 3D surface finishes (lacquer, baize, metal, skin, cel shading) and physical camera exposure alongside the live 3D viewport.',
+        ),
+      ),
+      makeEl(ownerDoc, 'div', { class: 'material-studio-actions' }, activeTargetBadge, btnNew, btnUndo, btnRedo, btnSave),
     ),
-    makeEl(ownerDoc, 'div', { class: 'field' }, makeEl(ownerDoc, 'label', {}, tr('materialDoc')), docSelect),
-    makeEl(ownerDoc, 'div', { class: 'material-studio-preview-wrap' }, previewCanvas, evReadout),
-    makeEl(ownerDoc, 'div', { class: 'field' }, makeEl(ownerDoc, 'label', {}, tr('presets')), presetRow),
-    addSelect('surface', 'surfaceModel', SURFACE_MODELS),
-    addColor('baseColorHex', 'baseColor'),
-    addSlider('roughness', 'roughness', 0.04, 1.0, 0.01),
-    addSlider('metallic', 'metallic', 0.0, 1.0, 0.01),
-    addSlider('normalScale', 'normalScale', 0.0, 2.0, 0.05),
-    addSlider('clearcoat', 'clearcoat', 0.0, 1.0, 0.01),
-    addSlider('clearcoatRoughness', 'clearcoatRoughness', 0.03, 1.0, 0.01),
-    addSlider('sheen', 'sheen', 0.0, 1.0, 0.01),
-    addSlider('sheenTint', 'sheenTint', 0.0, 1.0, 0.01),
-    addSlider('subsurface', 'subsurface', 0.0, 1.0, 0.01),
-    addColor('subsurfaceColorHex', 'subsurfaceColor'),
-    addSlider('rampCenter', 'rampCenter', 0.1, 0.9, 0.01),
-    addSlider('rampSoftness', 'rampSoftness', 0.01, 0.5, 0.01),
-    addSlider('rimStrength', 'rimStrength', 0.0, 1.5, 0.02),
-    makeEl(ownerDoc, 'hr', {}),
-    makeEl(ownerDoc, 'strong', { class: 'material-studio-subhead' }, tr('cameraSection')),
-    addSelect('tonemap', 'tonemap', TONEMAP_MODES),
-    addSlider('aperture', 'aperture', 1.4, 22.0, 0.2),
-    makeEl(ownerDoc, 'div', { class: 'field' }, makeEl(ownerDoc, 'label', { for: shutterId }, tr('shutterInv')), shutterInput, shutterVal),
-    addSlider('iso', 'iso', 50, 3200, 50),
-    addSlider('compensation', 'compensation', -3.0, 3.0, 0.1),
+    makeEl(ownerDoc, 'div', { class: 'material-studio-card' },
+      makeEl(ownerDoc, 'div', { class: 'field field-select' }, makeEl(ownerDoc, 'label', {}, tr('materialDoc')), docSelect),
+      sceneEntitiesRow,
+      makeEl(ownerDoc, 'div', { class: 'material-studio-hero' },
+        makeEl(ownerDoc, 'div', { class: 'material-studio-preview-wrap' }, previewCanvas, evReadout, lightingPills),
+        makeEl(ownerDoc, 'div', { style: 'display:flex;flex-direction:column;gap:6px;min-width:0;' },
+          makeEl(ownerDoc, 'strong', { style: 'font-size:11.5px;color:#cfd6e3;' }, tr('presets')),
+          presetRow,
+        ),
+      ),
+    ),
+    makeEl(ownerDoc, 'div', { class: 'material-studio-card' },
+      makeEl(ownerDoc, 'div', { class: 'material-studio-card-head' },
+        makeEl(ownerDoc, 'strong', {}, 'Surface Shader & Finish'),
+        btnToggleAllChannels,
+      ),
+      addSelect('surface', 'surfaceModel', SURFACE_MODELS),
+      surfaceGuideBox,
+      addColor('baseColorHex', 'baseColor'),
+      addSlider('roughness', 'roughness', 0.04, 1.0, 0.01),
+      addSlider('metallic', 'metallic', 0.0, 1.0, 0.01),
+      addSlider('normalScale', 'normalScale', 0.0, 2.0, 0.05),
+      addSlider('clearcoat', 'clearcoat', 0.0, 1.0, 0.01),
+      addSlider('clearcoatRoughness', 'clearcoatRoughness', 0.03, 1.0, 0.01),
+      addSlider('sheen', 'sheen', 0.0, 1.0, 0.01),
+      addSlider('sheenTint', 'sheenTint', 0.0, 1.0, 0.01),
+      addSlider('subsurface', 'subsurface', 0.0, 1.0, 0.01),
+      addColor('subsurfaceColorHex', 'subsurfaceColor'),
+      addSlider('rampCenter', 'rampCenter', 0.1, 0.9, 0.01),
+      addSlider('rampSoftness', 'rampSoftness', 0.01, 0.5, 0.01),
+      addSlider('rimStrength', 'rimStrength', 0.0, 1.5, 0.02),
+    ),
+    makeEl(ownerDoc, 'div', { class: 'material-studio-card' },
+      makeEl(ownerDoc, 'div', { class: 'material-studio-card-head' },
+        makeEl(ownerDoc, 'strong', { class: 'material-studio-subhead' }, tr('cameraSection')),
+        makeEl(ownerDoc, 'span', { class: 'material-studio-subtitle' }, 'Live 3D viewport exposure & highlight rolloff'),
+      ),
+      addSelect('tonemap', 'tonemap', TONEMAP_MODES),
+      addSlider('aperture', 'aperture', 1.4, 22.0, 0.2),
+      makeEl(ownerDoc, 'div', { class: 'field' }, makeEl(ownerDoc, 'label', { for: shutterId }, tr('shutterInv')), shutterInput, shutterVal),
+      addSlider('iso', 'iso', 50, 3200, 50),
+      addSlider('compensation', 'compensation', -3.0, 3.0, 0.1),
+    ),
   );
 
   container.append(root);

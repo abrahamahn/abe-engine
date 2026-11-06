@@ -246,11 +246,17 @@ test('mountMaterialStudio aligns with StudioWorkbenchApi and responds in <50ms',
   assert.equal(instance.getState().activeDocId, 'mat-1');
   assert.equal(instance.getState().name, 'arch_stone');
 
+  // Verify context-aware slider filtering: stylized_ramp hides Charlie cloth sheen until woven_velvet is applied.
+  const sheenInput = container.queryAll((el) => el.getAttribute?.('data-field') === 'sheen')[0];
+  assert.ok(sheenInput);
+  assert.equal(sheenInput.parentNode.hidden, true);
+
   // Verify preset application + <50ms live update budget (including shader-ball rasterization).
   const t0 = performance.now();
   assert.equal(instance.applyPreset('woven_velvet'), true);
   const elapsedMs = performance.now() - t0;
   assert.ok(elapsedMs < 50, `live preset + shader-ball update took ${elapsedMs.toFixed(2)}ms (want <50ms)`);
+  assert.equal(sheenInput.parentNode.hidden, false);
 
   assert.equal(instance.getState().surface, 'charlie_cloth');
   assert.ok(previewLooks.length >= 1);

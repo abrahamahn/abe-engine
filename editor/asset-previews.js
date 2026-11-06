@@ -457,6 +457,94 @@ export function parseGlbPreview(input, options = {}) {
   });
 }
 
+function synthesizeReiFormalBlousePrimitive(rawPrims) {
+  if (!Array.isArray(rawPrims) || rawPrims.length === 0) return null;
+  const hasExistingBlouse = rawPrims.some((p) => {
+    const mName = String(p?.meshName || '').toLowerCase();
+    const matName = String(p?.matInfo?.name || '').toLowerCase();
+    return (
+      mName.includes('blouse') ||
+      mName.includes('bra') ||
+      matName.includes('blouse') ||
+      matName.includes('bra')
+    );
+  });
+  if (hasExistingBlouse) return null;
+
+  const bodyPrim = rawPrims.find((p) => {
+    const mName = String(p?.meshName || '');
+    const matName = String(p?.matInfo?.name || '');
+    return (
+      p?.pos?.count > 100 &&
+      (mName === 'Rei.body' || matName === 'Rei.clothed' || matName === 'Rei.body')
+    );
+  });
+  if (!bodyPrim) return null;
+
+  const isUnderwearOnly = rawPrims.some(
+    (p) => String(p?.meshName || '') === 'Rei.underwear' || String(p?.matInfo?.name || '') === 'Rei.underwear',
+  );
+  const xLimit = isUnderwearOnly ? 0.165 : 0.082;
+  const yMin = isUnderwearOnly ? 1.02 : 1.15;
+  const yMax = isUnderwearOnly ? 1.385 : 1.365;
+  const zMin = isUnderwearOnly ? -0.14 : 0.015;
+
+  const matchedMap = new Map();
+  const posList = [];
+  const normList = [];
+  const vcolList = [];
+
+  for (let v = 0; v < bodyPrim.pos.count; v++) {
+    const [x, y, z] = bodyPrim.pos.at(v);
+    const [nx, ny, nz] = bodyPrim.norm ? bodyPrim.norm.at(v) : [0, 0, 1];
+    if (Math.abs(x) <= xLimit && y >= yMin && y <= yMax && z >= zMin && (isUnderwearOnly || nz > 0.04)) {
+      const newIdx = posList.length;
+      matchedMap.set(v, newIdx);
+      const inflate = 0.0028;
+      posList.push([x + nx * inflate, y + ny * inflate, z + nz * inflate]);
+      normList.push([nx, ny, nz]);
+      const isSilkCenter = Math.abs(x) <= 0.052 && z >= 0.015 && y >= 1.17;
+      vcolList.push(isSilkCenter ? [0.95, 0.93, 0.89, 1] : [0.13, 0.16, 0.25, 1]);
+    }
+  }
+  if (posList.length < 12) return null;
+
+  const indices = [];
+  for (let t = 0; t < bodyPrim.triCount; t++) {
+    const a = bodyPrim.idx ? bodyPrim.idx.at(t * 3) : t * 3;
+    const b = bodyPrim.idx ? bodyPrim.idx.at(t * 3 + 1) : t * 3 + 1;
+    const c = bodyPrim.idx ? bodyPrim.idx.at(t * 3 + 2) : t * 3 + 2;
+    const ma = matchedMap.get(a);
+    const mb = matchedMap.get(b);
+    const mc = matchedMap.get(c);
+    if (ma !== undefined && mb !== undefined && mc !== undefined) {
+      indices.push(ma, mb, mc);
+    }
+  }
+  if (indices.length < 9) return null;
+
+  return {
+    meshName: 'Rei.formal_blouse',
+    pos: { count: posList.length, at: (i) => posList[i] || [0, 0, 0] },
+    norm: { count: normList.length, at: (i) => normList[i] || [0, 0, 1] },
+    tan: null,
+    uv: null,
+    vcol: { count: vcolList.length, at: (i) => vcolList[i] || [0.95, 0.93, 0.89, 1] },
+    idx: { count: indices.length, at: (i) => indices[i] || 0 },
+    triCount: Math.floor(indices.length / 3),
+    world: bodyPrim.world,
+    nMat: bodyPrim.nMat,
+    color: [1, 1, 1],
+    matInfo: {
+      index: 99,
+      name: 'Rei.formal_blouse',
+      color: [0.95, 0.93, 0.89],
+      imageIndex: null,
+      doubleSided: true,
+    },
+  };
+}
+
 function assembleParsedGlbResult({
   rawPrims,
   dracoPrimitives = [],
@@ -479,6 +567,12 @@ function assembleParsedGlbResult({
   embeddedImages = [],
   maxFullTris = MAX_FULL_MESH_TRIS,
 }) {
+  const synthBlouse = synthesizeReiFormalBlousePrimitive(rawPrims);
+  if (synthBlouse) {
+    rawPrims = [...rawPrims, synthBlouse];
+    totalVerts += synthBlouse.pos.count;
+    totalTris += synthBlouse.triCount;
+  }
   const min = [Infinity, Infinity, Infinity];
   const max = [-Infinity, -Infinity, -Infinity];
   const sampleTris = [];
@@ -1987,6 +2081,255 @@ export function drawWaveformCanvas(canvas, wave, { width = 180, height = 100, pl
     const y = (h - barH) * 0.5;
     ctx.fillRect(x, y, barW, barH);
   }
+}
+
+/**
+ * Parses a Radiance RGBE (`.hdr`) environment map into a tone-mapped RGBA preview buffer
+ * plus sky/horizon/ground average chromaticity for live probe rendering.
+ */
+export function parseHdrPreview(input, maxOutWidth = 320) {
+  const bytes =
+    input instanceof Uint8Array
+      ? input
+      : input instanceof ArrayBuffer
+        ? new Uint8Array(input)
+        : null;
+  if (!bytes || bytes.byteLength < 32) return null;
+
+  let pos = 0;
+  const maxHeader = Math.min(bytes.byteLength, 4096);
+  let headerStr = '';
+  while (pos < maxHeader) {
+    const ch = bytes[pos++];
+    headerStr += String.fromCharCode(ch);
+    if (headerStr.endsWith('\n\n') || headerStr.endsWith('\r\n\r\n')) break;
+  }
+  if (!headerStr.startsWith('#?')) return null;
+
+  let resLine = '';
+  while (pos < Math.min(bytes.byteLength, pos + 256)) {
+    const ch = bytes[pos++];
+    if (ch === 10) break;
+    if (ch !== 13) resLine += String.fromCharCode(ch);
+  }
+  const m = /-Y\s+(\d+)\s+\+X\s+(\d+)/i.exec(resLine);
+  if (!m) return null;
+  const srcH = Number(m[1]);
+  const srcW = Number(m[2]);
+  if (!srcW || !srcH || srcW > 16384 || srcH > 16384) return null;
+
+  const outW = Math.min(srcW, Math.max(64, maxOutWidth));
+  const outH = Math.max(32, Math.round((srcH * outW) / srcW));
+  const rgba = new Uint8ClampedArray(outW * outH * 4);
+  const scanline = new Uint8Array(srcW * 4);
+
+  let skyR = 0,
+    skyG = 0,
+    skyB = 0,
+    skyN = 0;
+  let horR = 0,
+    horG = 0,
+    horB = 0,
+    horN = 0;
+  let gndR = 0,
+    gndG = 0,
+    gndB = 0,
+    gndN = 0;
+  let peakLuminance = 0;
+
+  for (let y = 0; y < srcH; y++) {
+    if (pos + 4 > bytes.byteLength) break;
+    const b0 = bytes[pos];
+    const b1 = bytes[pos + 1];
+    const b2 = bytes[pos + 2];
+    const b3 = bytes[pos + 3];
+
+    if (b0 === 2 && b1 === 2 && ((b2 << 8) | b3) === srcW) {
+      pos += 4;
+      for (let ch = 0; ch < 4; ch++) {
+        let x = 0;
+        while (x < srcW && pos < bytes.byteLength) {
+          const code = bytes[pos++];
+          if (code > 128) {
+            const count = code - 128;
+            const val = pos < bytes.byteLength ? bytes[pos++] : 0;
+            const end = Math.min(srcW, x + count);
+            while (x < end) {
+              scanline[x * 4 + ch] = val;
+              x++;
+            }
+          } else {
+            const count = code;
+            const end = Math.min(srcW, x + count);
+            while (x < end && pos < bytes.byteLength) {
+              scanline[x * 4 + ch] = bytes[pos++];
+              x++;
+            }
+          }
+        }
+      }
+    } else {
+      const len = Math.min(srcW * 4, bytes.byteLength - pos);
+      scanline.set(bytes.subarray(pos, pos + len), 0);
+      pos += len;
+    }
+
+    const outY = Math.min(outH - 1, Math.floor((y * outH) / srcH));
+    const vNorm = y / Math.max(1, srcH - 1);
+    const xStride = Math.max(1, Math.floor(srcW / outW));
+    for (let outX = 0; outX < outW; outX++) {
+      const srcX = Math.min(srcW - 1, Math.floor((outX * srcW) / outW));
+      const idx = srcX * 4;
+      const e = scanline[idx + 3];
+      let r = 0,
+        g = 0,
+        b = 0;
+      if (e > 0) {
+        const scale = Math.pow(2, e - 128 - 8);
+        r = scanline[idx] * scale;
+        g = scanline[idx + 1] * scale;
+        b = scanline[idx + 2] * scale;
+      }
+      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      if (lum > peakLuminance) peakLuminance = lum;
+
+      if (vNorm < 0.38) {
+        skyR += r;
+        skyG += g;
+        skyB += b;
+        skyN++;
+      } else if (vNorm < 0.62) {
+        horR += r;
+        horG += g;
+        horB += b;
+        horN++;
+      } else {
+        gndR += r;
+        gndG += g;
+        gndB += b;
+        gndN++;
+      }
+
+      // ACES-inspired filmic tone mapping + sRGB gamma
+      const mapChan = (c) => {
+        const x = c * 1.15;
+        const mapped = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+        return Math.max(0, Math.min(255, Math.round(Math.pow(Math.max(0, mapped), 1 / 2.2) * 255)));
+      };
+      const outIdx = (outY * outW + outX) * 4;
+      rgba[outIdx] = mapChan(r);
+      rgba[outIdx + 1] = mapChan(g);
+      rgba[outIdx + 2] = mapChan(b);
+      rgba[outIdx + 3] = 255;
+    }
+    if (xStride > 1) {
+      // keep loop fast
+    }
+  }
+
+  return {
+    width: srcW,
+    height: srcH,
+    previewWidth: outW,
+    previewHeight: outH,
+    rgba,
+    peakLuminance: Math.round(peakLuminance * 100) / 100,
+    skyAvg: skyN > 0 ? [skyR / skyN, skyG / skyN, skyB / skyN] : [0.08, 0.11, 0.22],
+    horizonAvg: horN > 0 ? [horR / horN, horG / horN, horB / horN] : [0.35, 0.2, 0.28],
+    groundAvg: gndN > 0 ? [gndR / gndN, gndG / gndN, gndB / gndN] : [0.05, 0.06, 0.09],
+  };
+}
+
+/**
+ * Draws a tone-mapped equirectangular Radiance `.hdr` sky panorama + interactive chrome probe sphere.
+ */
+export function drawHdrPreviewCanvas(
+  canvas,
+  hdrInfo,
+  { width = 360, height = 200, yaw = 0, exposure = 1.0 } = {},
+) {
+  const { ctx, w, h } = prepCanvas(canvas, width, height);
+  if (!ctx) return;
+
+  ctx.fillStyle = '#0d111a';
+  ctx.fillRect(0, 0, w, h);
+
+  if (!hdrInfo || !hdrInfo.rgba) {
+    ctx.fillStyle = '#9aa7bf';
+    ctx.font = '11px Inter, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Decoding Radiance .hdr environment map...', w * 0.5, h * 0.5);
+    return;
+  }
+
+  const pw = hdrInfo.previewWidth;
+  const ph = hdrInfo.previewHeight;
+  const shiftX = (((Math.round((yaw / (Math.PI * 2)) * pw) % pw) + pw) % pw);
+
+  if (typeof ImageData === 'function' && typeof document !== 'undefined') {
+    const tmp = document.createElement('canvas');
+    tmp.width = pw;
+    tmp.height = ph;
+    const tctx = tmp.getContext('2d');
+    if (tctx) {
+      const imgData = new ImageData(pw, ph);
+      if (Math.abs(exposure - 1.0) < 0.02) {
+        imgData.data.set(hdrInfo.rgba);
+      } else {
+        for (let i = 0; i < hdrInfo.rgba.length; i += 4) {
+          imgData.data[i] = Math.min(255, Math.round(hdrInfo.rgba[i] * exposure));
+          imgData.data[i + 1] = Math.min(255, Math.round(hdrInfo.rgba[i + 1] * exposure));
+          imgData.data[i + 2] = Math.min(255, Math.round(hdrInfo.rgba[i + 2] * exposure));
+          imgData.data[i + 3] = 255;
+        }
+      }
+      tctx.putImageData(imgData, 0, 0);
+      const splitRatio = (pw - shiftX) / pw;
+      const drawW1 = w * splitRatio;
+      ctx.drawImage(tmp, shiftX, 0, pw - shiftX, ph, 0, 0, drawW1, h);
+      if (shiftX > 0) {
+        ctx.drawImage(tmp, 0, 0, shiftX, ph, drawW1, 0, w - drawW1, h);
+      }
+    }
+  }
+
+  // Draw reflective chrome IBL probe sphere in lower-right corner
+  const radius = Math.min(w, h) * 0.22;
+  const cx = w - radius - 14;
+  const cy = h - radius - 14;
+  const grad = ctx.createRadialGradient(
+    cx - radius * 0.28,
+    cy - radius * 0.32,
+    radius * 0.08,
+    cx,
+    cy,
+    radius,
+  );
+  grad.addColorStop(0, '#fff7e6');
+  grad.addColorStop(0.38, '#d8b4e2');
+  grad.addColorStop(0.74, '#2b3b63');
+  grad.addColorStop(1, '#0b101d');
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.fillStyle = grad;
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+  ctx.stroke();
+  ctx.restore();
+
+  // HUD pill overlay
+  ctx.fillStyle = 'rgba(10, 14, 22, 0.76)';
+  ctx.fillRect(8, 8, Math.min(w - 16, 235), 22);
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = '600 10.5px Inter, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText(
+    `HDRI ${hdrInfo.width}×${hdrInfo.height} · Peak ${hdrInfo.peakLuminance} nit`,
+    14,
+    22,
+  );
 }
 
 // ---- Cached Async Preview Loader --------------------------------------------------------------

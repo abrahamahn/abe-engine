@@ -1685,6 +1685,9 @@ export function createRotaryKnob(
     ariaLabel,
     disabled = false,
     onChange,
+    onCommit,
+    onDragStart,
+    onDragEnd,
   },
 ) {
   const safeSpan = Math.max(1e-9, max - min);
@@ -1805,6 +1808,18 @@ export function createRotaryKnob(
 
   const readoutEl = createDomNode(doc, 'span', { class: 'gdaw-knob-val' }, format(currentVal));
 
+  const rangeEl = createDomNode(doc, 'input', {
+    type: 'range',
+    class: `gdaw-range gdaw-knob-slider gdaw-knob-slider--${accent}`,
+    min: String(min),
+    max: String(max),
+    step: String(step),
+    value: String(currentVal),
+    disabled: disabled ? 'true' : null,
+    'aria-label': `${ariaLabel || label} bar`,
+    'data-knob-bar': dataDsp || label,
+  });
+
   const dialAttrs = {
     class: `gdaw-knob-dial ${disabled ? 'disabled' : ''}`,
     role: 'slider',
@@ -1840,54 +1855,126 @@ export function createRotaryKnob(
     dialEl.value = String(v);
     dialEl.setAttribute('aria-valuenow', String(v));
     dialEl.setAttribute('aria-valuetext', text);
+    rangeEl.value = String(v);
+    const pct = Math.max(0, Math.min(100, ((finiteClamp(v, min, max, min) - min) / safeSpan) * 100));
+    rangeEl.setAttribute('style', `--gdaw-bar-pct: ${pct.toFixed(1)}%;`);
   };
 
   syncVisuals(currentVal);
 
-  const commit = (rawNext, fine = false) => {
+  const commit = (rawNext, fine = false, live = false) => {
     if (disabled) return;
     const qStep = fine ? step * 0.1 : step;
     const next = quantizeControlValue(rawNext, min, max, qStep);
     if (next === currentVal) return;
     currentVal = next;
     syncVisuals(next);
-    onChange?.(next);
+    onChange?.(next, { live });
+    if (!live) {
+      onCommit?.(next);
+    }
   };
 
   dialEl.addEventListener('pointerdown', (e) => {
     if (disabled) return;
     e.preventDefault?.();
+    e.stopPropagation?.();
     dialEl.focus?.();
+    try {
+      if (e.pointerId !== undefined) dialEl.setPointerCapture?.(e.pointerId);
+    } catch { /* ignore */ }
+    onDragStart?.();
     let anchorY = Number(e.clientY ?? 0);
+    let anchorX = Number(e.clientX ?? 0);
     let anchorVal = currentVal;
     let prevShift = Boolean(e.shiftKey);
+    let ended = false;
 
     const onMove = (ev) => {
       const curY = Number(ev.clientY ?? anchorY);
+      const curX = Number(ev.clientX ?? anchorX);
       const shift = Boolean(ev.shiftKey);
       if (shift !== prevShift) {
         anchorY = curY;
+        anchorX = curX;
         anchorVal = currentVal;
         prevShift = shift;
       }
       const spanPx = shift ? 1320 : 132;
-      const deltaNorm = (anchorY - curY) / spanPx;
-      commit(anchorVal + deltaNorm * safeSpan, shift);
+      const dy = anchorY - curY;
+      const dx = curX - anchorX;
+      const primaryDelta = Math.abs(dx) > Math.abs(dy) ? dx : dy;
+      const deltaNorm = primaryDelta / spanPx;
+      commit(anchorVal + deltaNorm * safeSpan, shift, true);
     };
     const onUp = () => {
+      if (ended) return;
+      ended = true;
       doc.removeEventListener('pointermove', onMove);
       doc.removeEventListener('pointerup', onUp);
       doc.removeEventListener('pointercancel', onUp);
+      globalThis.window?.removeEventListener?.('pointermove', onMove);
+      globalThis.window?.removeEventListener?.('pointerup', onUp);
+      globalThis.window?.removeEventListener?.('pointercancel', onUp);
+      onDragEnd?.();
+      onCommit?.(currentVal);
     };
     doc.addEventListener('pointermove', onMove);
     doc.addEventListener('pointerup', onUp);
     doc.addEventListener('pointercancel', onUp);
+    globalThis.window?.addEventListener?.('pointermove', onMove);
+    globalThis.window?.addEventListener?.('pointerup', onUp);
+    globalThis.window?.addEventListener?.('pointercancel', onUp);
+  });
+
+  // Draggable horizontal slider bar underneath the rotary dial
+  let barDragging = false;
+  const finishBarDrag = () => {
+    if (!barDragging) return;
+    barDragging = false;
+    doc.removeEventListener('pointerup', finishBarDrag);
+    doc.removeEventListener('pointercancel', finishBarDrag);
+    globalThis.window?.removeEventListener?.('pointerup', finishBarDrag);
+    globalThis.window?.removeEventListener?.('pointercancel', finishBarDrag);
+    onDragEnd?.();
+    onCommit?.(currentVal);
+  };
+  rangeEl.addEventListener('pointerdown', (e) => {
+    if (disabled) return;
+    e.stopPropagation?.();
+    if (!barDragging) {
+      barDragging = true;
+      onDragStart?.();
+      doc.addEventListener('pointerup', finishBarDrag);
+      doc.addEventListener('pointercancel', finishBarDrag);
+      globalThis.window?.addEventListener?.('pointerup', finishBarDrag);
+      globalThis.window?.addEventListener?.('pointercancel', finishBarDrag);
+    }
+  });
+  rangeEl.addEventListener('input', (e) => {
+    if (disabled) return;
+    const raw = e?.target?.value ?? rangeEl.value;
+    if (raw !== undefined && raw !== '') {
+      commit(Number(raw), false, barDragging);
+    }
+  });
+  rangeEl.addEventListener('change', () => {
+    if (barDragging) {
+      finishBarDrag();
+    } else {
+      onCommit?.(currentVal);
+    }
+  });
+  rangeEl.addEventListener('dblclick', (e) => {
+    if (disabled) return;
+    e.preventDefault?.();
+    commit(resolvedDefault, true, false);
   });
 
   dialEl.addEventListener('dblclick', (e) => {
     if (disabled) return;
     e.preventDefault?.();
-    commit(resolvedDefault, true);
+    commit(resolvedDefault, true, false);
   });
 
   dialEl.addEventListener('wheel', (e) => {
@@ -1895,7 +1982,7 @@ export function createRotaryKnob(
     e.preventDefault?.();
     const dir = Number(e.deltaY ?? 0) < 0 ? 1 : -1;
     const fine = Boolean(e.shiftKey);
-    commit(currentVal + dir * (fine ? step * 0.1 : step), fine);
+    commit(currentVal + dir * (fine ? step * 0.1 : step), fine, false);
   });
 
   dialEl.addEventListener('keydown', (e) => {
@@ -1904,29 +1991,29 @@ export function createRotaryKnob(
     const delta = fine ? step * 0.1 : step;
     if (e.key === 'ArrowUp' || e.key === 'ArrowRight') {
       e.preventDefault?.();
-      commit(currentVal + delta, fine);
+      commit(currentVal + delta, fine, false);
     } else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') {
       e.preventDefault?.();
-      commit(currentVal - delta, fine);
+      commit(currentVal - delta, fine, false);
     } else if (e.key === 'PageUp') {
       e.preventDefault?.();
-      commit(currentVal + step * 10, false);
+      commit(currentVal + step * 10, false, false);
     } else if (e.key === 'PageDown') {
       e.preventDefault?.();
-      commit(currentVal - step * 10, false);
+      commit(currentVal - step * 10, false, false);
     } else if (e.key === 'Home') {
       e.preventDefault?.();
-      commit(resolvedDefault, true);
+      commit(resolvedDefault, true, false);
     } else if (e.key === 'End') {
       e.preventDefault?.();
-      commit(max, false);
+      commit(max, false, false);
     }
   });
 
   dialEl.addEventListener('input', (e) => {
     if (disabled) return;
     const raw = e?.target?.value ?? dialEl.value;
-    if (raw !== undefined && raw !== '') commit(Number(raw), true);
+    if (raw !== undefined && raw !== '') commit(Number(raw), true, false);
   });
 
   return createDomNode(
@@ -1936,6 +2023,7 @@ export function createRotaryKnob(
     createDomNode(doc, 'span', { class: 'gdaw-knob-lbl', title: label }, label),
     dialEl,
     readoutEl,
+    rangeEl,
   );
 }
 
@@ -1963,6 +2051,9 @@ export function createVerticalFader(
     busId = '',
     accentColor = '#d4af37',
     onChange,
+    onCommit,
+    onDragStart,
+    onDragEnd,
   },
 ) {
   let currentVol = finiteClamp(value, 0, max, defaultValue);
@@ -2039,22 +2130,38 @@ export function createVerticalFader(
 
   syncFader(currentVol);
 
-  const commitVol = (nextRaw) => {
+  const commitVol = (nextRaw, live = false) => {
     const clamped = Number(finiteClamp(nextRaw, 0, max, defaultValue).toFixed(4));
     if (clamped === currentVol) return;
     currentVol = clamped;
     syncFader(clamped);
-    onChange?.(clamped);
+    onChange?.(clamped, { live });
+    if (!live) {
+      onCommit?.(clamped);
+    }
   };
 
   trackEl.addEventListener('pointerdown', (e) => {
     e.preventDefault?.();
+    e.stopPropagation?.();
     trackEl.focus?.();
+    try {
+      if (e.pointerId !== undefined) trackEl.setPointerCapture?.(e.pointerId);
+    } catch { /* ignore */ }
+    onDragStart?.();
+    const rect = trackEl.getBoundingClientRect?.();
+    const baseHeight = rect?.height > 20 ? rect.height : 124;
+    if (rect && rect.height > 20 && typeof e.clientY === 'number') {
+      const clickedNorm = finiteClamp((rect.bottom - e.clientY) / rect.height, 0, 1, volumeToFaderNorm(currentVol, max));
+      const curNorm = volumeToFaderNorm(currentVol, max);
+      if (Math.abs(clickedNorm - curNorm) > 0.12) {
+        commitVol(faderNormToVolume(clickedNorm, max), true);
+      }
+    }
     let anchorY = Number(e.clientY ?? 0);
     let anchorNorm = volumeToFaderNorm(currentVol, max);
     let prevShift = Boolean(e.shiftKey);
-    const rect = trackEl.getBoundingClientRect?.();
-    const baseHeight = rect?.height > 20 ? rect.height : 124;
+    let ended = false;
 
     const onMove = (ev) => {
       const curY = Number(ev.clientY ?? anchorY);
@@ -2066,21 +2173,31 @@ export function createVerticalFader(
       }
       const span = shift ? baseHeight * 10 : baseHeight;
       const nextNorm = finiteClamp(anchorNorm + (anchorY - curY) / span, 0, 1, anchorNorm);
-      commitVol(faderNormToVolume(nextNorm, max));
+      commitVol(faderNormToVolume(nextNorm, max), true);
     };
     const onUp = () => {
+      if (ended) return;
+      ended = true;
       doc.removeEventListener('pointermove', onMove);
       doc.removeEventListener('pointerup', onUp);
       doc.removeEventListener('pointercancel', onUp);
+      globalThis.window?.removeEventListener?.('pointermove', onMove);
+      globalThis.window?.removeEventListener?.('pointerup', onUp);
+      globalThis.window?.removeEventListener?.('pointercancel', onUp);
+      onDragEnd?.();
+      onCommit?.(currentVol);
     };
     doc.addEventListener('pointermove', onMove);
     doc.addEventListener('pointerup', onUp);
     doc.addEventListener('pointercancel', onUp);
+    globalThis.window?.addEventListener?.('pointermove', onMove);
+    globalThis.window?.addEventListener?.('pointerup', onUp);
+    globalThis.window?.addEventListener?.('pointercancel', onUp);
   });
 
   trackEl.addEventListener('dblclick', (e) => {
     e.preventDefault?.();
-    commitVol(defaultValue);
+    commitVol(defaultValue, false);
   });
 
   trackEl.addEventListener('wheel', (e) => {
@@ -2088,7 +2205,7 @@ export function createVerticalFader(
     const dir = Number(e.deltaY ?? 0) < 0 ? 1 : -1;
     const stepNorm = e.shiftKey ? 0.004 : 0.025;
     const nextNorm = finiteClamp(volumeToFaderNorm(currentVol, max) + dir * stepNorm, 0, 1, 0);
-    commitVol(faderNormToVolume(nextNorm, max));
+    commitVol(faderNormToVolume(nextNorm, max), false);
   });
 
   trackEl.addEventListener('keydown', (e) => {
@@ -2096,19 +2213,19 @@ export function createVerticalFader(
     const curNorm = volumeToFaderNorm(currentVol, max);
     if (e.key === 'ArrowUp' || e.key === 'ArrowRight') {
       e.preventDefault?.();
-      commitVol(faderNormToVolume(finiteClamp(curNorm + stepNorm, 0, 1, curNorm), max));
+      commitVol(faderNormToVolume(finiteClamp(curNorm + stepNorm, 0, 1, curNorm), max), false);
     } else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') {
       e.preventDefault?.();
-      commitVol(faderNormToVolume(finiteClamp(curNorm - stepNorm, 0, 1, curNorm), max));
+      commitVol(faderNormToVolume(finiteClamp(curNorm - stepNorm, 0, 1, curNorm), max), false);
     } else if (e.key === 'Home') {
       e.preventDefault?.();
-      commitVol(defaultValue);
+      commitVol(defaultValue, false);
     }
   });
 
   trackEl.addEventListener('input', (e) => {
     const raw = e?.target?.value ?? trackEl.value;
-    if (raw !== undefined && raw !== '') commitVol(Number(raw));
+    if (raw !== undefined && raw !== '') commitVol(Number(raw), false);
   });
 
   return createDomNode(
@@ -2127,7 +2244,13 @@ function ensureStylesheet(doc) {
   const link = doc.createElement('link');
   link.id = 'ganbate-audio-daw-css';
   link.rel = 'stylesheet';
-  link.href = '/editor/audio-daw.css';
+  let href = '/editor/audio-daw.css';
+  try {
+    if (import.meta?.url && import.meta.url.startsWith('http')) {
+      href = new URL('./audio-daw.css', import.meta.url).href;
+    }
+  } catch { /* fallback */ }
+  link.href = href;
   doc.head.append(link);
 }
 
@@ -2215,9 +2338,32 @@ export function mountAudioDaw(container, studioApi = {}) {
     lastMeters: {},
     playheadMs: 0,
     rafId: 0,
+    activeDragCount: 0,
     active: true,
     destroyed: false,
   };
+
+  function beginInteractiveDrag() {
+    ui.activeDragCount = (ui.activeDragCount || 0) + 1;
+  }
+
+  function endInteractiveDrag() {
+    ui.activeDragCount = Math.max(0, (ui.activeDragCount || 0) - 1);
+  }
+
+  function queryNodeByAttr(root, attr, val) {
+    if (!root) return null;
+    if (typeof root.querySelector === 'function') {
+      try {
+        const hit = root.querySelector(`[${attr}="${val}"]`);
+        if (hit) return hit;
+      } catch { /* fallback */ }
+    }
+    if (typeof root.queryByAttr === 'function') {
+      return root.queryByAttr(attr, val);
+    }
+    return null;
+  }
 
   function resolveAssetUrl(relPath) {
     if (!relPath) return '';
@@ -2297,21 +2443,60 @@ export function mountAudioDaw(container, studioApi = {}) {
     }
   }
 
-  async function dispatchOps(label, ops, merge) {
+  function updateDirtyBadgeInPlace() {
+    const badge = queryNodeByAttr(toolbarEl, 'data-role', 'dirty-badge');
+    if (badge) {
+      badge.className = `gdaw-badge ${ui.dirty ? 'dirty' : ''}`;
+      badge.textContent = ui.dirty ? 'Draft · Unsaved' : 'Synced';
+    }
+  }
+
+  function updateLiveDspGraphsInPlace() {
+    const ctx = activeStripContext();
+    const s = ctx?.strip;
+    if (!s) return;
+    const eqPoly = queryNodeByAttr(dspEl, 'data-role', 'eq-polyline');
+    if (eqPoly) {
+      eqPoly.setAttribute('points', computeEqPolylinePoints(s, ui.root.sampleRate));
+    }
+    const odPoly = queryNodeByAttr(dspEl, 'data-role', 'od-polyline');
+    if (odPoly) {
+      odPoly.setAttribute('points', computeOverdrivePolylinePoints(s.overdrive?.drive ?? 0));
+    }
+  }
+
+  async function dispatchOps(label, ops, merge, { live = false } = {}) {
     if (!Array.isArray(ops) || ops.length === 0) return null;
     applyOps(ui.root, ops);
     ui.root = normalizeSoundBankRoot(ui.root);
     ui.dirty = true;
     syncSelectionInvariants();
-    recomputeOfflineMeters();
-    renderAll();
 
+    if (live || ui.activeDragCount > 0) {
+      updateDirtyBadgeInPlace();
+      updateLiveDspGraphsInPlace();
+      if (live) return null;
+    } else {
+      recomputeOfflineMeters();
+      renderAll();
+    }
+
+    const targetDoc = ui.docId || ui.docPath || '';
     const editFn = studioApi.edit || studioApi.editDocument;
-    if (typeof editFn === 'function') {
-      const updated = await editFn.call(studioApi, ui.docId || ui.docPath || null, ops, label, merge);
-      if (updated && typeof updated === 'object' && updated.root) {
+    if (typeof editFn === 'function' && targetDoc) {
+      const updated = await editFn.call(studioApi, targetDoc, ops, label, merge);
+      if (
+        updated &&
+        typeof updated === 'object' &&
+        updated.root &&
+        (updated.kind === SOUNDBANK_KIND ||
+          updated.root?.ganbate === SOUNDBANK_KIND ||
+          String(updated.path || '').endsWith('.soundbank.json'))
+      ) {
         ingestSnapshot(updated);
-        renderAll();
+        if (ui.activeDragCount === 0) {
+          renderAll();
+        }
       }
       return updated;
     }
@@ -2504,7 +2689,7 @@ export function mountAudioDaw(container, studioApi = {}) {
       ),
       el(
         'span',
-        { class: `gdaw-badge ${ui.dirty ? 'dirty' : ''}` },
+        { class: `gdaw-badge ${ui.dirty ? 'dirty' : ''}`, 'data-role': 'dirty-badge' },
         ui.dirty ? 'Draft · Unsaved' : 'Synced',
       ),
       el('span', { class: 'gdaw-sep' }),
@@ -2859,27 +3044,11 @@ export function mountAudioDaw(container, studioApi = {}) {
 
   // ---- Panel 2: Event Action Sheet & Contact-Sync Timeline ------------------------------------
 
-  function buildClipSvg(layer) {
-    const seed = layer.assetId || layer.poolId || layer.id;
-    const peaks = runtime.peaks.get(seed) || synthesizeWaveformPeaks(seed, 42);
+  function computeClipFadePoints(layer) {
     const dur = Math.max(1, layer.durationMs);
     const fiPct = Math.min(100, ((layer.fadeInMs || 0) / dur) * 100);
     const foPct = Math.min(100, ((layer.fadeOutMs || 0) / dur) * 100);
-
-    const wavePts = [];
-    for (let i = 0; i < peaks.length; i++) {
-      const x = (i / Math.max(1, peaks.length - 1)) * 200;
-      const y = 17 - peaks[i] * 14;
-      wavePts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
-    }
-    for (let i = peaks.length - 1; i >= 0; i--) {
-      const x = (i / Math.max(1, peaks.length - 1)) * 200;
-      const y = 17 + peaks[i] * 14;
-      wavePts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
-    }
-
-    // Build curved fade envelope path (0..200 x 0..34)
-    const envPts = ['0,34'];
+    const envPts = [];
     const steps = 12;
     for (let s = 0; s <= steps; s++) {
       const t = s / steps;
@@ -2893,14 +3062,32 @@ export function mountAudioDaw(container, studioApi = {}) {
       const y = (34 - evaluateFadeCurve(1 - t, layer.fadeCurve) * 32).toFixed(1);
       envPts.push(`${x},${y}`);
     }
-    envPts.push('200,34');
+    return envPts.join(' ');
+  }
+
+  function buildClipSvg(layer) {
+    const seed = layer.assetId || layer.poolId || layer.id;
+    const peaks = runtime.peaks.get(seed) || synthesizeWaveformPeaks(seed, 42);
+
+    const wavePts = [];
+    for (let i = 0; i < peaks.length; i++) {
+      const x = (i / Math.max(1, peaks.length - 1)) * 200;
+      const y = 17 - peaks[i] * 14;
+      wavePts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+    }
+    for (let i = peaks.length - 1; i >= 0; i--) {
+      const x = (i / Math.max(1, peaks.length - 1)) * 200;
+      const y = 17 + peaks[i] * 14;
+      wavePts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+    }
 
     return svgEl(
       'svg',
       { viewBox: '0 0 200 34', preserveAspectRatio: 'none' },
       svgEl('polygon', { points: wavePts.join(' '), fill: layer.color || '#60a5fa', opacity: '0.68' }),
       svgEl('polyline', {
-        points: envPts.slice(1, -1).join(' '),
+        'data-role': 'clip-fade-poly',
+        points: computeClipFadePoints(layer),
         fill: 'none',
         stroke: '#f8fafc',
         'stroke-width': '1.3',
@@ -2950,7 +3137,8 @@ export function mountAudioDaw(container, studioApi = {}) {
       return;
     }
 
-    const pxPerMs = 0.72 * ui.timelineZoom;
+    const getPxPerMs = () => 0.72 * ui.timelineZoom;
+    const pxPerMs = getPxPerMs();
     const trackWidthPx = Math.max(360, Math.round(ev.durationMs * pxPerMs));
     const contactFrame60 = Math.round((ev.contactMarkerMs / 1000) * 60);
 
@@ -2964,6 +3152,7 @@ export function mountAudioDaw(container, studioApi = {}) {
           'div',
           {
             class: 'gdaw-tl-tick',
+            'data-tick-ms': String(ms),
             style: `left: ${168 + Math.round(ms * pxPerMs)}px`,
           },
           `${ms}ms · F${f60}`,
@@ -2971,41 +3160,303 @@ export function mountAudioDaw(container, studioApi = {}) {
       );
     }
 
+    const contactFlagEl = el(
+      'span',
+      { class: 'gdaw-contact-flag', 'data-role': 'contact-flag' },
+      `${ev.contactLabel} · ${Math.round(ev.contactMarkerMs)}ms (F${contactFrame60})`,
+    );
+
+    let stageEl = null;
+
+    const startContactMarkerDrag = (e) => {
+      e.preventDefault?.();
+      e.stopPropagation?.();
+      const targetNode = e.currentTarget || rulerEl;
+      try {
+        if (e.pointerId !== undefined) targetNode.setPointerCapture?.(e.pointerId);
+      } catch { /* ignore */ }
+
+      beginInteractiveDrag();
+      const isDirectLineDrag = e.currentTarget === contactLine;
+      const startX = Number(e.clientX ?? 0);
+      const origMarkerMs = ev.contactMarkerMs;
+      const refEl = stageEl || rulerEl;
+      const rect = refEl?.getBoundingClientRect?.();
+      let latestMs = origMarkerMs;
+      let ended = false;
+
+      const applyMarkerMs = (nextMs) => {
+        latestMs = Math.round(finiteClamp(nextMs, 0, ev.durationMs, origMarkerMs));
+        const curPxPerMs = getPxPerMs();
+        contactLine.setAttribute('style', `left: ${168 + Math.round(latestMs * curPxPerMs)}px`);
+        const f60 = Math.round((latestMs / 1000) * 60);
+        contactFlagEl.textContent = `${ev.contactLabel} · ${Math.round(latestMs)}ms (F${f60})`;
+        const contactInput = queryNodeByAttr(timelineEl, 'data-field', 'event-contact-ms');
+        if (contactInput) contactInput.value = String(latestMs);
+        void dispatchOps(
+          'Move contact marker',
+          [{ set: ['events', ui.selectedEventId, 'contactMarkerMs'], value: latestMs }],
+          `contact:${ui.selectedEventId}`,
+          { live: true },
+        );
+      };
+
+      if (!isDirectLineDrag && rect) {
+        const x = startX - rect.left - 168;
+        applyMarkerMs(x / getPxPerMs());
+      }
+
+      const onMove = (me) => {
+        const curX = Number(me.clientX ?? startX);
+        const curPxPerMs = getPxPerMs();
+        if (isDirectLineDrag || !rect) {
+          applyMarkerMs(origMarkerMs + (curX - startX) / curPxPerMs);
+        } else {
+          const x = curX - rect.left - 168;
+          applyMarkerMs(x / curPxPerMs);
+        }
+      };
+
+      const onUp = () => {
+        if (ended) return;
+        ended = true;
+        doc.removeEventListener('pointermove', onMove);
+        doc.removeEventListener('pointerup', onUp);
+        doc.removeEventListener('pointercancel', onUp);
+        globalThis.window?.removeEventListener?.('pointermove', onMove);
+        globalThis.window?.removeEventListener?.('pointerup', onUp);
+        globalThis.window?.removeEventListener?.('pointercancel', onUp);
+        endInteractiveDrag();
+        void dispatchOps(
+          'Move contact marker',
+          [{ set: ['events', ui.selectedEventId, 'contactMarkerMs'], value: latestMs }],
+          `contact:${ui.selectedEventId}`,
+          { live: false },
+        );
+      };
+
+      doc.addEventListener('pointermove', onMove);
+      doc.addEventListener('pointerup', onUp);
+      doc.addEventListener('pointercancel', onUp);
+      globalThis.window?.addEventListener?.('pointermove', onMove);
+      globalThis.window?.addEventListener?.('pointerup', onUp);
+      globalThis.window?.addEventListener?.('pointercancel', onUp);
+    };
+
     const rulerEl = el(
       'div',
       {
         class: 'gdaw-tl-ruler',
         title: 'Click or drag to move the Animation Contact Marker',
-        onpointerdown: (e) => {
-          const rect = rulerEl.getBoundingClientRect?.();
-          if (!rect) return;
-          const updateMarker = (clientX) => {
-            const x = clientX - rect.left - 168;
-            const nextMs = Math.round(finiteClamp(x / pxPerMs, 0, ev.durationMs, ev.contactMarkerMs));
-            void dispatchOps(
-              'Move contact marker',
-              [{ set: ['events', ui.selectedEventId, 'contactMarkerMs'], value: nextMs }],
-              `contact:${ui.selectedEventId}`,
-            );
-          };
-          updateMarker(e.clientX);
-          const onMove = (me) => updateMarker(me.clientX);
-          const onUp = () => {
-            doc.removeEventListener('pointermove', onMove);
-            doc.removeEventListener('pointerup', onUp);
-          };
-          doc.addEventListener('pointermove', onMove);
-          doc.addEventListener('pointerup', onUp);
-        },
+        onpointerdown: startContactMarkerDrag,
       },
       ticks,
     );
+
+    const contactLine = el(
+      'div',
+      {
+        class: 'gdaw-contact-line',
+        'data-role': 'contact-line',
+        title: 'Drag to move the Animation Contact Marker',
+        style: `left: ${168 + Math.round(ev.contactMarkerMs * pxPerMs)}px`,
+        onpointerdown: startContactMarkerDrag,
+      },
+      contactFlagEl,
+    );
+
+    const playheadLine = el('div', {
+      class: 'gdaw-playhead',
+      'data-role': 'playhead-line',
+      style: `left: ${168 + Math.round(ui.playheadMs * pxPerMs)}px`,
+    });
 
     const layers = orderedLayers(ev);
     const laneEls = layers.map((layer) => {
       const isSelected = layer.id === ui.selectedLayerId;
       const clipLeft = Math.round(layer.startMs * pxPerMs);
       const clipWidth = Math.max(14, Math.round(layer.durationMs * pxPerMs));
+      const clipSvg = buildClipSvg(layer);
+      const fadePoly = queryNodeByAttr(clipSvg, 'data-role', 'clip-fade-poly');
+
+      const formatClipDelta = (startMs) => {
+        const d = Math.round(startMs - ev.contactMarkerMs);
+        return d === 0 ? '@Contact' : d > 0 ? `+${d}ms` : `${d}ms`;
+      };
+
+      const timingBadgeEl = el(
+        'span',
+        { class: 'gdaw-clip-badge', 'data-role': 'clip-badge' },
+        `${layer.label} · ${formatClipDelta(layer.startMs)}`,
+      );
+
+      const fadeInHandle = el('div', {
+        class: 'gdaw-clip-fade gdaw-clip-fade-l',
+        'data-clip-handle': 'fade-in',
+        title: 'Drag to adjust Fade-In duration',
+      });
+
+      const fadeOutHandle = el('div', {
+        class: 'gdaw-clip-fade gdaw-clip-fade-r',
+        'data-clip-handle': 'fade-out',
+        title: 'Drag to adjust Fade-Out duration',
+      });
+
+      const resizeLeftHandle = el('div', {
+        class: 'gdaw-clip-handle gdaw-clip-handle-l',
+        'data-clip-handle': 'left',
+        title: 'Drag left edge to trim start / in-point',
+      });
+
+      const resizeRightHandle = el('div', {
+        class: 'gdaw-clip-handle gdaw-clip-handle-r',
+        'data-clip-handle': 'right',
+        title: 'Drag right edge to resize duration / out-point',
+      });
+
+      const syncFadeHandles = (curLayer) => {
+        const dur = Math.max(1, curLayer.durationMs);
+        const fiPct = Math.min(95, Math.max(0, ((curLayer.fadeInMs || 0) / dur) * 100));
+        const foPct = Math.min(95, Math.max(0, ((curLayer.fadeOutMs || 0) / dur) * 100));
+        fadeInHandle.setAttribute('style', `left: ${fiPct.toFixed(1)}%;`);
+        fadeOutHandle.setAttribute('style', `right: ${foPct.toFixed(1)}%;`);
+        if (fadePoly) {
+          fadePoly.setAttribute('points', computeClipFadePoints(curLayer));
+        }
+      };
+      syncFadeHandles(layer);
+
+      const startClipInteraction = (e, mode) => {
+        e.preventDefault?.();
+        e.stopPropagation?.();
+        const handleTarget = e.currentTarget || clipEl;
+        try {
+          if (e.pointerId !== undefined) handleTarget.setPointerCapture?.(e.pointerId);
+        } catch { /* ignore */ }
+
+        const wasSelected = ui.selectedLayerId === layer.id && ui.inspectorTarget.kind === 'layer';
+        ui.selectedLayerId = layer.id;
+        ui.inspectorTarget = { kind: 'layer', eventId: ui.selectedEventId, id: layer.id };
+
+        beginInteractiveDrag();
+        const startX = Number(e.clientX ?? 0);
+        const origStart = layer.startMs;
+        const origDur = layer.durationMs;
+        const origTrim = layer.trimStartMs || 0;
+        const origFi = layer.fadeInMs || 0;
+        const origFo = layer.fadeOutMs || 0;
+        let moved = false;
+        let ended = false;
+        let lastOps = [];
+        let lastMergeKey = `clip-${mode}:${layer.id}`;
+        let lastLabel = 'Edit foley clip';
+
+        const syncInspectorField = (fieldKey, val) => {
+          const inp = queryNodeByAttr(timelineEl, 'data-clip-field', fieldKey);
+          if (inp) inp.value = String(Math.round(Number(val) * 100) / 100);
+        };
+
+        const onMove = (me) => {
+          const curX = Number(me.clientX ?? startX);
+          const dx = curX - startX;
+          if (Math.abs(dx) < 1 && !moved) return;
+          moved = true;
+          const curPxPerMs = getPxPerMs();
+          const deltaMs = dx / curPxPerMs;
+          const liveLayer = ev.layers[layer.id] || layer;
+
+          if (mode === 'move') {
+            const nextStart = Math.round(
+              finiteClamp(origStart + deltaMs, 0, Math.max(0, ev.durationMs - 5), origStart),
+            );
+            lastLabel = 'Move foley clip';
+            lastOps = [{ set: ['events', ui.selectedEventId, 'layers', layer.id, 'startMs'], value: nextStart }];
+            clipEl.setAttribute(
+              'style',
+              `left: ${Math.round(nextStart * curPxPerMs)}px; width: ${Math.max(14, Math.round(liveLayer.durationMs * curPxPerMs))}px;`,
+            );
+            timingBadgeEl.textContent = `${liveLayer.label} · ${formatClipDelta(nextStart)}`;
+            syncInspectorField('startMs', nextStart);
+          } else if (mode === 'resize-r') {
+            const nextDur = Math.round(
+              finiteClamp(origDur + deltaMs, 10, Math.max(20, ev.durationMs - origStart), origDur),
+            );
+            lastLabel = 'Resize foley clip length';
+            lastOps = [{ set: ['events', ui.selectedEventId, 'layers', layer.id, 'durationMs'], value: nextDur }];
+            clipEl.setAttribute(
+              'style',
+              `left: ${Math.round(liveLayer.startMs * curPxPerMs)}px; width: ${Math.max(14, Math.round(nextDur * curPxPerMs))}px;`,
+            );
+            syncInspectorField('durationMs', nextDur);
+          } else if (mode === 'resize-l') {
+            const maxShiftRight = Math.max(0, origDur - 10);
+            const maxShiftLeft = -origStart;
+            const shiftMs = Math.round(finiteClamp(deltaMs, maxShiftLeft, maxShiftRight, 0));
+            const nextStart = origStart + shiftMs;
+            const nextDur = origDur - shiftMs;
+            const nextTrim = Math.max(0, origTrim + shiftMs);
+            lastLabel = 'Trim foley clip start';
+            lastOps = [
+              { set: ['events', ui.selectedEventId, 'layers', layer.id, 'startMs'], value: nextStart },
+              { set: ['events', ui.selectedEventId, 'layers', layer.id, 'durationMs'], value: nextDur },
+              { set: ['events', ui.selectedEventId, 'layers', layer.id, 'trimStartMs'], value: nextTrim },
+            ];
+            clipEl.setAttribute(
+              'style',
+              `left: ${Math.round(nextStart * curPxPerMs)}px; width: ${Math.max(14, Math.round(nextDur * curPxPerMs))}px;`,
+            );
+            timingBadgeEl.textContent = `${liveLayer.label} · ${formatClipDelta(nextStart)}`;
+            syncInspectorField('startMs', nextStart);
+            syncInspectorField('durationMs', nextDur);
+            syncInspectorField('trimStartMs', nextTrim);
+          } else if (mode === 'fade-in') {
+            const nextFi = Math.round(finiteClamp(origFi + deltaMs, 0, origDur, origFi));
+            lastLabel = 'Adjust clip fade-in';
+            lastOps = [{ set: ['events', ui.selectedEventId, 'layers', layer.id, 'fadeInMs'], value: nextFi }];
+            syncInspectorField('fadeInMs', nextFi);
+          } else if (mode === 'fade-out') {
+            const nextFo = Math.round(finiteClamp(origFo - deltaMs, 0, origDur, origFo));
+            lastLabel = 'Adjust clip fade-out';
+            lastOps = [{ set: ['events', ui.selectedEventId, 'layers', layer.id, 'fadeOutMs'], value: nextFo }];
+            syncInspectorField('fadeOutMs', nextFo);
+          }
+
+          if (lastOps.length > 0) {
+            void dispatchOps(lastLabel, lastOps, lastMergeKey, { live: true });
+            const updatedLayer = ui.root.events[ui.selectedEventId]?.layers?.[layer.id];
+            if (updatedLayer) syncFadeHandles(updatedLayer);
+          }
+        };
+
+        const onUp = () => {
+          if (ended) return;
+          ended = true;
+          doc.removeEventListener('pointermove', onMove);
+          doc.removeEventListener('pointerup', onUp);
+          doc.removeEventListener('pointercancel', onUp);
+          globalThis.window?.removeEventListener?.('pointermove', onMove);
+          globalThis.window?.removeEventListener?.('pointerup', onUp);
+          globalThis.window?.removeEventListener?.('pointercancel', onUp);
+          endInteractiveDrag();
+          if (moved && lastOps.length > 0) {
+            void dispatchOps(lastLabel, lastOps, lastMergeKey, { live: false });
+          } else if (!wasSelected) {
+            renderAll();
+          }
+        };
+
+        doc.addEventListener('pointermove', onMove);
+        doc.addEventListener('pointerup', onUp);
+        doc.addEventListener('pointercancel', onUp);
+        globalThis.window?.addEventListener?.('pointermove', onMove);
+        globalThis.window?.addEventListener?.('pointerup', onUp);
+        globalThis.window?.addEventListener?.('pointercancel', onUp);
+      };
+
+      resizeLeftHandle.addEventListener('pointerdown', (e) => startClipInteraction(e, 'resize-l'));
+      resizeRightHandle.addEventListener('pointerdown', (e) => startClipInteraction(e, 'resize-r'));
+      fadeInHandle.addEventListener('pointerdown', (e) => startClipInteraction(e, 'fade-in'));
+      fadeOutHandle.addEventListener('pointerdown', (e) => startClipInteraction(e, 'fade-out'));
 
       const clipEl = el(
         'div',
@@ -3013,36 +3464,14 @@ export function mountAudioDaw(container, studioApi = {}) {
           class: `gdaw-clip ${isSelected ? 'selected' : ''} ${layer.enabled ? '' : 'muted'}`,
           'data-layer-id': layer.id,
           style: `left: ${clipLeft}px; width: ${clipWidth}px;`,
-          onpointerdown: (e) => {
-            e.stopPropagation();
-            ui.selectedLayerId = layer.id;
-            ui.inspectorTarget = { kind: 'layer', eventId: ui.selectedEventId, id: layer.id };
-            const startX = e.clientX;
-            const origStart = layer.startMs;
-            let moved = false;
-            const onMove = (me) => {
-              const dx = me.clientX - startX;
-              if (Math.abs(dx) < 2 && !moved) return;
-              moved = true;
-              const nextStart = Math.round(
-                finiteClamp(origStart + dx / pxPerMs, 0, ev.durationMs - 5, origStart),
-              );
-              void dispatchOps(
-                'Move foley clip',
-                [{ set: ['events', ui.selectedEventId, 'layers', layer.id, 'startMs'], value: nextStart }],
-                `clip-start:${layer.id}`,
-              );
-            };
-            const onUp = () => {
-              doc.removeEventListener('pointermove', onMove);
-              doc.removeEventListener('pointerup', onUp);
-              if (!moved) renderAll();
-            };
-            doc.addEventListener('pointermove', onMove);
-            doc.addEventListener('pointerup', onUp);
-          },
+          onpointerdown: (e) => startClipInteraction(e, 'move'),
         },
-        buildClipSvg(layer),
+        clipSvg,
+        timingBadgeEl,
+        fadeInHandle,
+        fadeOutHandle,
+        resizeLeftHandle,
+        resizeRightHandle,
       );
 
       return el(
@@ -3122,49 +3551,95 @@ export function mountAudioDaw(container, studioApi = {}) {
             ),
           ),
         ),
-        el('div', { class: 'gdaw-lane-track', style: `width: ${trackWidthPx}px;` }, clipEl),
+        el(
+          'div',
+          { class: 'gdaw-lane-track', 'data-lane-track': layer.id, style: `width: ${trackWidthPx}px;` },
+          clipEl,
+        ),
       );
     });
 
-    const contactLine = el(
+    stageEl = el(
       'div',
-      {
-        class: 'gdaw-contact-line',
-        style: `left: ${168 + Math.round(ev.contactMarkerMs * pxPerMs)}px`,
-      },
-      el('span', { class: 'gdaw-contact-flag' }, `${ev.contactLabel} · ${Math.round(ev.contactMarkerMs)}ms (F${contactFrame60})`),
+      { class: 'gdaw-tl-stage', style: `width: ${168 + trackWidthPx + 24}px;` },
+      rulerEl,
+      contactLine,
+      playheadLine,
+      laneEls,
     );
 
-    const playheadLine = el('div', {
-      class: 'gdaw-playhead',
-      style: `left: ${168 + Math.round(ui.playheadMs * pxPerMs)}px`,
-    });
+    const updateTimelineZoomInPlace = () => {
+      const curPxPerMs = getPxPerMs();
+      const nextTrackWidth = Math.max(360, Math.round(ev.durationMs * curPxPerMs));
+      stageEl.setAttribute('style', `width: ${168 + nextTrackWidth + 24}px;`);
+      for (const tickNode of ticks) {
+        const ms = Number(tickNode.getAttribute('data-tick-ms') || 0);
+        tickNode.setAttribute('style', `left: ${168 + Math.round(ms * curPxPerMs)}px`);
+      }
+      contactLine.setAttribute('style', `left: ${168 + Math.round(ev.contactMarkerMs * curPxPerMs)}px`);
+      playheadLine.setAttribute('style', `left: ${168 + Math.round(ui.playheadMs * curPxPerMs)}px`);
+      for (const layer of orderedLayers(ev)) {
+        const trackNode = queryNodeByAttr(stageEl, 'data-lane-track', layer.id);
+        if (trackNode) trackNode.setAttribute('style', `width: ${nextTrackWidth}px;`);
+        const clipNode = queryNodeByAttr(stageEl, 'data-layer-id', layer.id);
+        if (clipNode) {
+          clipNode.setAttribute(
+            'style',
+            `left: ${Math.round(layer.startMs * curPxPerMs)}px; width: ${Math.max(14, Math.round(layer.durationMs * curPxPerMs))}px;`,
+          );
+        }
+      }
+    };
 
     const activeLayer = ev.layers[ui.selectedLayerId];
     const clipInspector = activeLayer
       ? el(
           'div',
           { class: 'gdaw-clip-bar' },
-          kvNum('Start (ms)', activeLayer.startMs, 0, ev.durationMs, 1, (v) =>
-            dispatchOps(
-              'Set clip start',
-              [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'startMs'], value: v }],
-              `clip-start:${ui.selectedLayerId}`,
-            ),
+          kvNum(
+            'Start (ms)',
+            activeLayer.startMs,
+            0,
+            ev.durationMs,
+            1,
+            (v, meta) =>
+              dispatchOps(
+                'Set clip start',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'startMs'], value: v }],
+                `clip-start:${ui.selectedLayerId}`,
+                meta,
+              ),
+            { dataClipField: 'startMs' },
           ),
-          kvNum('Length (ms)', activeLayer.durationMs, 5, 60000, 1, (v) =>
-            dispatchOps(
-              'Set clip duration',
-              [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'durationMs'], value: v }],
-              `clip-dur:${ui.selectedLayerId}`,
-            ),
+          kvNum(
+            'Length (ms)',
+            activeLayer.durationMs,
+            5,
+            60000,
+            1,
+            (v, meta) =>
+              dispatchOps(
+                'Set clip duration',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'durationMs'], value: v }],
+                `clip-dur:${ui.selectedLayerId}`,
+                meta,
+              ),
+            { dataClipField: 'durationMs' },
           ),
-          kvNum('Trim (ms)', activeLayer.trimStartMs, 0, 60000, 1, (v) =>
-            dispatchOps(
-              'Set clip trim',
-              [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'trimStartMs'], value: v }],
-              `clip-trim:${ui.selectedLayerId}`,
-            ),
+          kvNum(
+            'Trim (ms)',
+            activeLayer.trimStartMs,
+            0,
+            60000,
+            1,
+            (v, meta) =>
+              dispatchOps(
+                'Set clip trim',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'trimStartMs'], value: v }],
+                `clip-trim:${ui.selectedLayerId}`,
+                meta,
+              ),
+            { dataClipField: 'trimStartMs' },
           ),
           createRotaryKnob(doc, {
             label: 'Fade In',
@@ -3177,11 +3652,26 @@ export function mountAudioDaw(container, studioApi = {}) {
             size: 'sm',
             ariaLabel: 'Clip Fade In Ms',
             format: (v) => `${Math.round(v)} ms`,
-            onChange: (v) =>
+            onDragStart: beginInteractiveDrag,
+            onDragEnd: endInteractiveDrag,
+            onChange: (v, meta) => {
               void dispatchOps(
                 'Set clip fade-in',
                 [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'fadeInMs'], value: v }],
                 `clip-fi:${ui.selectedLayerId}`,
+                meta,
+              );
+              const clipNode = queryNodeByAttr(stageEl, 'data-layer-id', ui.selectedLayerId);
+              const poly = queryNodeByAttr(clipNode, 'data-role', 'clip-fade-poly');
+              const updatedLayer = ui.root.events[ui.selectedEventId]?.layers?.[ui.selectedLayerId];
+              if (poly && updatedLayer) poly.setAttribute('points', computeClipFadePoints(updatedLayer));
+            },
+            onCommit: (v) =>
+              void dispatchOps(
+                'Set clip fade-in',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'fadeInMs'], value: v }],
+                `clip-fi:${ui.selectedLayerId}`,
+                { live: false },
               ),
           }),
           createRotaryKnob(doc, {
@@ -3195,11 +3685,26 @@ export function mountAudioDaw(container, studioApi = {}) {
             size: 'sm',
             ariaLabel: 'Clip Fade Out Ms',
             format: (v) => `${Math.round(v)} ms`,
-            onChange: (v) =>
+            onDragStart: beginInteractiveDrag,
+            onDragEnd: endInteractiveDrag,
+            onChange: (v, meta) => {
               void dispatchOps(
                 'Set clip fade-out',
                 [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'fadeOutMs'], value: v }],
                 `clip-fo:${ui.selectedLayerId}`,
+                meta,
+              );
+              const clipNode = queryNodeByAttr(stageEl, 'data-layer-id', ui.selectedLayerId);
+              const poly = queryNodeByAttr(clipNode, 'data-role', 'clip-fade-poly');
+              const updatedLayer = ui.root.events[ui.selectedEventId]?.layers?.[ui.selectedLayerId];
+              if (poly && updatedLayer) poly.setAttribute('points', computeClipFadePoints(updatedLayer));
+            },
+            onCommit: (v) =>
+              void dispatchOps(
+                'Set clip fade-out',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'fadeOutMs'], value: v }],
+                `clip-fo:${ui.selectedLayerId}`,
+                { live: false },
               ),
           }),
           el(
@@ -3235,11 +3740,21 @@ export function mountAudioDaw(container, studioApi = {}) {
             size: 'sm',
             ariaLabel: 'Clip Gain dB',
             format: (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)} dB`,
-            onChange: (v) =>
+            onDragStart: beginInteractiveDrag,
+            onDragEnd: endInteractiveDrag,
+            onChange: (v, meta) =>
               void dispatchOps(
                 'Set clip gain',
                 [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'gainDb'], value: v }],
                 `clip-gain:${ui.selectedLayerId}`,
+                meta,
+              ),
+            onCommit: (v) =>
+              void dispatchOps(
+                'Set clip gain',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'gainDb'], value: v }],
+                `clip-gain:${ui.selectedLayerId}`,
+                { live: false },
               ),
           }),
           createRotaryKnob(doc, {
@@ -3254,11 +3769,21 @@ export function mountAudioDaw(container, studioApi = {}) {
             size: 'sm',
             ariaLabel: 'Clip Pitch Semitones',
             format: (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)} st`,
-            onChange: (v) =>
+            onDragStart: beginInteractiveDrag,
+            onDragEnd: endInteractiveDrag,
+            onChange: (v, meta) =>
               void dispatchOps(
                 'Set clip pitch',
                 [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'pitchSemitones'], value: v }],
                 `clip-pitch:${ui.selectedLayerId}`,
+                meta,
+              ),
+            onCommit: (v) =>
+              void dispatchOps(
+                'Set clip pitch',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'pitchSemitones'], value: v }],
+                `clip-pitch:${ui.selectedLayerId}`,
+                { live: false },
               ),
           }),
           createRotaryKnob(doc, {
@@ -3272,11 +3797,21 @@ export function mountAudioDaw(container, studioApi = {}) {
             size: 'sm',
             ariaLabel: 'Clip Pitch Variance Cents',
             format: (v) => `±${Math.round(v)} c`,
-            onChange: (v) =>
+            onDragStart: beginInteractiveDrag,
+            onDragEnd: endInteractiveDrag,
+            onChange: (v, meta) =>
               void dispatchOps(
                 'Set pitch jitter',
                 [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'pitchJitterCents'], value: v }],
                 `clip-pjit:${ui.selectedLayerId}`,
+                meta,
+              ),
+            onCommit: (v) =>
+              void dispatchOps(
+                'Set pitch jitter',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'pitchJitterCents'], value: v }],
+                `clip-pjit:${ui.selectedLayerId}`,
+                { live: false },
               ),
           }),
           el(
@@ -3406,19 +3941,35 @@ export function mountAudioDaw(container, studioApi = {}) {
           },
           '+ Event',
         ),
-        kvNum('Sheet (ms)', ev.durationMs, 60, 60000, 10, (v) =>
-          dispatchOps(
-            'Set sheet duration',
-            [{ set: ['events', ui.selectedEventId, 'durationMs'], value: v }],
-            `ev-dur:${ui.selectedEventId}`,
-          ),
+        kvNum(
+          'Sheet (ms)',
+          ev.durationMs,
+          60,
+          60000,
+          10,
+          (v, meta) =>
+            dispatchOps(
+              'Set sheet duration',
+              [{ set: ['events', ui.selectedEventId, 'durationMs'], value: v }],
+              `ev-dur:${ui.selectedEventId}`,
+              meta,
+            ),
+          { dataField: 'event-duration-ms' },
         ),
-        kvNum('Contact (ms)', ev.contactMarkerMs, 0, ev.durationMs, 5, (v) =>
-          dispatchOps(
-            'Set contact marker',
-            [{ set: ['events', ui.selectedEventId, 'contactMarkerMs'], value: v }],
-            `contact:${ui.selectedEventId}`,
-          ),
+        kvNum(
+          'Contact (ms)',
+          ev.contactMarkerMs,
+          0,
+          ev.durationMs,
+          5,
+          (v, meta) =>
+            dispatchOps(
+              'Set contact marker',
+              [{ set: ['events', ui.selectedEventId, 'contactMarkerMs'], value: v }],
+              `contact:${ui.selectedEventId}`,
+              meta,
+            ),
+          { dataField: 'event-contact-ms' },
         ),
         createRotaryKnob(doc, {
           label: 'Zoom',
@@ -3431,45 +3982,41 @@ export function mountAudioDaw(container, studioApi = {}) {
           size: 'sm',
           ariaLabel: 'Timeline Zoom',
           format: (v) => `${v.toFixed(1)}×`,
-          onChange: (v) => {
+          onDragStart: beginInteractiveDrag,
+          onDragEnd: endInteractiveDrag,
+          onChange: (v, meta) => {
             ui.timelineZoom = v || 1;
-            renderTimelinePanel();
+            if (meta?.live) {
+              updateTimelineZoomInPlace();
+            } else {
+              renderTimelinePanel();
+            }
+          },
+          onCommit: () => {
+            if (ui.activeDragCount === 0) renderTimelinePanel();
           },
         }),
       ),
-      el(
-        'div',
-        { class: 'gdaw-tl-scroll' },
-        el(
-          'div',
-          { class: 'gdaw-tl-stage', style: `width: ${168 + trackWidthPx + 24}px;` },
-          rulerEl,
-          contactLine,
-          playheadLine,
-          laneEls,
-        ),
-      ),
+      el('div', { class: 'gdaw-tl-scroll' }, stageEl),
       clipInspector,
     );
   }
 
-  function kvNum(labelText, value, min, max, step, onChange) {
-    return el(
-      'label',
-      { class: 'gdaw-kv' },
-      labelText,
-      el('input', {
-        type: 'number',
-        min,
-        max,
-        step,
-        value: Math.round(Number(value) * 100) / 100,
-        onchange: (e) => {
-          const n = finiteClamp(e.target.value, min, max, value);
-          void onChange(n);
-        },
-      }),
-    );
+  function kvNum(labelText, value, min, max, step, onChange, { dataField, dataClipField } = {}) {
+    const inputAttrs = {
+      type: 'number',
+      min,
+      max,
+      step,
+      value: Math.round(Number(value) * 100) / 100,
+      onchange: (e) => {
+        const n = finiteClamp(e.target.value, min, max, value);
+        void onChange(n, { live: false });
+      },
+    };
+    if (dataField) inputAttrs['data-field'] = dataField;
+    if (dataClipField) inputAttrs['data-clip-field'] = dataClipField;
+    return el('label', { class: 'gdaw-kv' }, labelText, el('input', inputAttrs));
   }
 
   // ---- Panel 3: Multi-Channel Mixing Console & Live Metering ----------------------------------
@@ -3525,11 +4072,21 @@ export function mountAudioDaw(container, studioApi = {}) {
             size: 'sm',
             ariaLabel: `${bus.label} pan`,
             format: fmtPanText,
-            onChange: (v) =>
+            onDragStart: beginInteractiveDrag,
+            onDragEnd: endInteractiveDrag,
+            onChange: (v, meta) =>
               void dispatchOps(
                 `Pan ${bus.label}`,
                 [{ set: ['buses', bus.id, 'strip', 'pan'], value: v }],
                 `pan:${bus.id}`,
+                meta,
+              ),
+            onCommit: (v) =>
+              void dispatchOps(
+                `Pan ${bus.label}`,
+                [{ set: ['buses', bus.id, 'strip', 'pan'], value: v }],
+                `pan:${bus.id}`,
+                { live: false },
               ),
           }),
           el(
@@ -3576,11 +4133,21 @@ export function mountAudioDaw(container, studioApi = {}) {
               defaultValue: 1.0,
               busId: bus.id,
               accentColor: bus.color,
-              onChange: (v) =>
+              onDragStart: beginInteractiveDrag,
+              onDragEnd: endInteractiveDrag,
+              onChange: (v, meta) =>
                 void dispatchOps(
                   `Set ${bus.label} fader`,
                   [{ set: ['buses', bus.id, 'volume'], value: v }],
                   `fader:${bus.id}`,
+                  meta,
+                ),
+              onCommit: (v) =>
+                void dispatchOps(
+                  `Set ${bus.label} fader`,
+                  [{ set: ['buses', bus.id, 'volume'], value: v }],
+                  `fader:${bus.id}`,
+                  { live: false },
                 ),
             }),
           ),
@@ -3801,7 +4368,9 @@ export function mountAudioDaw(container, studioApi = {}) {
         ma.anR.getFloatTimeDomainData(ma.bufR);
         const prevGr = ui.lastMeters[MASTER_BUS_ID]?.gainReductionDb || 0;
         ui.lastMeters[MASTER_BUS_ID] = analyzeStereoFrames(ma.bufL, ma.bufR, prevGr);
-        renderConsolePanel();
+        if (ui.activeDragCount === 0) {
+          renderConsolePanel();
+        }
       }
       ui.rafId = globalThis.requestAnimationFrame(tick);
     };
@@ -3833,24 +4402,29 @@ export function mountAudioDaw(container, studioApi = {}) {
     };
   }
 
-  function buildEqSvg(strip) {
+  function computeEqPolylinePoints(strip, sampleRate = DEFAULT_SAMPLE_RATE) {
     const freqs = [];
     for (let i = 0; i < 48; i++) {
       freqs.push(20 * (20000 / 20) ** (i / 47));
     }
-    const mags = evaluateStripResponseDb(strip, freqs, ui.root.sampleRate);
-    const pts = mags.map((db, i) => {
-      const x = (i / 47) * 260;
-      const y = 39 - finiteClamp(db, -18, 18, 0) * (34 / 18);
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    });
+    const mags = evaluateStripResponseDb(strip, freqs, sampleRate);
+    return mags
+      .map((db, i) => {
+        const x = (i / 47) * 260;
+        const y = 39 - finiteClamp(db, -18, 18, 0) * (34 / 18);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(' ');
+  }
 
+  function buildEqSvg(strip) {
     return svgEl(
       'svg',
       { class: 'gdaw-eq-svg', viewBox: '0 0 260 78', preserveAspectRatio: 'none' },
       svgEl('line', { x1: '0', y1: '39', x2: '260', y2: '39', stroke: '#2c2f36', 'stroke-width': '1' }),
       svgEl('polyline', {
-        points: pts.join(' '),
+        'data-role': 'eq-polyline',
+        points: computeEqPolylinePoints(strip, ui.root.sampleRate),
         fill: 'none',
         stroke: '#e8b44a',
         'stroke-width': '1.8',
@@ -3858,7 +4432,7 @@ export function mountAudioDaw(container, studioApi = {}) {
     );
   }
 
-  function buildOverdriveSvg(drive) {
+  function computeOverdrivePolylinePoints(drive) {
     const pts = [];
     for (let i = 0; i <= 40; i++) {
       const xNorm = (i / 40) * 2 - 1;
@@ -3867,12 +4441,17 @@ export function mountAudioDaw(container, studioApi = {}) {
       const y = 27 - yNorm * 23;
       pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
     }
+    return pts.join(' ');
+  }
+
+  function buildOverdriveSvg(drive) {
     return svgEl(
       'svg',
       { class: 'gdaw-od-svg', viewBox: '0 0 260 54', preserveAspectRatio: 'none' },
       svgEl('line', { x1: '0', y1: '27', x2: '260', y2: '27', stroke: '#2c2f36', 'stroke-width': '1' }),
       svgEl('polyline', {
-        points: pts.join(' '),
+        'data-role': 'od-polyline',
+        points: computeOverdrivePolylinePoints(drive),
         fill: 'none',
         stroke: '#fb923c',
         'stroke-width': '1.8',
@@ -3905,8 +4484,16 @@ export function mountAudioDaw(container, studioApi = {}) {
         disabled = false,
         autoEnablePath,
       } = {},
-    ) =>
-      createRotaryKnob(doc, {
+    ) => {
+      const buildOps = (nextVal) => {
+        const ops = [{ set: [...ctx.basePath, ...subPath], value: nextVal }];
+        if (autoEnablePath) {
+          ops.unshift({ set: [...ctx.basePath, ...autoEnablePath], value: true });
+        }
+        return ops;
+      };
+      const mergeKey = `dsp:${ctx.basePath.join('/')}:${subPath.join('.')}`;
+      return createRotaryKnob(doc, {
         label: labelText,
         value: val,
         min,
@@ -3920,18 +4507,16 @@ export function mountAudioDaw(container, studioApi = {}) {
         dataDsp: subPath.join('.'),
         ariaLabel: `${labelText} (${subPath.join('.')})`,
         format: fmt,
-        onChange: (nextVal) => {
-          const ops = [{ set: [...ctx.basePath, ...subPath], value: nextVal }];
-          if (autoEnablePath) {
-            ops.unshift({ set: [...ctx.basePath, ...autoEnablePath], value: true });
-          }
-          void dispatchOps(
-            `DSP ${subPath.join('.')}`,
-            ops,
-            `dsp:${ctx.basePath.join('/')}:${subPath.join('.')}`,
-          );
+        onDragStart: beginInteractiveDrag,
+        onDragEnd: endInteractiveDrag,
+        onChange: (nextVal, meta) => {
+          void dispatchOps(`DSP ${subPath.join('.')}`, buildOps(nextVal), mergeKey, meta);
+        },
+        onCommit: (nextVal) => {
+          void dispatchOps(`DSP ${subPath.join('.')}`, buildOps(nextVal), mergeKey, { live: false });
         },
       });
+    };
 
     const targetSelect = el(
       'select',
@@ -4418,28 +5003,35 @@ export function mountAudioDaw(container, studioApi = {}) {
       studioApi.on('doc', (payload) => {
         if (payload && typeof payload === 'object') {
           if (
-            payload.id === ui.docId ||
+            (ui.docId && payload.id === ui.docId) ||
             String(payload.path || '').endsWith('.soundbank.json') ||
+            payload.kind === SOUNDBANK_KIND ||
             payload.root?.ganbate === SOUNDBANK_KIND
           ) {
             ingestSnapshot(payload);
-            renderAll();
+            if (ui.activeDragCount === 0) {
+              renderAll();
+            }
           }
         }
       }),
       studioApi.on('assets', () => {
         refreshDocumentCatalog();
-        renderToolbar();
-        renderBrowserPanel();
+        if (ui.activeDragCount === 0) {
+          renderToolbar();
+          renderBrowserPanel();
+        }
       }),
-      studioApi.on('locale', () => renderAll()),
+      studioApi.on('locale', () => {
+        if (ui.activeDragCount === 0) renderAll();
+      }),
     );
   } else if (typeof studioApi.subscribe === 'function') {
     unsubs.push(
       studioApi.subscribe((snap) => {
         refreshDocumentCatalog();
         if (snap?.activeDocument) ingestSnapshot(snap.activeDocument);
-        renderAll();
+        if (ui.activeDragCount === 0) renderAll();
       }),
     );
   }
@@ -4467,7 +5059,7 @@ export function mountAudioDaw(container, studioApi = {}) {
     refresh(snapshot) {
       refreshDocumentCatalog();
       if (snapshot?.activeDocument) ingestSnapshot(snapshot.activeDocument);
-      renderAll();
+      if (ui.activeDragCount === 0) renderAll();
     },
     setDocument(pathOrId, docSnap) {
       if (pathOrId && typeof pathOrId === 'object' && docSnap === undefined) {

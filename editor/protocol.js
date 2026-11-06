@@ -241,6 +241,7 @@ function inferCloudDocKind(path, root) {
   if (lower.endsWith('.character.json') || root?.ganbate === 'character') return 'character';
   if (lower.endsWith('.seq.json') || root?.ganbate === 'seq') return 'seq';
   if (lower.endsWith('.vfx.json') || root?.ganbate === 'vfx') return 'vfx';
+  if (lower.endsWith('.terrain.json') || root?.ganbate === 'terrain') return 'terrain';
   if (lower.endsWith('.data.json') || root?.ganbate === 'data') return 'data';
   if (lower.endsWith('.glb')) return 'model';
   if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.webp')) return 'texture';
@@ -282,6 +283,17 @@ function defaultRootForCreate(kind, id, path, schema, name) {
       return { ganbate: 'seq', version: 1, name: docName, duration: 4.0, tracks: [] };
     case 'vfx':
       return { ganbate: 'vfx', version: 1, name: docName, emitters: [] };
+    case 'terrain':
+      return {
+        ganbate: 'terrain',
+        version: 1,
+        name: docName,
+        grid: { cols: 32, rows: 32, cellSize: 1, minHeight: 0, maxHeight: 0, heights: new Array(32 * 32).fill(0) },
+        water: { enabled: true, level: -0.25 },
+        sky: { preset: 'dusk', timeHours: 17.5, weather: 'clear' },
+        splines: [],
+        scatter: [],
+      };
     case 'data':
     default:
       return {
@@ -546,6 +558,21 @@ export class CloudStudioHost {
           material: { type: 'asset', kind: 'material' },
         },
       },
+      terrain: existingComponents.terrain || {
+        label: 'Landscape Terrain',
+        fields: {
+          cols: { type: 'int', min: 8, max: 256, default: 48 },
+          rows: { type: 'int', min: 8, max: 256, default: 48 },
+          cellSize: { type: 'float', min: 0.25, max: 10, default: 1.0 },
+          waterLevel: { type: 'float', min: -10, max: 10, default: -0.25 },
+        },
+      },
+      water: existingComponents.water || {
+        label: 'Water Surface',
+        fields: {
+          level: { type: 'float', min: -10, max: 10, default: -0.25 },
+        },
+      },
     });
     this.schemas = [{ ganbate: 'schema', version: 1, components: existingComponents }];
   }
@@ -739,11 +766,24 @@ export class CloudStudioHost {
         instances: [0, 0],
         lights: [lampStart, hasLight ? 1 : 0],
       };
-      if (ent?.components?.mesh) {
-        const [tx, ty, tz] = [transform[12], transform[13], transform[14]];
+      const [tx, ty, tz] = [transform[12], transform[13], transform[14]];
+      const sx = Math.max(0.25, Math.hypot(transform[0], transform[1], transform[2]) || 1);
+      const sy = Math.max(0.25, Math.hypot(transform[4], transform[5], transform[6]) || 1);
+      const sz = Math.max(0.25, Math.hypot(transform[8], transform[9], transform[10]) || 1);
+      if (ent?.components?.terrain) {
+        const halfW = ((Number(ent.components.terrain.cols) || 32) * (Number(ent.components.terrain.cellSize) || 1)) * 0.5;
+        const halfD = ((Number(ent.components.terrain.rows) || 32) * (Number(ent.components.terrain.cellSize) || 1)) * 0.5;
         record.bounds = [
-          [tx - 0.5, ty - 0.5, tz - 0.5],
-          [tx + 0.5, ty + 0.5, tz + 0.5],
+          [tx - halfW, ty + (Number(ent.components.terrain.minHeight) || -1), tz - halfD],
+          [tx + halfW, ty + (Number(ent.components.terrain.maxHeight) || 3), tz + halfD],
+        ];
+      } else if (ent?.components?.mesh || ent?.components?.water || ent?.components?.light || ent?.components?.camera || ent?.components?.transform) {
+        const rx = 0.6 * sx;
+        const ry = 0.6 * sy;
+        const rz = 0.6 * sz;
+        record.bounds = [
+          [tx - rx, ty - ry, tz - rz],
+          [tx + rx, ty + ry, tz + rz],
         ];
       }
       indexById.set(id, entities.length);
@@ -901,9 +941,11 @@ export class CloudStudioHost {
           type: 'rescanned',
           req,
           ok: true,
-          added: 0,
-          moved: 0,
-          removed: 0,
+          count: this.assets.length,
+          added: [],
+          moved: [],
+          removed: [],
+          created: [],
           identity: 0,
           problems: [],
           drafts: [],
@@ -1186,6 +1228,55 @@ export class CloudStudioHost {
           statements: ops.length,
           spawned: [],
         });
+        break;
+      }
+      case 'asset-import': {
+        const rawPath = String(msg.path || '').replace(/\\/g, '/').replace(/^\/+/, '');
+        if (!rawPath) {
+          this._emit({ type: 'error', req, message: 'missing import path' });
+          break;
+        }
+        const id = cloudDocId(rawPath);
+        const kind = inferCloudDocKind(rawPath);
+        const bytes = typeof msg.dataBase64 === 'string' ? Math.floor((msg.dataBase64.length * 3) / 4) : 0;
+        if (rawPath.toLowerCase().endsWith('.json') && typeof msg.dataBase64 === 'string') {
+          try {
+            const jsonText = typeof atob === 'function'
+              ? atob(msg.dataBase64)
+              : Buffer.from(msg.dataBase64, 'base64').toString('utf8');
+            const parsed = JSON.parse(jsonText);
+            if (parsed && typeof parsed === 'object') {
+              this._upsertDoc(rawPath, parsed, kind);
+            }
+          } catch {
+            /* binary or non-JSON import */
+          }
+        }
+        const existingIdx = this.assets.findIndex((a) => a.id === id || a.path === rawPath);
+        const assetEntry = { id, kind, path: rawPath, bytes };
+        if (existingIdx >= 0) this.assets[existingIdx] = assetEntry;
+        else this.assets.push(assetEntry);
+        this.assets.sort((a, b) => a.path.localeCompare(b.path));
+        this._emit({ type: 'assets', assets: structuredClone(this.assets) });
+        this._emit({ type: 'asset-imported', req, id, path: rawPath, kind, bytes });
+        break;
+      }
+      case 'asset-move': {
+        const targetId = msg.id;
+        const toPath = String(msg.to || '').replace(/\\/g, '/').replace(/^\/+/, '');
+        const asset = this.assets.find((a) => a.id === targetId);
+        if (!asset || !toPath) {
+          this._emit({ type: 'error', req, message: 'asset move failed' });
+          break;
+        }
+        const fromPath = asset.path;
+        asset.path = toPath;
+        if (this.docs.has(targetId)) {
+          this.docs.get(targetId).path = toPath;
+        }
+        this.assets.sort((a, b) => a.path.localeCompare(b.path));
+        this._emit({ type: 'assets', assets: structuredClone(this.assets) });
+        this._emit({ type: 'asset-moved', req, id: targetId, from: fromPath, to: toPath });
         break;
       }
       case 'brick-crystallize': {

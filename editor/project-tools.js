@@ -1,7 +1,26 @@
 // Project-defined tools run at the game's origin. They never receive the Studio pairing token.
-function webOrigin(value) {
+function isLocalHttpHostname(hostname) {
+  const h = String(hostname || '').toLowerCase().replace(/\.$/, '');
+  if (h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '0.0.0.0') return true;
+  if (h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.ts.net')) return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (m) {
+    const a = Number(m[1]);
+    const b = Number(m[2]);
+    if (a === 10 || a === 127) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+  }
+  return false;
+}
+
+function webOrigin(value, { allowSameOrigin = false, studioOrigin = null } = {}) {
   const url = new URL(value);
-  const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  const sameAsStudio = Boolean(
+    allowSameOrigin && studioOrigin && url.origin === new URL('/', studioOrigin).origin,
+  );
+  const local = isLocalHttpHostname(url.hostname) || (sameAsStudio && url.protocol === 'http:');
   if (url.username || url.password || url.search || url.hash || url.pathname !== '/' ||
       !(url.protocol === 'https:' || (url.protocol === 'http:' && local))) {
     throw new Error('Project tools require an HTTPS origin or a local HTTP server.');
@@ -426,9 +445,9 @@ export function resolveProjectTools(manifest, studioOrigin, override, options = 
   const rawOrigin = manifest.origin === 'same-origin' && allowSameOrigin
     ? new URL('/', studioOrigin).origin
     : manifest.origin;
-  const configured = webOrigin(rawOrigin);
+  const configured = webOrigin(rawOrigin, { allowSameOrigin, studioOrigin });
   const explicitOverride = Boolean(override);
-  const candidate = explicitOverride && configured.local ? webOrigin(override) : configured;
+  const candidate = explicitOverride && configured.local ? webOrigin(override, { allowSameOrigin, studioOrigin }) : configured;
   if (explicitOverride && configured.local && !candidate.local) throw new Error('A local tool origin must stay local.');
   const requested = normalizeLoopbackOrigin(candidate, studioOrigin, { allowSameOrigin, explicitOverride });
   // Cookies are host-scoped, not port-scoped. A paired Studio's HttpOnly cookie belongs only to Studio.

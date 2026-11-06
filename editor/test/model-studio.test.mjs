@@ -253,6 +253,12 @@ test('mountModelStudio implements StudioWorkbenchInstance lifecycle with StudioW
   assert.equal(instance.previewBytes(archGlb, 'arch_blockout.glb'), true);
   assert.ok(instance.getState().parsed.triangles > 10);
 
+  await instance.uploadFiles([{
+    name: 'lantern_prop.glb',
+    arrayBuffer: async () => archGlb.buffer.slice(archGlb.byteOffset, archGlb.byteOffset + archGlb.byteLength),
+  }]);
+  assert.ok(requests.some((r) => r.type === 'asset-import' && r.path === 'content/models/lantern_prop.glb'));
+
   instance.onDeactivate();
   assert.equal(instance.getState().active, false);
   instance.onActivate();

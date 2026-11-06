@@ -6,10 +6,13 @@
 
 import {
   drawGlbPreviewCanvas,
+  drawHdrPreviewCanvas,
+  drawLookPreviewCanvas,
   drawWaveformCanvas,
   extractWavPeaks,
   parseGlbPreview,
   parseGlbPreviewAsync,
+  parseHdrPreview,
 } from './asset-previews.js';
 
 export const DEFAULT_CATALOG_URLS = Object.freeze([
@@ -513,6 +516,79 @@ export function compareGlbClusterItems(catalog, clusterIdOrItems) {
 
 // ---- Non-Destructive Human Triage Persistence & Exports ---------------------------------------
 
+export const DEFAULT_SEEDED_DECISIONS = Object.freeze({
+  'character-model:rei-d30-rigged-v1.glb': {
+    action: 'Keep',
+    notes: 'This should be the main rei with rigged version and tailored formal clothing.',
+    updatedAt: '2026-11-06T15:34:47.243Z',
+  },
+  'character-model:rei-body-foundation-v2.glb': {
+    action: 'Keep',
+    notes: 'Keep this as the default foundation body.',
+    updatedAt: '2026-11-06T15:36:14.794Z',
+  },
+  'table-variant:yozakura-poker-table-end-abe-v1.glb': {
+    action: 'Keep',
+    notes: 'This should be the canonical live portrait table.',
+    updatedAt: '2026-11-06T15:37:01.078Z',
+  },
+  'table-variant:yozakura-poker-table-side-abe-v1.glb': {
+    action: 'Archive',
+    notes: '',
+    updatedAt: '2026-11-06T15:37:02.987Z',
+  },
+  'table-variant:yozakura-poker-table-end.glb': {
+    action: 'Archive',
+    notes: '',
+    updatedAt: '2026-11-06T15:37:04.477Z',
+  },
+  'table-variant:yozakura-poker-table-side.glb': {
+    action: 'Keep',
+    notes: 'This should be the canonical live table.',
+    updatedAt: '2026-11-06T15:37:19.048Z',
+  },
+  'image-asset:public-games-rooms-yozakura-harbor-render.png': {
+    action: 'Keep',
+    notes: 'This should be the first yozakura harbor stage.',
+    updatedAt: '2026-11-06T15:38:27.519Z',
+  },
+  '3d-model:yozakura-dusk.hdr': {
+    action: null,
+    notes: 'would like to see the rendered view',
+    updatedAt: '2026-11-06T15:39:11.613Z',
+  },
+  '3d-model:yozakura-harbor-931dba1f7130250e-v3.gbew': {
+    action: null,
+    notes: 'would like to see the rendered view',
+    updatedAt: '2026-11-06T15:39:23.035Z',
+  },
+  '3d-model:yozakura-harbor.scene.json': {
+    action: null,
+    notes: 'would like to see the rendered view',
+    updatedAt: '2026-11-06T15:39:52.148Z',
+  },
+  '3d-model:yozakura-v5.look.json': {
+    action: null,
+    notes: 'would like to see the rendered view',
+    updatedAt: '2026-11-06T15:39:59.091Z',
+  },
+  'table-variant:GanbatePokerStage': {
+    action: null,
+    notes: 'would like to see the rendered view',
+    updatedAt: '2026-11-06T15:40:22.735Z',
+  },
+  'table-variant:ganbateTable': {
+    action: null,
+    notes: 'would like to see the rendered view',
+    updatedAt: '2026-11-06T15:40:27.869Z',
+  },
+  'table-variant:PokerPerformance2DTable': {
+    action: null,
+    notes: 'would like to see the rendered view',
+    updatedAt: '2026-11-06T15:40:32.335Z',
+  },
+});
+
 export function loadTriageDecisionsFromStorage(storage = globalThis.localStorage) {
   if (!storage || typeof storage.getItem !== 'function') return {};
   try {
@@ -775,6 +851,12 @@ export function mountCodeXray(container, studioApi = {}) {
     orbitPanY: 0,
     glbShading: 'textured', // 'textured' | 'clay' | 'wireframe' | 'normals'
     glbFocus: 'body', // 'body' | 'bust'
+    shelfWidthPct: 56,
+    clusterTabsHeight: 195,
+    previewHeight: 290,
+    codeViewerHeight: 290,
+    clusterLimit: 36,
+    hdrExposure: 1.0,
     expandedDirs: new Set(['ganbate-main', 'ganbate-engine', 'ganbate-main/main', 'ganbate-main/main/backend', 'ganbate-main/main/database', 'ganbate-main/main/apps', 'ganbate-engine/src', 'ganbate-engine/crates']),
     auditSort: 'priority', // 'priority' | 'loc' | 'callers' | 'path'
     auditOnlyUndecided: false,
@@ -789,11 +871,16 @@ export function mountCodeXray(container, studioApi = {}) {
       triage: 'all',
       query: '',
     },
-    decisions: loadTriageDecisionsFromStorage(storage),
+    decisions: {
+      ...DEFAULT_SEEDED_DECISIONS,
+      ...loadTriageDecisionsFromStorage(storage),
+    },
     glbCache: new Map(),
     glbInflight: new Map(),
     glbQueue: [],
     glbActiveLoads: 0,
+    hdrCache: new Map(),
+    lookCache: new Map(),
     bookshelfLimit: 120,
     sourceCache: new Map(),
     sourceInflight: new Set(),
@@ -804,6 +891,76 @@ export function mountCodeXray(container, studioApi = {}) {
   const root = h('div', { class: 'cxr-root', 'data-testid': 'code-xray-workbench' });
   container.innerHTML = '';
   container.append(root);
+
+  function bindColSplitterDrag(splitterEl, workspaceEl) {
+    if (!splitterEl || !workspaceEl) return;
+    let dragging = false;
+    splitterEl.addEventListener('pointerdown', (ev) => {
+      dragging = true;
+      root.classList.add('is-resizing-col');
+      splitterEl.classList.add('is-dragging');
+      splitterEl.setPointerCapture?.(ev.pointerId);
+      ev.preventDefault?.();
+    });
+    splitterEl.addEventListener('pointermove', (ev) => {
+      if (!dragging) return;
+      const rect = workspaceEl.getBoundingClientRect?.();
+      if (!rect || rect.width <= 200) return;
+      const relX = (ev.clientX || 0) - rect.left;
+      const pct = Math.max(24, Math.min(78, Math.round((relX / rect.width) * 1000) / 10));
+      state.shelfWidthPct = pct;
+      workspaceEl.style.gridTemplateColumns = `${pct}% 7px minmax(0, 1fr)`;
+    });
+    const endDrag = () => {
+      if (!dragging) return;
+      dragging = false;
+      root.classList.remove('is-resizing-col');
+      splitterEl.classList.remove('is-dragging');
+    };
+    splitterEl.addEventListener('pointerup', endDrag);
+    splitterEl.addEventListener('pointercancel', endDrag);
+  }
+
+  function bindRowSplitterDrag(splitterEl, targetEl, stateKey, minPx = 110, maxPx = 780) {
+    if (!splitterEl || !targetEl) return;
+    let dragging = false;
+    let startY = 0;
+    let startH = 0;
+    splitterEl.addEventListener('pointerdown', (ev) => {
+      dragging = true;
+      startY = ev.clientY || 0;
+      const rect = targetEl.getBoundingClientRect?.();
+      startH = rect?.height || Number(state[stateKey]) || 260;
+      root.classList.add('is-resizing-row');
+      splitterEl.classList.add('is-dragging');
+      splitterEl.setPointerCapture?.(ev.pointerId);
+      ev.preventDefault?.();
+    });
+    splitterEl.addEventListener('pointermove', (ev) => {
+      if (!dragging) return;
+      const dy = (ev.clientY || 0) - startY;
+      const nextH = Math.max(minPx, Math.min(maxPx, Math.round(startH + dy)));
+      state[stateKey] = nextH;
+      targetEl.style.height = `${nextH}px`;
+      targetEl.style.maxHeight = `${nextH}px`;
+      const iframe = targetEl.querySelector?.('.cxr-sandbox-iframe');
+      if (iframe) {
+        iframe.style.height = `${ Math.max(120, nextH - 24) }px`;
+      }
+      const canvas = targetEl.querySelector?.('.cxr-preview-canvas');
+      if (canvas) {
+        canvas.style.height = `${ Math.max(130, nextH - 68) }px`;
+      }
+    });
+    const endDrag = () => {
+      if (!dragging) return;
+      dragging = false;
+      root.classList.remove('is-resizing-row');
+      splitterEl.classList.remove('is-dragging');
+    };
+    splitterEl.addEventListener('pointerup', endDrag);
+    splitterEl.addEventListener('pointercancel', endDrag);
+  }
 
   function ensureDefaultSelection() {
     if (!state.catalog) return;
@@ -948,6 +1105,56 @@ export function mountCodeXray(container, studioApi = {}) {
     }
   }
 
+  function updateSourceInspectorDom(item, cachedSource) {
+    if (!root || !item || state.selectedItemId !== item.id) return false;
+    const sec = root.querySelector?.('[data-testid="source-code-inspector"]');
+    if (!sec) return false;
+    const lines =
+      cachedSource?.ok && typeof cachedSource.text === 'string'
+        ? cachedSource.text.split('\n')
+        : null;
+    const maxPreviewLines = 260;
+    const existingPre = sec.querySelector?.('.cxr-code-viewer');
+    const existingPlaceholder = sec.querySelector?.('[data-source-loading="1"]');
+    if (lines) {
+      const codeText =
+        lines
+          .slice(0, maxPreviewLines)
+          .map((ln, idx) => `${String(idx + 1).padStart(4, ' ')} │ ${ln}`)
+          .join('\n') +
+        (lines.length > maxPreviewLines
+          ? `\n... (${lines.length - maxPreviewLines} more lines — ${lines.length} total lines)`
+          : '');
+      if (existingPre) {
+        existingPre.textContent = codeText;
+        return true;
+      }
+      if (existingPlaceholder) {
+        const preEl = h(
+          'pre',
+          {
+            class: 'cxr-code-viewer',
+            style: `height:${state.codeViewerHeight}px;max-height:${state.codeViewerHeight}px;`,
+          },
+          codeText,
+        );
+        const codeSplitter = h('div', {
+          class: 'cxr-splitter-row',
+          'data-testid': 'cxr-splitter-code',
+          title: 'Drag to resize source code viewer height',
+        });
+        bindRowSplitterDrag(codeSplitter, preEl, 'codeViewerHeight', 120, 760);
+        existingPlaceholder.replaceWith?.(preEl);
+        sec.append(codeSplitter);
+        return true;
+      }
+    } else if (existingPlaceholder && cachedSource) {
+      existingPlaceholder.textContent = cachedSource.text;
+      return true;
+    }
+    return false;
+  }
+
   function ensureSourceLoaded(item) {
     if (!item || typeof fetchImpl !== 'function') return;
     if (!isSourceCodePath(item.repoPath) && item.preview?.kind !== 'source-code' && !item.codeIntel) return;
@@ -959,14 +1166,20 @@ export function mountCodeXray(container, studioApi = {}) {
         if (!res?.ok) throw new Error(`HTTP ${res?.status || 'err'}`);
         const text = await res.text();
         if (!state.disposed) {
-          state.sourceCache.set(item.id, { ok: true, text });
-          if (state.selectedItemId === item.id) render();
+          const entry = { ok: true, text };
+          state.sourceCache.set(item.id, entry);
+          if (state.selectedItemId === item.id && !updateSourceInspectorDom(item, entry)) {
+            render();
+          }
         }
       })
       .catch((err) => {
         if (!state.disposed) {
-          state.sourceCache.set(item.id, { ok: false, text: `Unable to load live file preview (${err?.message || 'offline'}).` });
-          if (state.selectedItemId === item.id) render();
+          const entry = { ok: false, text: `Unable to load live file preview (${err?.message || 'offline'}).` };
+          state.sourceCache.set(item.id, entry);
+          if (state.selectedItemId === item.id && !updateSourceInspectorDom(item, entry)) {
+            render();
+          }
         }
       })
       .finally(() => {
@@ -996,8 +1209,26 @@ export function mountCodeXray(container, studioApi = {}) {
   function selectItem(itemId) {
     if (!itemId) return;
     state.selectedItemId = itemId;
-    state.sandboxLiveMounted = false;
+    const allItems = state.catalog?.items || [];
+    const targetItem = allItems.find((i) => i.id === itemId) || null;
+    state.sandboxLiveMounted = itemId === 'table-variant:PokerPerformance2DTable';
     state.imageZoomed = false;
+
+    const existingInspector = root.querySelector?.('.cxr-inspector-pane');
+    const existingShelf = root.querySelector?.('.cxr-shelf-pane');
+    if (existingInspector && existingShelf && targetItem) {
+      const cards = existingShelf.querySelectorAll?.('[data-item-id]') || [];
+      for (const card of cards) {
+        if (card.getAttribute?.('data-item-id') === itemId) {
+          card.classList.add('is-selected');
+        } else {
+          card.classList.remove('is-selected');
+        }
+      }
+      existingInspector.innerHTML = '';
+      existingInspector.append(renderInspector(targetItem));
+      return;
+    }
     render();
   }
 
@@ -1094,39 +1325,54 @@ export function mountCodeXray(container, studioApi = {}) {
     const itemsById = new Map((state.catalog?.items || []).map((i) => [i.id, i]));
     const activeCluster = clusters.find((c) => c.id === state.selectedClusterId) || clusters[0];
 
-    const tabs = h(
+    const tabsWrap = h(
       'div',
-      { class: 'cxr-cluster-tabs' },
-      clusters.map((cl) =>
-        h(
-          'button',
-          {
-            type: 'button',
-            class: `cxr-cluster-tab${cl.id === activeCluster?.id ? ' is-selected' : ''}`,
-            'data-cluster-id': cl.id,
-            onClick: () => {
-              state.selectedClusterId = cl.id;
-              if (cl.itemIds?.length) {
-                state.selectedItemId = cl.canonicalItemId || cl.itemIds[0];
-              }
-              render();
-            },
-          },
-          h('div', { class: 'cxr-cluster-tab-title' }, cl.title),
+      {
+        class: 'cxr-cluster-tabs-wrap',
+        style: `height:${state.clusterTabsHeight}px;max-height:${state.clusterTabsHeight}px;`,
+      },
+      h(
+        'div',
+        { class: 'cxr-cluster-tabs' },
+        clusters.map((cl) =>
           h(
-            'div',
-            { class: 'cxr-cluster-tab-meta' },
-            h('span', {}, `${cl.itemCount} items`),
-            h('span', {}, `Reclaim ${formatBytes(cl.reclaimableBytes)}`),
-            cl.reclaimableLoc > 0 ? h('span', {}, `${cl.reclaimableLoc.toLocaleString('en-US')} LOC`) : null,
-            h('span', {}, `Impl ${cl.implementationPct ?? 0}% / Integ ${cl.integrationPct ?? 0}%`),
+            'button',
+            {
+              type: 'button',
+              class: `cxr-cluster-tab${cl.id === activeCluster?.id ? ' is-selected' : ''}`,
+              'data-cluster-id': cl.id,
+              onClick: () => {
+                state.selectedClusterId = cl.id;
+                state.clusterLimit = 36;
+                if (cl.itemIds?.length) {
+                  state.selectedItemId = cl.canonicalItemId || cl.itemIds[0];
+                }
+                render();
+              },
+            },
+            h('div', { class: 'cxr-cluster-tab-title' }, cl.title),
+            h(
+              'div',
+              { class: 'cxr-cluster-tab-meta' },
+              h('span', {}, `${cl.itemCount} items`),
+              h('span', {}, `Reclaim ${formatBytes(cl.reclaimableBytes)}`),
+              cl.reclaimableLoc > 0 ? h('span', {}, `${cl.reclaimableLoc.toLocaleString('en-US')} LOC`) : null,
+              h('span', {}, `Impl ${cl.implementationPct ?? 0}% / Integ ${cl.integrationPct ?? 0}%`),
+            ),
           ),
         ),
       ),
     );
 
+    const clusterSplitter = h('div', {
+      class: 'cxr-splitter-row',
+      'data-testid': 'cxr-splitter-clusters',
+      title: 'Drag to resize Overlap Clusters header height',
+    });
+    bindRowSplitterDrag(clusterSplitter, tabsWrap, 'clusterTabsHeight', 96, 520);
+
     if (!activeCluster) {
-      return h('div', {}, tabs, h('p', {}, 'No clusters detected in current catalog.'));
+      return h('div', {}, tabsWrap, clusterSplitter, h('p', {}, 'No clusters detected in current catalog.'));
     }
 
     const clusterItems = filterCatalogItems(
@@ -1195,10 +1441,14 @@ export function mountCodeXray(container, studioApi = {}) {
           )
         : null;
 
+    const clusterLimit = state.clusterLimit || 36;
+    const visibleClusterItems = clusterItems.slice(0, clusterLimit);
+
     return h(
       'div',
-      { style: 'display:flex;flex-direction:column;gap:12px;' },
-      tabs,
+      { style: 'display:flex;flex-direction:column;gap:10px;' },
+      tabsWrap,
+      clusterSplitter,
       h(
         'div',
         { class: 'cxr-cluster-banner' },
@@ -1219,14 +1469,28 @@ export function mountCodeXray(container, studioApi = {}) {
       h(
         'div',
         { class: 'cxr-card-grid' },
-        clusterItems.map((it, idx) =>
+        visibleClusterItems.map((it, idx) =>
           renderBookCard(it, {
             showTurntable:
               is3dCluster &&
-              (state.glbCache.has(it.id) || (idx < 6 && (it.fileSize || 0) <= 20 * 1024 * 1024)),
+              (state.glbCache.has(it.id) || (idx < 4 && (it.fileSize || 0) <= 20 * 1024 * 1024)),
           }),
         ),
       ),
+      clusterItems.length > clusterLimit
+        ? h(
+            'button',
+            {
+              type: 'button',
+              class: 'cxr-btn',
+              onClick: () => {
+                state.clusterLimit = clusterLimit + 36;
+                render();
+              },
+            },
+            `Show More Cluster Surfaces (+36 · showing ${visibleClusterItems.length} of ${clusterItems.length})`,
+          )
+        : null,
     );
   }
 
@@ -1243,10 +1507,26 @@ export function mountCodeXray(container, studioApi = {}) {
     // 1. Live Preview Stage
     let previewContent = null;
     const pKind = item.preview?.kind || 'code-summary';
+    const repoPathStr = String(item.repoPath || '');
+    const isHdrAsset = repoPathStr.endsWith('.hdr') || item.id === '3d-model:yozakura-dusk.hdr';
+    const isLookJson = repoPathStr.endsWith('.look.json') || item.id === '3d-model:yozakura-v5.look.json';
+    const isGbewOrScene =
+      repoPathStr.endsWith('.gbew') ||
+      repoPathStr.endsWith('yozakura-harbor.scene.json') ||
+      item.id === '3d-model:yozakura-harbor-931dba1f7130250e-v3.gbew' ||
+      item.id === '3d-model:yozakura-harbor.scene.json';
+    const is3dPokerTableCode =
+      item.id === 'table-variant:GanbatePokerStage' || item.id === 'table-variant:ganbateTable';
+
     if (pKind === 'glb' || item.glbStats) {
       const stageW = 480;
-      const stageH = 310;
-      const canvas = h('canvas', { class: 'cxr-preview-canvas', width: stageW, height: stageH });
+      const stageH = Math.max(180, state.previewHeight - 40);
+      const canvas = h('canvas', {
+        class: 'cxr-preview-canvas',
+        width: stageW,
+        height: stageH,
+        style: `height:${stageH}px;`,
+      });
       bindOrbitDrag(canvas, item, stageW, stageH, false);
       void loadGlbGeometryForCanvas(item, canvas, stageW, stageH, false);
       const cachedGlb = state.glbCache.get(item.id);
@@ -1275,7 +1555,7 @@ export function mountCodeXray(container, studioApi = {}) {
         : null;
       previewContent = h(
         'div',
-        { class: 'cxr-preview-stage' },
+        { class: 'cxr-preview-stage', style: `height:${state.previewHeight}px;max-height:${state.previewHeight}px;` },
         h(
           'div',
           { class: 'cxr-glb-toolbar' },
@@ -1356,6 +1636,181 @@ export function mountCodeXray(container, studioApi = {}) {
         ),
         submeshList,
       );
+    } else if (isHdrAsset) {
+      const hdrCanvas = h('canvas', {
+        class: 'cxr-preview-canvas',
+        width: 480,
+        height: 230,
+        style: 'height:230px;',
+      });
+      const cachedHdr = state.hdrCache.get(item.id);
+      drawHdrPreviewCanvas(hdrCanvas, cachedHdr || null, {
+        width: 480,
+        height: 230,
+        exposure: state.hdrExposure,
+      });
+      if (!cachedHdr && typeof fetchImpl === 'function') {
+        fetchImpl(previewUrl)
+          .then((r) => (r?.ok ? r.arrayBuffer() : null))
+          .then((buf) => {
+            if (!buf || state.disposed) return;
+            const parsedHdr = parseHdrPreview(buf);
+            if (parsedHdr) {
+              state.hdrCache.set(item.id, parsedHdr);
+              drawHdrPreviewCanvas(hdrCanvas, parsedHdr, {
+                width: 480,
+                height: 230,
+                exposure: state.hdrExposure,
+              });
+            }
+          })
+          .catch(() => {});
+      }
+      previewContent = h(
+        'div',
+        { class: 'cxr-preview-stage', style: `height:${state.previewHeight}px;max-height:${state.previewHeight}px;` },
+        h(
+          'div',
+          { class: 'cxr-glb-toolbar' },
+          [0.6, 1.0, 1.6, 2.4].map((exp) =>
+            h(
+              'button',
+              {
+                type: 'button',
+                class: `cxr-pill${state.hdrExposure === exp ? ' is-active' : ''}`,
+                onClick: () => {
+                  state.hdrExposure = exp;
+                  drawHdrPreviewCanvas(hdrCanvas, state.hdrCache.get(item.id) || null, {
+                    width: 480,
+                    height: 230,
+                    exposure: exp,
+                  });
+                },
+              },
+              `EV ${exp}x`,
+            ),
+          ),
+        ),
+        hdrCanvas,
+        h(
+          'span',
+          { class: 'cxr-subtitle' },
+          'Radiance RGBE (.hdr) Equirectangular Sky + Reflective IBL Probe Sphere',
+        ),
+      );
+    } else if (isLookJson) {
+      const lookCanvas = h('canvas', {
+        class: 'cxr-preview-canvas',
+        width: 480,
+        height: 210,
+        style: 'height:210px;',
+      });
+      const cachedLook = state.lookCache.get(item.id);
+      drawLookPreviewCanvas(lookCanvas, cachedLook || item.docSummary || {}, { width: 480, height: 210 });
+      if (!cachedLook && typeof fetchImpl === 'function') {
+        const fileUrl = `/api/project/file?repo=${encodeURIComponent(item.repo || 'ganbate-main')}&path=${encodeURIComponent(item.repoPath || '')}`;
+        fetchImpl(fileUrl)
+          .then((r) => (r?.ok ? r.json() : null))
+          .then((docJson) => {
+            if (!docJson || state.disposed) return;
+            state.lookCache.set(item.id, docJson);
+            drawLookPreviewCanvas(lookCanvas, docJson, { width: 480, height: 210 });
+          })
+          .catch(() => {});
+      }
+      previewContent = h(
+        'div',
+        { class: 'cxr-preview-stage', style: `height:${state.previewHeight}px;max-height:${state.previewHeight}px;` },
+        lookCanvas,
+        h(
+          'div',
+          { class: 'cxr-header-actions' },
+          h('span', { class: 'cxr-subtitle' }, 'Live Look Profile Grade (Fog · Exposure · Warmth · Harbor Keylights)'),
+          studioApi.activateWorkbench
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  class: 'cxr-btn cxr-btn-primary',
+                  onClick: () => studioApi.activateWorkbench('world'),
+                },
+                'Open in 3D World & Look',
+              )
+            : null,
+        ),
+      );
+    } else if (isGbewOrScene) {
+      previewContent = h(
+        'div',
+        { class: 'cxr-preview-stage', style: `height:${state.previewHeight}px;max-height:${state.previewHeight}px;` },
+        h('img', {
+          class: `cxr-preview-img${state.imageZoomed ? ' is-zoomed' : ''}`,
+          src: '/games/rooms/yozakura-harbor-render.png',
+          alt: item.title,
+        }),
+        h(
+          'div',
+          { class: 'cxr-header-actions' },
+          h('span', { class: 'cxr-subtitle' }, 'Yozakura Harbor Stage Render + World Scene Graph'),
+          studioApi.activateWorkbench
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  class: 'cxr-btn cxr-btn-primary',
+                  onClick: () => studioApi.activateWorkbench('world'),
+                },
+                'Open in 3D World & Look',
+              )
+            : null,
+        ),
+      );
+    } else if (is3dPokerTableCode) {
+      const stageW = 480;
+      const stageH = 220;
+      const tableProxyItem = {
+        id: '3d-model:yozakura-poker-table-side.glb',
+        repo: 'ganbate-main',
+        repoPath: 'main/apps/web/public/games/tables/yozakura-poker-table-side.glb',
+        preview: { kind: 'glb', assetUrl: '/games/tables/yozakura-poker-table-side.glb' },
+      };
+      const canvas = h('canvas', {
+        class: 'cxr-preview-canvas',
+        width: stageW,
+        height: stageH,
+        style: `height:${stageH}px;`,
+      });
+      bindOrbitDrag(canvas, tableProxyItem, stageW, stageH, false);
+      void loadGlbGeometryForCanvas(tableProxyItem, canvas, stageW, stageH, false);
+      previewContent = h(
+        'div',
+        { class: 'cxr-preview-stage', style: `height:${state.previewHeight}px;max-height:${state.previewHeight}px;` },
+        state.sandboxLiveMounted
+          ? h('iframe', {
+              class: 'cxr-sandbox-iframe',
+              src: '/ganbate-stage-review.html',
+              title: `Live 3D Stage Workbench: ${item.title}`,
+              style: `height:${Math.max(140, state.previewHeight - 24)}px;`,
+            })
+          : canvas,
+        h(
+          'div',
+          { class: 'cxr-header-actions' },
+          h('span', { class: 'cxr-subtitle' }, '3D Yozakura Poker Table Stage Turntable'),
+          h(
+            'button',
+            {
+              type: 'button',
+              class: 'cxr-btn cxr-btn-primary',
+              onClick: () => {
+                state.sandboxLiveMounted = !state.sandboxLiveMounted;
+                render();
+              },
+            },
+            state.sandboxLiveMounted ? 'Show 3D Mesh Turntable' : '▶ Mount Full 3D Stage Workbench',
+          ),
+        ),
+      );
     } else if (pKind === 'image') {
       const img = h('img', {
         class: `cxr-preview-img${state.imageZoomed ? ' is-zoomed' : ''}`,
@@ -1364,7 +1819,7 @@ export function mountCodeXray(container, studioApi = {}) {
       });
       previewContent = h(
         'div',
-        { class: 'cxr-preview-stage' },
+        { class: 'cxr-preview-stage', style: `height:${state.previewHeight}px;max-height:${state.previewHeight}px;` },
         img,
         h(
           'button',
@@ -1398,18 +1853,22 @@ export function mountCodeXray(container, studioApi = {}) {
         h('audio', { controls: true, src: previewUrl, style: 'width:100%;max-width:340px;' }),
       );
     } else if (pKind === 'sandbox-page' || pKind === 'sandbox-widget' || pKind === 'iframe-review') {
+      const sandboxKeyParam = item.preview?.sandboxKey
+        ? `&sandboxKey=${encodeURIComponent(item.preview.sandboxKey)}`
+        : '';
       const iframeSrc =
         pKind === 'iframe-review' && item.preview?.assetUrl
           ? item.preview.assetUrl
-          : `/__studio-xray-preview?item=${encodeURIComponent(item.id)}`;
+          : `/__studio-xray-preview?item=${encodeURIComponent(item.id)}&embed=stage${sandboxKeyParam}`;
       previewContent = h(
         'div',
-        { class: 'cxr-preview-stage' },
+        { class: 'cxr-preview-stage', style: `height:${state.previewHeight}px;max-height:${state.previewHeight}px;` },
         state.sandboxLiveMounted
           ? h('iframe', {
               class: 'cxr-sandbox-iframe',
               src: iframeSrc,
               title: `Live Sandbox Preview: ${item.title}`,
+              style: `height:${Math.max(140, state.previewHeight - 24)}px;`,
             })
           : h(
               'div',
@@ -1458,6 +1917,16 @@ export function mountCodeXray(container, studioApi = {}) {
             )
           : null,
       );
+    }
+
+    let previewSplitter = null;
+    if (previewContent) {
+      previewSplitter = h('div', {
+        class: 'cxr-splitter-row',
+        'data-testid': 'cxr-splitter-preview',
+        title: 'Drag to resize Live Preview viewport height',
+      });
+      bindRowSplitterDrag(previewSplitter, previewContent, 'previewHeight', 140, 760);
     }
 
     // glTF 2.0 Mesh / Rig Breakdown if `.glb`
@@ -1638,6 +2107,31 @@ export function mountCodeXray(container, studioApi = {}) {
         : null;
       const maxPreviewLines = 260;
 
+      let codePreEl = null;
+      let codeSplitterEl = null;
+      if (lines) {
+        codePreEl = h(
+          'pre',
+          {
+            class: 'cxr-code-viewer',
+            style: `height:${state.codeViewerHeight}px;max-height:${state.codeViewerHeight}px;`,
+          },
+          lines
+            .slice(0, maxPreviewLines)
+            .map((ln, idx) => `${String(idx + 1).padStart(4, ' ')} │ ${ln}`)
+            .join('\n') +
+            (lines.length > maxPreviewLines
+              ? `\n... (${lines.length - maxPreviewLines} more lines — ${lines.length} total lines)`
+              : ''),
+        );
+        codeSplitterEl = h('div', {
+          class: 'cxr-splitter-row',
+          'data-testid': 'cxr-splitter-code',
+          title: 'Drag to resize source code viewer height',
+        });
+        bindRowSplitterDrag(codeSplitterEl, codePreEl, 'codeViewerHeight', 120, 760);
+      }
+
       codeIntelSection = h(
         'section',
         { class: 'cxr-section', 'data-testid': 'source-code-inspector' },
@@ -1671,23 +2165,13 @@ export function mountCodeXray(container, studioApi = {}) {
                 : null,
             )
           : null,
-        lines
-          ? h(
-              'pre',
-              { class: 'cxr-code-viewer' },
-              lines
-                .slice(0, maxPreviewLines)
-                .map((ln, idx) => `${String(idx + 1).padStart(4, ' ')} │ ${ln}`)
-                .join('\n') +
-                (lines.length > maxPreviewLines
-                  ? `\n... (${lines.length - maxPreviewLines} more lines — ${lines.length} total lines)`
-                  : ''),
-            )
-          : h(
-              'div',
-              { class: 'cxr-subtitle' },
-              cachedSource ? cachedSource.text : 'Loading source file from workspace...',
-            ),
+        codePreEl ||
+          h(
+            'div',
+            { class: 'cxr-subtitle', 'data-source-loading': '1' },
+            cachedSource ? cachedSource.text : 'Loading source file from workspace...',
+          ),
+        codeSplitterEl,
       );
     }
 
@@ -1700,6 +2184,7 @@ export function mountCodeXray(container, studioApi = {}) {
         h('div', { style: 'font-size:13px;font-weight:700;color:#fff;' }, item.title),
         h('div', { class: 'cxr-card-path' }, `${item.repo}:${item.repoPath}`),
         previewContent,
+        previewSplitter,
       ),
       triageSection,
       codeIntelSection,
@@ -1962,6 +2447,8 @@ export function mountCodeXray(container, studioApi = {}) {
 
   function render() {
     if (state.disposed) return;
+    const prevShelfScroll = root.querySelector?.('.cxr-shelf-pane')?.scrollTop || 0;
+    const prevInspScroll = root.querySelector?.('.cxr-inspector-pane')?.scrollTop || 0;
     root.innerHTML = '';
 
     if (state.loading || !state.catalog) {
@@ -2205,8 +2692,26 @@ export function mountCodeXray(container, studioApi = {}) {
     );
 
     const inspectorPane = h('aside', { class: 'cxr-inspector-pane' }, renderInspector(selectedItem));
+    const colSplitter = h('div', {
+      class: 'cxr-splitter-col',
+      'data-testid': 'cxr-splitter-col',
+      title: 'Drag to resize Left Shelf vs Right Inspector width',
+    });
+    const workspace = h(
+      'div',
+      {
+        class: 'cxr-workspace',
+        style: `grid-template-columns: ${state.shelfWidthPct}% 7px minmax(0, 1fr);`,
+      },
+      shelfPane,
+      colSplitter,
+      inspectorPane,
+    );
+    bindColSplitterDrag(colSplitter, workspace);
 
-    root.append(header, toolbar, h('div', { class: 'cxr-workspace' }, shelfPane, inspectorPane));
+    root.append(header, toolbar, workspace);
+    if (prevShelfScroll > 0 && 'scrollTop' in shelfPane) shelfPane.scrollTop = prevShelfScroll;
+    if (prevInspScroll > 0 && 'scrollTop' in inspectorPane) inspectorPane.scrollTop = prevInspScroll;
   }
 
   render();
