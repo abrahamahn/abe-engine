@@ -1246,6 +1246,66 @@ body:not(.workbench-active).pie-split-active #preview-frame > #pie-stage {
   margin-top: 6px;
 }
 
+.tri-modal-inspector-hub {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  margin: 4px 6px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(114, 152, 232, 0.28);
+  background: linear-gradient(180deg, rgba(28, 33, 46, 0.92), rgba(20, 23, 31, 0.96));
+}
+.tri-modal-inspector-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.tri-modal-inspector-head strong {
+  color: #e6ecf8;
+  font-size: 11.5px;
+}
+.tri-modal-badge {
+  font: 600 10px/1.2 var(--mono);
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(114, 152, 232, 0.18);
+  color: #9dc0ff;
+  border: 1px solid rgba(114, 152, 232, 0.35);
+}
+.tri-modal-section {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+.tri-modal-section-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: #9ba3b4;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.tri-modal-pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.tri-modal-code {
+  margin: 0;
+  padding: 6px;
+  max-height: 150px;
+  overflow: auto;
+  border-radius: 4px;
+  border: 1px solid #2b2e37;
+  background: #12141a;
+  color: #b9d0ff;
+  font: 10.5px/1.35 var(--mono);
+}
+
 @media (max-width: 768px), (max-height: 520px) {
   body { grid-template-rows: auto auto minmax(0, 1fr) 4px min(180px, 24vh); }
   body.workbench-active { grid-template-rows: auto minmax(0, 1fr); }

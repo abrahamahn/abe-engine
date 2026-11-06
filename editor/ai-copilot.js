@@ -654,6 +654,199 @@ export function verifyAndSolveSemanticSceneGraph(rawGraph, { autoResolve = true 
 }
 
 /**
+ * Inverse Semantic Lifting (L: R^3 -> G_rel) + Minimal-Perturbation Constraint Projection
+ * (x* = argmin_{x in C} ||x - x_hat||^2).
+ * Given a continuous 3D drag/transform position `proposedPos` (x_hat) for `nodeId`, projects
+ * `x_hat` onto the collision-free & surface-supported manifold `x*` and inversely rewrites
+ * the discrete relational edges (`on_top_of`, `left_of`, `right_of`, `behind`, `in_front_of`, `facing`).
+ */
+export function liftEntityPositionToSemanticGraph(
+  currentSceneGraph,
+  nodeId,
+  proposedPos,
+  options = {},
+) {
+  const graph = structuredClone(
+    currentSceneGraph && typeof currentSceneGraph === 'object'
+      ? currentSceneGraph
+      : buildDefaultSemanticSceneGraph(),
+  );
+  if (!Array.isArray(graph.nodes)) graph.nodes = [];
+  if (!Array.isArray(graph.relations)) graph.relations = [];
+
+  const cleanId = sanitizeAlias(nodeId || 'entity', 'entity').toLowerCase();
+  let subj = graph.nodes.find((n) => n?.id?.toLowerCase() === cleanId);
+  if (!subj) {
+    subj = {
+      id: cleanId,
+      category: options.category || 'prop.item',
+      prefab: options.prefab || `prefab:${cleanId}`,
+      transform: { pos: [0, 0, 0], yaw_deg: 0, scale: [1, 1, 1] },
+      bounds: options.bounds || { type: 'aabb', size: [0.4, 0.4, 0.4] },
+    };
+    graph.nodes.push(subj);
+  }
+
+  const xHat = [
+    Number(proposedPos?.[0] ?? subj.transform?.pos?.[0] ?? 0),
+    Number(proposedPos?.[1] ?? subj.transform?.pos?.[1] ?? 0),
+    Number(proposedPos?.[2] ?? subj.transform?.pos?.[2] ?? 0),
+  ].map((v) => (Number.isFinite(v) ? Number(v.toFixed(3)) : 0));
+
+  const xStar = xHat.slice();
+  const [sx, , sz] = getNodeHalfExtents(subj);
+  const sh = getNodeHeight(subj);
+
+  // Find primary reference anchor (table or largest support surface)
+  const anchorNode =
+    graph.nodes.find((n) => n.id !== subj.id && /table|desk|pavilion|stage/i.test(n.id)) ||
+    graph.nodes.find((n) => n.id !== subj.id) ||
+    null;
+
+  let inferredPredicate = 'behind';
+  let projected = false;
+  let projectionReason = null;
+
+  if (anchorNode) {
+    const [ox, , oz] = getNodeHalfExtents(anchorNode);
+    const oh = getNodeHeight(anchorNode);
+    const apos = anchorNode.transform?.pos || [0, 0, 0];
+    const dx = xStar[0] - apos[0];
+    const dz = xStar[2] - apos[2];
+
+    const isSurfaceProp = /chip|card|shoe|cup|tea|vase|trophy|prop/i.test(subj.id) || xHat[1] >= oh * 0.65;
+    if (isSurfaceProp && Math.abs(dx) <= ox + sx && Math.abs(dz) <= oz + sz) {
+      inferredPredicate = 'on_top_of';
+      const targetY = Number((apos[1] + oh).toFixed(3));
+      if (Math.abs(xStar[1] - targetY) > 1e-3) {
+        xStar[1] = targetY;
+        projected = true;
+        projectionReason = `Snapped ${subj.id} onto top surface of ${anchorNode.id} (y*=${targetY}m)`;
+      }
+    } else {
+      if (xStar[1] < 0) {
+        xStar[1] = 0;
+        projected = true;
+        projectionReason = `Clamped ${subj.id} to floor plane (y*=0.00m)`;
+      }
+      // Minimal-perturbation AABB projection outside anchorNode
+      const minSepX = ox + sx + 0.08;
+      const minSepZ = oz + sz + 0.08;
+      const penX = minSepX - Math.abs(dx);
+      const penZ = minSepZ - Math.abs(dz);
+      const yOverlap = xStar[1] < apos[1] + oh && apos[1] < xStar[1] + sh;
+      if (yOverlap && penX > 0 && penZ > 0) {
+        projected = true;
+        if (penX <= penZ) {
+          const signX = dx >= 0 ? 1 : -1;
+          xStar[0] = Number((apos[0] + signX * minSepX).toFixed(3));
+        } else {
+          const signZ = dz >= 0 ? 1 : -1;
+          xStar[2] = Number((apos[2] + signZ * minSepZ).toFixed(3));
+        }
+        projectionReason = `Projected ${subj.id} outside ${anchorNode.id} collider (x̂ -> x*)`;
+      }
+
+      // Inverse Semantic Lifting: infer discrete directional relation from resolved (dx*, dz*)
+      const rdx = xStar[0] - apos[0];
+      const rdz = xStar[2] - apos[2];
+      const normX = rdx / Math.max(0.1, ox);
+      const normZ = rdz / Math.max(0.1, oz);
+      if (Math.abs(normX) > Math.abs(normZ)) {
+        inferredPredicate = normX < 0 ? 'left_of' : 'right_of';
+      } else {
+        inferredPredicate = normZ < 0 ? 'behind' : 'in_front_of';
+      }
+    }
+
+    subj.transform = {
+      ...(subj.transform || {}),
+      pos: xStar,
+      yaw_deg: Number(
+        (
+          (Math.atan2(apos[0] - xStar[0], apos[2] - xStar[2]) * 180) /
+          Math.PI
+        ).toFixed(1),
+      ),
+    };
+
+    // Rewrite symbolic relation for subj -> anchorNode
+    graph.relations = graph.relations.filter((r) => r.subject !== subj.id);
+    graph.relations.push({
+      subject: subj.id,
+      predicate: inferredPredicate,
+      object: anchorNode.id,
+      clearance_m: inferredPredicate === 'on_top_of' ? 0.0 : 0.25,
+    });
+    if (inferredPredicate !== 'on_top_of') {
+      graph.relations.push({
+        subject: subj.id,
+        predicate: 'facing',
+        object: anchorNode.id,
+      });
+    }
+  } else {
+    subj.transform = { ...(subj.transform || {}), pos: xStar };
+  }
+
+  const perturbationL2 = Number(
+    Math.hypot(xStar[0] - xHat[0], xStar[1] - xHat[1], xStar[2] - xHat[2]).toFixed(3),
+  );
+  return {
+    ok: true,
+    nodeId: subj.id,
+    proposedPos: xHat,
+    resolvedPos: xStar,
+    perturbationL2,
+    projected,
+    projectionReason,
+    inferredRelation: anchorNode
+      ? { subject: subj.id, predicate: inferredPredicate, object: anchorNode.id }
+      : null,
+    ghost: projected
+      ? { from: xHat, to: xStar, distance: perturbationL2, reason: projectionReason }
+      : null,
+    graph,
+  };
+}
+
+/**
+ * Simulates a 2-Agent Concurrent Editing Conflict (Agent A moves table to [-0.45, 0, 0] while
+ * Agent B places/moves dealer_rei to `left_of(poker_table_main)` at [-1.42, 0, 0] relative to S_0)
+ * and resolves the resulting -0.51m AABB overlap via Relational Intent-Preserving Projection (x̂ -> x*).
+ */
+export function simulateTwoAgentSemanticConflict(currentSceneGraph = null) {
+  const graph = structuredClone(
+    currentSceneGraph && typeof currentSceneGraph === 'object'
+      ? currentSceneGraph
+      : buildDefaultSemanticSceneGraph(),
+  );
+  const table =
+    graph.nodes.find((n) => /table/i.test(n.id)) || graph.nodes[0];
+  if (table) {
+    table.transform.pos = [-0.45, 0, 0];
+  }
+  const naiveDealerPos = [-1.42, 0, 0];
+  const lifted = liftEntityPositionToSemanticGraph(
+    graph,
+    'dealer_rei',
+    naiveDealerPos,
+  );
+  return {
+    ok: true,
+    agentA: { actor: 'Agent A (Layout)', edit: 'Move poker_table_main -> [-0.45, 0, 0]' },
+    agentB: { actor: 'Agent B (Character)', edit: 'Place dealer_rei left_of(poker_table_main) -> x̂=[-1.42, 0, 0]' },
+    naiveOverlapM: 0.51,
+    proposedPos: naiveDealerPos,
+    resolvedPos: lifted.resolvedPos,
+    perturbationL2: lifted.perturbationL2,
+    ghost: lifted.ghost,
+    inferredRelation: lifted.inferredRelation,
+    graph: lifted.graph,
+  };
+}
+
+/**
  * Multi-clause compositional Neuro-Symbolic spatial prompt compiler.
  * Parses compound sentences (split on `and`, `then`, `;`) with arbitrary entity nouns,
  * quantities, spatial prepositions (`on top of`, `behind`, `in front of`, `left of`, `right of`, `facing`),
@@ -2833,6 +3026,8 @@ export function mountAiCopilot(container, hooks = {}) {
     else renderContextTab();
   }
 
+  let lastProjectionGhost = null;
+
   const api = {
     element: root,
     isOpen: () => !root.hidden,
@@ -2883,6 +3078,64 @@ export function mountAiCopilot(container, hooks = {}) {
       if (!root.hidden && activeTab === 'context') renderBody();
       return out;
     },
+    liftEntityPosition: (nodeId, proposedPos, options = {}) => {
+      const res = liftEntityPositionToSemanticGraph(
+        semanticSceneGraphCache,
+        nodeId,
+        proposedPos,
+        options,
+      );
+      semanticSceneGraphCache = res.graph;
+      semanticSceneVerification = verifyAndSolveSemanticSceneGraph(semanticSceneGraphCache, {
+        autoResolve: false,
+      });
+      lastProjectionGhost = res.ghost || null;
+      if (!root.hidden && activeTab === 'context') renderBody();
+      return res;
+    },
+    simulateTwoAgentConflict: () => {
+      const res = simulateTwoAgentSemanticConflict(semanticSceneGraphCache);
+      semanticSceneGraphCache = res.graph;
+      semanticSceneVerification = verifyAndSolveSemanticSceneGraph(semanticSceneGraphCache, {
+        autoResolve: false,
+      });
+      lastProjectionGhost = res.ghost || null;
+      if (!root.hidden && activeTab === 'context') renderBody();
+      return res;
+    },
+    registerSemanticNode: (descriptor) => {
+      if (!descriptor || typeof descriptor !== 'object') return null;
+      const nodeId = sanitizeAlias(descriptor.id || descriptor.name || 'node', 'node').toLowerCase();
+      const pos = Array.isArray(descriptor.position) ? descriptor.position : [0, 0, 0];
+      const res = liftEntityPositionToSemanticGraph(semanticSceneGraphCache, nodeId, pos, {
+        category: descriptor.role || 'prop.item',
+        prefab: descriptor.assetId || `prefab:${nodeId}`,
+        bounds: descriptor.bounds
+          ? {
+              type: descriptor.bounds.shape === 'cylinder' ? 'cylinder' : 'aabb',
+              size: Array.isArray(descriptor.bounds.halfExtents)
+                ? descriptor.bounds.halfExtents.map((h) => Number((h * 2).toFixed(3)))
+                : [0.4, 0.4, 0.4],
+              radius: descriptor.bounds.radius,
+              height: descriptor.bounds.height,
+            }
+          : undefined,
+      });
+      semanticSceneGraphCache = res.graph;
+      lastProjectionGhost = res.ghost || null;
+      if (!root.hidden && activeTab === 'context') renderBody();
+      return res;
+    },
+    registerSemanticMaterial: (materialDescriptor) => {
+      if (!materialDescriptor || typeof materialDescriptor !== 'object') return null;
+      semanticSceneGraphCache.materials = {
+        ...(semanticSceneGraphCache.materials || {}),
+        [materialDescriptor.id || 'active']: materialDescriptor,
+      };
+      if (!root.hidden && activeTab === 'context') renderBody();
+      return materialDescriptor;
+    },
+    getLastProjectionGhost: () => lastProjectionGhost,
     destroy: () => root.remove(),
   };
 

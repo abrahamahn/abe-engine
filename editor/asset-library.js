@@ -199,12 +199,21 @@ export function filterAssets(
       if (!recentArr || !recentArr.includes(a.id)) return false;
     } else if (collection === 'unused') {
       if (!usageCounts || (usageCounts[a.id] || 0) > 0) return false;
+    } else if (typeof collection === 'string' && collection.startsWith('academic:')) {
+      const targetDomain = collection.slice('academic:'.length);
+      if (a.kind !== 'model' && a.kind !== 'prefab' && a.kind !== 'character') return false;
+      const sem = inferAssetSemanticAffordance(a);
+      if (sem.academicCollection !== targetDomain) return false;
     } else if (folder && !inFolder(assetFolder(a.path), folder)) {
       return false;
     }
     if (kind && kind !== 'all' && a.kind !== kind) return false;
     if (tokens.length) {
-      const hay = `${a.path} ${a.kind} ${a.id}`.toLowerCase();
+      const semAliases =
+        a.kind === 'model' || a.kind === 'prefab' || a.kind === 'character'
+          ? inferAssetSemanticAffordance(a).aliases.join(' ')
+          : '';
+      const hay = `${a.path} ${a.kind} ${a.id} ${semAliases}`.toLowerCase();
       for (const tok of tokens) {
         if (!hay.includes(tok)) return false;
       }
@@ -274,11 +283,32 @@ export function canPlaceAsset(asset, doc) {
   return { ok: true, reason: null };
 }
 
-export function placementEntity(asset, { parent = null, localTranslation = null } = {}) {
+export function placementEntity(
+  asset,
+  { parent = null, localTranslation = null, localRotation = null, sceneContext = null } = {},
+) {
+  if (sceneContext) {
+    const resolved = resolveSemanticAssetDrop(
+      asset,
+      Array.isArray(localTranslation) ? localTranslation : [0, 0, 0],
+      sceneContext,
+      { parent },
+    );
+    return resolved.entity;
+  }
   const transform = {};
   if (Array.isArray(localTranslation)) {
     const clean = localTranslation.map((v) => M.tidy(v, 3));
     if (clean.some((v) => Math.abs(v) >= 1e-5)) transform.translation = clean;
+  }
+  if (Array.isArray(localRotation) && localRotation.length === 4) {
+    const cleanRot = localRotation.map((v) => M.tidy(v, 4));
+    const isIdentity =
+      Math.abs(cleanRot[0]) < 1e-4 &&
+      Math.abs(cleanRot[1]) < 1e-4 &&
+      Math.abs(cleanRot[2]) < 1e-4 &&
+      Math.abs(cleanRot[3] - 1) < 1e-4;
+    if (!isIdentity) transform.rotation = cleanRot;
   }
   const components = { transform };
   const entity = { name: assetStem(asset.path) || asset.kind, components };
@@ -289,6 +319,638 @@ export function placementEntity(asset, { parent = null, localTranslation = null 
     entity.prefab = { asset: asset.id };
   }
   return entity;
+}
+
+// ---- Tri-Modal Semantic Affordance Registry & Smart Drop Solver --------------------------------
+
+const ROLE_DEFAULT_BOUNDS = Object.freeze({
+  support_surface: { shape: 'aabb', halfExtents: [1.3, 0.45, 0.85], surfaceY: 0.9 },
+  surface_prop: { shape: 'cylinder', halfExtents: [0.16, 0.18, 0.16], surfaceY: 0.36 },
+  seating: { shape: 'cylinder', halfExtents: [0.32, 0.45, 0.32], surfaceY: 0.48 },
+  luminaire: { shape: 'cylinder', halfExtents: [0.28, 0.55, 0.28], surfaceY: 1.1 },
+  articulated_agent: { shape: 'cylinder', halfExtents: [0.35, 0.88, 0.35], surfaceY: 1.76 },
+  architectural_prop: { shape: 'aabb', halfExtents: [0.45, 0.9, 0.45], surfaceY: 1.8 },
+});
+
+const ROLE_BILINGUAL_ALIASES = Object.freeze({
+  support_surface: ['table', 'desk', 'support_surface', '테이블', '탁자', '상'],
+  surface_prop: ['vessel', 'prop', 'cup', 'chip', '소품', '잔', '병', '칩'],
+  seating: ['chair', 'seat', 'stool', '의자', '좌석', '스툴'],
+  luminaire: ['lantern', 'lamp', 'beacon', 'light', '등불', '조명', '랜턴'],
+  articulated_agent: ['character', 'avatar', 'dealer', 'agent', '캐릭터', '딜러', '아바타'],
+  architectural_prop: ['pillar', 'arch', 'pavilion', 'wall', '기둥', '정자', '건물'],
+});
+
+/**
+ * Synthesizes a `ganbate.semantic.node.v2` affordance descriptor for any project asset.
+ * Compatible with `buildSemanticNodeDescriptor` in `model-studio.js` and `ai-copilot.js`.
+ */
+export function inferAssetSemanticAffordance(asset, options = {}) {
+  const rawPath = String(asset?.path || asset?.name || asset?.id || 'prop');
+  const stem = assetStem(rawPath) || 'prop';
+  const hay = `${rawPath} ${stem} ${asset?.kind || ''}`.toLowerCase();
+  const explicitSemantic = options?.meta?.semantic || asset?.meta?.semantic || {};
+
+  let role = explicitSemantic.role || null;
+  if (!role) {
+    if (
+      asset?.kind === 'character' ||
+      /(^|[-_/\s])(character|avatar|dealer|rei|haruka|sora|ren|kaito|minji|human|npc|rigged)([-_/.\s]|$)/i.test(hay)
+    ) {
+      role = 'articulated_agent';
+    } else if (
+      /(^|[-_/\s])(table|desk|counter|altar|pedestal|workbench|island|stage-table|felt)([-_/.\s]|$)/i.test(hay)
+    ) {
+      role = 'support_surface';
+    } else if (
+      /(^|[-_/\s])(chair|stool|seat|bench|cushion|zabuton|sofa|throne)([-_/.\s]|$)/i.test(hay)
+    ) {
+      role = 'seating';
+    } else if (
+      /(^|[-_/\s])(lantern|lamp|beacon|light|sconce|candle|chandelier|toro|andon)([-_/.\s]|$)/i.test(hay)
+    ) {
+      role = 'luminaire';
+    } else if (
+      /(^|[-_/\s])(vessel|cup|teapot|bottle|chip|card|shoe|tray|bowl|plate|vase|book|laptop|dice|coin|ashtray|coaster|glass|sakazuki)([-_/.\s]|$)/i.test(hay)
+    ) {
+      role = 'surface_prop';
+    } else {
+      role = 'architectural_prop';
+    }
+  }
+
+  const defaults = ROLE_DEFAULT_BOUNDS[role] || ROLE_DEFAULT_BOUNDS.architectural_prop;
+  const rawBounds = options.bounds || explicitSemantic.bounds?.aabb || asset?.meta?.bounds;
+  const rawSize = options.size || explicitSemantic.bounds?.size || asset?.meta?.size;
+  let hx = defaults.halfExtents[0];
+  let hy = defaults.halfExtents[1];
+  let hz = defaults.halfExtents[2];
+  let surfaceY = defaults.surfaceY;
+  let groundRestError = 0;
+
+  if (Array.isArray(explicitSemantic.bounds?.halfExtents) && explicitSemantic.bounds.halfExtents.length === 3) {
+    [hx, hy, hz] = explicitSemantic.bounds.halfExtents.map((v) => Math.max(0.04, Number(v) || 0.2));
+    surfaceY = Number(explicitSemantic.bounds.surfaceY) || hy * 2;
+    groundRestError = Number(explicitSemantic.bounds.groundRestError) || 0;
+  } else if (Array.isArray(rawBounds) && Array.isArray(rawBounds[0]) && Array.isArray(rawBounds[1])) {
+    const [minB, maxB] = rawBounds;
+    hx = Math.max(0.04, (Number(maxB[0]) - Number(minB[0])) * 0.5);
+    hy = Math.max(0.04, (Number(maxB[1]) - Number(minB[1])) * 0.5);
+    hz = Math.max(0.04, (Number(maxB[2]) - Number(minB[2])) * 0.5);
+    surfaceY = Math.max(0.08, Number(maxB[1]) - Number(minB[1]));
+    groundRestError = M.tidy(Math.abs(Number(minB[1]) || 0), 4);
+  } else if (Array.isArray(rawSize) && rawSize.length === 3 && rawSize.some((v) => Number(v) > 0)) {
+    hx = Math.max(0.04, Number(rawSize[0]) * 0.5);
+    hy = Math.max(0.04, Number(rawSize[1]) * 0.5);
+    hz = Math.max(0.04, Number(rawSize[2]) * 0.5);
+    surfaceY = Math.max(0.08, Number(rawSize[1]));
+  }
+
+  const shape = explicitSemantic.bounds?.shape || defaults.shape;
+  const radius = M.tidy(Math.max(hx, hz), 3);
+  const height = M.tidy(hy * 2, 3);
+  const domain = explicitSemantic.affordances?.domain || (role === 'surface_prop' ? 'table_surface' : 'floor');
+  const defaultRelation =
+    explicitSemantic.affordances?.defaultRelation ||
+    (domain === 'table_surface'
+      ? 'on_top_of'
+      : role === 'seating' || role === 'articulated_agent'
+        ? 'in_front_of'
+        : 'beside');
+
+  const affordances = {
+    domain,
+    defaultRelation,
+    supportsOnTopOf: Boolean(explicitSemantic.affordances?.supportsOnTopOf ?? (role === 'support_surface')),
+    emitsLight: Boolean(explicitSemantic.affordances?.emitsLight ?? (role === 'luminaire')),
+    orientToTarget: Boolean(
+      explicitSemantic.affordances?.orientToTarget ?? (role === 'seating' || role === 'articulated_agent'),
+    ),
+    walkwayClearance: Number(
+      explicitSemantic.affordances?.walkwayClearance ??
+        (role === 'support_surface' ? 0.55 : role === 'architectural_prop' ? 0.35 : 0.2),
+    ),
+    collisionClearance: Number(
+      explicitSemantic.affordances?.collisionClearance ?? (domain === 'table_surface' ? 0.04 : 0.08),
+    ),
+  };
+
+  const academicCollection =
+    role === 'articulated_agent'
+      ? 'characters'
+      : role === 'support_surface' || role === 'surface_prop' || role === 'seating'
+        ? 'tabletop'
+        : role === 'luminaire'
+          ? 'lighting'
+          : 'architecture';
+
+  const stemTokens = stem
+    .toLowerCase()
+    .split(/[-_.\s]+/)
+    .filter(Boolean);
+  const aliases = [
+    ...new Set([
+      stem.toLowerCase(),
+      ...stemTokens,
+      ...(ROLE_BILINGUAL_ALIASES[role] || []),
+      ...(Array.isArray(explicitSemantic.aliases) ? explicitSemantic.aliases : []),
+    ]),
+  ];
+
+  const pos = Array.isArray(options.position)
+    ? options.position.map((v) => M.tidy(Number(v) || 0, 3))
+    : [0, 0, 0];
+
+  return {
+    schema: 'ganbate.semantic.node.v2',
+    id: options.id || stem.replace(/[^a-zA-Z0-9_]/g, '_'),
+    type: stem,
+    role,
+    academicCollection,
+    path: asset?.path || '',
+    assetId: asset?.id || null,
+    aliases,
+    position: pos,
+    relation: defaultRelation,
+    bounds: {
+      shape,
+      halfExtents: [M.tidy(hx, 3), M.tidy(hy, 3), M.tidy(hz, 3)],
+      radius,
+      height,
+      surfaceY: M.tidy(surfaceY, 3),
+      groundRestError,
+    },
+    affordances,
+    sockets: {
+      ground_origin: [0, 0, 0],
+      top_center: [0, M.tidy(surfaceY, 3), 0],
+      ...(asset?.meta?.sockets || explicitSemantic.sockets || {}),
+    },
+  };
+}
+
+/**
+ * Builds a dynamic Tri-Modal Semantic Asset Catalog (`ganbate.semantic.catalog.v2`) from the
+ * project's asset registry so NL prompt grounding and constraint solvers can resolve any asset.
+ */
+export function buildSemanticCatalogFromAssets(assets = [], metaByAssetId = {}) {
+  const placeableKinds = new Set(['model', 'prefab', 'character']);
+  const entries = [];
+  const byType = {};
+  const byAssetId = {};
+
+  for (const asset of Array.isArray(assets) ? assets : []) {
+    if (!asset || (asset.kind && !placeableKinds.has(asset.kind))) continue;
+    const extra = (asset.id && metaByAssetId[asset.id]) || {};
+    const desc = inferAssetSemanticAffordance(asset, extra);
+    entries.push(desc);
+    byType[desc.type] = desc;
+    if (asset.id) byAssetId[asset.id] = desc;
+  }
+
+  const resolveQuery = (queryToken) => {
+    const q = String(queryToken || '').trim().toLowerCase();
+    if (!q) return null;
+    if (byType[q]) return byType[q];
+    if (byAssetId[q]) return byAssetId[q];
+    return (
+      entries.find((e) => e.aliases.includes(q)) ||
+      entries.find((e) => e.aliases.some((al) => al.includes(q) || q.includes(al))) ||
+      null
+    );
+  };
+
+  return {
+    schema: 'ganbate.semantic.catalog.v2',
+    entries,
+    byType,
+    byAssetId,
+    resolveQuery,
+  };
+}
+
+/** Normalizes existing scene nodes from either a `ganbate.semantic.graph.v2` or an ECS `doc`. */
+export function extractSceneSemanticNodes(sceneContext, assets = []) {
+  if (!sceneContext) return [];
+  const assetById = new Map((Array.isArray(assets) ? assets : []).map((a) => [a.id, a]));
+
+  const normalizeNode = (n, fallbackId) => {
+    if (!n) return null;
+    if (n.schema === 'ganbate.semantic.node.v2' && n.bounds?.halfExtents && n.affordances) {
+      return {
+        ...n,
+        id: n.id || fallbackId || n.type || 'node',
+        position: Array.isArray(n.position) ? n.position.map((v) => Number(v) || 0) : [0, 0, 0],
+      };
+    }
+    const matchedAsset = (n.assetId && assetById.get(n.assetId)) || {
+      id: n.assetId || n.id || fallbackId,
+      path: n.path || n.type || n.name || fallbackId || 'prop',
+      kind: n.kind || 'model',
+      meta: n.meta,
+    };
+    const inferred = inferAssetSemanticAffordance(matchedAsset, {
+      id: n.id || fallbackId,
+      position: n.position || [0, 0, 0],
+      bounds: n.bounds?.aabb,
+      meta: {
+        semantic: {
+          role: n.role,
+          bounds: n.bounds,
+          affordances: n.affordances,
+        },
+      },
+    });
+    return inferred;
+  };
+
+  if (Array.isArray(sceneContext)) {
+    return sceneContext.map((n, i) => normalizeNode(n, `node_${i}`)).filter(Boolean);
+  }
+  if (Array.isArray(sceneContext.nodes)) {
+    return sceneContext.nodes.map((n, i) => normalizeNode(n, `node_${i}`)).filter(Boolean);
+  }
+  const entities = sceneContext?.root?.entities || sceneContext?.entities;
+  if (entities && typeof entities === 'object') {
+    const out = [];
+    for (const [entId, ent] of Object.entries(entities)) {
+      if (!ent || typeof ent !== 'object') continue;
+      const modelId = ent.components?.mesh?.model || ent.prefab?.asset || null;
+      const matched = (modelId && assetById.get(modelId)) || {
+        id: modelId || entId,
+        path: ent.name || entId,
+        kind: ent.prefab ? 'prefab' : 'model',
+      };
+      const pos = ent.components?.transform?.translation || [0, 0, 0];
+      out.push(
+        inferAssetSemanticAffordance(matched, {
+          id: entId,
+          position: pos,
+          meta: ent.semantic ? { semantic: ent.semantic } : undefined,
+        }),
+      );
+    }
+    return out;
+  }
+  return [];
+}
+
+/**
+ * Solves Forward Surface Snapping (for `table_surface` props) and Minimal-Perturbation Constraint
+ * Projection ($x^* = \arg\min_{x \in \mathcal{C}} \|x - \hat{x}\|_2^2$) for floor/seating/character
+ * nodes dropped at $\hat{x}$.
+ */
+export function projectAssetDropPosition(descriptor, proposedPos, existingNodes = [], options = {}) {
+  const xHat = Array.isArray(proposedPos) && proposedPos.length >= 3
+    ? [Number(proposedPos[0]) || 0, Number(proposedPos[1]) || 0, Number(proposedPos[2]) || 0]
+    : [0, 0, 0];
+  const domain = descriptor?.affordances?.domain || 'floor';
+  const [hx, , hz] = descriptor?.bounds?.halfExtents || [0.25, 0.4, 0.25];
+  const propRadius = descriptor?.bounds?.radius || Math.max(hx, hz);
+  const clearance = descriptor?.affordances?.collisionClearance ?? (domain === 'table_surface' ? 0.04 : 0.08);
+  const snapMargin = options.surfaceSnapMargin ?? 0.45;
+
+  // 1. Check if a surface prop is dropped onto or near a support_surface
+  if (domain === 'table_surface' || descriptor?.role === 'surface_prop') {
+    const surfaces = existingNodes.filter(
+      (n) => n && (n.role === 'support_surface' || n.affordances?.supportsOnTopOf),
+    );
+    let bestSurface = null;
+    let bestDistSq = Infinity;
+    for (const s of surfaces) {
+      const [sx, , sz] = s.position || [0, 0, 0];
+      const [shx, , shz] = s.bounds?.halfExtents || [1.2, 0.45, 0.8];
+      const dx = Math.max(0, Math.abs(xHat[0] - sx) - shx);
+      const dz = Math.max(0, Math.abs(xHat[2] - sz) - shz);
+      const outDist = Math.hypot(dx, dz);
+      if (outDist <= snapMargin) {
+        const centerDistSq = (xHat[0] - sx) ** 2 + (xHat[2] - sz) ** 2;
+        if (centerDistSq < bestDistSq) {
+          bestDistSq = centerDistSq;
+          bestSurface = s;
+        }
+      }
+    }
+
+    if (bestSurface) {
+      const [sx, sy, sz] = bestSurface.position || [0, 0, 0];
+      const [shx, , shz] = bestSurface.bounds?.halfExtents || [1.2, 0.45, 0.8];
+      const surfaceTopY = sy + (bestSurface.bounds?.surfaceY ?? (bestSurface.bounds?.halfExtents?.[1] || 0.45) * 2);
+      const maxOffX = Math.max(0.05, shx - propRadius - clearance);
+      const maxOffZ = Math.max(0.05, shz - propRadius - clearance);
+
+      let x = Math.max(sx - maxOffX, Math.min(sx + maxOffX, xHat[0]));
+      let z = Math.max(sz - maxOffZ, Math.min(sz + maxOffZ, xHat[2]));
+
+      // Avoid overlapping sibling props on the same support surface
+      const siblingProps = existingNodes.filter(
+        (n) =>
+          n &&
+          n.id !== bestSurface.id &&
+          (n.role === 'surface_prop' || n.affordances?.domain === 'table_surface') &&
+          Math.abs((n.position?.[1] || 0) - surfaceTopY) < 0.35,
+      );
+      for (const sib of siblingProps) {
+        const [ox, , oz] = sib.position || [0, 0, 0];
+        const minSep = propRadius + (sib.bounds?.radius || 0.16) + clearance;
+        const dx = x - ox;
+        const dz = z - oz;
+        const dist = Math.hypot(dx, dz);
+        if (dist < minSep) {
+          const ux = dist > 1e-5 ? dx / dist : 1;
+          const uz = dist > 1e-5 ? dz / dist : 0;
+          x = Math.max(sx - maxOffX, Math.min(sx + maxOffX, ox + ux * minSep));
+          z = Math.max(sz - maxOffZ, Math.min(sz + maxOffZ, oz + uz * minSep));
+        }
+      }
+
+      const xStar = [M.tidy(x, 3), M.tidy(surfaceTopY, 3), M.tidy(z, 3)];
+      const relX = (xStar[0] - sx) / Math.max(0.1, shx);
+      const relZ = (xStar[2] - sz) / Math.max(0.1, shz);
+      let anchor = 'center';
+      if (Math.abs(relX) >= 0.32 || Math.abs(relZ) >= 0.32) {
+        if (Math.abs(relX) >= Math.abs(relZ)) {
+          anchor = relX < 0 ? 'west' : 'east';
+        } else {
+          anchor = relZ < 0 ? 'north' : 'south';
+        }
+      }
+      const dist3d = Math.hypot(xStar[0] - xHat[0], xStar[1] - xHat[1], xStar[2] - xHat[2]);
+      return {
+        position: xStar,
+        proposedPosition: xHat.map((v) => M.tidy(v, 3)),
+        projected: dist3d > 1e-3,
+        distance: M.tidy(dist3d, 3),
+        mode: 'surface_snap',
+        supportTargetId: bestSurface.id,
+        violatedTargetId: null,
+        anchor,
+        ghost:
+          dist3d > 1e-3
+            ? {
+                from: xHat.map((v) => M.tidy(v, 3)),
+                to: xStar,
+                reason: 'support_surface_snap',
+                targetId: bestSurface.id,
+              }
+            : null,
+      };
+    }
+  }
+
+  // 2. Floor-domain Minimal-Perturbation Constraint Projection ($x^* = \arg\min_{x \in \mathcal{C}} \|x - \hat{x}\|_2^2$)
+  const groundY = Number(options.groundY ?? 0);
+  let x = xHat[0];
+  let z = xHat[2];
+  let violatedTargetId = null;
+
+  const floorObstacles = existingNodes.filter(
+    (n) => n && n.role !== 'surface_prop' && n.affordances?.domain !== 'table_surface',
+  );
+
+  for (let pass = 0; pass < 3; pass++) {
+    let anyChange = false;
+    for (const obs of floorObstacles) {
+      const [ox, , oz] = obs.position || [0, 0, 0];
+      const [ohx, , ohz] = obs.bounds?.halfExtents || [0.5, 0.5, 0.5];
+      const expandX = ohx + hx + clearance;
+      const expandZ = ohz + hz + clearance;
+      const dx = x - ox;
+      const dz = z - oz;
+
+      if (Math.abs(dx) < expandX && Math.abs(dz) < expandZ) {
+        // Point (x, z) is strictly inside the expanded AABB; project to the closest boundary face
+        const dLeft = dx + expandX; // distance to x = ox - expandX
+        const dRight = expandX - dx; // distance to x = ox + expandX
+        const dBack = dz + expandZ; // distance to z = oz - expandZ
+        const dFront = expandZ - dz; // distance to z = oz + expandZ
+        const minPen = Math.min(dLeft, dRight, dBack, dFront);
+
+        if (minPen === dLeft) {
+          x = ox - expandX;
+        } else if (minPen === dRight) {
+          x = ox + expandX;
+        } else if (minPen === dBack) {
+          z = oz - expandZ;
+        } else {
+          z = oz + expandZ;
+        }
+        violatedTargetId = violatedTargetId || obs.id;
+        anyChange = true;
+      }
+    }
+    if (!anyChange) break;
+  }
+
+  const xStar = [M.tidy(x, 3), M.tidy(groundY, 3), M.tidy(z, 3)];
+  const planarDist = Math.hypot(xStar[0] - xHat[0], xStar[2] - xHat[2]);
+  return {
+    position: xStar,
+    proposedPosition: xHat.map((v) => M.tidy(v, 3)),
+    projected: Boolean(violatedTargetId) || planarDist > 1e-3,
+    distance: M.tidy(planarDist, 3),
+    mode: violatedTargetId ? 'aabb_minimal_perturbation' : 'ground_snap',
+    supportTargetId: null,
+    violatedTargetId,
+    anchor: null,
+    ghost: violatedTargetId
+      ? {
+          from: xHat.map((v) => M.tidy(v, 3)),
+          to: xStar,
+          reason: 'aabb_collision_projection',
+          targetId: violatedTargetId,
+        }
+      : null,
+  };
+}
+
+/**
+ * Inverse Semantic Lifting ($\mathcal{L}: \mathbb{R}^3 \to \mathcal{G}_{\text{rel}}$):
+ * Infers discrete relational edges (`on_top_of`, `left_of`, `right_of`, `behind`, `in_front_of`,
+ * `facing`) and facing orientation from a resolved 3D drop position relative to scene nodes.
+ */
+export function liftPositionToSemanticEdges(node, existingNodes = [], projection = null) {
+  const edges = [];
+  const [x, , z] = node?.position || [0, 0, 0];
+
+  if (projection?.supportTargetId) {
+    const anchor = projection.anchor || 'center';
+    edges.push({
+      from: node.id,
+      rel: 'on_top_of',
+      to: projection.supportTargetId,
+      anchor,
+    });
+    return {
+      edges,
+      primaryRelation: 'on_top_of',
+      targetId: projection.supportTargetId,
+      anchor,
+      yawDeg: 0,
+      rotation: [0, 0, 0, 1],
+    };
+  }
+
+  const candidates = existingNodes.filter(
+    (n) => n && n.id !== node.id && n.role !== 'surface_prop',
+  );
+  if (!candidates.length) {
+    return {
+      edges,
+      primaryRelation: 'grounded',
+      targetId: null,
+      anchor: null,
+      yawDeg: 0,
+      rotation: [0, 0, 0, 1],
+    };
+  }
+
+  // Prefer the obstacle that triggered projection, or the nearest support_surface, or nearest node
+  let refNode =
+    (projection?.violatedTargetId && candidates.find((n) => n.id === projection.violatedTargetId)) ||
+    null;
+  if (!refNode) {
+    const surfaces = candidates.filter(
+      (n) => n.role === 'support_surface' || n.affordances?.supportsOnTopOf,
+    );
+    const pool = surfaces.length ? surfaces : candidates;
+    let bestDist = Infinity;
+    for (const c of pool) {
+      const [cx, , cz] = c.position || [0, 0, 0];
+      const d = Math.hypot(x - cx, z - cz);
+      if (d < bestDist) {
+        bestDist = d;
+        refNode = c;
+      }
+    }
+  }
+
+  const [rx, , rz] = refNode.position || [0, 0, 0];
+  const [rhx, , rhz] = refNode.bounds?.halfExtents || [0.8, 0.45, 0.8];
+  const dx = x - rx;
+  const dz = z - rz;
+  const normX = dx / Math.max(0.2, rhx);
+  const normZ = dz / Math.max(0.2, rhz);
+
+  let primaryRelation = 'beside';
+  if (Math.abs(normX) >= Math.abs(normZ)) {
+    primaryRelation = dx < 0 ? 'left_of' : 'right_of';
+  } else {
+    primaryRelation = dz < 0 ? 'behind' : 'in_front_of';
+  }
+
+  edges.push({
+    from: node.id,
+    rel: primaryRelation,
+    to: refNode.id,
+  });
+
+  let yawDeg = 0;
+  let rotation = [0, 0, 0, 1];
+  if (node?.affordances?.orientToTarget || node?.role === 'seating' || node?.role === 'articulated_agent') {
+    const theta = Math.atan2(rx - x, rz - z);
+    yawDeg = M.tidy((theta * 180) / Math.PI, 1);
+    rotation = [0, M.tidy(Math.sin(theta * 0.5), 4), 0, M.tidy(Math.cos(theta * 0.5), 4)];
+    edges.push({
+      from: node.id,
+      rel: 'facing',
+      to: refNode.id,
+      yawDeg,
+    });
+  }
+
+  return {
+    edges,
+    primaryRelation,
+    targetId: refNode.id,
+    anchor: null,
+    yawDeg,
+    rotation,
+  };
+}
+
+/**
+ * End-to-end Tri-Modal Smart Drop solver for the Asset Library -> 3D Viewport boundary:
+ * 1. Infers `ganbate.semantic.node.v2` affordances (`inferAssetSemanticAffordance`),
+ * 2. Solves surface snapping or minimal-perturbation AABB projection (`projectAssetDropPosition`),
+ * 3. Lifts the resolved 3D transform into symbolic relational graph edges (`liftPositionToSemanticEdges`),
+ * 4. Emits `{ entity, node, edges, projection, lifted, descriptor }`.
+ */
+export function resolveSemanticAssetDrop(asset, dropPoint, sceneContext = {}, options = {}) {
+  const descriptor = inferAssetSemanticAffordance(asset, options);
+  const existingNodes = extractSceneSemanticNodes(sceneContext, options.assets || []);
+  const takenIds = new Set(existingNodes.map((n) => n.id));
+  let nodeId = options.nodeId || descriptor.id;
+  if (takenIds.has(nodeId)) {
+    let seq = existingNodes.length + 1;
+    while (takenIds.has(`${descriptor.id}_${seq}`)) seq += 1;
+    nodeId = `${descriptor.id}_${seq}`;
+  }
+
+  const projection = projectAssetDropPosition(descriptor, dropPoint, existingNodes, options);
+  const candidateNode = {
+    ...descriptor,
+    id: nodeId,
+    position: projection.position,
+  };
+  const lifted = liftPositionToSemanticEdges(candidateNode, existingNodes, projection);
+
+  const node = {
+    ...candidateNode,
+    relation: lifted.primaryRelation,
+    targetId: lifted.targetId,
+    yawDeg: lifted.yawDeg,
+    ...(projection.anchor ? { anchor: projection.anchor } : {}),
+  };
+
+  const entity = placementEntity(asset, {
+    parent: options.parent || null,
+    localTranslation: projection.position,
+    localRotation: lifted.rotation,
+  });
+
+  return {
+    entity,
+    node,
+    edges: lifted.edges,
+    projection,
+    lifted,
+    descriptor,
+  };
+}
+
+/**
+ * Computes a target drop coordinate $\hat{x}$ for a symbolic relation (`on_top_of`, `in_front_of`,
+ * `behind`, `left_of`, `right_of`) relative to the primary support surface or scene centerpiece.
+ */
+export function computeRelationalDropPoint(relation, descriptor, sceneContext = {}, assets = []) {
+  const existingNodes = extractSceneSemanticNodes(sceneContext, assets);
+  const surfaces = existingNodes.filter(
+    (n) => n && (n.role === 'support_surface' || n.affordances?.supportsOnTopOf),
+  );
+  const refNode = surfaces[0] || existingNodes[0] || null;
+  if (!refNode) return [0, 0, 0];
+
+  const [rx, ry, rz] = refNode.position || [0, 0, 0];
+  const [rhx, , rhz] = refNode.bounds?.halfExtents || [1.2, 0.45, 0.8];
+  const [hx, , hz] = descriptor?.bounds?.halfExtents || [0.3, 0.45, 0.3];
+  const clearance = (descriptor?.affordances?.collisionClearance ?? 0.08) + 0.04;
+
+  switch (relation) {
+    case 'on_top_of': {
+      const topY = ry + (refNode.bounds?.surfaceY ?? 0.9);
+      return [M.tidy(rx, 3), M.tidy(topY, 3), M.tidy(rz, 3)];
+    }
+    case 'left_of':
+      return [M.tidy(rx - (rhx + hx + clearance), 3), 0, M.tidy(rz, 3)];
+    case 'right_of':
+      return [M.tidy(rx + (rhx + hx + clearance), 3), 0, M.tidy(rz, 3)];
+    case 'behind':
+      return [M.tidy(rx, 3), 0, M.tidy(rz - (rhz + hz + clearance), 3)];
+    case 'in_front_of':
+    default:
+      return [M.tidy(rx, 3), 0, M.tidy(rz + (rhz + hz + clearance), 3)];
+  }
 }
 
 /** Projects a viewport CSS pixel `(clientX, clientY)` onto the horizontal plane near the orbit
@@ -1252,6 +1914,44 @@ export function createAssetLibrary({
       }
     }
 
+    const semanticAssets = assets.filter(
+      (a) => a.kind === 'model' || a.kind === 'prefab' || a.kind === 'character',
+    );
+    if (semanticAssets.length > 0) {
+      const countsByDomain = { architecture: 0, tabletop: 0, characters: 0, lighting: 0 };
+      for (const a of semanticAssets) {
+        const dom = inferAssetSemanticAffordance(a).academicCollection;
+        if (dom && countsByDomain[dom] !== undefined) countsByDomain[dom] += 1;
+      }
+      nav.append(
+        el('div', { class: 'folder-divider' }, trOr('triModalCollections', 'Tri-Modal Collections')),
+      );
+      addCollection(
+        'academic:architecture',
+        '🏛',
+        trOr('academicArchitecture', 'Architecture & Pavilion'),
+        countsByDomain.architecture,
+      );
+      addCollection(
+        'academic:tabletop',
+        '⬡',
+        trOr('academicTabletop', 'Surface & Seating'),
+        countsByDomain.tabletop,
+      );
+      addCollection(
+        'academic:characters',
+        '🦾',
+        trOr('academicCharacters', 'Articulated Agents'),
+        countsByDomain.characters,
+      );
+      addCollection(
+        'academic:lighting',
+        '✦',
+        trOr('academicLighting', 'Luminaires & Beacons'),
+        countsByDomain.lighting,
+      );
+    }
+
     nav.append(el('div', { class: 'folder-divider' }, t('foldersHeading')));
     const tree = buildFolderTree(assets, contentRoots, ui.folder);
     const appendNode = (node, depth) => {
@@ -1343,7 +2043,15 @@ export function createAssetLibrary({
           ? '◷ ' + t('recentAssets')
           : ui.collection === 'intake'
             ? '⬇ ' + trOr('artIntake', 'Art Intake')
-            : '◌ ' + t('unusedAssets');
+            : ui.collection === 'academic:architecture'
+              ? '🏛 ' + trOr('academicArchitecture', 'Architecture & Pavilion')
+              : ui.collection === 'academic:tabletop'
+                ? '⬡ ' + trOr('academicTabletop', 'Surface & Seating')
+                : ui.collection === 'academic:characters'
+                  ? '🦾 ' + trOr('academicCharacters', 'Articulated Agents')
+                  : ui.collection === 'academic:lighting'
+                    ? '✦ ' + trOr('academicLighting', 'Luminaires & Beacons')
+                    : '◌ ' + t('unusedAssets');
       crumbs.append(
         el('span', { class: 'crumb-sep' }, '▸'),
         el('span', { class: 'crumb current' }, collLabel),
@@ -1549,6 +2257,84 @@ export function createAssetLibrary({
       }, t('moveAsset')),
     );
     pane.append(actions);
+
+    // Tri-Modal Semantic Affordance Inspector (`ganbate.semantic.node.v2`)
+    if (selected.kind === 'model' || selected.kind === 'prefab' || selected.kind === 'character') {
+      const semDesc = inferAssetSemanticAffordance(selected, {
+        bounds: meta?.bounds,
+        size: meta?.size,
+      });
+      const hxText = semDesc.bounds.halfExtents.map((v) => M.tidy(v, 2)).join('×');
+      const placeCheck = canPlaceAsset(selected, doc);
+      const relationPills =
+        semDesc.affordances.domain === 'table_surface'
+          ? ['on_top_of', 'left_of', 'right_of']
+          : ['in_front_of', 'left_of', 'right_of', 'behind'];
+
+      const spawnRow = el('div', {
+        id: 'asset-semantic-spawn-relations',
+        class: 'asset-inspector-actions',
+      });
+      for (const rel of relationPills) {
+        spawnRow.append(
+          el(
+            'button',
+            {
+              type: 'button',
+              class: `mini${rel === semDesc.affordances.defaultRelation ? ' on' : ''}`,
+              'data-spawn-relation': rel,
+              disabled: (selected.kind === 'model' || selected.kind === 'prefab') && !placeCheck.ok,
+              title: `Spawn ${semDesc.type} via Tri-Modal Constraint Solver (${rel})`,
+              onclick: () => {
+                recordRecent(selected.id);
+                const targetDrop = computeRelationalDropPoint(rel, semDesc, doc || {}, assets || []);
+                const dropPayload = resolveSemanticAssetDrop(selected, targetDrop, doc || {}, {
+                  bounds: meta?.bounds,
+                  size: meta?.size,
+                  assets,
+                });
+                if (typeof window !== 'undefined' && typeof CustomEvent === 'function') {
+                  window.dispatchEvent(
+                    new CustomEvent('ganbate:semantic-asset-drop', {
+                      detail: { asset: selected, relation: rel, ...dropPayload },
+                    }),
+                  );
+                }
+                if (placeCheck.ok && typeof onPlaceAsset === 'function') {
+                  onPlaceAsset(selected, dropPayload);
+                }
+              },
+            },
+            `+ ${rel}`,
+          ),
+        );
+      }
+
+      pane.append(
+        el('div', { class: 'where-used-header' },
+          el('span', {}, trOr('semanticAffordance', 'Semantic Affordance')),
+          el('span', { class: 'stat-chip' }, semDesc.role),
+        ),
+        el('div', { id: 'asset-semantic-affordance', class: 'asset-inspector-stats' },
+          el('span', { class: 'stat-chip', title: 'Domain · Default Relation' },
+            `${semDesc.affordances.domain} · ${semDesc.affordances.defaultRelation}`),
+          el('span', { class: 'stat-chip', title: 'Collider Shape & Half-Extents (m)' },
+            `${semDesc.bounds.shape} ±(${hxText})m`),
+          el('span', { class: 'stat-chip', title: 'Support Surface Top Y' },
+            `topY ${semDesc.bounds.surfaceY}m`),
+          el('button', {
+            type: 'button',
+            id: 'copy-semantic-node-json',
+            class: 'mini',
+            title: 'Copy ganbate.semantic.node.v2 JSON descriptor',
+            onclick: () => {
+              navigator.clipboard?.writeText(JSON.stringify(semDesc, null, 2)).catch(() => {});
+            },
+          }, trOr('copySemanticNode', 'Copy Semantic Node')),
+        ),
+        spawnRow,
+      );
+    }
 
     // Where Used Explorer
     const uses = ui.usesByAsset.get(selected.id);
@@ -2007,6 +2793,33 @@ export function createAssetLibrary({
     openInModelStudio,
     notifyAssetMoved,
     stopAudio,
+    inferSemanticAffordance: (asset, opts = {}) => {
+      const meta = asset ? previews.getMeta(asset) : null;
+      return inferAssetSemanticAffordance(asset, {
+        bounds: meta?.bounds,
+        size: meta?.size,
+        ...opts,
+      });
+    },
+    buildSemanticCatalog: () => {
+      const { assets } = getContext?.() || { assets: [] };
+      const metaByAssetId = {};
+      for (const a of assets || []) {
+        const m = previews.getMeta(a);
+        if (m) metaByAssetId[a.id] = { bounds: m.bounds, size: m.size };
+      }
+      return buildSemanticCatalogFromAssets(assets || [], metaByAssetId);
+    },
+    resolveSemanticDrop: (asset, dropPoint, sceneContext = null, opts = {}) => {
+      const { assets, doc } = getContext?.() || { assets: [], doc: null };
+      const meta = asset ? previews.getMeta(asset) : null;
+      return resolveSemanticAssetDrop(asset, dropPoint, sceneContext || doc || {}, {
+        bounds: meta?.bounds,
+        size: meta?.size,
+        assets,
+        ...opts,
+      });
+    },
     state: ui,
   };
 }

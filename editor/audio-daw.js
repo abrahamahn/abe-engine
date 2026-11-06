@@ -13,6 +13,16 @@ export const SOUNDBANK_VERSION = 1;
 export const MASTER_BUS_ID = 'master';
 export const DEFAULT_SAMPLE_RATE = 48000;
 export const MIN_METER_DB = -72;
+export const POKER_PRODUCTION_CUE_IDS = Object.freeze([
+  'HAND_START_SHUFFLE',
+  'CARD_DEAL_FLIGHT',
+  'CHIP_BET_TOSS',
+  'CHECK_DOUBLE_TAP',
+  'HERO_CARD_PEEL',
+  'ALL_IN_SHOVE',
+  'POT_SWEEP_WIN',
+  'YOZAKURA_AMBIENCE',
+]);
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -288,6 +298,102 @@ export function createStarterSoundBank({
         transientOffsetMs: 60,
         tags: ['motion', 'whoosh'],
       },
+      riffle_shuffle_01: {
+        order: 3,
+        poolId: 'pool_card_foley',
+        label: 'Deck Riffle Shuffle · Take 1',
+        bus: 'foley',
+        path: 'content/audio/riffle_shuffle_01.wav',
+        takeIndex: 1,
+        takeCount: 2,
+        defaultDurationMs: 420,
+        transientOffsetMs: 28,
+        tags: ['card', 'shuffle', 'foley'],
+      },
+      card_deal_snap_01: {
+        order: 4,
+        poolId: 'pool_card_foley',
+        label: 'Card Deal Flight Snap · Take 2',
+        bus: 'foley',
+        path: 'content/audio/card_deal_snap_01.wav',
+        takeIndex: 2,
+        takeCount: 2,
+        defaultDurationMs: 190,
+        transientOffsetMs: 14,
+        tags: ['card', 'deal', 'foley'],
+      },
+      chip_ceramic_toss_01: {
+        order: 5,
+        poolId: 'pool_chip_foley',
+        label: 'Ceramic Chip Toss · Take 1',
+        bus: 'foley',
+        path: 'content/audio/chip_ceramic_toss_01.wav',
+        takeIndex: 1,
+        takeCount: 2,
+        defaultDurationMs: 240,
+        transientOffsetMs: 18,
+        tags: ['chip', 'bet', 'foley'],
+      },
+      check_table_tap_01: {
+        order: 6,
+        poolId: 'foley_impact',
+        label: 'Felt Check Double Tap',
+        bus: 'foley',
+        path: 'content/audio/check_table_tap_01.wav',
+        takeIndex: 1,
+        takeCount: 1,
+        defaultDurationMs: 260,
+        transientOffsetMs: 16,
+        tags: ['check', 'tap', 'foley'],
+      },
+      card_peel_squeeze_01: {
+        order: 7,
+        poolId: 'pool_card_foley',
+        label: 'Hero Card Peel Squeeze',
+        bus: 'foley',
+        path: 'content/audio/card_peel_squeeze_01.wav',
+        takeIndex: 1,
+        takeCount: 1,
+        defaultDurationMs: 340,
+        transientOffsetMs: 24,
+        tags: ['card', 'peel', 'foley'],
+      },
+      all_in_stack_shove_01: {
+        order: 8,
+        poolId: 'pool_chip_foley',
+        label: 'All-In Stack Shove · Take 2',
+        bus: 'sfx',
+        path: 'content/audio/all_in_stack_shove_01.wav',
+        takeIndex: 2,
+        takeCount: 2,
+        defaultDurationMs: 520,
+        transientOffsetMs: 32,
+        tags: ['chip', 'all-in', 'shove'],
+      },
+      pot_sweep_cascade_01: {
+        order: 9,
+        poolId: 'pool_chip_foley',
+        label: 'Pot Sweep Chip Cascade',
+        bus: 'sfx',
+        path: 'content/audio/pot_sweep_cascade_01.wav',
+        takeIndex: 1,
+        takeCount: 1,
+        defaultDurationMs: 640,
+        transientOffsetMs: 22,
+        tags: ['pot', 'sweep', 'win'],
+      },
+      yozakura_room_tone_01: {
+        order: 10,
+        poolId: 'pool_ambience',
+        label: 'Yozakura Pavilion Night Ambience',
+        bus: 'ambience',
+        path: 'content/audio/yozakura_room_tone_01.wav',
+        takeIndex: 1,
+        takeCount: 1,
+        defaultDurationMs: 1200,
+        transientOffsetMs: 10,
+        tags: ['ambience', 'yozakura', 'room'],
+      },
     },
     containers: {
       foley_impact: {
@@ -307,6 +413,33 @@ export function createStarterSoundBank({
         roundRobinMode: 'sequential',
         pitchJitterCents: 20,
         gainJitterDb: 0.5,
+      },
+      pool_card_foley: {
+        order: 2,
+        label: 'Card Handling Foley Pool',
+        bus: 'foley',
+        assetIds: ['riffle_shuffle_01', 'card_deal_snap_01', 'card_peel_squeeze_01'],
+        roundRobinMode: 'shuffle-no-repeat',
+        pitchJitterCents: 25,
+        gainJitterDb: 0.6,
+      },
+      pool_chip_foley: {
+        order: 3,
+        label: 'Ceramic Chip Foley Pool',
+        bus: 'foley',
+        assetIds: ['chip_ceramic_toss_01', 'all_in_stack_shove_01', 'pot_sweep_cascade_01'],
+        roundRobinMode: 'shuffle-no-repeat',
+        pitchJitterCents: 30,
+        gainJitterDb: 0.7,
+      },
+      pool_ambience: {
+        order: 4,
+        label: 'Yozakura Spatial Ambience Pool',
+        bus: 'ambience',
+        assetIds: ['yozakura_room_tone_01'],
+        roundRobinMode: 'sequential',
+        pitchJitterCents: 5,
+        gainJitterDb: 0.2,
       },
     },
     events: {
@@ -365,6 +498,366 @@ export function createStarterSoundBank({
           },
         },
       },
+      HAND_START_SHUFFLE: {
+        order: 1,
+        cueId: 'HAND_START_SHUFFLE',
+        label: 'HAND_START_SHUFFLE · Deck Riffle & Bridge',
+        bus: 'foley',
+        durationMs: 680,
+        contactMarkerMs: 180,
+        contactLabel: 'Riffle Interlock (F11)',
+        description: 'Two-half deck riffle leading into bridge cascade snap on felt',
+        layers: {
+          lyr_shuffle_whoosh: {
+            order: 0,
+            label: 'Deck Split Lift',
+            assetId: 'whoosh_pre_01',
+            poolId: 'whoosh_pre',
+            bus: 'sfx',
+            enabled: true,
+            solo: false,
+            startMs: 40,
+            durationMs: 150,
+            trimStartMs: 0,
+            fadeInMs: 20,
+            fadeOutMs: 35,
+            fadeCurve: 'cosine',
+            gainDb: -5.0,
+            pan: -0.08,
+            pitchSemitones: 0,
+            pitchJitterCents: 15,
+            gainJitterDb: 0.4,
+            color: '#60a5fa',
+            strip: createDefaultStrip(),
+          },
+          lyr_shuffle_riffle: {
+            order: 1,
+            label: 'Riffle Cascade Snap',
+            assetId: 'riffle_shuffle_01',
+            poolId: 'pool_card_foley',
+            bus: 'foley',
+            enabled: true,
+            solo: false,
+            startMs: 152,
+            durationMs: 420,
+            trimStartMs: 0,
+            fadeInMs: 6,
+            fadeOutMs: 80,
+            fadeCurve: 's-curve',
+            gainDb: 0.5,
+            pan: 0.0,
+            pitchSemitones: 0,
+            pitchJitterCents: 25,
+            gainJitterDb: 0.6,
+            color: '#4ade80',
+            strip: createDefaultStrip(),
+          },
+        },
+      },
+      CARD_DEAL_FLIGHT: {
+        order: 2,
+        cueId: 'CARD_DEAL_FLIGHT',
+        label: 'CARD_DEAL_FLIGHT · Shoe Slide & Felt Landing',
+        bus: 'foley',
+        durationMs: 420,
+        contactMarkerMs: 120,
+        contactLabel: 'Card Felt Landing (F7)',
+        description: 'Shoe release air swipe synchronized to felt landing transient',
+        layers: {
+          lyr_deal_air: {
+            order: 0,
+            label: 'Flight Air Swipe',
+            assetId: 'whoosh_pre_01',
+            poolId: 'whoosh_pre',
+            bus: 'sfx',
+            enabled: true,
+            solo: false,
+            startMs: 25,
+            durationMs: 110,
+            trimStartMs: 0,
+            fadeInMs: 15,
+            fadeOutMs: 30,
+            fadeCurve: 'cosine',
+            gainDb: -6.0,
+            pan: -0.12,
+            pitchSemitones: 2,
+            pitchJitterCents: 20,
+            gainJitterDb: 0.5,
+            color: '#38bdf8',
+            strip: createDefaultStrip(),
+          },
+          lyr_deal_snap: {
+            order: 1,
+            label: 'Felt Landing Snap',
+            assetId: 'card_deal_snap_01',
+            poolId: 'pool_card_foley',
+            bus: 'foley',
+            enabled: true,
+            solo: false,
+            startMs: 106,
+            durationMs: 190,
+            trimStartMs: 0,
+            fadeInMs: 3,
+            fadeOutMs: 55,
+            fadeCurve: 's-curve',
+            gainDb: 0.0,
+            pan: 0.08,
+            pitchSemitones: 0,
+            pitchJitterCents: 30,
+            gainJitterDb: 0.6,
+            color: '#4ade80',
+            strip: createDefaultStrip(),
+          },
+        },
+      },
+      CHIP_BET_TOSS: {
+        order: 3,
+        cueId: 'CHIP_BET_TOSS',
+        label: 'CHIP_BET_TOSS · Ceramic Chip Clink & Settle',
+        bus: 'foley',
+        durationMs: 480,
+        contactMarkerMs: 150,
+        contactLabel: 'Chip Stack Impact (F9)',
+        description: 'Ceramic chip arc leading into multi-take pot contact clink',
+        layers: {
+          lyr_chip_arc: {
+            order: 0,
+            label: 'Toss Release Whoosh',
+            assetId: 'whoosh_pre_01',
+            poolId: 'whoosh_pre',
+            bus: 'sfx',
+            enabled: true,
+            solo: false,
+            startMs: 45,
+            durationMs: 120,
+            trimStartMs: 0,
+            fadeInMs: 18,
+            fadeOutMs: 30,
+            fadeCurve: 'cosine',
+            gainDb: -5.5,
+            pan: -0.05,
+            pitchSemitones: 1,
+            pitchJitterCents: 18,
+            gainJitterDb: 0.4,
+            color: '#60a5fa',
+            strip: createDefaultStrip(),
+          },
+          lyr_chip_clink: {
+            order: 1,
+            label: 'Ceramic Impact Clink',
+            assetId: 'chip_ceramic_toss_01',
+            poolId: 'pool_chip_foley',
+            bus: 'foley',
+            enabled: true,
+            solo: false,
+            startMs: 132,
+            durationMs: 240,
+            trimStartMs: 0,
+            fadeInMs: 4,
+            fadeOutMs: 70,
+            fadeCurve: 's-curve',
+            gainDb: 0.5,
+            pan: 0.04,
+            pitchSemitones: 0,
+            pitchJitterCents: 35,
+            gainJitterDb: 0.8,
+            color: '#4ade80',
+            strip: createDefaultStrip(),
+          },
+        },
+      },
+      CHECK_DOUBLE_TAP: {
+        order: 4,
+        cueId: 'CHECK_DOUBLE_TAP',
+        label: 'CHECK_DOUBLE_TAP · Knuckle Felt Double Tap',
+        bus: 'foley',
+        durationMs: 460,
+        contactMarkerMs: 110,
+        contactLabel: 'First Tap Contact (F7)',
+        description: 'Low-end felt thud paired with double-tap wood resonance',
+        layers: {
+          lyr_check_tap: {
+            order: 0,
+            label: 'Double Tap Transient',
+            assetId: 'check_table_tap_01',
+            poolId: 'foley_impact',
+            bus: 'foley',
+            enabled: true,
+            solo: false,
+            startMs: 94,
+            durationMs: 260,
+            trimStartMs: 0,
+            fadeInMs: 4,
+            fadeOutMs: 65,
+            fadeCurve: 's-curve',
+            gainDb: 0.0,
+            pan: 0.0,
+            pitchSemitones: -2,
+            pitchJitterCents: 20,
+            gainJitterDb: 0.5,
+            color: '#4ade80',
+            strip: createDefaultStrip(),
+          },
+        },
+      },
+      HERO_CARD_PEEL: {
+        order: 5,
+        cueId: 'HERO_CARD_PEEL',
+        label: 'HERO_CARD_PEEL · Slow Corner Squeeze & Snap',
+        bus: 'foley',
+        durationMs: 560,
+        contactMarkerMs: 210,
+        contactLabel: 'Corner Reveal Snap (F13)',
+        description: 'Tactile card stock bend leading into crisp corner release snap',
+        layers: {
+          lyr_peel_bend: {
+            order: 0,
+            label: 'Card Stock Squeeze',
+            assetId: 'card_peel_squeeze_01',
+            poolId: 'pool_card_foley',
+            bus: 'foley',
+            enabled: true,
+            solo: false,
+            startMs: 186,
+            durationMs: 340,
+            trimStartMs: 0,
+            fadeInMs: 12,
+            fadeOutMs: 75,
+            fadeCurve: 'cosine',
+            gainDb: 0.0,
+            pan: 0.0,
+            pitchSemitones: 0,
+            pitchJitterCents: 18,
+            gainJitterDb: 0.4,
+            color: '#38bdf8',
+            strip: createDefaultStrip(),
+          },
+        },
+      },
+      ALL_IN_SHOVE: {
+        order: 6,
+        cueId: 'ALL_IN_SHOVE',
+        label: 'ALL_IN_SHOVE · Heavy Stack Slide & Sub Impact',
+        bus: 'sfx',
+        durationMs: 880,
+        contactMarkerMs: 240,
+        contactLabel: 'Stack Center Impact (F14)',
+        description: 'Heavy multi-column chip slide into center pot with sub-bass punch',
+        layers: {
+          lyr_shove_pre: {
+            order: 0,
+            label: 'Felt Slide Friction',
+            assetId: 'whoosh_pre_01',
+            poolId: 'whoosh_pre',
+            bus: 'foley',
+            enabled: true,
+            solo: false,
+            startMs: 70,
+            durationMs: 190,
+            trimStartMs: 0,
+            fadeInMs: 25,
+            fadeOutMs: 40,
+            fadeCurve: 'cosine',
+            gainDb: -2.0,
+            pan: -0.06,
+            pitchSemitones: -3,
+            pitchJitterCents: 20,
+            gainJitterDb: 0.5,
+            color: '#60a5fa',
+            strip: createDefaultStrip(),
+          },
+          lyr_shove_impact: {
+            order: 1,
+            label: 'Heavy Stack Shove',
+            assetId: 'all_in_stack_shove_01',
+            poolId: 'pool_chip_foley',
+            bus: 'sfx',
+            enabled: true,
+            solo: false,
+            startMs: 208,
+            durationMs: 520,
+            trimStartMs: 0,
+            fadeInMs: 5,
+            fadeOutMs: 110,
+            fadeCurve: 's-curve',
+            gainDb: 1.5,
+            pan: 0.02,
+            pitchSemitones: 0,
+            pitchJitterCents: 25,
+            gainJitterDb: 0.6,
+            color: '#e8b44a',
+            strip: createDefaultStrip(),
+          },
+        },
+      },
+      POT_SWEEP_WIN: {
+        order: 7,
+        cueId: 'POT_SWEEP_WIN',
+        label: 'POT_SWEEP_WIN · Winner Pot Gather & Cascade',
+        bus: 'sfx',
+        durationMs: 950,
+        contactMarkerMs: 220,
+        contactLabel: 'Pot Gather Crest (F13)',
+        description: 'Sweeping chip cascade and celebratory harmonic shimmer',
+        layers: {
+          lyr_pot_cascade: {
+            order: 0,
+            label: 'Pot Chip Cascade',
+            assetId: 'pot_sweep_cascade_01',
+            poolId: 'pool_chip_foley',
+            bus: 'sfx',
+            enabled: true,
+            solo: false,
+            startMs: 198,
+            durationMs: 640,
+            trimStartMs: 0,
+            fadeInMs: 10,
+            fadeOutMs: 140,
+            fadeCurve: 's-curve',
+            gainDb: 1.0,
+            pan: 0.0,
+            pitchSemitones: 0,
+            pitchJitterCents: 25,
+            gainJitterDb: 0.5,
+            color: '#e8b44a',
+            strip: createDefaultStrip(),
+          },
+        },
+      },
+      YOZAKURA_AMBIENCE: {
+        order: 8,
+        cueId: 'YOZAKURA_AMBIENCE',
+        label: 'YOZAKURA_AMBIENCE · Pavilion Courtyard & Lantern Bed',
+        bus: 'ambience',
+        durationMs: 1400,
+        contactMarkerMs: 160,
+        contactLabel: 'Shoji Downbeat (F10)',
+        description: 'Spatialized timber room tone and warm garden breeze bed',
+        layers: {
+          lyr_yozakura_bed: {
+            order: 0,
+            label: 'Pavilion Room Tone',
+            assetId: 'yozakura_room_tone_01',
+            poolId: 'pool_ambience',
+            bus: 'ambience',
+            enabled: true,
+            solo: false,
+            startMs: 150,
+            durationMs: 1100,
+            trimStartMs: 0,
+            fadeInMs: 90,
+            fadeOutMs: 180,
+            fadeCurve: 'cosine',
+            gainDb: -3.0,
+            pan: 0.0,
+            pitchSemitones: 0,
+            pitchJitterCents: 5,
+            gainJitterDb: 0.2,
+            color: '#2dd4bf',
+            strip: createDefaultStrip(),
+          },
+        },
+      },
     },
     sequences: {
       seq_double_hit: {
@@ -373,6 +866,36 @@ export function createStarterSoundBank({
         steps: [
           { eventId: 'evt_surface_hit', atMs: 0, label: 'Primary Hit' },
           { eventId: 'evt_surface_hit', atMs: 320, label: 'Follow-up Hit' },
+        ],
+      },
+      seq_poker_full_hand: {
+        order: 1,
+        label: 'Poker Full Hand Choreography',
+        steps: [
+          { eventId: 'HAND_START_SHUFFLE', atMs: 0, label: '01 Shuffle' },
+          { eventId: 'CARD_DEAL_FLIGHT', atMs: 320, label: '02 Hole Deal' },
+          { eventId: 'CHECK_DOUBLE_TAP', atMs: 620, label: '03 Check Tap' },
+          { eventId: 'CHIP_BET_TOSS', atMs: 920, label: '04 Turn Bet' },
+          { eventId: 'HERO_CARD_PEEL', atMs: 1240, label: '05 River Peel' },
+          { eventId: 'POT_SWEEP_WIN', atMs: 1620, label: '06 Pot Sweep' },
+        ],
+      },
+      seq_all_in_drama: {
+        order: 2,
+        label: 'All-In Runout Sequence',
+        steps: [
+          { eventId: 'ALL_IN_SHOVE', atMs: 0, label: '01 Shove Stack' },
+          { eventId: 'HERO_CARD_PEEL', atMs: 480, label: '02 Squeeze Peel' },
+          { eventId: 'POT_SWEEP_WIN', atMs: 920, label: '03 Winner Cascade' },
+        ],
+      },
+      seq_salon_arrival: {
+        order: 3,
+        label: 'Yozakura Arrival → Deal',
+        steps: [
+          { eventId: 'YOZAKURA_AMBIENCE', atMs: 0, label: '01 Pavilion Bed' },
+          { eventId: 'HAND_START_SHUFFLE', atMs: 450, label: '02 Deck Riffle' },
+          { eventId: 'CARD_DEAL_FLIGHT', atMs: 920, label: '03 Deal Snap' },
         ],
       },
     },
@@ -1425,6 +1948,778 @@ export function buildRegisterProjectSoundOps(root, projectAsset, targetBus, even
   return { assetId, layerId: placedLayerId, ops };
 }
 
+// ---- Tri-Modal Audio Semantic Graph Kernel (Forward Grounding, Inverse Lifting, û -> u*) ----
+
+export function createPokerProductionSoundBank(options = {}) {
+  return createStarterSoundBank({
+    id: options.id || '9c5e2a7310d4582bb631f485c9d0e123',
+    name: options.name || 'Ganbate Production SoundBank',
+  });
+}
+
+function resolveLayerTransientOffsetMs(root, layer) {
+  if (!layer) return 18;
+  if (layer.assetId && root?.assets?.[layer.assetId]) {
+    return Number(root.assets[layer.assetId].transientOffsetMs) || 0;
+  }
+  if (layer.poolId && root?.containers?.[layer.poolId]) {
+    const firstId = root.containers[layer.poolId].assetIds?.[0];
+    if (firstId && root?.assets?.[firstId]) {
+      return Number(root.assets[firstId].transientOffsetMs) || 0;
+    }
+  }
+  return 18;
+}
+
+/**
+ * Inverse Audio Semantic Lifting (`L_audio: Timeline/DSP State -> G_rel`).
+ * Infers symbolic temporal (`at_contact`, `leads_contact`, `trails_contact`), routing (`routed_to_bus`),
+ * spatial (`spatialized_from`), and dynamic ducking (`ducks_bus`) relational edges from continuous DAW state.
+ */
+export function inferAudioSemanticEdges(root, eventId = null) {
+  const edges = [];
+  if (!root || typeof root !== 'object') return edges;
+  const targetEventIds = eventId && root.events?.[eventId] ? [eventId] : Object.keys(root.events || {});
+
+  for (const eid of targetEventIds) {
+    const ev = root.events?.[eid];
+    if (!ev) continue;
+    const contactMs = Number(ev.contactMarkerMs) || 0;
+    for (const layer of orderedLayers(ev)) {
+      const transientMs = resolveLayerTransientOffsetMs(root, layer);
+      const onsetMs = (Number(layer.startMs) || 0) + transientMs;
+      const deltaMs = Math.round(onsetMs - contactMs);
+      let rel = 'at_contact';
+      if (deltaMs < -8) rel = 'leads_contact';
+      else if (deltaMs > 8 && (Number(layer.startMs) || 0) >= contactMs - 4) rel = 'trails_contact';
+      else if (Math.abs(deltaMs) > 8) rel = deltaMs < 0 ? 'leads_contact' : 'trails_contact';
+
+      edges.push({
+        from: `layer:${layer.id}`,
+        rel,
+        to: `contact:${eid}`,
+        eventId: eid,
+        layerId: layer.id,
+        transientOffsetMs: transientMs,
+        deltaMs,
+        startMs: Math.round(Number(layer.startMs) || 0),
+        contactMarkerMs: Math.round(contactMs),
+      });
+      edges.push({
+        from: `layer:${layer.id}`,
+        rel: 'routed_to_bus',
+        to: `bus:${layer.bus}`,
+        eventId: eid,
+        layerId: layer.id,
+      });
+      if (layer.spatialSourceNode || ev.spatialSourceNode) {
+        edges.push({
+          from: `layer:${layer.id}`,
+          rel: 'spatialized_from',
+          to: `node:${layer.spatialSourceNode || ev.spatialSourceNode}`,
+          eventId: eid,
+          layerId: layer.id,
+        });
+      }
+    }
+  }
+
+  if (root.dynamics?.enabled && root.dynamics.ducking) {
+    for (const rule of Object.values(root.dynamics.ducking)) {
+      if (!rule?.enabled) continue;
+      for (const targetBus of rule.targetBuses || []) {
+        edges.push({
+          from: `bus:${rule.sourceBus}`,
+          rel: 'ducks_bus',
+          to: `bus:${targetBus}`,
+          amount: rule.amount,
+        });
+      }
+    }
+  }
+  return edges;
+}
+
+/**
+ * Minimal-Perturbation Audio Constraint Projection (`u* = argmin ||u - û||² s.t. u in C_audio`).
+ * Verifies and projects:
+ * 1. Temporal boundary & pre-impact lead-in feasibility (`0 <= startMs <= durationMs - clipDurationMs`)
+ * 2. Master bus headroom non-clipping manifold (`peakDb <= maxPeakDb`, default `-0.5 dBFS`)
+ */
+export function projectAudioConstraints(
+  root,
+  eventId,
+  { mode = 'project', maxPeakDb = -0.5, mutate = true } = {},
+) {
+  const working = mutate ? root : structuredClone(root);
+  const evId = eventId && working?.events?.[eventId] ? eventId : orderedEvents(working)[0]?.id;
+  const ev = working?.events?.[evId];
+  if (!ev) {
+    return { valid: true, mode, violations: [], ops: [], ghost: null, edges: [] };
+  }
+
+  const violations = [];
+  const ops = [];
+  const sheetDur = Math.max(40, Number(ev.durationMs) || 520);
+
+  for (const [lid, layer] of Object.entries(ev.layers || {})) {
+    const rawStart = Number(layer.startMs) || 0;
+    const rawDur = Math.max(5, Number(layer.durationMs) || 200);
+    const maxValidStart = Math.max(0, sheetDur - Math.min(rawDur, sheetDur - 5));
+    if (rawStart < 0 || rawStart > maxValidStart) {
+      const projectedStart = Math.round(finiteClamp(rawStart, 0, maxValidStart, 0));
+      const trimDelta = rawStart < 0 ? Math.round(-rawStart) : 0;
+      const projectedTrim = Math.round((Number(layer.trimStartMs) || 0) + trimDelta);
+      violations.push({
+        kind: 'temporal_bounds',
+        eventId: evId,
+        layerId: lid,
+        label: layer.label || lid,
+        proposedStartMs: Math.round(rawStart),
+        projectedStartMs: projectedStart,
+        durationMs: Math.round(rawDur),
+        deltaMs: Math.round(projectedStart - rawStart),
+      });
+      if (mode === 'project') {
+        layer.startMs = projectedStart;
+        ops.push({ set: ['events', evId, 'layers', lid, 'startMs'], value: projectedStart });
+        if (trimDelta > 0) {
+          layer.trimStartMs = projectedTrim;
+          ops.push({ set: ['events', evId, 'layers', lid, 'trimStartMs'], value: projectedTrim });
+        }
+      }
+    }
+  }
+
+  const rendered = renderEventOfflineJs(working, evId);
+  const masterMeter = rendered?.meters?.[MASTER_BUS_ID];
+  const masterPeakDb = masterMeter ? Math.max(masterMeter.peakLDb, masterMeter.peakRDb) : MIN_METER_DB;
+  if (masterPeakDb > maxPeakDb) {
+    const excessDb = masterPeakDb - maxPeakDb;
+    const gainReductionDb = -Number((excessDb + 0.25).toFixed(2));
+    violations.push({
+      kind: 'headroom_clipping',
+      eventId: evId,
+      busId: MASTER_BUS_ID,
+      proposedPeakDb: Number(masterPeakDb.toFixed(2)),
+      projectedPeakDb: Number(maxPeakDb.toFixed(2)),
+      gainDeltaDb: gainReductionDb,
+    });
+    if (mode === 'project') {
+      for (const [lid, layer] of Object.entries(ev.layers || {})) {
+        if (!layer.enabled) continue;
+        const nextGain = Number(finiteClamp((Number(layer.gainDb) || 0) + gainReductionDb, -48, 18, 0).toFixed(2));
+        layer.gainDb = nextGain;
+        ops.push({ set: ['events', evId, 'layers', lid, 'gainDb'], value: nextGain });
+      }
+    }
+  }
+
+  return {
+    valid: violations.length === 0,
+    mode,
+    violations,
+    ops,
+    ghost: violations[0] || null,
+    edges: inferAudioSemanticEdges(working, evId),
+  };
+}
+
+/**
+ * Propagates an Animation Contact Marker shift (`contactMarkerMs -> nextContactMs`) along
+ * inferred `G_rel` edges (`at_contact`, `leads_contact`, `trails_contact`) and runs
+ * Minimal-Perturbation Audio Constraint Projection (`û -> u*`).
+ */
+export function propagateContactMarkerShift(
+  root,
+  eventId,
+  nextContactMs,
+  { mode = 'project', mutate = true } = {},
+) {
+  const working = mutate ? root : structuredClone(root);
+  const evId = eventId && working?.events?.[eventId] ? eventId : orderedEvents(working)[0]?.id;
+  const ev = working?.events?.[evId];
+  if (!ev) return { ops: [], projection: null, edges: [] };
+
+  const prevEdges = inferAudioSemanticEdges(working, evId);
+  const clampedContact = Math.round(finiteClamp(nextContactMs, 0, ev.durationMs, ev.contactMarkerMs));
+  const deltaMs = clampedContact - ev.contactMarkerMs;
+  ev.contactMarkerMs = clampedContact;
+  const ops = [{ set: ['events', evId, 'contactMarkerMs'], value: clampedContact }];
+
+  for (const edge of prevEdges) {
+    if (
+      (edge.rel === 'at_contact' || edge.rel === 'leads_contact' || edge.rel === 'trails_contact') &&
+      ev.layers?.[edge.layerId]
+    ) {
+      const layer = ev.layers[edge.layerId];
+      const nextStart = Math.round(layer.startMs + deltaMs);
+      layer.startMs = nextStart;
+      ops.push({ set: ['events', evId, 'layers', edge.layerId, 'startMs'], value: nextStart });
+    }
+  }
+
+  const projection = projectAudioConstraints(working, evId, { mode, maxPeakDb: -0.5, mutate: true });
+  if (projection.ops.length) {
+    ops.push(...projection.ops);
+  }
+  return {
+    eventId: evId,
+    contactMarkerMs: ev.contactMarkerMs,
+    deltaMs,
+    ops,
+    projection,
+    edges: inferAudioSemanticEdges(working, evId),
+  };
+}
+
+/**
+ * Serializes the active Event Action Sheet, inferred `G_rel` edges, and Master DSP strip
+ * into canonical `.gbs` Audio DSL statements (Modality 2 of the Tri-Modal Engine).
+ */
+export function serializeAudioSemanticGbs(root, eventId = null) {
+  if (!root || typeof root !== 'object') return '';
+  const evId = eventId && root.events?.[eventId] ? eventId : orderedEvents(root)[0]?.id;
+  const ev = root.events?.[evId];
+  if (!ev) return '';
+  const lines = [
+    `audio.event ${evId} contact=${Math.round(ev.contactMarkerMs)}ms duration=${Math.round(ev.durationMs)}ms bus=${ev.bus}`,
+  ];
+  const edges = inferAudioSemanticEdges(root, evId);
+  for (const edge of edges) {
+    if (edge.rel === 'at_contact' || edge.rel === 'leads_contact' || edge.rel === 'trails_contact') {
+      const layer = ev.layers?.[edge.layerId];
+      lines.push(
+        `audio.edge ${edge.layerId} ${edge.rel} delta=${edge.deltaMs >= 0 ? `+${edge.deltaMs}` : edge.deltaMs}ms start=${edge.startMs}ms bus=${layer?.bus || ev.bus}`,
+      );
+    }
+  }
+  const master = root.buses?.[MASTER_BUS_ID]?.strip;
+  if (master) {
+    lines.push(
+      `audio.dsp ${MASTER_BUS_ID} width=${Math.round(master.stereoWidthPct)}% comp=${master.compressor?.enabled ? 'on' : 'off'} rev=${Math.round((master.reverb?.mix || 0) * 100)}%`,
+    );
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Compiles `.gbs` Audio DSL statements (`audio.event`, `audio.edge`, `audio.layer`, `audio.dsp`)
+ * into structured SoundBank ops and runs Minimal-Perturbation Constraint Projection (`û -> u*`).
+ */
+export function compileAudioGbsCommand(root, gbsText, { eventId = null, mode = 'project' } = {}) {
+  const statements = String(gbsText || '')
+    .split(/[\n;]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  let targetEventId = eventId && root?.events?.[eventId] ? eventId : orderedEvents(root)[0]?.id;
+  const ops = [];
+  const appliedTokens = [];
+
+  for (const stmt of statements) {
+    const tokens = stmt.split(/\s+/);
+    const head = (tokens[0] || '').toLowerCase();
+    const kv = {};
+    for (const tok of tokens.slice(1)) {
+      const eqIdx = tok.indexOf('=');
+      if (eqIdx > 0) {
+        kv[tok.slice(0, eqIdx).toLowerCase()] = tok.slice(eqIdx + 1);
+      }
+    }
+
+    if (head === 'audio.event') {
+      const candId = tokens[1] && !tokens[1].includes('=') ? tokens[1] : targetEventId;
+      if (root?.events?.[candId]) targetEventId = candId;
+      const ev = root?.events?.[targetEventId];
+      if (ev) {
+        if (kv.duration) {
+          const dur = Math.round(finiteClamp( parseFloat(kv.duration), 60, 60000, ev.durationMs));
+          ev.durationMs = dur;
+          ops.push({ set: ['events', targetEventId, 'durationMs'], value: dur });
+        }
+        if (kv.contact) {
+          const nextC = Math.round(finiteClamp(parseFloat(kv.contact), 0, ev.durationMs, ev.contactMarkerMs));
+          const shifted = propagateContactMarkerShift(root, targetEventId, nextC, { mode, mutate: true });
+          ops.push(...shifted.ops);
+        }
+        appliedTokens.push(`event:${targetEventId}`);
+      }
+    } else if (head === 'audio.edge' || head === 'audio.layer') {
+      const layerId = tokens[1];
+      const relOrToken = tokens[2] && !tokens[2].includes('=') ? tokens[2] : null;
+      const ev = root?.events?.[targetEventId];
+      const layer = ev?.layers?.[layerId];
+      if (ev && layer) {
+        const transientMs = resolveLayerTransientOffsetMs(root, layer);
+        if (kv.start !== undefined) {
+          layer.startMs = Math.round(parseFloat(kv.start) || 0);
+          ops.push({ set: ['events', targetEventId, 'layers', layerId, 'startMs'], value: layer.startMs });
+        } else if (relOrToken === 'at_contact') {
+          layer.startMs = Math.round(ev.contactMarkerMs - transientMs);
+          ops.push({ set: ['events', targetEventId, 'layers', layerId, 'startMs'], value: layer.startMs });
+        } else if (relOrToken === 'leads_contact') {
+          const d = kv.delta !== undefined ? parseFloat(kv.delta) : -28;
+          layer.startMs = Math.round(ev.contactMarkerMs - transientMs + (d < 0 ? d : -Math.abs(d)));
+          ops.push({ set: ['events', targetEventId, 'layers', layerId, 'startMs'], value: layer.startMs });
+        } else if (relOrToken === 'trails_contact') {
+          const d = kv.delta !== undefined ? parseFloat(kv.delta) : 24;
+          layer.startMs = Math.round(ev.contactMarkerMs - transientMs + Math.abs(d));
+          ops.push({ set: ['events', targetEventId, 'layers', layerId, 'startMs'], value: layer.startMs });
+        }
+        if (kv.gain !== undefined) {
+          layer.gainDb = finiteClamp(parseFloat(kv.gain), -48, 18, layer.gainDb);
+          ops.push({ set: ['events', targetEventId, 'layers', layerId, 'gainDb'], value: layer.gainDb });
+        }
+        if (kv.bus && root.buses?.[kv.bus]) {
+          layer.bus = kv.bus;
+          ops.push({ set: ['events', targetEventId, 'layers', layerId, 'bus'], value: kv.bus });
+        }
+        appliedTokens.push(`${head}:${layerId}`);
+      }
+    } else if (head === 'audio.dsp') {
+      const busId = tokens[1] && root?.buses?.[tokens[1]] ? tokens[1] : MASTER_BUS_ID;
+      const strip = root?.buses?.[busId]?.strip;
+      if (strip) {
+        if (kv.width !== undefined) {
+          strip.stereoWidthPct = Math.round(finiteClamp(parseFloat(kv.width), 0, 200, 100));
+          ops.push({ set: ['buses', busId, 'strip', 'stereoWidthPct'], value: strip.stereoWidthPct });
+        }
+        if (kv.comp !== undefined) {
+          strip.compressor.enabled = kv.comp === 'on' || kv.comp === 'true' || kv.comp === '1';
+          ops.push({ set: ['buses', busId, 'strip', 'compressor', 'enabled'], value: strip.compressor.enabled });
+        }
+        if (kv.rev !== undefined) {
+          const revNum = parseFloat(kv.rev);
+          const mix = revNum > 1 ? revNum / 100 : revNum;
+          strip.reverb.enabled = mix > 0;
+          strip.reverb.mix = Number(finiteClamp(mix, 0, 1, 0.2).toFixed(2));
+          ops.push(
+            { set: ['buses', busId, 'strip', 'reverb', 'enabled'], value: strip.reverb.enabled },
+            { set: ['buses', busId, 'strip', 'reverb', 'mix'], value: strip.reverb.mix },
+          );
+        }
+        appliedTokens.push(`dsp:${busId}`);
+      }
+    }
+  }
+
+  const projection = projectAudioConstraints(root, targetEventId, { mode, maxPeakDb: -0.5, mutate: true });
+  if (projection.ops.length) {
+    ops.push(...projection.ops);
+  }
+  return {
+    applied: ops.length > 0,
+    targetEventId,
+    ops,
+    projection,
+    edges: inferAudioSemanticEdges(root, targetEventId),
+    summary: appliedTokens.length ? `GBS: ${appliedTokens.join(', ')}` : 'No GBS audio ops matched',
+  };
+}
+
+/**
+ * Simulates a 2-Agent concurrent audio authoring conflict:
+ * - Agent A (Animation Timing Agent) shifts `contactMarkerMs` earlier to `32ms` while preserving `leads_contact`.
+ * - Agent B (Sound Design Agent) boosts layer gain (`+11.5 dB`) and widens pre-impact lead-in (`startMs = -28ms`).
+ * Naive merge produces a negative start time (`-28ms`) and Master bus clipping (`> +3 dBFS`).
+ * Our Constraint-Preserving Audio Solver projects `û -> u*` onto `[0ms, -0.5 dBFS]` and emits a Ghost record.
+ */
+export function simulateTwoAgentAudioConflict(root, eventId = null, { mode = 'project' } = {}) {
+  const evId = eventId && root?.events?.[eventId] ? eventId : orderedEvents(root)[0]?.id;
+  const ev = root?.events?.[evId];
+  if (!ev) return null;
+  const layers = orderedLayers(ev);
+  const firstLayer = layers[0];
+  const secondLayer = layers[1] || layers[0];
+  if (!firstLayer) return null;
+
+  const proposedContactMs = 32;
+  const proposedNegativeStartMs = -28;
+  const proposedHotGainDb = 11.5;
+
+  ev.contactMarkerMs = proposedContactMs;
+  ev.layers[firstLayer.id].startMs = proposedNegativeStartMs;
+  ev.layers[secondLayer.id].gainDb = proposedHotGainDb;
+
+  const projection = projectAudioConstraints(root, evId, { mode, maxPeakDb: -0.5, mutate: true });
+  return {
+    eventId: evId,
+    layerId: firstLayer.id,
+    proposed: {
+      contactMarkerMs: proposedContactMs,
+      startMs: proposedNegativeStartMs,
+      gainDb: proposedHotGainDb,
+    },
+    projected: {
+      contactMarkerMs: ev.contactMarkerMs,
+      startMs: ev.layers[firstLayer.id].startMs,
+      trimStartMs: ev.layers[firstLayer.id].trimStartMs,
+      gainDb: ev.layers[secondLayer.id].gainDb,
+    },
+    projection,
+  };
+}
+
+let activeMountedDawController = null;
+
+/**
+ * Sequencer / Studio to Audio Engine Cue Bridge (`triggerSequencerAudioCue`).
+ * Resolves any of the 8 `POKER_PRODUCTION_CUE_IDS` (or custom event ID / `cueId`) against the
+ * SoundBank, computes offline bus meters and `G_rel` edges, and triggers playback on the mounted DAW.
+ */
+export function triggerSequencerAudioCue(rootOrCueId, maybeCueId = null, maybeOptions = {}) {
+  let root = null;
+  let cueId = '';
+  let options = maybeOptions || {};
+
+  if (typeof rootOrCueId === 'string') {
+    cueId = rootOrCueId;
+    options = (maybeCueId && typeof maybeCueId === 'object' ? maybeCueId : maybeOptions) || {};
+    if (activeMountedDawController) {
+      return activeMountedDawController.triggerSequencerAudioCue(cueId, options);
+    }
+    root = createPokerProductionSoundBank();
+  } else {
+    root = rootOrCueId || createPokerProductionSoundBank();
+    cueId = String(maybeCueId || '');
+  }
+
+  const events = root?.events || {};
+  let resolvedId = events[cueId] ? cueId : null;
+  if (!resolvedId) {
+    const upper = cueId.toUpperCase();
+    if (events[upper]) resolvedId = upper;
+  }
+  if (!resolvedId) {
+    for (const [eid, ev] of Object.entries(events)) {
+      if (ev?.cueId === cueId || String(ev?.cueId || '').toLowerCase() === cueId.toLowerCase()) {
+        resolvedId = eid;
+        break;
+      }
+    }
+  }
+  if (!resolvedId) {
+    resolvedId = orderedEvents(root)[0]?.id || 'evt_surface_hit';
+  }
+
+  const ev = events[resolvedId];
+  if (!ev) {
+    return { triggered: false, eventId: resolvedId, cueId, edges: [], meters: {} };
+  }
+
+  if (typeof options.contactMarkerMs === 'number') {
+    propagateContactMarkerShift(root, resolvedId, options.contactMarkerMs, {
+      mode: options.mode || 'project',
+      mutate: true,
+    });
+  }
+
+  const rendered = renderEventOfflineJs(root, resolvedId);
+  return {
+    triggered: true,
+    eventId: resolvedId,
+    cueId: ev.cueId || resolvedId,
+    label: ev.label || resolvedId,
+    bus: ev.bus || 'foley',
+    durationMs: ev.durationMs,
+    contactMarkerMs: ev.contactMarkerMs,
+    layerCount: orderedLayers(ev).length,
+    meters: rendered?.meters || {},
+    edges: inferAudioSemanticEdges(root, resolvedId),
+    gbs: serializeAudioSemanticGbs(root, resolvedId),
+  };
+}
+
+/**
+ * Forward Scene-to-Audio Grounding (`G_scene -> Audio DSP & Contact Timeline`).
+ * Synchronizes 3D scene graph nodes (`nodes[]` or `entities{}`) and camera state (`eye`, `target`)
+ * into 3D Spatializer distance rolloff, azimuth stereo pan, distance LPF occlusion, reverb wet mix,
+ * and active cue selection.
+ */
+export function syncAudioGraphWithScene(rootOrSceneGraph, sceneGraphOrCamera = null, maybeCamera = null) {
+  let root = null;
+  let sceneGraph = null;
+  let cameraState = null;
+
+  if (rootOrSceneGraph && rootOrSceneGraph.ganbate === SOUNDBANK_KIND) {
+    root = rootOrSceneGraph;
+    sceneGraph = sceneGraphOrCamera;
+    cameraState = maybeCamera;
+  } else {
+    sceneGraph = rootOrSceneGraph;
+    cameraState = sceneGraphOrCamera;
+    if (activeMountedDawController) {
+      return activeMountedDawController.syncAudioGraphWithScene(sceneGraph, cameraState);
+    }
+    root = createStarterSoundBank();
+  }
+
+  const eye = Array.isArray(cameraState?.eye) ? cameraState.eye : [0, 1.68, 2.48];
+  const rawNodes = [];
+  if (Array.isArray(sceneGraph?.nodes)) {
+    for (const n of sceneGraph.nodes) {
+      if (n && typeof n === 'object') rawNodes.push(n);
+    }
+  } else if (sceneGraph?.entities && typeof sceneGraph.entities === 'object') {
+    for (const [id, ent] of Object.entries(sceneGraph.entities)) {
+      const pos =
+        ent?.transform?.position ||
+        ent?.components?.transform?.translation ||
+        ent?.position ||
+        [0, 0, 0];
+      rawNodes.push({ id, type: ent?.kind || ent?.name || id, position: pos, action: ent?.action });
+    }
+  }
+
+  const ops = [];
+  const spatialMappings = [];
+  let selectedEventId = null;
+
+  for (const node of rawNodes) {
+    const pos = Array.isArray(node.position)
+      ? node.position
+      : Array.isArray(node.transform?.pos)
+        ? node.transform.pos
+        : [0, 0, 0];
+    const dx = (Number(pos[0]) || 0) - (Number(eye[0]) || 0);
+    const dy = (Number(pos[1]) || 0) - (Number(eye[1]) || 0);
+    const dz = (Number(pos[2]) || 0) - (Number(eye[2]) || 0);
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const pan = Number(finiteClamp(dx / Math.max(1.2, dist), -1, 1, 0).toFixed(2));
+    const lpfHz = Math.round(finiteClamp(20000 * Math.exp(-0.065 * Math.max(0, dist - 1.5)), 1500, 20000, 20000));
+    const reverbMix = Number(finiteClamp(0.06 + dist * 0.03, 0.04, 0.55, 0.14).toFixed(2));
+
+    const pickBus = (candidates) =>
+      candidates.find((b) => root.buses?.[b]) || orderedBuses(root)[0]?.id || MASTER_BUS_ID;
+
+    const idLower = `${node.id || ''} ${node.type || ''}`.toLowerCase();
+    let targetBus = pickBus(['foley', 'cards', 'table']);
+    if (idLower.includes('dealer') || idLower.includes('humanoid') || idLower.includes('character')) {
+      targetBus = pickBus(['dialogue', 'voices', 'cards', 'foley']);
+      if (node.action === 'shuffle' && root.events?.HAND_START_SHUFFLE) {
+        selectedEventId = 'HAND_START_SHUFFLE';
+      } else if (node.action === 'deal' && root.events?.CARD_DEAL_FLIGHT) {
+        selectedEventId = 'CARD_DEAL_FLIGHT';
+      }
+    } else if (idLower.includes('chip') || idLower.includes('trophy')) {
+      targetBus = pickBus(['sfx', 'chips', 'foley']);
+      if (!selectedEventId && root.events?.CHIP_BET_TOSS) selectedEventId = 'CHIP_BET_TOSS';
+    } else if (idLower.includes('lantern') || idLower.includes('sakura') || idLower.includes('pavilion')) {
+      targetBus = pickBus(['ambience', 'musical']);
+    }
+
+    if (root.buses?.[targetBus]) {
+      const strip = root.buses[targetBus].strip;
+      strip.pan = pan;
+      strip.spatial = {
+        enabled: true,
+        minDistance: 1.2,
+        maxDistance: Math.max(12, Math.round(dist * 6)),
+        rolloff: 1.0,
+      };
+      strip.lowPass.enabled = dist > 2.5;
+      strip.lowPass.frequencyHz = lpfHz;
+      strip.reverb.enabled = true;
+      strip.reverb.mix = reverbMix;
+
+      ops.push(
+        { set: ['buses', targetBus, 'strip', 'pan'], value: pan },
+        { set: ['buses', targetBus, 'strip', 'spatial'], value: structuredClone(strip.spatial) },
+        { set: ['buses', targetBus, 'strip', 'lowPass', 'enabled'], value: strip.lowPass.enabled },
+        { set: ['buses', targetBus, 'strip', 'lowPass', 'frequencyHz'], value: lpfHz },
+        { set: ['buses', targetBus, 'strip', 'reverb', 'enabled'], value: true },
+        { set: ['buses', targetBus, 'strip', 'reverb', 'mix'], value: reverbMix },
+      );
+      spatialMappings.push({
+        nodeId: node.id,
+        busId: targetBus,
+        distanceM: Number(dist.toFixed(2)),
+        pan,
+        lpfHz,
+        reverbMix,
+      });
+    }
+  }
+
+  const envPreset = sceneGraph?.environment?.preset;
+  if (envPreset && root.buses?.ambience) {
+    const ambVol = envPreset === 'night' ? 0.92 : envPreset === 'sunset' ? 0.85 : 0.75;
+    root.buses.ambience.volume = ambVol;
+    ops.push({ set: ['buses', 'ambience', 'volume'], value: ambVol });
+  }
+
+  return {
+    syncedNodes: rawNodes.length,
+    selectedEventId,
+    spatialMappings,
+    ops,
+    edges: inferAudioSemanticEdges(root, selectedEventId),
+  };
+}
+
+/**
+ * Tri-Modal Natural-Language Audio Prompt Compiler (`Prompt -> Structured Audio Graph Patch + Constraint Projection`).
+ */
+export function applyAudioSemanticPrompt(rootOrPromptText, maybePromptText = null) {
+  if (typeof rootOrPromptText === 'string' && maybePromptText === null) {
+    if (activeMountedDawController) {
+      return activeMountedDawController.applyAudioSemanticPrompt(rootOrPromptText);
+    }
+    const tempRoot = createStarterSoundBank();
+    return applyAudioSemanticPrompt(tempRoot, rootOrPromptText);
+  }
+
+  const root = rootOrPromptText;
+  const promptText = String(maybePromptText || '').trim();
+  if (!root || !promptText) {
+    return { applied: false, ops: [], summary: 'Empty prompt', edges: [] };
+  }
+
+  if (/^\s*audio\.(event|edge|layer|dsp)\b/i.test(promptText)) {
+    return compileAudioGbsCommand(root, promptText);
+  }
+
+  const lower = promptText.toLowerCase();
+  const ops = [];
+  const notes = [];
+
+  // 1. Resolve target Event Sheet from prompt keywords
+  let targetEventId = orderedEvents(root)[0]?.id || 'evt_surface_hit';
+  const eventMatchers = [
+    ['HAND_START_SHUFFLE', /(shuffle|riffle|셔플)/i],
+    ['CARD_DEAL_FLIGHT', /(deal|slide|card flight|카드 딜|딜링)/i],
+    ['CHIP_BET_TOSS', /(chip|bet|toss|칩|베팅)/i],
+    ['CHECK_DOUBLE_TAP', /(check|double tap|체크|탭)/i],
+    ['HERO_CARD_PEEL', /(peel|squeeze|쪼기|리버)/i],
+    ['ALL_IN_SHOVE', /(all-in|all in|shove|올인)/i],
+    ['POT_SWEEP_WIN', /(pot|sweep|win|팟|승리)/i],
+    ['YOZAKURA_AMBIENCE', /(ambience|yozakura|pavilion|앰비언스|배경음)/i],
+    ['evt_surface_hit', /(surface|impact|foley|표면|충격)/i],
+  ];
+  for (const [eid, regex] of eventMatchers) {
+    if (regex.test(promptText) && root.events?.[eid]) {
+      targetEventId = eid;
+      notes.push(`event=${eid}`);
+      break;
+    }
+  }
+
+  const ev = root.events?.[targetEventId];
+  const masterStrip = root.buses?.[MASTER_BUS_ID]?.strip;
+
+  // 2. Contact Marker timing adjustment + Forward Grounding of `at_contact` / `leads_contact` layers
+  const contactMatch = promptText.match(/(?:contact|impact|접촉|타격)[^\d]*(\d{2,4})\s*ms/i) ||
+    promptText.match(/(\d{2,4})\s*ms[^\d]*(?:contact|impact|접촉)/i);
+  if (contactMatch && ev) {
+    const prevEdges = inferAudioSemanticEdges(root, targetEventId);
+    const nextContactMs = Math.round(finiteClamp(Number(contactMatch[1]), 10, ev.durationMs - 10, ev.contactMarkerMs));
+    const contactDelta = nextContactMs - ev.contactMarkerMs;
+    ev.contactMarkerMs = nextContactMs;
+    ops.push({ set: ['events', targetEventId, 'contactMarkerMs'], value: nextContactMs });
+    for (const edge of prevEdges) {
+      if ((edge.rel === 'at_contact' || edge.rel === 'leads_contact') && ev.layers?.[edge.layerId]) {
+        const layer = ev.layers[edge.layerId];
+        const nextStart = Math.round(layer.startMs + contactDelta);
+        layer.startMs = nextStart;
+        ops.push({ set: ['events', targetEventId, 'layers', edge.layerId, 'startMs'], value: nextStart });
+      }
+    }
+    notes.push(`contact=${nextContactMs}ms`);
+  }
+
+  // 3. Stereo Width / Mono
+  const widthMatch = promptText.match(/(?:width|stereo|폭|넓이)[^\d]*(\d{1,3})\s*%/i);
+  if (widthMatch && masterStrip) {
+    const w = Math.round(finiteClamp(Number(widthMatch[1]), 0, 200, 100));
+    masterStrip.stereoWidthPct = w;
+    ops.push({ set: ['buses', MASTER_BUS_ID, 'strip', 'stereoWidthPct'], value: w });
+    notes.push(`width=${w}%`);
+  } else if (/(widen|wider|넓게|와이드)/i.test(lower) && masterStrip) {
+    masterStrip.stereoWidthPct = 145;
+    ops.push({ set: ['buses', MASTER_BUS_ID, 'strip', 'stereoWidthPct'], value: 145 });
+    notes.push('width=145%');
+  } else if (/\b(mono|모노)\b/i.test(lower) && masterStrip) {
+    masterStrip.stereoMode = 'mono';
+    masterStrip.stereoWidthPct = 0;
+    ops.push(
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'stereoMode'], value: 'mono' },
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'stereoWidthPct'], value: 0 },
+    );
+    notes.push('stereo=mono');
+  }
+
+  // 4. Punch / Compression / Heavy Low-End
+  if (/(punch|heavier|heavy|compress|tight|무겁게|펀치|압축|단단)/i.test(lower) && masterStrip) {
+    masterStrip.compressor.enabled = true;
+    masterStrip.compressor.thresholdDb = -18;
+    masterStrip.compressor.ratio = 4.0;
+    masterStrip.compressor.makeupGainDb = 2.0;
+    masterStrip.eq.enabled = true;
+    masterStrip.eq.lowGainDb = 3.0;
+    ops.push(
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'compressor', 'enabled'], value: true },
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'compressor', 'thresholdDb'], value: -18 },
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'compressor', 'ratio'], value: 4.0 },
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'compressor', 'makeupGainDb'], value: 2.0 },
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'eq', 'enabled'], value: true },
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'eq', 'lowGainDb'], value: 3.0 },
+    );
+    notes.push('compressor+lowBoost');
+  }
+
+  // 5. Warmth / Overdrive / Saturation
+  if (/(warm|saturat|overdrive|analog|따뜻|배음|드라이브)/i.test(lower) && masterStrip) {
+    masterStrip.overdrive.enabled = true;
+    masterStrip.overdrive.drive = 28;
+    masterStrip.overdrive.mix = 0.35;
+    ops.push(
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'overdrive', 'enabled'], value: true },
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'overdrive', 'drive'], value: 28 },
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'overdrive', 'mix'], value: 0.35 },
+    );
+    notes.push('overdrive=28%');
+  }
+
+  // 6. Reverb / Room / Space / Delay
+  if (/(reverb|room|hall|space|ambient|잔향|공간감|리버브)/i.test(lower) && masterStrip) {
+    masterStrip.reverb.enabled = true;
+    masterStrip.reverb.roomSize = 0.48;
+    masterStrip.reverb.mix = 0.24;
+    ops.push(
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'reverb', 'enabled'], value: true },
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'reverb', 'roomSize'], value: 0.48 },
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'reverb', 'mix'], value: 0.24 },
+    );
+    notes.push('reverb=24%');
+  }
+  if (/(delay|echo|딜레이|에코)/i.test(lower) && masterStrip) {
+    masterStrip.delay.enabled = true;
+    masterStrip.delay.timeMs = 160;
+    masterStrip.delay.mix = 0.2;
+    ops.push(
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'delay', 'enabled'], value: true },
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'delay', 'timeMs'], value: 160 },
+      { set: ['buses', MASTER_BUS_ID, 'strip', 'delay', 'mix'], value: 0.2 },
+    );
+    notes.push('delay=160ms');
+  }
+
+  // 7. Run Minimal-Perturbation Audio Constraint Projection (û -> u*)
+  const projection = projectAudioConstraints(root, targetEventId, { mode: 'project', mutate: true });
+  if (projection.ops.length) {
+    ops.push(...projection.ops);
+  }
+
+  return {
+    applied: ops.length > 0,
+    targetEventId,
+    ops,
+    projection,
+    edges: inferAudioSemanticEdges(root, targetEventId),
+    summary: notes.length ? `Applied: ${notes.join(', ')}` : 'Synced audio graph invariants',
+  };
+}
+
 // ---- Live Browser Web Audio Graph (gracefully skipped in headless Node) ---------------------
 
 class BrowserDawAudioRuntime {
@@ -2339,6 +3634,12 @@ export function mountAudioDaw(container, studioApi = {}) {
     playheadMs: 0,
     rafId: 0,
     activeDragCount: 0,
+    solverMode: 'project', // 'project' | 'rollback'
+    edgeLockEnabled: false,
+    promptText: '',
+    lastProjectionGhost: null,
+    lastConflictReport: null,
+    lastPromptSummary: '',
     active: true,
     destroyed: false,
   };
@@ -3279,9 +4580,16 @@ export function mountAudioDaw(container, studioApi = {}) {
       const clipSvg = buildClipSvg(layer);
       const fadePoly = queryNodeByAttr(clipSvg, 'data-role', 'clip-fade-poly');
 
-      const formatClipDelta = (startMs) => {
-        const d = Math.round(startMs - ev.contactMarkerMs);
-        return d === 0 ? '@Contact' : d > 0 ? `+${d}ms` : `${d}ms`;
+      const formatClipDelta = (startMs, contactMs = ev.contactMarkerMs) => {
+        const d = Math.round(startMs - contactMs);
+        const transientMs = resolveLayerTransientOffsetMs(ui.root, layer);
+        const onsetDelta = Math.round((Number(startMs) || 0) + transientMs - (Number(contactMs) || 0));
+        let rel = 'at_contact';
+        if (onsetDelta < -8) rel = 'leads_contact';
+        else if (onsetDelta > 8 && (Number(startMs) || 0) >= contactMs - 4) rel = 'trails_contact';
+        else if (Math.abs(onsetDelta) > 8) rel = onsetDelta < 0 ? 'leads_contact' : 'trails_contact';
+        const deltaStr = d === 0 ? '@Contact' : d > 0 ? `+${d}ms` : `${d}ms`;
+        return `${deltaStr} [${rel}]`;
       };
 
       const timingBadgeEl = el(
@@ -3474,6 +4782,23 @@ export function mountAudioDaw(container, studioApi = {}) {
         resizeRightHandle,
       );
 
+      const ghostEl =
+        ui.lastProjectionGhost &&
+        ui.lastProjectionGhost.eventId === ui.selectedEventId &&
+        ui.lastProjectionGhost.layerId === layer.id &&
+        typeof ui.lastProjectionGhost.proposedStartMs === 'number'
+          ? el(
+              'div',
+              {
+                class: 'gdaw-clip-ghost',
+                'data-role': 'clip-ghost',
+                style: `left: ${Math.max(0, Math.round(ui.lastProjectionGhost.proposedStartMs * pxPerMs))}px; width: ${Math.max(24, Math.round((ui.lastProjectionGhost.durationMs || layer.durationMs) * pxPerMs))}px;`,
+                title: `Rejected û (${ui.lastProjectionGhost.proposedStartMs}ms) → Projected u* (${ui.lastProjectionGhost.projectedStartMs}ms)`,
+              },
+              `û ${ui.lastProjectionGhost.proposedStartMs}ms → u* ${ui.lastProjectionGhost.projectedStartMs}ms`,
+            )
+          : null;
+
       return el(
         'div',
         { class: `gdaw-lane ${isSelected ? 'selected' : ''}` },
@@ -3539,6 +4864,25 @@ export function mountAudioDaw(container, studioApi = {}) {
               'button',
               {
                 type: 'button',
+                'data-action': `snap-layer-contact-${layer.id}`,
+                title: 'Snap layer transient to Animation Contact Marker (at_contact)',
+                onclick: () => {
+                  const transientMs = resolveLayerTransientOffsetMs(ui.root, layer);
+                  const snappedStart = Math.max(0, Math.round(ev.contactMarkerMs - transientMs));
+                  void dispatchOps('Snap layer to contact marker', [
+                    {
+                      set: ['events', ui.selectedEventId, 'layers', layer.id, 'startMs'],
+                      value: snappedStart,
+                    },
+                  ]);
+                },
+              },
+              '@',
+            ),
+            el(
+              'button',
+              {
+                type: 'button',
                 class: 'danger',
                 title: 'Remove layer',
                 onclick: () => {
@@ -3554,6 +4898,7 @@ export function mountAudioDaw(container, studioApi = {}) {
         el(
           'div',
           { class: 'gdaw-lane-track', 'data-lane-track': layer.id, style: `width: ${trackWidthPx}px;` },
+          ghostEl,
           clipEl,
         ),
       );
@@ -3962,13 +5307,27 @@ export function mountAudioDaw(container, studioApi = {}) {
           0,
           ev.durationMs,
           5,
-          (v, meta) =>
-            dispatchOps(
+          (v, meta) => {
+            if (ui.edgeLockEnabled) {
+              const shifted = propagateContactMarkerShift(ui.root, ui.selectedEventId, v, {
+                mode: ui.solverMode,
+                mutate: false,
+              });
+              ui.lastProjectionGhost = shifted.projection?.ghost || null;
+              return dispatchOps(
+                'Move contact marker (G_rel locked)',
+                shifted.ops,
+                `contact:${ui.selectedEventId}`,
+                meta,
+              );
+            }
+            return dispatchOps(
               'Set contact marker',
               [{ set: ['events', ui.selectedEventId, 'contactMarkerMs'], value: v }],
               `contact:${ui.selectedEventId}`,
               meta,
-            ),
+            );
+          },
           { dataField: 'event-contact-ms' },
         ),
         createRotaryKnob(doc, {
@@ -3996,6 +5355,130 @@ export function mountAudioDaw(container, studioApi = {}) {
             if (ui.activeDragCount === 0) renderTimelinePanel();
           },
         }),
+      ),
+      el(
+        'div',
+        { class: 'gdaw-trimodal-bar', 'data-role': 'trimodal-bar' },
+        el(
+          'span',
+          { class: 'gdaw-trimodal-edges', 'data-role': 'audio-edges-summary' },
+          (() => {
+            const rels = inferAudioSemanticEdges(ui.root, ui.selectedEventId).filter(
+              (ed) => ed.rel === 'at_contact' || ed.rel === 'leads_contact' || ed.rel === 'trails_contact',
+            );
+            return rels.length
+              ? `G_rel: ${rels.map((r) => `${r.layerId}→${r.rel}`).join(' · ')}`
+              : 'G_rel: synced';
+          })(),
+        ),
+        el(
+          'div',
+          { class: 'gdaw-trimodal-controls' },
+          el('input', {
+            type: 'text',
+            class: 'gdaw-trimodal-prompt',
+            'data-field': 'audio-semantic-prompt',
+            placeholder: 'Tri-Modal Audio Prompt (e.g., "widen stereo 145%, punchier low end, contact 160ms")',
+            value: ui.promptText || '',
+            oninput: (e) => {
+              ui.promptText = e.target.value;
+            },
+          }),
+          el(
+            'button',
+            {
+              type: 'button',
+              class: 'gdaw-hw-btn primary',
+              'data-action': 'apply-audio-prompt',
+              onclick: () => {
+                const inp = queryNodeByAttr(timelineEl, 'data-field', 'audio-semantic-prompt');
+                const text = inp ? inp.value : ui.promptText;
+                ui.promptText = text;
+                const res = applyAudioSemanticPrompt(ui.root, text);
+                if (res.targetEventId && ui.root.events[res.targetEventId]) {
+                  ui.selectedEventId = res.targetEventId;
+                }
+                ui.lastPromptSummary = res.summary;
+                ui.lastProjectionGhost = res.projection?.ghost || null;
+                ui.dirty = true;
+                syncSelectionInvariants();
+                recomputeOfflineMeters();
+                renderAll();
+              },
+            },
+            'Apply Prompt',
+          ),
+          el(
+            'button',
+            {
+              type: 'button',
+              class: `gdaw-hw-btn ${ui.edgeLockEnabled ? 'lit-gold active' : ''}`,
+              'aria-pressed': String(Boolean(ui.edgeLockEnabled)),
+              'data-action': 'toggle-edge-lock',
+              title: 'When enabled, moving Contact (ms) co-translates at_contact / leads_contact layers and projects û → u*',
+              onclick: () => {
+                ui.edgeLockEnabled = !ui.edgeLockEnabled;
+                renderTimelinePanel();
+              },
+            },
+            '🔗 G_rel Lock',
+          ),
+          el(
+            'button',
+            {
+              type: 'button',
+              class: `gdaw-hw-btn ${ui.solverMode === 'project' ? 'lit-cyan active' : ''}`,
+              'data-action': 'toggle-audio-solver-mode',
+              onclick: () => {
+                ui.solverMode = ui.solverMode === 'project' ? 'rollback' : 'project';
+                renderTimelinePanel();
+              },
+            },
+            ui.solverMode === 'project' ? 'Solver: û → u* Project' : 'Solver: Strict Rollback',
+          ),
+          el(
+            'button',
+            {
+              type: 'button',
+              class: 'gdaw-hw-btn',
+              'data-action': 'simulate-audio-conflict',
+              title: 'Simulate 2-Agent timing & headroom conflict and project û → u*',
+              onclick: () => {
+                const report = simulateTwoAgentAudioConflict(ui.root, ui.selectedEventId, {
+                  mode: ui.solverMode,
+                });
+                if (report) {
+                  ui.lastConflictReport = report;
+                  ui.lastProjectionGhost = report.projection?.ghost || null;
+                  ui.lastPromptSummary = `û (${report.proposed.startMs}ms) → u* (${report.projected.startMs}ms, peak ≤ -0.5 dBFS)`;
+                  ui.dirty = true;
+                  recomputeOfflineMeters();
+                  renderAll();
+                }
+              },
+            },
+            '⚡ 2-Agent Conflict',
+          ),
+          el(
+            'span',
+            {
+              class: 'gdaw-trimodal-edges',
+              'data-role': 'audio-gbs-preview',
+              title: 'Click to load canonical .gbs Audio DSL into prompt input',
+              onclick: () => {
+                ui.promptText = serializeAudioSemanticGbs(ui.root, ui.selectedEventId).replace(/\n/g, '; ');
+                renderTimelinePanel();
+              },
+            },
+            (() => {
+              const firstLine = serializeAudioSemanticGbs(ui.root, ui.selectedEventId).split('\n')[0] || '';
+              return `.gbs: ${firstLine}`;
+            })(),
+          ),
+          ui.lastPromptSummary
+            ? el('span', { class: 'gdaw-trimodal-status', 'data-role': 'audio-solver-status' }, ui.lastPromptSummary)
+            : null,
+        ),
       ),
       el('div', { class: 'gdaw-tl-scroll' }, stageEl),
       clipInspector,
@@ -5041,6 +6524,9 @@ export function mountAudioDaw(container, studioApi = {}) {
   function destroy() {
     if (ui.destroyed) return;
     ui.destroyed = true;
+    if (activeMountedDawController === controller) {
+      activeMountedDawController = null;
+    }
     if (ui.rafId && globalThis.cancelAnimationFrame) {
       globalThis.cancelAnimationFrame(ui.rafId);
       ui.rafId = 0;
@@ -5053,7 +6539,7 @@ export function mountAudioDaw(container, studioApi = {}) {
     if (rootEl.parentNode === container) rootEl.remove?.();
   }
 
-  return {
+  const controller = {
     destroy,
     unmount: destroy,
     refresh(snapshot) {
@@ -5096,13 +6582,119 @@ export function mountAudioDaw(container, studioApi = {}) {
         selectedLayerId: ui.selectedLayerId,
         inspectorTarget: { ...ui.inspectorTarget },
         meters: { ...ui.lastMeters },
+        solverMode: ui.solverMode,
+        edgeLockEnabled: ui.edgeLockEnabled,
+        lastProjectionGhost: ui.lastProjectionGhost ? { ...ui.lastProjectionGhost } : null,
+        edges: inferAudioSemanticEdges(ui.root, ui.selectedEventId),
+        gbs: serializeAudioSemanticGbs(ui.root, ui.selectedEventId),
       };
+    },
+    propagateContactMarkerShift(nextContactMs, eventId = ui.selectedEventId, options = {}) {
+      const res = propagateContactMarkerShift(ui.root, eventId, nextContactMs, {
+        mode: options.mode || ui.solverMode,
+        mutate: true,
+      });
+      ui.lastProjectionGhost = res.projection?.ghost || null;
+      ui.dirty = true;
+      recomputeOfflineMeters();
+      if (ui.activeDragCount === 0) renderAll();
+      return res;
+    },
+    serializeAudioSemanticGbs(eventId = ui.selectedEventId) {
+      return serializeAudioSemanticGbs(ui.root, eventId);
+    },
+    compileAudioGbsCommand(gbsText, options = {}) {
+      const res = compileAudioGbsCommand(ui.root, gbsText, {
+        eventId: options.eventId || ui.selectedEventId,
+        mode: options.mode || ui.solverMode,
+      });
+      if (res.targetEventId && ui.root.events[res.targetEventId]) {
+        ui.selectedEventId = res.targetEventId;
+      }
+      ui.lastPromptSummary = res.summary;
+      ui.lastProjectionGhost = res.projection?.ghost || null;
+      ui.dirty = true;
+      syncSelectionInvariants();
+      recomputeOfflineMeters();
+      if (ui.activeDragCount === 0) renderAll();
+      return res;
+    },
+    syncAudioGraphWithScene(sceneGraph, cameraState = null) {
+      const res = syncAudioGraphWithScene(ui.root, sceneGraph, cameraState);
+      if (res.selectedEventId && ui.root.events[res.selectedEventId]) {
+        ui.selectedEventId = res.selectedEventId;
+      }
+      syncSelectionInvariants();
+      recomputeOfflineMeters();
+      if (ui.activeDragCount === 0) renderAll();
+      return res;
+    },
+    applyAudioSemanticPrompt(promptText) {
+      ui.promptText = String(promptText || '');
+      const res = applyAudioSemanticPrompt(ui.root, ui.promptText);
+      if (res.targetEventId && ui.root.events[res.targetEventId]) {
+        ui.selectedEventId = res.targetEventId;
+      }
+      ui.lastPromptSummary = res.summary;
+      ui.lastProjectionGhost = res.projection?.ghost || null;
+      ui.dirty = true;
+      syncSelectionInvariants();
+      recomputeOfflineMeters();
+      if (ui.activeDragCount === 0) renderAll();
+      return res;
+    },
+    inferAudioSemanticEdges(eventId = ui.selectedEventId) {
+      return inferAudioSemanticEdges(ui.root, eventId);
+    },
+    triggerSequencerAudioCue(cueId, options = {}) {
+      const res = triggerSequencerAudioCue(ui.root, cueId, options);
+      if (res.triggered && ui.root.events[res.eventId]) {
+        ui.selectedEventId = res.eventId;
+        syncSelectionInvariants();
+        recomputeOfflineMeters();
+        if (options.audition !== false) {
+          void auditionEvent(res.eventId);
+        } else if (ui.activeDragCount === 0) {
+          renderAll();
+        }
+      }
+      return res;
+    },
+    projectAudioConstraints(eventId = ui.selectedEventId, options = {}) {
+      const res = projectAudioConstraints(ui.root, eventId, {
+        mode: options.mode || ui.solverMode,
+        maxPeakDb: options.maxPeakDb ?? -0.5,
+        mutate: options.mutate ?? true,
+      });
+      ui.lastProjectionGhost = res.ghost || null;
+      recomputeOfflineMeters();
+      if (ui.activeDragCount === 0) renderAll();
+      return res;
+    },
+    simulateTwoAgentAudioConflict(eventId = ui.selectedEventId, options = {}) {
+      const report = simulateTwoAgentAudioConflict(ui.root, eventId, {
+        mode: options.mode || ui.solverMode,
+      });
+      if (report) {
+        ui.lastConflictReport = report;
+        ui.lastProjectionGhost = report.projection?.ghost || null;
+        ui.lastPromptSummary = `û (${report.proposed.startMs}ms) → u* (${report.projected.startMs}ms, peak ≤ -0.5 dBFS)`;
+        ui.dirty = true;
+        recomputeOfflineMeters();
+        if (ui.activeDragCount === 0) renderAll();
+      }
+      return report;
     },
     auditionEvent,
     playSequence,
     stopPlayback: () => runtime.stopAll(),
     bounceEventWav,
   };
+
+  activeMountedDawController = controller;
+  return controller;
 }
+
+export const mountAudioDawWorkbench = mountAudioDaw;
 
 export default mountAudioDaw;

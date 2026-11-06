@@ -9,37 +9,37 @@ export const SURFACE_MODELS = Object.freeze([
   {
     id: 'stylized_ramp',
     label: 'Stylized Ramp (Soft Cel)',
-    summary: 'Art-directed light-to-shadow ramp with controllable band center, softness, and silhouette rim light for stylized 3D environments.',
+    summary: 'Non-photorealistic (NPR) light-to-shadow ramp with controllable terminator center, transition softness, and view-dependent Fresnel rim lighting.',
     fields: ['rampCenter', 'rampSoftness', 'rimStrength'],
   },
   {
     id: 'stylized_character',
     label: 'Stylized Character (Anime / Banded)',
-    summary: 'Expressive character shader combining cel shadow banding, warm subsurface skin scatter, specular gloss, and rim lighting for 3D cast models.',
+    summary: 'Hybrid character BSDF combining NPR shadow banding, warm subsurface dermal scatter, specular lobe control, and silhouette rim lighting.',
     fields: ['rampCenter', 'rampSoftness', 'rimStrength', 'subsurface', 'subsurfaceColorHex', 'clearcoat', 'clearcoatRoughness'],
   },
   {
     id: 'standard_ggx',
     label: 'Standard GGX (Photoreal PBR)',
-    summary: 'Physically-based microfacet surface for metals, stone, wood, and painted props using Base Albedo, Roughness, Metallic, and Normal Strength.',
+    summary: 'Cook-Torrance GGX microfacet BSDF with Smith height-correlated masking-shadowing and Schlick Fresnel for physically-based dielectrics and conductors.',
     fields: [],
   },
   {
     id: 'clearcoat',
     label: 'ClearCoat (Lacquer / Ceramic)',
-    summary: 'Dual-layer surface with a glossy transparent varnish coat over a base material — ideal for lacquered table rails, polished wood, and ceramic tokens.',
+    summary: 'Dual-layer dielectric BSDF pairing an isotropic glossy polyurethane/lacquer coat (IOR 1.5) over a rough or metallic substrate.',
     fields: ['clearcoat', 'clearcoatRoughness'],
   },
   {
     id: 'charlie_cloth',
     label: 'Charlie Cloth (Velvet / Woven)',
-    summary: 'Micro-fiber sheen BRDF that produces soft grazing highlights across table baize/felt, velvet cushions, and woven garments.',
+    summary: 'Estevez-Kulla ("Charlie") inverted-Gaussian microfiber sheen NDF producing retroreflective grazing highlights on woven textiles and velvet.',
     fields: ['sheen', 'sheenTint'],
   },
   {
     id: 'subsurface_skin',
     label: 'Subsurface Skin (Organic / Jade)',
-    summary: 'Translucent scattering surface where light wraps softly through skin, jade, wax, porcelain, or warm paper lanterns.',
+    summary: 'Translucent wrap-diffusion BSDF modeling shallow multiple scattering across organic dermis, nephrite jade, wax, and unglazed porcelain.',
     fields: ['subsurface', 'subsurfaceColorHex'],
   },
 ]);
@@ -54,7 +54,7 @@ export const MATERIAL_PRESETS = Object.freeze([
   {
     id: 'polished_lacquer',
     label: 'Polished Lacquer',
-    usage: 'Table Rails, Wood & Ceramic',
+    usage: 'Dual-Layer Urushi Wood & Glazed Ceramic',
     name: 'polished_lacquer',
     surface: 'clearcoat',
     baseColorHex: '#7a1612',
@@ -72,7 +72,7 @@ export const MATERIAL_PRESETS = Object.freeze([
   {
     id: 'brushed_brass',
     label: 'Brushed Brass',
-    usage: 'Metal Trim, Coins & Lanterns',
+    usage: 'GGX Microfacet Conductor & Architectural Hardware',
     name: 'brushed_brass',
     surface: 'standard_ggx',
     baseColorHex: '#d8ad54',
@@ -90,7 +90,7 @@ export const MATERIAL_PRESETS = Object.freeze([
   {
     id: 'woven_velvet',
     label: 'Woven Velvet',
-    usage: 'Table Baize, Felt & Cloth',
+    usage: 'Charlie Microfiber Textile & Upholstery',
     name: 'woven_velvet',
     surface: 'charlie_cloth',
     baseColorHex: '#233a66',
@@ -108,7 +108,7 @@ export const MATERIAL_PRESETS = Object.freeze([
   {
     id: 'subsurface_porcelain',
     label: 'Subsurface Porcelain',
-    usage: 'Skin, Jade & Paper Lanterns',
+    usage: 'Translucent Diffusion: Dermis, Jade & Shoji',
     name: 'subsurface_porcelain',
     surface: 'subsurface_skin',
     baseColorHex: '#ede3d5',
@@ -126,7 +126,7 @@ export const MATERIAL_PRESETS = Object.freeze([
   {
     id: 'cel_character',
     label: 'Cel Character',
-    usage: '3D Cast & Stylized Avatars',
+    usage: 'Hybrid NPR Character & Stylized Rig Surface',
     name: 'cel_character',
     surface: 'stylized_character',
     baseColorHex: '#e87a64',
@@ -144,7 +144,7 @@ export const MATERIAL_PRESETS = Object.freeze([
   {
     id: 'painterly_stone',
     label: 'Painterly Stone',
-    usage: 'Environment & Architecture',
+    usage: 'Stylized Ramp Architectural Masonry & Terrain',
     name: 'painterly_stone',
     surface: 'stylized_ramp',
     baseColorHex: '#7d8078',
@@ -575,12 +575,289 @@ export function stateFromMaterialRoot(root = {}, fallback = {}) {
   return base;
 }
 
+/**
+ * Physically-Based BSDF Verifier & Minimal-Perturbation Projector
+ *   m* = argmin_{m in C_PBR} ||m - m_hat||_2^2
+ *
+ * Enforces 4 physical rendering invariants:
+ *   1. Conductor–Dielectric Subsurface Exclusion: Conductors (metallic > 0.5) have zero
+ *      mean-free path for subsurface volume scatter (subsurface = 0).
+ *   2. Semiconductor Forbidden Zone: For standard_ggx / clearcoat PBR surfaces, metallic values
+ *      in (0.18, 0.82) represent non-physical partial conductors and snap to the nearest valid manifold.
+ *   3. Multi-Lobe Directional-Hemispherical Energy Conservation:
+ *      w_diffuse + w_clearcoat + w_subsurface + w_sheen <= 1.0.
+ *   4. Physical Linear Reflectance Envelope: Relative luminance Y = 0.2126 R + 0.7152 G + 0.0722 B
+ *      is bounded to [0.03, 0.90] for dielectrics and [0.12, 0.98] for conductors.
+ */
+function computeDirectionalHemisphericalEnergy(s) {
+  const m = clamp(Number(s.metallic) || 0, 0, 1);
+  const cc = clamp(Number(s.clearcoat) || 0, 0, 1);
+  const sss = clamp(Number(s.subsurface) || 0, 0, 1);
+  const sh = clamp(Number(s.sheen) || 0, 0, 1);
+  const baseSubstrate = (1.0 - m) * (1.0 - 0.45 * cc) * (1.0 - 0.45 * sss) * 0.68 + m * 0.78;
+  const secondaryLobes = cc * 0.38 + (1.0 - m) * (sss * 0.42 + sh * 0.32);
+  return baseSubstrate + secondaryLobes;
+}
+
+export function verifyAndProjectPbrMaterial(rawState = {}, { autoProject = true } = {}) {
+  const original = { ...defaultLabState(), ...rawState };
+  const projected = { ...original };
+  const issues = [];
+
+  // 1. Microfacet roughness singularity guard (alpha >= 0.03)
+  if (projected.roughness < 0.03) {
+    issues.push({
+      code: 'ggx_roughness_singularity',
+      message: `GGX roughness (${projected.roughness.toFixed(3)}) below microfacet stability floor 0.03.`,
+    });
+    if (autoProject) projected.roughness = 0.04;
+  }
+  if (projected.clearcoatRoughness < 0.02) {
+    issues.push({
+      code: 'clearcoat_roughness_singularity',
+      message: `ClearCoat roughness (${projected.clearcoatRoughness.toFixed(3)}) below floor 0.02.`,
+    });
+    if (autoProject) projected.clearcoatRoughness = 0.03;
+  }
+
+  // 2. Conductor vs. Subsurface volume scattering mutual exclusion
+  if (projected.metallic > 0.5 && projected.subsurface > 0.05) {
+    issues.push({
+      code: 'conductor_subsurface_conflict',
+      message: `Conductor (metallic=${projected.metallic.toFixed(2)}) cannot exhibit dielectric subsurface scattering (${projected.subsurface.toFixed(2)}).`,
+    });
+    if (autoProject) {
+      if (projected.surface === 'subsurface_skin' || projected.surface === 'stylized_character') {
+        projected.metallic = 0.0;
+      } else {
+        projected.subsurface = 0.0;
+      }
+    }
+  }
+
+  // 3. Semiconductor forbidden zone for physically-based GGX / ClearCoat
+  if (
+    (projected.surface === 'standard_ggx' || projected.surface === 'clearcoat') &&
+    projected.metallic > 0.18 &&
+    projected.metallic < 0.82
+  ) {
+    issues.push({
+      code: 'non_binary_metallic_zone',
+      message: `Metallic (${projected.metallic.toFixed(2)}) lies in non-physical semiconductor transition zone (0.18, 0.82).`,
+    });
+    if (autoProject) {
+      projected.metallic = projected.metallic >= 0.5 ? 0.88 : 0.08;
+    }
+  }
+
+  // 4. Multi-lobe directional-hemispherical energy conservation <= 1.0
+  const rawEnergy = computeDirectionalHemisphericalEnergy(projected);
+  if (rawEnergy > 1.0) {
+    issues.push({
+      code: 'energy_conservation_exceeded',
+      message: `Multi-lobe directional-hemispherical reflectance (${rawEnergy.toFixed(2)}) exceeds 1.00 energy conservation limit.`,
+    });
+    if (autoProject) {
+      for (let iter = 0; iter < 6 && computeDirectionalHemisphericalEnergy(projected) > 0.995; iter++) {
+        const cur = computeDirectionalHemisphericalEnergy(projected);
+        const factor = clamp(0.96 / cur, 0.4, 0.95);
+        projected.clearcoat = Number(clamp(projected.clearcoat * factor, 0, 1).toFixed(4));
+        projected.subsurface = Number(clamp(projected.subsurface * factor, 0, 1).toFixed(4));
+        projected.sheen = Number(clamp(projected.sheen * factor, 0, 1).toFixed(4));
+      }
+    }
+  }
+
+  // 5. Physical linear albedo luminance envelope Y in [minY, maxY]
+  const linRgb = srgbHexToLinear(projected.baseColorHex);
+  const lumY = 0.2126 * linRgb[0] + 0.7152 * linRgb[1] + 0.0722 * linRgb[2];
+  const minY = projected.metallic > 0.5 ? 0.12 : 0.025;
+  const maxY = projected.metallic > 0.5 ? 0.98 : 0.90;
+  if (lumY < minY || lumY > maxY) {
+    issues.push({
+      code: 'albedo_luminance_out_of_range',
+      message: `Linear albedo luminance Y=${lumY.toFixed(3)} outside physical range [${minY.toFixed(2)}, ${maxY.toFixed(2)}].`,
+    });
+    if (autoProject) {
+      const targetY = clamp(lumY, minY, maxY);
+      if (lumY > 1e-4) {
+        const ratio = targetY / lumY;
+        projected.baseColorHex = linearToSrgbHex(linRgb.map((c) => clamp(c * ratio, 0, 1)));
+      } else {
+        projected.baseColorHex = linearToSrgbHex([minY, minY, minY]);
+      }
+    }
+  }
+
+  // Compute L2 parameter perturbation ||m* - m_hat||_2
+  const keys = ['roughness', 'metallic', 'clearcoat', 'clearcoatRoughness', 'sheen', 'subsurface'];
+  let sqSum = 0;
+  for (const k of keys) {
+    const d = (Number(projected[k]) || 0) - (Number(original[k]) || 0);
+    sqSum += d * d;
+  }
+  const origRgb = srgbHexToLinear(original.baseColorHex);
+  const projRgb = srgbHexToLinear(projected.baseColorHex);
+  for (let i = 0; i < 3; i++) {
+    const d = projRgb[i] - origRgb[i];
+    sqSum += d * d;
+  }
+  const perturbationL2 = Number(Math.sqrt(sqSum).toFixed(4));
+  const finalEnergy = Number(computeDirectionalHemisphericalEnergy(projected).toFixed(3));
+  const finalLuminanceY = Number(
+    (0.2126 * projRgb[0] + 0.7152 * projRgb[1] + 0.0722 * projRgb[2]).toFixed(3),
+  );
+
+  return {
+    valid: issues.length === 0,
+    issues,
+    projectedState: projected,
+    perturbationL2,
+    energyBudget: finalEnergy,
+    luminanceY: finalLuminanceY,
+  };
+}
+
+/**
+ * Inverse Semantic Material Lifter: L_mat : R^d -> G_mat
+ * Lifts continuous BSDF parameters + EV100 camera exposure into a symbolic node & relational edges
+ * for the unified Semantic World Graph (`studioApi.registerSemanticMaterial` / `studioApi.patchWorldGraph`).
+ */
+export function liftMaterialToSemanticDescriptor(rawState = {}, targetEntityId = null) {
+  const verification = verifyAndProjectPbrMaterial(rawState, { autoProject: false });
+  const s = { ...defaultLabState(), ...rawState };
+  const rgb = srgbHexToLinear(s.baseColorHex);
+  const ev = Number(computeEv100(s).toFixed(2));
+
+  let bsdfClass = 'microfacet_dielectric';
+  if (s.surface === 'clearcoat') bsdfClass = 'dielectric_clearcoat';
+  else if (s.surface === 'charlie_cloth') bsdfClass = 'charlie_microfiber';
+  else if (s.surface === 'subsurface_skin') bsdfClass = 'subsurface_dipole';
+  else if (s.surface === 'stylized_ramp' || s.surface === 'stylized_character') bsdfClass = 'npr_stylized';
+  else if (s.metallic >= 0.5) bsdfClass = 'microfacet_conductor';
+
+  let finishRegime = 'satin_microfacet';
+  if (s.surface === 'charlie_cloth' || s.sheen >= 0.5) finishRegime = 'velvet_retroreflective';
+  else if (s.roughness <= 0.16 || (s.surface === 'clearcoat' && s.clearcoatRoughness <= 0.1)) finishRegime = 'mirror_specular';
+  else if (s.roughness >= 0.65) finishRegime = 'matte_diffuse';
+
+  const maxC = Math.max(rgb[0], rgb[1], rgb[2]);
+  const minC = Math.min(rgb[0], rgb[1], rgb[2]);
+  const chroma = maxC - minC;
+  let chromaticity = 'neutral_achromatic';
+  if (chroma > 0.04) {
+    if (rgb[0] >= rgb[1] && rgb[1] >= rgb[2] * 1.35) chromaticity = 'warm_gold_amber';
+    else if (rgb[0] > rgb[1] * 1.4 && rgb[0] > rgb[2] * 1.4) chromaticity = 'crimson_lacquer';
+    else if (rgb[2] > rgb[0] * 1.25 && rgb[2] >= rgb[1]) chromaticity = 'deep_indigo';
+    else if (rgb[1] > rgb[0] * 1.15 && rgb[1] >= rgb[2]) chromaticity = 'celadon_jade';
+    else chromaticity = 'warm_terracotta';
+  } else if (verification.luminanceY > 0.55) {
+    chromaticity = 'ivory_porcelain';
+  }
+
+  let exposureRegime = 'studio_reference_ev13';
+  if (ev < 10.5) exposureRegime = 'low_key_nocturne';
+  else if (ev < 12.3) exposureRegime = 'golden_hour_warm';
+  else if (ev > 13.8) exposureRegime = 'high_key_daylight';
+
+  const materialId = String(s.name || 'material_surface');
+  const entityRef = targetEntityId || 'scene_root';
+  return {
+    schema: 'ganbate.semantic.material.v1',
+    id: materialId,
+    targetEntity: entityRef,
+    surface: s.surface,
+    bsdfClass,
+    finishRegime,
+    chromaticity,
+    exposureRegime,
+    tonemap: s.tonemap,
+    ev100: ev,
+    pbrVerified: verification.valid,
+    energyBudget: verification.energyBudget,
+    luminanceY: verification.luminanceY,
+    perturbationL2: verification.perturbationL2,
+    edges: [
+      { from: entityRef, rel: 'has_surface_bsdf', to: bsdfClass },
+      { from: materialId, rel: 'exhibits_finish', to: finishRegime },
+      { from: materialId, rel: 'illuminated_under', to: exposureRegime },
+    ],
+  };
+}
+
+/**
+ * Deterministic Natural-Language / `.gbs` Material Intent Compiler.
+ * Translates natural-language or `.gbs` surface descriptions into physically verified BSDF states.
+ */
+export function compileMaterialIntent(promptText = '', currentState = {}) {
+  const text = String(promptText || '').trim().toLowerCase();
+  const next = { ...defaultLabState(), ...currentState };
+  if (!text) {
+    return verifyAndProjectPbrMaterial(next, { autoProject: true });
+  }
+
+  // 1. Match canonical presets or surface classes
+  if (text.includes('lacquer') || text.includes('urushi') || text.includes('clearcoat') || text.includes('varnish')) {
+    Object.assign(next, MATERIAL_PRESETS.find((p) => p.id === 'polished_lacquer'));
+  } else if (text.includes('brass') || text.includes('gold') || text.includes('metal') || text.includes('conductor') || text.includes('bronze')) {
+    Object.assign(next, MATERIAL_PRESETS.find((p) => p.id === 'brushed_brass'));
+  } else if (text.includes('velvet') || text.includes('cloth') || text.includes('silk') || text.includes('charlie') || text.includes('textile')) {
+    Object.assign(next, MATERIAL_PRESETS.find((p) => p.id === 'woven_velvet'));
+  } else if (text.includes('porcelain') || text.includes('jade') || text.includes('subsurface') || text.includes('skin') || text.includes('shoji') || text.includes('wax')) {
+    Object.assign(next, MATERIAL_PRESETS.find((p) => p.id === 'subsurface_porcelain'));
+  } else if (text.includes('character') || text.includes('anime') || text.includes('avatar')) {
+    Object.assign(next, MATERIAL_PRESETS.find((p) => p.id === 'cel_character'));
+  } else if (text.includes('stone') || text.includes('slate') || text.includes('masonry') || text.includes('ramp') || text.includes('cel')) {
+    Object.assign(next, MATERIAL_PRESETS.find((p) => p.id === 'painterly_stone'));
+  }
+
+  // 2. Chromaticity modifiers
+  if (text.includes('crimson') || text.includes('vermilion') || text.includes('red')) next.baseColorHex = '#7a1612';
+  else if (text.includes('jade') || text.includes('emerald') || text.includes('celadon') || text.includes('green')) next.baseColorHex = '#2d6e5e';
+  else if (text.includes('indigo') || text.includes('navy') || text.includes('sapphire') || text.includes('blue')) next.baseColorHex = '#233a66';
+  else if (text.includes('gold') || text.includes('brass') || text.includes('amber')) next.baseColorHex = '#d8ad54';
+  else if (text.includes('ivory') || text.includes('white') || text.includes('porcelain')) next.baseColorHex = '#ede3d5';
+  else if (text.includes('obsidian') || text.includes('charcoal') || text.includes('dark')) next.baseColorHex = '#262930';
+
+  // 3. Microfacet roughness / finish modifiers
+  if (text.includes('mirror') || text.includes('polished') || text.includes('glossy')) {
+    next.roughness = 0.08;
+    if (next.surface === 'clearcoat') next.clearcoatRoughness = 0.04;
+  } else if (text.includes('weathered') || text.includes('rough') || text.includes('matte')) {
+    next.roughness = 0.74;
+  } else if (text.includes('satin') || text.includes('brushed')) {
+    next.roughness = 0.28;
+  }
+
+  // 4. Physical camera exposure / lighting modifiers
+  if (text.includes('sunset') || text.includes('golden hour') || text.includes('ev11')) {
+    next.aperture = 4.0;
+    next.shutterSpeed = 1 / 125;
+    next.iso = 100;
+    next.compensation = -0.3;
+    next.tonemap = 'agx';
+  } else if (text.includes('night') || text.includes('nocturne') || text.includes('low key') || text.includes('ev9')) {
+    next.aperture = 2.0;
+    next.shutterSpeed = 1 / 60;
+    next.iso = 200;
+    next.compensation = -0.7;
+    next.tonemap = 'agx';
+  } else if (text.includes('daylight') || text.includes('sunny') || text.includes('ev13')) {
+    next.aperture = 8.0;
+    next.shutterSpeed = 1 / 125;
+    next.iso = 100;
+    next.compensation = 0.0;
+  }
+
+  return verifyAndProjectPbrMaterial(next, { autoProject: true });
+}
+
 const LABELS = Object.freeze({
   materialStudioTitle: 'Material & Surface Lab',
   materialDoc: 'Material Asset',
   newMaterial: 'New Material',
-  presets: 'Surface Presets (3D Game Surfaces)',
-  surfaceModel: 'Surface Response (BRDF)',
+  presets: 'Canonical BSDF Presets (Physically-Based & NPR)',
+  surfaceModel: 'Surface Response (BSDF)',
   baseColor: 'Base Albedo',
   roughness: 'Roughness',
   metallic: 'Metallic',
@@ -830,6 +1107,24 @@ function ensureMaterialStudioStyles(ownerDoc) {
   ownerDoc.head.append(styleEl);
 }
 
+function inferPresetForSceneEntity(entityId, ent) {
+  const tag = `${entityId || ''} ${ent?.name || ''} ${ent?.components?.mesh?.node || ''} ${ent?.components?.world_instance?.role || ''} ${ent?.components?.world_instance?.category || ''}`.toLowerCase();
+  if (tag.includes('brass') || tag.includes('hardware') || tag.includes('finial') || tag.includes('metal')) return 'brushed_brass';
+  if (tag.includes('cushion') || tag.includes('velvet') || tag.includes('cloth') || tag.includes('silk') || tag.includes('zabuton')) return 'woven_velvet';
+  if (tag.includes('lantern') || tag.includes('shoji') || tag.includes('toro') || tag.includes('porcelain') || tag.includes('jade')) return 'subsurface_porcelain';
+  if (tag.includes('character') || tag.includes('actor') || tag.includes('avatar')) return 'cel_character';
+  if (tag.includes('roof') || tag.includes('landscape') || tag.includes('stone') || tag.includes('garden') || tag.includes('cliff') || tag.includes('water')) return 'painterly_stone';
+  return 'polished_lacquer';
+}
+
+function buildInlineMaterialComponent(rawState = {}) {
+  const root = {};
+  for (const op of buildMaterialDocOps(rawState)) {
+    if (op.set?.length === 1) root[op.set[0]] = op.value;
+  }
+  return root;
+}
+
 export function mountMaterialStudio(container, studioApi = {}) {
   if (!container) throw new Error('mountMaterialStudio requires a container element.');
   const ownerDoc = container.ownerDocument || globalThis.document;
@@ -843,7 +1138,11 @@ export function mountMaterialStudio(container, studioApi = {}) {
   let state = defaultLabState();
   let activeDocId = null;
   let activeDocPath = null;
+  let focusedEntityId = null;
   let showAllChannels = false;
+  let autoProjectPbr = true;
+  let lastVerification = verifyAndProjectPbrMaterial(state, { autoProject: false });
+  let lastSemanticDescriptor = liftMaterialToSemanticDescriptor(state, focusedEntityId);
   const unsubs = [];
   const controls = new Map();
   const fieldRows = new Map();
@@ -859,8 +1158,16 @@ export function mountMaterialStudio(container, studioApi = {}) {
   const evReadout = makeEl(ownerDoc, 'span', { class: 'material-studio-ev', 'data-key': 'ev100-readout' });
   const docSelect = makeEl(ownerDoc, 'select', { 'aria-label': tr('materialDoc'), class: 'material-studio-doc-select' });
   const activeTargetBadge = makeEl(ownerDoc, 'span', { class: 'material-studio-badge', 'data-key': 'target-badge' });
+  const pbrVerifierBadge = makeEl(ownerDoc, 'span', { class: 'material-studio-badge', 'data-key': 'pbr-verifier-badge' });
+  const semanticDescriptorPill = makeEl(ownerDoc, 'div', { class: 'material-studio-guide', 'data-key': 'semantic-descriptor-pill' });
   const surfaceGuideBox = makeEl(ownerDoc, 'div', { class: 'material-studio-guide', 'data-key': 'surface-guide' });
   const sceneEntitiesRow = makeEl(ownerDoc, 'div', { class: 'material-studio-scene-entities', 'data-key': 'scene-entities' });
+  const intentInput = makeEl(ownerDoc, 'input', {
+    type: 'text',
+    'data-field': 'material-intent',
+    placeholder: 'Tri-Modal Material Intent (e.g. "weathered brushed brass under sunset EV11", "translucent jade porcelain")…',
+    style: 'flex:1;min-width:180px;',
+  });
 
   function paintPreview() {
     const w = Number(previewCanvas.width) || 96;
@@ -884,8 +1191,22 @@ export function mountMaterialStudio(container, studioApi = {}) {
     const modelMeta = SURFACE_MODELS.find((m) => m.id === state.surface) || SURFACE_MODELS[0];
     surfaceGuideBox.textContent = modelMeta.summary || '';
     activeTargetBadge.textContent = activeDocPath
-      ? `Editing Asset: ${activeDocPath}`
-      : 'Live 3D Scene Look + Shader Preview';
+      ? `Asset: ${activeDocPath}`
+      : 'Live 3D Scene Look + BSDF Graph';
+
+    lastSemanticDescriptor = liftMaterialToSemanticDescriptor(state, focusedEntityId);
+    const v = lastVerification;
+    if (v.valid && v.perturbationL2 === 0) {
+      pbrVerifierBadge.textContent = `✓ PBR Verified · E=${v.energyBudget.toFixed(2)}≤1.0 · Y=${v.luminanceY.toFixed(2)}`;
+    } else if (autoProjectPbr && v.perturbationL2 > 0) {
+      pbrVerifierBadge.textContent = `⚡ Projected m̂→m* (ΔL2=${v.perturbationL2.toFixed(3)}) · E=${v.energyBudget.toFixed(2)}`;
+    } else {
+      pbrVerifierBadge.textContent = `⚠ PBR Constraint Violation (${v.issues.length}) · E=${v.energyBudget.toFixed(2)}`;
+    }
+
+    const d = lastSemanticDescriptor;
+    semanticDescriptorPill.textContent =
+      `Inverse Lift L_mat: [${d.bsdfClass}] · finish=${d.finishRegime} · chroma=${d.chromaticity} · exposure=${d.exposureRegime} (${d.targetEntity} → ${d.surface})`;
 
     const activeFields = new Set(modelMeta.fields || []);
     const conditionalKeys = [
@@ -915,17 +1236,48 @@ export function mountMaterialStudio(container, studioApi = {}) {
   }
 
   function pushLivePreviewAndEdit(label, merge = true) {
+    lastVerification = verifyAndProjectPbrMaterial(state, { autoProject: autoProjectPbr });
+    if (autoProjectPbr && lastVerification.perturbationL2 > 0) {
+      state = { ...state, ...lastVerification.projectedState };
+      for (const [key, binding] of controls.entries()) {
+        binding.sync(state[key]);
+      }
+    }
     paintPreview();
     syncContextualUi();
+    const lookPatch = buildLookPreviewPatch(state);
     const vp = studioApi?.getViewport?.();
     if (vp?.setPreviewLook) {
-      vp.setPreviewLook(buildLookPreviewPatch(state));
+      vp.setPreviewLook(lookPatch);
+    }
+    if (typeof studioApi?.registerSemanticMaterial === 'function') {
+      try { studioApi.registerSemanticMaterial(lastSemanticDescriptor); } catch { /* ignore */ }
+    }
+    if (typeof studioApi?.patchWorldGraph === 'function') {
+      try {
+        studioApi.patchWorldGraph({
+          source: 'material-studio',
+          materialDescriptor: lastSemanticDescriptor,
+          look: lookPatch,
+        });
+      } catch { /* ignore */ }
     }
     if (activeDocId && typeof studioApi?.edit === 'function') {
       const ops = buildMaterialDocOps(state);
       Promise.resolve(studioApi.edit(activeDocId, ops, label || 'Edit Material', merge)).catch((err) => {
         studioApi?.log?.(String(err?.message || err), 'error');
       });
+    } else if (focusedEntityId && typeof studioApi?.edit === 'function') {
+      const activeSceneDoc = studioApi?.getState?.()?.activeDocument;
+      if (activeSceneDoc?.id && activeSceneDoc?.root?.entities?.[focusedEntityId]) {
+        const matComp = buildInlineMaterialComponent(state);
+        const sceneOps = [
+          { set: ['entities', focusedEntityId, 'components', 'material'], value: matComp },
+        ];
+        Promise.resolve(studioApi.edit(activeSceneDoc.id, sceneOps, label || `Set Material on ${focusedEntityId}`, merge)).catch(() => {
+          /* ignore scene inline material write errors when read-only */
+        });
+      }
     }
   }
 
@@ -937,32 +1289,71 @@ export function mountMaterialStudio(container, studioApi = {}) {
     if (repaint) paintPreview();
   }
 
+  function bindSceneEntity(entityId, { frameCamera = false } = {}) {
+    if (!entityId) return false;
+    const snap = studioApi?.getState?.();
+    const ent = snap?.activeDocument?.root?.entities?.[entityId];
+    focusedEntityId = entityId;
+    if (ent?.components?.material && typeof ent.components.material === 'object') {
+      state = stateFromMaterialRoot(ent.components.material, state);
+    } else if (ent) {
+      const inferredId = inferPresetForSceneEntity(entityId, ent);
+      const preset = MATERIAL_PRESETS.find((p) => p.id === inferredId);
+      if (preset) {
+        state = {
+          ...state,
+          ...preset,
+          name: (ent.name || entityId).toLowerCase().replace(/[^a-z0-9_-]+/g, '_'),
+        };
+      }
+    }
+    if (frameCamera && ent) {
+      studioApi?.setSelection?.([entityId]);
+      const wbBounds = ent?.components?.world_instance?.bounds;
+      const trs = ent?.components?.transform?.translation;
+      if (Array.isArray(wbBounds) && wbBounds.length === 2) {
+        studioApi?.getViewport?.()?.frameBounds?.(wbBounds);
+      } else if (Array.isArray(trs) && trs.length >= 3) {
+        studioApi?.getViewport?.()?.setCameraPose?.({
+          target: [Number(trs[0]) || 0, Number(trs[1]) || 0, Number(trs[2]) || 0],
+          distance: 8,
+        });
+      }
+    }
+    refreshSceneEntitiesBar();
+    syncControlsFromState(false);
+    pushLivePreviewAndEdit(`Bind material to ${ent?.name || entityId}`, true);
+    return true;
+  }
+
   function refreshSceneEntitiesBar() {
     while (sceneEntitiesRow.firstChild) sceneEntitiesRow.removeChild(sceneEntitiesRow.firstChild);
     const snap = studioApi?.getState?.();
     const entities = snap?.activeDocument?.root?.entities;
     if (!entities || typeof entities !== 'object') return;
-    const entries = Object.entries(entities).slice(0, 6);
-    if (!entries.length) return;
-    sceneEntitiesRow.append(makeEl(ownerDoc, 'span', { class: 'material-studio-subtitle' }, 'Focus 3D Scene Entity:'));
-    for (const [entityId, ent] of entries) {
-      const label = ent?.name || entityId;
+    const allEntries = Object.entries(entities);
+    const surfaceEntries = allEntries.filter(
+      ([, ent]) => ent?.components?.mesh || ent?.components?.world_instance || ent?.components?.material,
+    );
+    const nonLightEntries = allEntries.filter(
+      ([, ent]) => !ent?.components?.light && !ent?.components?.camera,
+    );
+    const chosen = (surfaceEntries.length ? surfaceEntries : nonLightEntries.length ? nonLightEntries : allEntries).slice(0, 8);
+    if (!chosen.length) return;
+    sceneEntitiesRow.append(makeEl(ownerDoc, 'span', { class: 'material-studio-subtitle' }, 'Bind 3D Surface Entity:'));
+    for (const [entityId, ent] of chosen) {
+      const rawLabel = ent?.name || entityId;
+      const label = rawLabel.replace(/^[a-z0-9]+-/, '');
+      const isFocused = focusedEntityId === entityId;
       sceneEntitiesRow.append(
         makeEl(ownerDoc, 'button', {
           type: 'button',
-          class: 'mini',
+          class: `mini${isFocused ? ' on' : ''}`,
           'data-scene-entity': entityId,
           onclick: () => {
-            studioApi?.setSelection?.([entityId]);
-            const trs = ent?.components?.transform?.translation;
-            if (Array.isArray(trs) && trs.length >= 3) {
-              studioApi?.getViewport?.()?.setCameraPose?.({
-                target: [Number(trs[0]) || 0, Number(trs[1]) || 0, Number(trs[2]) || 0],
-                distance: 8,
-              });
-            }
+            bindSceneEntity(entityId, { frameCamera: true });
           },
-        }, label),
+        }, label || rawLabel),
       );
     }
   }
@@ -1221,17 +1612,56 @@ export function mountMaterialStudio(container, studioApi = {}) {
     },
   }, 'Show All Channels');
 
+  const btnToggleAutoProject = makeEl(ownerDoc, 'button', {
+    type: 'button',
+    class: 'mini on',
+    'data-action': 'toggle-pbr-autoproject',
+    onclick: () => {
+      autoProjectPbr = !autoProjectPbr;
+      btnToggleAutoProject.className = `mini${autoProjectPbr ? ' on' : ''}`;
+      btnToggleAutoProject.textContent = autoProjectPbr ? 'Auto-Project m* ON' : 'Auto-Project m* OFF';
+      pushLivePreviewAndEdit('Toggle PBR Auto-Project', true);
+    },
+  }, 'Auto-Project m* ON');
+
+  function applyIntent(promptText) {
+    const compiled = compileMaterialIntent(promptText ?? intentInput.value, state);
+    lastVerification = compiled;
+    state = { ...state, ...compiled.projectedState };
+    syncControlsFromState(false);
+    pushLivePreviewAndEdit(`Compile Material Intent: ${String(promptText ?? intentInput.value).slice(0, 36)}`, false);
+    return compiled;
+  }
+
+  const btnApplyIntent = makeEl(ownerDoc, 'button', {
+    type: 'button',
+    class: 'mini on',
+    'data-action': 'apply-material-intent',
+    onclick: () => {
+      applyIntent(intentInput.value);
+    },
+  }, 'Compile Intent');
+
   root.append(
     makeEl(ownerDoc, 'div', { class: 'component material-studio-header' },
       makeEl(ownerDoc, 'div', { class: 'material-studio-title-group' },
         makeEl(ownerDoc, 'strong', {}, tr('materialStudioTitle')),
         makeEl(ownerDoc, 'span', { class: 'material-studio-subtitle' },
-          'Tune 3D surface finishes (lacquer, baize, metal, skin, cel shading) and physical camera exposure alongside the live 3D viewport.',
+          'Tri-Modal BSDF & Physical Camera Workbench — Natural-language intent, energy-conserving PBR projection (m*), and inverse semantic lifting.',
         ),
       ),
-      makeEl(ownerDoc, 'div', { class: 'material-studio-actions' }, activeTargetBadge, btnNew, btnUndo, btnRedo, btnSave),
+      makeEl(ownerDoc, 'div', { class: 'material-studio-actions' }, pbrVerifierBadge, activeTargetBadge, btnNew, btnUndo, btnRedo, btnSave),
     ),
     makeEl(ownerDoc, 'div', { class: 'material-studio-card' },
+      makeEl(ownerDoc, 'div', { class: 'material-studio-card-head' },
+        makeEl(ownerDoc, 'strong', {}, 'Tri-Modal Material Intent & PBR Constraint Verifier'),
+        btnToggleAutoProject,
+      ),
+      makeEl(ownerDoc, 'div', { style: 'display:flex;gap:6px;align-items:center;flex-wrap:wrap;' },
+        intentInput,
+        btnApplyIntent,
+      ),
+      semanticDescriptorPill,
       makeEl(ownerDoc, 'div', { class: 'field field-select' }, makeEl(ownerDoc, 'label', {}, tr('materialDoc')), docSelect),
       sceneEntitiesRow,
       makeEl(ownerDoc, 'div', { class: 'material-studio-hero' },
@@ -1296,6 +1726,14 @@ export function mountMaterialStudio(container, studioApi = {}) {
       }
     });
     if (typeof offDoc === 'function') unsubs.push(offDoc);
+
+    const offSel = studioApi.on('selection', (sel) => {
+      const pickedId = Array.isArray(sel?.entityIds) ? sel.entityIds[0] : null;
+      if (pickedId && pickedId !== focusedEntityId && !activeDocId) {
+        bindSceneEntity(pickedId, { frameCamera: false });
+      }
+    });
+    if (typeof offSel === 'function') unsubs.push(offSel);
   }
 
   const initialActive = studioApi?.getActiveDocument?.();
@@ -1337,8 +1775,16 @@ export function mountMaterialStudio(container, studioApi = {}) {
       return selectDocument(pathOrId);
     },
     applyPreset,
+    applyIntent,
+    bindSceneEntity,
+    verifyPbr() {
+      return verifyAndProjectPbrMaterial(state, { autoProject: false });
+    },
+    getSemanticDescriptor() {
+      return liftMaterialToSemanticDescriptor(state, focusedEntityId);
+    },
     getState() {
-      return { ...state, activeDocId, activeDocPath };
+      return { ...state, activeDocId, activeDocPath, focusedEntityId };
     },
     setState(patch) {
       state = { ...state, ...patch };

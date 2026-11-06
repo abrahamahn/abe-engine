@@ -749,6 +749,202 @@ export function exportTerrainToGbs(doc) {
 }
 
 /**
+ * Projects all scattered landscape props onto the feasible terrain constraint manifold:
+ *   x* = argmin_{x in C} ||x - x_hat||^2
+ * Enforces:
+ *   1. Exact ground heightfield snap (`y* = sampleHeightAtWorld(grid, x, z)`)
+ *   2. Walkway corridor clearance (`dist_XZ >= halfWidth + 0.65m`)
+ *   3. Mutual prop non-penetration (`dist_XZ >= 1.35m`)
+ *   4. Dry-land elevation above water level
+ */
+export function projectScatterConstraints(doc) {
+  const root = doc?.root || doc || {};
+  const grid = root.grid || { cols: 32, rows: 32, cellSize: 1, heights: [] };
+  const splines = Array.isArray(root.splines) ? root.splines : [];
+  const waterLevel = root.water?.enabled !== false ? (Number(root.water?.level) ?? -0.25) : -999;
+  const rawScatter = Array.isArray(root.scatter) ? structuredClone(root.scatter) : [];
+
+  const sampledSplinePts = [];
+  for (const sp of splines) {
+    const pts = evaluateCatmullRomSpline(sp.points || [], 6);
+    const minClear = Math.max(0.8, (Number(sp.width) || 3.0) * 0.5) + 0.65;
+    for (const p of pts) {
+      sampledSplinePts.push({ x: p[0], z: p[2], minClear, splineId: sp.id || 'walkway_01' });
+    }
+  }
+
+  let repairedCount = 0;
+  let maxDisplacementM = 0;
+  const relationalEdges = [];
+
+  for (let i = 0; i < rawScatter.length; i++) {
+    const item = rawScatter[i];
+    const orig = Array.isArray(item.translation) ? item.translation.slice() : [0, 0, 0];
+    let wx = Number(orig[0]) || 0;
+    let wz = Number(orig[2]) || 0;
+
+    // 1. Walkway corridor clearance projection
+    let nearestSpline = null;
+    let nearestDist = Infinity;
+    for (const sp of sampledSplinePts) {
+      const dx = wx - sp.x;
+      const dz = wz - sp.z;
+      const d = Math.hypot(dx, dz);
+      if (d < nearestDist) {
+        nearestDist = d;
+        nearestSpline = sp;
+      }
+      if (d < sp.minClear) {
+        const push = sp.minClear - d + 0.05;
+        const ux = d > 1e-4 ? dx / d : 1;
+        const uz = d > 1e-4 ? dz / d : 0;
+        wx += ux * push;
+        wz += uz * push;
+      }
+    }
+
+    // 2. Mutual horizontal non-penetration against earlier items
+    for (let j = 0; j < i; j++) {
+      const other = rawScatter[j].translation || [0, 0, 0];
+      const dx = wx - other[0];
+      const dz = wz - other[2];
+      const d = Math.hypot(dx, dz);
+      const minSep = 1.35;
+      if (d < minSep) {
+        const push = minSep - d + 0.04;
+        const ux = d > 1e-4 ? dx / d : 0;
+        const uz = d > 1e-4 ? dz / d : 1;
+        wx += ux * push;
+        wz += uz * push;
+      }
+    }
+
+    // 3. Snap to ground heightfield & enforce water clearance
+    let wy = sampleHeightAtWorld(grid, wx, wz);
+    if (wy <= waterLevel + 0.08) {
+      wy = waterLevel + 0.12;
+    }
+
+    const nextPos = [round3(wx), round3(wy), round3(wz)];
+    const disp = round3(Math.hypot(nextPos[0] - orig[0], nextPos[1] - orig[1], nextPos[2] - orig[2]));
+    if (disp > 0.01) {
+      repairedCount++;
+      if (disp > maxDisplacementM) maxDisplacementM = disp;
+    }
+    item.translation = nextPos;
+
+    relationalEdges.push({
+      from: item.id || `scatter_${i + 1}`,
+      to: 'terrain0000000001',
+      type: 'snap_to_ground',
+      elevationM: nextPos[1],
+    });
+    if (nearestSpline && nearestDist <= 8.0) {
+      relationalEdges.push({
+        from: item.id || `scatter_${i + 1}`,
+        to: nearestSpline.splineId,
+        type: 'along_spline',
+        offsetM: round3(nearestDist),
+      });
+    }
+  }
+
+  return {
+    repairedCount,
+    maxDisplacementM,
+    nextScatter: rawScatter,
+    relationalEdges,
+  };
+}
+
+/**
+ * Resolves a 2-Agent Landscape Co-Design transaction where:
+ *   - `Agent A (Walkway & Grading Architect)` places a garden landmark near the walkway
+ *   - `Agent B (Foliage & Lighting Director)` places a stone lantern at an overlapping coordinate
+ * Computes Pareto-minimal conflict resolution `(x_A*, x_B*)` and re-projects all scatter constraints.
+ */
+export function resolveTerrainTwoAgentCoDesign(doc, options = {}) {
+  const root = doc?.root || doc || {};
+  const grid = root.grid || { cols: 32, rows: 32, cellSize: 1, heights: [] };
+  const propA = options.agentA || {
+    id: 'co_pavilion_01',
+    name: 'Garden Stone Basin',
+    archetype: 'accent_rock',
+    proposedXZ: [2.4, 1.8],
+    weight: 0.55,
+  };
+  const propB = options.agentB || {
+    id: 'co_lantern_01',
+    name: 'Walkway Stone Lantern',
+    archetype: 'lantern',
+    proposedXZ: [2.6, 1.9],
+    weight: 0.45,
+    emitsLight: true,
+  };
+
+  let [ax, az] = propA.proposedXZ;
+  let [bx, bz] = propB.proposedXZ;
+  const dx = bx - ax;
+  const dz = bz - az;
+  const dist = Math.hypot(dx, dz);
+  const minSep = 1.6;
+  let conflictResolved = false;
+
+  if (dist < minSep) {
+    conflictResolved = true;
+    const overlap = minSep - dist + 0.05;
+    const ux = dist > 1e-4 ? dx / dist : 1;
+    const uz = dist > 1e-4 ? dz / dist : 0;
+    const wA = Number(propA.weight) || 0.5;
+    const wB = Number(propB.weight) || 0.5;
+    const wSum = wA + wB || 1;
+    ax -= ux * overlap * (wB / wSum);
+    az -= uz * overlap * (wB / wSum);
+    bx += ux * overlap * (wA / wSum);
+    bz += uz * overlap * (wA / wSum);
+  }
+
+  const ay = sampleHeightAtWorld(grid, ax, az);
+  const by = sampleHeightAtWorld(grid, bx, bz);
+
+  const mergedScatter = [
+    ...(Array.isArray(root.scatter) ? root.scatter.filter((s) => s.id !== propA.id && s.id !== propB.id) : []),
+    {
+      id: propA.id,
+      name: propA.name,
+      archetype: propA.archetype || 'accent_rock',
+      translation: [round3(ax), round3(ay), round3(az)],
+      rotationYaw: 0,
+      scale: [1, 1, 1],
+      emitsLight: false,
+    },
+    {
+      id: propB.id,
+      name: propB.name,
+      archetype: propB.archetype || 'lantern',
+      translation: [round3(bx), round3(by), round3(bz)],
+      rotationYaw: 0,
+      scale: [1, 1, 1],
+      emitsLight: Boolean(propB.emitsLight),
+    },
+  ];
+
+  const projected = projectScatterConstraints({
+    ...root,
+    scatter: mergedScatter,
+  });
+
+  return {
+    conflictResolved,
+    agentAResolved: projected.nextScatter.find((s) => s.id === propA.id)?.translation || [round3(ax), round3(ay), round3(az)],
+    agentBResolved: projected.nextScatter.find((s) => s.id === propB.id)?.translation || [round3(bx), round3(by), round3(bz)],
+    repairedCount: projected.repairedCount,
+    nextScatter: projected.nextScatter,
+    relationalEdges: projected.relationalEdges,
+  };
+}
+
+/**
  * Builds scene entity definitions from a `.terrain.json` document so syncing a landscape
  * immediately populates the open `.scene.json` with a terrain heightfield entity, water plane,
  * spline walkways, and scattered props.
@@ -756,6 +952,11 @@ export function exportTerrainToGbs(doc) {
 export function buildTerrainSceneEntities(doc) {
   const root = doc?.root || doc || {};
   const grid = root.grid || { cols: 32, rows: 32, cellSize: 1, heights: [] };
+  const cols = Number(grid.cols) || 32;
+  const rows = Number(grid.rows) || 32;
+  const cellSize = Number(grid.cellSize) || 1;
+  const worldWidth = Math.max(8, (cols - 1) * cellSize);
+  const worldDepth = Math.max(8, (rows - 1) * cellSize);
   const out = {};
 
   out['terrain0000000001'] = {
@@ -764,12 +965,16 @@ export function buildTerrainSceneEntities(doc) {
     components: {
       transform: { translation: [0, 0, 0], rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
       terrain: {
-        cols: grid.cols,
-        rows: grid.rows,
-        cellSize: grid.cellSize,
+        cols,
+        rows,
+        resolution: cols,
+        cellSize,
+        worldWidth,
+        worldDepth,
         minHeight: grid.minHeight,
         maxHeight: grid.maxHeight,
         heights: Array.isArray(grid.heights) ? grid.heights.slice() : [],
+        splatLayers: Array.isArray(root.layers) ? structuredClone(root.layers) : [],
         waterLevel: root.water?.level ?? -0.25,
         splines: structuredClone(root.splines || []),
       },
@@ -783,9 +988,11 @@ export function buildTerrainSceneEntities(doc) {
       parent: 'terrain0000000001',
       order: 'a1',
       components: {
-        transform: { translation: [0, wl, 0], rotation: [0, 0, 0, 1], scale: [24, 0.1, 24] },
+        transform: { translation: [0, wl, 0], rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
         water: {
           level: wl,
+          worldWidth,
+          worldDepth,
           shallowColor: root.water?.shallowColor || [0.16, 0.44, 0.56, 0.72],
           deepColor: root.water?.deepColor || [0.06, 0.18, 0.30, 0.88],
         },
@@ -799,6 +1006,8 @@ export function buildTerrainSceneEntities(doc) {
     const eid = `terrainsc${String(i + 1).padStart(8, '0')}`;
     const yaw = Number(item.rotationYaw) || 0;
     const half = yaw * 0.5;
+    const isLantern = item.archetype === 'lantern' || Boolean(item.emitsLight);
+    const isTree = item.archetype === 'foliage_tree';
     const components = {
       transform: {
         translation: (item.translation || [0, 0, 0]).map((v) => round3(v)),
@@ -806,9 +1015,15 @@ export function buildTerrainSceneEntities(doc) {
         scale: (item.scale || [1, 1, 1]).map((v) => round3(v)),
       },
       mesh: {
+        primitive: isLantern ? 'lantern' : isTree ? 'tree' : 'box',
         archetype: item.archetype || 'foliage_tree',
+        color: isLantern ? [0.95, 0.72, 0.38] : isTree ? [0.92, 0.58, 0.72] : [0.52, 0.54, 0.56],
         ...(item.assetId ? { model: item.assetId } : {}),
       },
+      relations: [
+        { type: 'snap_to_ground', to: 'terrain0000000001' },
+        { type: 'along_spline', to: 'walkway_01' },
+      ],
     };
     if (item.emitsLight) {
       components.light = { color: [1.0, 0.86, 0.62], intensity: 3.6, range: 9.0 };
@@ -1098,6 +1313,7 @@ export function mountTerrainStudio(container, studioApi = {}) {
     'Cursor: 0.0m, 0.0m · Elev: 0.00m',
   );
   const aiDigestEl = el('pre', { class: 'terrain-ai-digest', 'data-role': 'terrain-ai-digest' }, '');
+  const constraintReadoutEl = el('pre', { class: 'terrain-ai-digest', 'data-role': 'terrain-constraint-readout' }, '');
   const splineListEl = el('div', { class: 'terrain-spline-list', 'data-role': 'terrain-spline-list' });
   const radiusValEl = el('span', { class: 'val' }, `${uiState.brushRadius.toFixed(1)}m`);
   const strengthValEl = el('span', { class: 'val' }, `${Math.round(uiState.brushStrength * 100)}%`);
@@ -1106,9 +1322,46 @@ export function mountTerrainStudio(container, studioApi = {}) {
   const brushButtons = new Map();
   const skyButtons = new Map();
 
+  async function repairScatterConstraints() {
+    const res = projectScatterConstraints(terrainDoc);
+    await commitTerrainMutation(
+      `Project scatter constraints (${res.repairedCount} repaired)`,
+      undefined,
+      (doc) => {
+        doc.scatter = res.nextScatter;
+      },
+    );
+    constraintReadoutEl.textContent =
+      `x* Projection: ${res.repairedCount} props adjusted (max Δ=${res.maxDisplacementM.toFixed(2)}m)\n` +
+      `Relational edges: ${res.relationalEdges.length} (snap_to_ground + along_spline)`;
+    return res;
+  }
+
+  async function runTwoAgentCoDesign(options = {}) {
+    const res = resolveTerrainTwoAgentCoDesign(terrainDoc, options);
+    await commitTerrainMutation(
+      'Resolve 2-Agent Landscape Co-Design',
+      undefined,
+      (doc) => {
+        doc.scatter = res.nextScatter;
+      },
+    );
+    constraintReadoutEl.textContent =
+      `2-Agent Co-Design: conflict=${res.conflictResolved ? 'RESOLVED' : 'NONE'}\n` +
+      `Agent A -> [${res.agentAResolved.join(', ')}] · Agent B -> [${res.agentBResolved.join(', ')}]\n` +
+      `Edges: ${res.relationalEdges.length}`;
+    return res;
+  }
+
   function updateInspectorWidgets() {
     const digest = summarizeTerrainForAi(terrainDoc);
     aiDigestEl.textContent = `${digest.text}\n(~${digest.tokensApprox} tokens · budget <120)`;
+    if (!constraintReadoutEl.textContent) {
+      const snap = projectScatterConstraints(terrainDoc);
+      constraintReadoutEl.textContent =
+        `Relational edges: ${snap.relationalEdges.length} (snap_to_ground + along_spline)\n` +
+        `Pending constraint drift: ${snap.repairedCount} props (max Δ=${snap.maxDisplacementM.toFixed(2)}m)`;
+    }
     waterValEl.textContent = `${Number(terrainDoc.water?.level ?? -0.25).toFixed(2)}m`;
     for (const [id, btn] of brushButtons) {
       const on = uiState.brushMode === id;
@@ -1579,6 +1832,24 @@ export function mountTerrainStudio(container, studioApi = {}) {
       el('h3', {}, '5. AI Semantic Digest (<120 tok)'),
       aiDigestEl,
     ),
+    el('section', { class: 'terrain-studio-card' },
+      el('h3', {}, '6. Relational Graph & Solver (x̂ → x*)'),
+      el('div', { class: 'terrain-studio-pill-group' },
+        el('button', {
+          type: 'button',
+          class: 'terrain-studio-btn',
+          'data-action': 'repair-scatter-constraints',
+          onclick: () => { void repairScatterConstraints(); },
+        }, '📐 Project (x̂ → x*)'),
+        el('button', {
+          type: 'button',
+          class: 'terrain-studio-btn',
+          'data-action': 'run-two-agent-codesign',
+          onclick: () => { void runTwoAgentCoDesign(); },
+        }, '🤝 2-Agent Co-Design'),
+      ),
+      constraintReadoutEl,
+    ),
   );
 
   const stageWrap = el('div', { class: 'terrain-stage-wrap' },
@@ -1648,6 +1919,8 @@ export function mountTerrainStudio(container, studioApi = {}) {
       updateInspectorWidgets();
       return terrainDoc.scatter;
     },
+    repairScatterConstraints,
+    runTwoAgentCoDesign,
     syncToScene,
     summarizeForAi: () => summarizeTerrainForAi(terrainDoc),
     exportGbs: () => exportTerrainToGbs(terrainDoc),

@@ -68,6 +68,7 @@ impl Studio {
                 "meta-set" => self.asset_meta_set(from, msg),
                 "intake-list" => self.asset_intake_list(from, msg),
                 "intake-preview" => self.asset_intake_preview(from, msg),
+                "semantic-catalog" => self.asset_semantic_catalog(from, msg),
                 other => Err(format!("unknown asset-usage op {other:?}")),
             };
         }
@@ -303,6 +304,169 @@ impl Studio {
                 ("kind", s(kind.name())),
                 ("bytes", n(bytes.len() as u64)),
                 ("dataBase64", s(&ganbate_core::digest::base64(&bytes))),
+                ("req", req),
+            ]),
+        )])
+    }
+
+    /// Synthesizes a `ganbate.semantic.catalog.v2` affordance catalog across all placeable
+    /// project assets (`model`, `prefab`, `character`), merging any `.meta.json` sidecar
+    /// collider/socket settings for the Tri-Modal Semantic World Graph solver.
+    pub fn asset_semantic_catalog(&self, from: ClientId, msg: &Value) -> Result<Outbox, String> {
+        let req = msg.get("req").cloned().unwrap_or(Value::Null);
+        let mut entries = Vec::new();
+        for entry in self.project.entries() {
+            if !matches!(entry.kind.name(), "model" | "prefab" | "character") {
+                continue;
+            }
+            let file_name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+            let stem = file_name
+                .strip_suffix(".prefab.json")
+                .or_else(|| file_name.strip_suffix(".character.json"))
+                .or_else(|| file_name.strip_suffix(".glb"))
+                .unwrap_or(file_name);
+            let hay = format!("{} {} {}", entry.path.to_lowercase(), stem.to_lowercase(), entry.kind.name());
+
+            let role = if entry.kind.name() == "character"
+                || hay.contains("character")
+                || hay.contains("avatar")
+                || hay.contains("dealer")
+                || hay.contains("rei")
+                || hay.contains("rigged")
+            {
+                "articulated_agent"
+            } else if hay.contains("table")
+                || hay.contains("desk")
+                || hay.contains("counter")
+                || hay.contains("altar")
+                || hay.contains("pedestal")
+            {
+                "support_surface"
+            } else if hay.contains("chair")
+                || hay.contains("stool")
+                || hay.contains("seat")
+                || hay.contains("bench")
+                || hay.contains("cushion")
+                || hay.contains("zabuton")
+            {
+                "seating"
+            } else if hay.contains("lantern")
+                || hay.contains("lamp")
+                || hay.contains("beacon")
+                || hay.contains("light")
+                || hay.contains("sconce")
+            {
+                "luminaire"
+            } else if hay.contains("vessel")
+                || hay.contains("cup")
+                || hay.contains("teapot")
+                || hay.contains("bottle")
+                || hay.contains("chip")
+                || hay.contains("tray")
+                || hay.contains("bowl")
+                || hay.contains("vase")
+            {
+                "surface_prop"
+            } else {
+                "architectural_prop"
+            };
+
+            let (mut hx, mut hy, mut hz, mut surface_y, shape) = match role {
+                "support_surface" => (1.3_f64, 0.45_f64, 0.85_f64, 0.9_f64, "aabb"),
+                "surface_prop" => (0.16, 0.18, 0.16, 0.36, "cylinder"),
+                "seating" => (0.32, 0.45, 0.32, 0.48, "cylinder"),
+                "luminaire" => (0.28, 0.55, 0.28, 1.1, "cylinder"),
+                "articulated_agent" => (0.35, 0.88, 0.35, 1.76, "cylinder"),
+                _ => (0.45, 0.9, 0.45, 1.8, "aabb"),
+            };
+
+            if !entry.kind.self_identified()
+                && let Ok(sidecar) = self.project.read_sidecar(&entry.id)
+                && let Ok(meta) = AssetMeta::from_sidecar(&sidecar)
+                && let Some(ref col) = meta.collider
+            {
+                let ext = col.half_extents;
+                if ext.iter().any(|&v| v > 0.0) {
+                    hx = (ext[0] as f64).max(0.04);
+                    hy = (ext[1] as f64).max(0.04);
+                    hz = (ext[2] as f64).max(0.04);
+                    surface_y = (hy * 2.0).max(0.08);
+                } else if col.radius > 0.0 && col.height > 0.0 {
+                    hx = (col.radius as f64).max(0.04);
+                    hz = (col.radius as f64).max(0.04);
+                    hy = ((col.height as f64) * 0.5).max(0.04);
+                    surface_y = (col.height as f64).max(0.08);
+                }
+            }
+
+            let domain = if role == "surface_prop" {
+                "table_surface"
+            } else {
+                "floor"
+            };
+            let default_rel = if domain == "table_surface" {
+                "on_top_of"
+            } else if role == "seating" || role == "articulated_agent" {
+                "in_front_of"
+            } else {
+                "beside"
+            };
+            let academic_collection = match role {
+                "articulated_agent" => "characters",
+                "support_surface" | "surface_prop" | "seating" => "tabletop",
+                "luminaire" => "lighting",
+                _ => "architecture",
+            };
+            let radius = hx.max(hz);
+
+            entries.push(obj(vec![
+                ("schema", s("ganbate.semantic.node.v2")),
+                ("id", s(stem)),
+                ("type", s(stem)),
+                ("role", s(role)),
+                ("academicCollection", s(academic_collection)),
+                ("path", s(&entry.path)),
+                ("assetId", s(&entry.id)),
+                (
+                    "bounds",
+                    obj(vec![
+                        ("shape", s(shape)),
+                        (
+                            "halfExtents",
+                            Value::Array(vec![
+                                Value::Number(hx),
+                                Value::Number(hy),
+                                Value::Number(hz),
+                            ]),
+                        ),
+                        ("radius", Value::Number(radius)),
+                        ("height", Value::Number(hy * 2.0)),
+                        ("surfaceY", Value::Number(surface_y)),
+                    ]),
+                ),
+                (
+                    "affordances",
+                    obj(vec![
+                        ("domain", s(domain)),
+                        ("defaultRelation", s(default_rel)),
+                        ("supportsOnTopOf", Value::Bool(role == "support_surface")),
+                        ("emitsLight", Value::Bool(role == "luminaire")),
+                        (
+                            "orientToTarget",
+                            Value::Bool(role == "seating" || role == "articulated_agent"),
+                        ),
+                    ]),
+                ),
+            ]));
+        }
+
+        Ok(vec![(
+            from,
+            obj(vec![
+                ("type", s("asset-usage")),
+                ("op", s("semantic-catalog")),
+                ("schema", s("ganbate.semantic.catalog.v2")),
+                ("entries", Value::Array(entries)),
                 ("req", req),
             ]),
         )])
@@ -1328,5 +1492,25 @@ mod tests {
             ganbate_pipeline::ddc::PivotPreset::BottomCenter
         );
         assert!((settings.scale - 0.01).abs() < 1e-6);
+
+        // 4. Query Tri-Modal semantic catalog (`op: "semantic-catalog"`).
+        let sem = st.handle(
+            client,
+            &parse_msg(r#"{"type":"asset-usage","op":"semantic-catalog","req":"sem-1"}"#),
+        );
+        let sem_msg = &find_type(&sem, "asset-usage")[0].1;
+        assert_eq!(sem_msg.get("op"), Some(&s("semantic-catalog")));
+        assert_eq!(
+            sem_msg.get("schema"),
+            Some(&s("ganbate.semantic.catalog.v2"))
+        );
+        let sem_entries = sem_msg.get("entries").unwrap().array().unwrap();
+        assert!(!sem_entries.is_empty());
+        assert!(
+            sem_entries
+                .iter()
+                .any(|e| e.get("id") == Some(&s("archway"))
+                    && e.get("role") == Some(&s("architectural_prop")))
+        );
     }
 }

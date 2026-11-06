@@ -152,7 +152,7 @@ pub unsafe extern "C" fn ganbate_load_world(ptr: *mut u8, len: usize) -> u32 {
     drop(bytes);
     match world {
         Ok((w, table)) => {
-            ENTITIES.with(|cell| *cell.borrow_mut() = entities_json(&table));
+            ENTITIES.with(|cell| *cell.borrow_mut() = entities_json(&w, &table));
             physics::prepare(&w, &table);
             say(
                 0,
@@ -176,18 +176,77 @@ pub unsafe extern "C" fn ganbate_load_world(ptr: *mut u8, len: usize) -> u32 {
 }
 
 /// An entity table as JSON: `{"entities": [{"id", "name", "parent", "transform", "instances":
-/// [first, count], "lights": [first, count]}], "data": {...}}`, or `""` when it is empty.
-pub(crate) fn entities_json(table: &ganbate_engine::world::EntityTable) -> String {
+/// [first, count], "lights": [first, count], "bounds": [[lo], [hi]]}], "instanceSpecs":
+/// [{"material", "bounds"}], "lamps": [[x, y, z]], "data": {...}}`, or `""` when it is empty.
+pub(crate) fn entities_json(
+    world: &ganbate_engine::world::World,
+    table: &ganbate_engine::world::EntityTable,
+) -> String {
     use ganbate_engine::json::{Value, to_compact};
     use std::collections::BTreeMap;
     if table.entities.is_empty() && table.data.is_empty() {
         return String::new();
     }
     let n = |v: u32| Value::Number(f64::from(v));
+    let arr3 = |v: [f32; 3]| Value::Array(v.iter().map(|x| Value::Number(f64::from(*x))).collect());
+    let inst_bounds: Vec<Option<([f32; 3], [f32; 3])>> = world
+        .instances
+        .iter()
+        .map(|inst| {
+            let mesh = world.meshes.get(inst.mesh as usize)?;
+            let mut lo = [f32::INFINITY; 3];
+            let mut hi = [f32::NEG_INFINITY; 3];
+            for p in &mesh.positions {
+                let w = inst.transform.point(*p);
+                for (k, v) in [w.0, w.1, w.2].into_iter().enumerate() {
+                    lo[k] = lo[k].min(v);
+                    hi[k] = hi[k].max(v);
+                }
+            }
+            (lo[0] <= hi[0]).then_some((lo, hi))
+        })
+        .collect();
+    let instance_specs: Vec<Value> = world
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(idx, inst)| {
+            let mat_name = world
+                .meshes
+                .get(inst.mesh as usize)
+                .and_then(|m| m.material)
+                .and_then(|mi| world.materials.get(mi as usize))
+                .map_or("", |mat| mat.name.as_str());
+            let b = inst_bounds
+                .get(idx)
+                .copied()
+                .flatten()
+                .map_or(Value::Null, |(lo, hi)| Value::Array(vec![arr3(lo), arr3(hi)]));
+            Value::Object(BTreeMap::from([
+                ("material".to_string(), Value::String(mat_name.to_string())),
+                ("bounds".into(), b),
+            ]))
+        })
+        .collect();
     let entities = table
         .entities
         .iter()
         .map(|e| {
+            let mut lo = [f32::INFINITY; 3];
+            let mut hi = [f32::NEG_INFINITY; 3];
+            for i in e.instances.clone() {
+                if let Some((ilo, ihi)) = inst_bounds.get(i as usize).copied().flatten() {
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(ilo[k]);
+                        hi[k] = hi[k].max(ihi[k]);
+                    }
+                }
+            }
+            let bounds_val = if lo[0] <= hi[0] {
+                Value::Array(vec![arr3(lo), arr3(hi)])
+            } else {
+                Value::Null
+            };
             Value::Object(BTreeMap::from([
                 ("id".to_string(), Value::String(format!("{:016x}", e.id))),
                 ("name".into(), Value::String(e.name.clone())),
@@ -213,12 +272,20 @@ pub(crate) fn entities_json(table: &ganbate_engine::world::EntityTable) -> Strin
                     "lights".into(),
                     Value::Array(vec![n(e.lights.start), n(e.lights.end - e.lights.start)]),
                 ),
+                ("bounds".into(), bounds_val),
             ]))
         })
+        .collect();
+    let lamps: Vec<Value> = world
+        .lights
+        .iter()
+        .map(|l| arr3([l.position.0, l.position.1, l.position.2]))
         .collect();
     let data = ganbate_engine::json::parse(table.data.as_bytes()).unwrap_or(Value::Null);
     to_compact(&Value::Object(BTreeMap::from([
         ("entities".to_string(), Value::Array(entities)),
+        ("instanceSpecs".into(), Value::Array(instance_specs)),
+        ("lamps".into(), Value::Array(lamps)),
         ("data".into(), data),
     ])))
     .unwrap_or_default()

@@ -7,15 +7,22 @@ import {
   assetStem,
   buildFolderTree,
   buildRenamedPath,
+  buildSemanticCatalogFromAssets,
   canPlaceAsset,
+  computeRelationalDropPoint,
+  extractSceneSemanticNodes,
   filterAssets,
   filterIntakeItems,
   formatBytes,
+  inferAssetSemanticAffordance,
   inFolder,
   kindCounts,
+  liftPositionToSemanticEdges,
   placementEntity,
+  projectAssetDropPosition,
   projectAssetUrl,
   raycastDropPoint,
+  resolveSemanticAssetDrop,
 } from '../asset-library.js';
 import { createPreviewManager, extractWavPeaks, parseGlbPreview } from '../asset-previews.js';
 
@@ -372,4 +379,162 @@ test('parseGlbPreview resolves EXT_texture_webp, alphaCutoff, skips zero-scale n
   });
   assert.equal(deferred.deferredLargeModel, true);
   assert.equal(fetchCalls, 0);
+});
+
+test('inferAssetSemanticAffordance and buildSemanticCatalogFromAssets synthesize ganbate.semantic.node.v2 descriptors and resolve EN/KO queries', () => {
+  const testAssets = [
+    { id: 'mdl_table', kind: 'model', path: 'content/models/props/table.glb' },
+    { id: 'mdl_vessel', kind: 'model', path: 'content/models/props/vessel.glb' },
+    { id: 'mdl_chair', kind: 'model', path: 'content/models/props/chair.glb' },
+    { id: 'mdl_lantern', kind: 'model', path: 'content/models/props/lantern.glb' },
+    { id: 'chr_rei', kind: 'character', path: 'content/characters/rei-d30-rigged.character.json' },
+    { id: 'mdl_pavilion', kind: 'model', path: 'content/models/world/yozakura-pavilion.glb' },
+  ];
+
+  const tableDesc = inferAssetSemanticAffordance(testAssets[0]);
+  assert.equal(tableDesc.schema, 'ganbate.semantic.node.v2');
+  assert.equal(tableDesc.role, 'support_surface');
+  assert.equal(tableDesc.affordances.supportsOnTopOf, true);
+  assert.equal(tableDesc.affordances.domain, 'floor');
+  assert.equal(tableDesc.bounds.surfaceY, 0.9);
+
+  const vesselDesc = inferAssetSemanticAffordance(testAssets[1], {
+    bounds: [[-0.12, 0, -0.12], [0.12, 0.28, 0.12]],
+  });
+  assert.equal(vesselDesc.role, 'surface_prop');
+  assert.equal(vesselDesc.affordances.domain, 'table_surface');
+  assert.equal(vesselDesc.affordances.defaultRelation, 'on_top_of');
+  assert.deepEqual(vesselDesc.bounds.halfExtents, [0.12, 0.14, 0.12]);
+  assert.equal(vesselDesc.bounds.surfaceY, 0.28);
+
+  const catalog = buildSemanticCatalogFromAssets(testAssets);
+  assert.equal(catalog.schema, 'ganbate.semantic.catalog.v2');
+  assert.equal(catalog.entries.length, 6);
+  assert.equal(catalog.resolveQuery('테이블')?.assetId, 'mdl_table');
+  assert.equal(catalog.resolveQuery('의자')?.assetId, 'mdl_chair');
+  assert.equal(catalog.resolveQuery('등불')?.assetId, 'mdl_lantern');
+  assert.equal(catalog.resolveQuery('캐릭터')?.assetId, 'chr_rei');
+  assert.equal(catalog.resolveQuery('yozakura-pavilion')?.role, 'architectural_prop');
+});
+
+test('resolveSemanticAssetDrop snaps surface props onto support_surface topY and lifts on_top_of anchor edges', () => {
+  const tableAsset = { id: 'mdl_table', kind: 'model', path: 'content/models/props/table.glb' };
+  const vesselAsset = { id: 'mdl_vessel', kind: 'model', path: 'content/models/props/vessel.glb' };
+
+  const tableNode = inferAssetSemanticAffordance(tableAsset, {
+    id: 'table_1',
+    position: [0, 0, 0],
+  });
+
+  // Drop vessel near the east side of the table
+  const dropResult = resolveSemanticAssetDrop(
+    vesselAsset,
+    [0.75, 0.0, 0.05],
+    { nodes: [tableNode] },
+  );
+
+  assert.equal(dropResult.projection.mode, 'surface_snap');
+  assert.equal(dropResult.projection.supportTargetId, 'table_1');
+  assert.equal(dropResult.projection.anchor, 'east');
+  assert.equal(dropResult.node.position[1], 0.9, 'snaps Y to table surfaceY (0.9m)');
+  assert.equal(dropResult.node.relation, 'on_top_of');
+  assert.deepEqual(dropResult.edges, [
+    { from: 'vessel', rel: 'on_top_of', to: 'table_1', anchor: 'east' },
+  ]);
+  assert.deepEqual(dropResult.entity.components.transform.translation, [0.75, 0.9, 0.05]);
+});
+
+test('resolveSemanticAssetDrop solves Minimal-Perturbation Constraint Projection (x* = argmin ||x - xHat||^2) and lifts symbolic + facing edges', () => {
+  const tableAsset = { id: 'mdl_table', kind: 'model', path: 'content/models/props/table.glb' };
+  const chairAsset = { id: 'mdl_chair', kind: 'model', path: 'content/models/props/chair.glb' };
+
+  const tableNode = inferAssetSemanticAffordance(tableAsset, {
+    id: 'table_main',
+    position: [0, 0, 0],
+  });
+
+  // Drop chair clipping inside the left (-X) side of the table at [-0.95, 0, 0.1].
+  // Table halfExtents = [1.3, 0.45, 0.85], chair halfExtents = [0.32, 0.45, 0.32], clearance = 0.08 -> expandX = 1.70
+  const drop = resolveSemanticAssetDrop(
+    chairAsset,
+    [-0.95, 0, 0.1],
+    { nodes: [tableNode] },
+  );
+
+  assert.equal(drop.projection.projected, true);
+  assert.equal(drop.projection.mode, 'aabb_minimal_perturbation');
+  assert.equal(drop.projection.violatedTargetId, 'table_main');
+  assert.deepEqual(drop.projection.proposedPosition, [-0.95, 0, 0.1]);
+  assert.deepEqual(drop.projection.position, [-1.7, 0, 0.1]);
+  assert.ok(drop.projection.ghost, 'emits hallucination/conflict ghost vector from xHat to xStar');
+  assert.deepEqual(drop.projection.ghost.from, [-0.95, 0, 0.1]);
+  assert.deepEqual(drop.projection.ghost.to, [-1.7, 0, 0.1]);
+
+  // Inverse Semantic Lifting: chair at [-1.7, 0, 0.1] is left_of table_main and oriented facing table_main
+  assert.equal(drop.node.relation, 'left_of');
+  assert.equal(drop.edges.some((e) => e.rel === 'left_of' && e.to === 'table_main'), true);
+  assert.equal(drop.edges.some((e) => e.rel === 'facing' && e.to === 'table_main'), true);
+  assert.ok(Array.isArray(drop.entity.components.transform.rotation), 'chair entity receives facing quaternion rotation');
+
+  // Verify ECS doc compatibility via placementEntity(..., { sceneContext: doc })
+  const ecsDoc = {
+    root: {
+      entities: {
+        table_main: {
+          name: 'table',
+          components: {
+            transform: { translation: [0, 0, 0] },
+            mesh: { model: 'mdl_table' },
+          },
+        },
+      },
+    },
+  };
+  const entFromDoc = placementEntity(chairAsset, {
+    localTranslation: [0.1, 0, 0.65],
+    sceneContext: ecsDoc,
+  });
+  // Closest boundary from [0.1, 0, 0.65] is front (+Z): expandZ = 0.85 + 0.32 + 0.08 = 1.25
+  assert.deepEqual(entFromDoc.components.transform.translation, [0.1, 0, 1.25]);
+  assert.ok(Array.isArray(entFromDoc.components.transform.rotation));
+});
+
+test('filterAssets supports academic:* Tri-Modal collections, bilingual search tokens, and computeRelationalDropPoint', () => {
+  const benchmarkAssets = [
+    { id: 'mdl_table', kind: 'model', path: 'content/models/props/table.glb' },
+    { id: 'mdl_chair', kind: 'model', path: 'content/models/props/chair.glb' },
+    { id: 'mdl_lantern', kind: 'model', path: 'content/models/props/lantern.glb' },
+    { id: 'chr_rei', kind: 'character', path: 'content/characters/rei-d30-rigged.character.json' },
+    { id: 'mdl_pavilion', kind: 'model', path: 'content/models/world/yozakura-pavilion.glb' },
+  ];
+
+  assert.deepEqual(
+    filterAssets(benchmarkAssets, { collection: 'academic:tabletop' }).map((a) => a.id),
+    ['mdl_chair', 'mdl_table'],
+  );
+  assert.deepEqual(
+    filterAssets(benchmarkAssets, { collection: 'academic:characters' }).map((a) => a.id),
+    ['chr_rei'],
+  );
+  assert.deepEqual(
+    filterAssets(benchmarkAssets, { collection: 'academic:lighting' }).map((a) => a.id),
+    ['mdl_lantern'],
+  );
+  assert.deepEqual(
+    filterAssets(benchmarkAssets, { collection: 'academic:architecture' }).map((a) => a.id),
+    ['mdl_pavilion'],
+  );
+  assert.deepEqual(
+    filterAssets(benchmarkAssets, { query: '의자' }).map((a) => a.id),
+    ['mdl_chair'],
+  );
+
+  const tableNode = inferAssetSemanticAffordance(benchmarkAssets[0], {
+    id: 'table_1',
+    position: [0, 0, 0],
+  });
+  const chairDesc = inferAssetSemanticAffordance(benchmarkAssets[1]);
+  const behindPt = computeRelationalDropPoint('behind', chairDesc, { nodes: [tableNode] });
+  assert.equal(behindPt[0], 0);
+  assert.ok(behindPt[2] < -1.2, `behind drop point should be at -Z outside table, got ${behindPt}`);
 });

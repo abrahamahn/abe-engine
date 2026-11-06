@@ -1093,3 +1093,84 @@
 .gdaw-od-svg {
   height: 54px;
 }
+
+/* Tri-Modal Audio Semantic Graph Kernel Bar & Constraint Projection Ghost */
+.gdaw-trimodal-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--gdaw-line);
+  background: linear-gradient(90deg, rgba(16, 20, 29, 0.96), rgba(22, 26, 36, 0.96));
+  font-size: 11px;
+}
+
+.gdaw-trimodal-edges {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10.5px;
+  color: #7dd3fc;
+  background: rgba(56, 189, 248, 0.1);
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  border-radius: 4px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+
+.gdaw-trimodal-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 260px;
+}
+
+.gdaw-trimodal-prompt {
+  flex: 1;
+  min-width: 200px;
+  background: #0b0d12;
+  color: #f1f5f9;
+  border: 1px solid #323846;
+  border-radius: 3px;
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+.gdaw-trimodal-prompt:focus {
+  outline: none;
+  border-color: var(--gdaw-accent);
+}
+
+.gdaw-trimodal-status {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  color: #fde68a;
+  background: rgba(232, 180, 74, 0.14);
+  border: 1px solid rgba(232, 180, 74, 0.35);
+  border-radius: 3px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+
+.gdaw-clip-ghost {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  border: 1.5px dashed #f87171;
+  border-radius: 4px;
+  background: rgba(239, 68, 68, 0.16);
+  color: #fecaca;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9.5px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  padding: 0 6px;
+  pointer-events: none;
+  z-index: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

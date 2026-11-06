@@ -37,6 +37,17 @@
   color: var(--accent, #e8b44a);
 }
 
+.gb-seq-semantic-box {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: rgba(88, 180, 255, 0.08);
+  border: 1px solid rgba(88, 180, 255, 0.35);
+  color: #bbe0ff;
+  line-height: 1.4;
+}
+
 .gb-seq-spacer {
   flex: 1 1 auto;
 }

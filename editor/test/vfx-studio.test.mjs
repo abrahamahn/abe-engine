@@ -1,10 +1,18 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  ALL_VFX_STUDIO_DOCS,
+  VFX_ACADEMIC_PRESET_DOCS,
+  VFX_ACADEMIC_SCENE_PRESETS,
   VFX_EMITTER_PRESETS,
   VFX_SCHEMA,
+  YOZAKURA_TABLE_VFX_DOCS,
+  YOZAKURA_VFX_TABLE_GUIDES,
   createDefaultVfxDocument,
+  liftVfxSpatialToSemantic,
   mountVfxStudio,
+  projectVfxConstraints,
+  renderEmbeddedVfxInspector,
   simulateVfxAt,
 } from '../vfx-studio.js';
 
@@ -116,3 +124,126 @@ test('mountVfxStudio renders budget HUD, adds emitter presets, and edits emitter
   handle.destroy();
   assert.equal(container.children.length, 0);
 });
+
+test('mountVfxStudio exposes Yozakura table VFX guide, seat anchor selector, and full burst/physics inspector', () => {
+  assert.deepEqual(Object.keys(YOZAKURA_TABLE_VFX_DOCS), [
+    'table-win-burst',
+    'all-in-chip-sparks',
+    'yozakura-sakura-petals',
+    'yozakura-lantern-embers',
+  ]);
+  assert.equal(
+    YOZAKURA_VFX_TABLE_GUIDES['table-win-burst'].sequencePath,
+    'content/sequences/poker-pot-award.seq.json',
+  );
+
+  const container = createMiniDom();
+  const edits = [];
+  const handle = mountVfxStudio(container, {
+    edit: (id, ops, label) => edits.push({ id, ops, label }),
+  });
+
+  // Defaults to table-win-burst with placement & trigger guide visible
+  const guideCard = container.find((el) => el.dataset?.role === 'vfx-table-guide');
+  assert.ok(guideCard);
+
+  const burstCountSlider = container.find((el) => el.dataset?.role === 'emitter-burst-count');
+  assert.ok(burstCountSlider);
+  assert.equal(burstCountSlider.value, '84');
+  burstCountSlider.value = '140';
+  burstCountSlider.dispatch('input');
+  assert.equal(edits.length, 1);
+  assert.deepEqual(edits[0].ops, [
+    { set: ['emitters', '0', 'bursts'], value: [{ timeS: 0, count: 140 }] },
+  ]);
+
+  const docSwitcher = container.find((el) => el.dataset?.vfxDoc === 'all-in-chip-sparks');
+  assert.ok(docSwitcher);
+  docSwitcher.dispatch('click');
+
+  const allInBurstSlider = container.find((el) => el.dataset?.role === 'emitter-burst-count');
+  assert.equal(allInBurstSlider.value, '90');
+
+  handle.destroy();
+});
+
+test('Tri-Modal VFX Core Engine: Inverse Semantic Lifting (L_vfx), Dual Constraint Projection, and Embedded Inspector', () => {
+  assert.deepEqual(Object.keys(VFX_ACADEMIC_PRESET_DOCS), [
+    'yozakura-tea-steam',
+    'ik-contact-glint',
+  ]);
+  assert.equal(Object.keys(ALL_VFX_STUDIO_DOCS).length, 6);
+  assert.deepEqual(Object.keys(VFX_ACADEMIC_SCENE_PRESETS), [
+    'yozakura_pavilion',
+    'character_ik_studio',
+    'tabletop_salon',
+  ]);
+
+  // 1. Inverse Semantic Lifting (L_vfx : R^3 -> G_rel)
+  const liftedTea = liftVfxSpatialToSemantic(
+    [0.16, 0.45, -0.04],
+    'yozakura_pavilion',
+    'yozakura-tea-steam',
+  );
+  assert.equal(liftedTea.nearestSocket.id, 'tea_set');
+  assert.equal(liftedTea.relation, 'rises_from');
+  assert.match(liftedTea.symbolicFormula, /rises_from\(yozakura-tea-steam, tea_set\)/);
+
+  // 2. Dual Spatial + GPU Frame-Budget Minimal-Perturbation Projection (\hat{\theta} -> \theta^*)
+  const hallucinatedNode = {
+    id: 'vfx_tea_steam',
+    type: 'vfx_emitter',
+    vfxId: 'yozakura-tea-steam',
+    scenePresetId: 'yozakura_pavilion',
+    rawPosition: [0.15, -0.25, -0.05], // underground / inside solid tea_table
+    position: [0.15, -0.25, -0.05],
+    spawnRate: 220, // excessive overdraw
+    burstCount: 190,
+    sizeBase: 0.095,
+    maxParticles: 320,
+    blendMode: 'additive',
+  };
+
+  const proj = projectVfxConstraints(hallucinatedNode, {
+    scenePresetId: 'yozakura_pavilion',
+  });
+  assert.equal(proj.wasProjected, true);
+  assert.equal(proj.spatialProjection.clamped, true);
+  assert.equal(proj.spatialProjection.projectedPosition[1], 0.44);
+  assert.ok(proj.spatialProjection.deltaL2 > 0.6);
+  assert.equal(proj.budgetProjection.clamped, true);
+  assert.ok(proj.budgetProjection.projectedGpuMs <= proj.budgetProjection.budgetMaxGpuMs);
+
+  // 3. Embedded Inspector widget for studio.js #inspector-body
+  const inspectorContainer = createMiniDom();
+  const changedNodes = [];
+  const inspector = renderEmbeddedVfxInspector(
+    inspectorContainer,
+    {
+      id: 'vfx_tea_steam',
+      type: 'vfx_emitter',
+      vfxId: 'yozakura-tea-steam',
+      scenePresetId: 'yozakura_pavilion',
+      position: [0.15, 0.44, -0.05],
+      spawnRate: 16,
+    },
+    {
+      onChange: (updated) => changedNodes.push(updated),
+    },
+  );
+  assert.ok(inspector);
+  const injectBtn = inspectorContainer.find(
+    (el) => el.dataset?.role === 'embedded-vfx-inject-hallucination',
+  );
+  assert.ok(injectBtn);
+  injectBtn.dispatch('click');
+  assert.ok(changedNodes.length >= 1);
+
+  const projectBtn = inspectorContainer.find(
+    (el) => el.dataset?.role === 'embedded-vfx-project-btn',
+  );
+  assert.ok(projectBtn);
+  projectBtn.dispatch('click');
+  assert.equal(inspector.getState().position[1], 0.44);
+});
+

@@ -1,14 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  DEFAULT_ACADEMIC_SEQUENCER_PRESET,
   SEQUENCE_SCHEMA,
+  SEQUENCER_DOMAIN_PRESETS,
   collectSequenceTriggers,
   createDefaultSequenceDocument,
+  createPresetSequenceDocument,
   evaluateSequenceAt,
+  inferTemporalBeatRelations,
   mountSequencerStudio,
   msToFrameLabel,
+  projectTrajectorySection,
+  resolveTemporalAgentConflict,
   sampleSequenceCurve,
   snapMsToFrame,
+  solveTwoBoneIkChain,
 } from '../sequencer-studio.js';
 
 function createMiniDom() {
@@ -81,13 +88,15 @@ test('sequencer curves, frame snapping, multi-track evaluation, and cue collecti
 
   const doc = createDefaultSequenceDocument('arena_reveal');
   assert.equal(doc.schema, SEQUENCE_SCHEMA);
+  assert.equal(doc.presetId, DEFAULT_ACADEMIC_SEQUENCER_PRESET);
+  assert.equal(DEFAULT_ACADEMIC_SEQUENCER_PRESET, 'character-ik-rig');
 
   const mid = evaluateSequenceAt(doc, 750);
   assert.ok(mid.camera);
   assert.equal(mid.skeletal.length, 1);
   assert.equal(mid.transforms.length, 1);
-  // Parabolic arc lift raises Y above base 0.9 at midpoint (750ms is halfway between 300ms and 1200ms)
   assert.ok(mid.transforms[0].position[1] > 1.05);
+  assert.ok(mid.transforms[0].ikPose);
 
   const cues = collectSequenceTriggers(doc, 1000, 1300);
   assert.equal(cues.length, 2);
@@ -97,9 +106,78 @@ test('sequencer curves, frame snapping, multi-track evaluation, and cue collecti
   );
 });
 
-test('mountSequencerStudio scrubs playhead, broadcasts PIE clock & cues, and emits edit ops', () => {
+test('Articulated Character Rigging 2-Bone IK, Inverse Temporal Lifting, and Trajectory Projection', () => {
+  // 1. Reachable target inside kinematic sphere
+  const ikValid = solveTwoBoneIkChain([0, 1.32, 0], [0.25, 1.02, 0.38], {
+    upperLen: 0.36,
+    lowerLen: 0.36,
+    maxReachRadius: 0.71,
+    surfaceMinY: 0.84,
+  });
+  assert.equal(ikValid.reachable, true);
+  assert.equal(ikValid.l2Perturbation, 0);
+  assert.ok(ikValid.elbowBendAngleDeg > 10);
+
+  // 2. Unreachable target & below desk surface -> projects onto kinematic manifold C_IK
+  const ikClamped = solveTwoBoneIkChain([0, 1.32, 0], [1.25, 0.52, 0.95], {
+    upperLen: 0.36,
+    lowerLen: 0.36,
+    maxReachRadius: 0.71,
+    surfaceMinY: 0.84,
+  });
+  assert.equal(ikClamped.reachable, false);
+  assert.equal(ikClamped.reachClamped, true);
+  assert.equal(ikClamped.surfaceClamped, true);
+  assert.ok(ikClamped.l2Perturbation > 0.5);
+  assert.ok(ikClamped.wristPos[1] >= 0.84);
+
+  // 3. Inverse Spatio-Temporal Lifting infers reaching_for, on_top_of, gaze_at, and contact_lock
+  const obstacles = SEQUENCER_DOMAIN_PRESETS['character-ik-rig'].obstacles;
+  const lifted = inferTemporalBeatRelations('wrist_hand_R', [0.28, 0.92, 0.44], obstacles, {
+    trackKind: 'skeletal',
+    gazeTargetId: 'artifact_orb',
+  });
+  const rels = lifted.edges.map((e) => e.rel);
+  assert.ok(rels.includes('reaching_for'));
+  assert.ok(rels.includes('on_top_of'));
+  assert.ok(rels.includes('gaze_at'));
+
+  // 4. Trajectory projection lifts low arc over desk obstacle and emits ghost arc points
+  const lowSection = {
+    id: 'sec_low_reach',
+    target: 'wrist_hand_R',
+    startMs: 300,
+    endMs: 1200,
+    fromPos: [-0.35, 0.78, 0.48],
+    toPos: [0.35, 0.78, 0.48],
+    arcLift: 0.01,
+    ikChain: {
+      shoulderPos: [0, 1.32, 0],
+      upperLen: 0.38,
+      lowerLen: 0.38,
+      maxReachRadius: 0.75,
+      surfaceMinY: 0.84,
+    },
+  };
+  const proj = projectTrajectorySection(lowSection, obstacles);
+  assert.equal(proj.violated, true);
+  assert.ok(proj.projectedSection.toPos[1] >= 0.84);
+  assert.ok(proj.projectedSection.arcLift > lowSection.arcLift);
+  assert.equal(proj.ghostArcPoints.length, proj.projectedArcPoints.length);
+
+  // 5. 2-Agent Temporal Conflict Resolution merges anchor shift + projects IK trajectory
+  const conflict = resolveTemporalAgentConflict(
+    { startMs: 300, endMs: 1200, fromPos: [0.28, 0.86, 0.44], toPos: [0.42, 0.65, 0.52] },
+    lowSection,
+    obstacles,
+  );
+  assert.equal(conflict.temporalOverlapMs, 900);
+  assert.ok(conflict.resolvedSection.toPos[1] >= 0.84);
+});
+
+test('mountSequencerStudio scrubs playhead, switches domain presets, resolves 2-agent rig conflict, and emits edit ops', () => {
   const container = createMiniDom();
-  const doc = createDefaultSequenceDocument('stage_seq');
+  const doc = createPresetSequenceDocument('character-ik-rig');
   const clocks = [];
   const cues = [];
   const edits = [];
@@ -118,17 +196,26 @@ test('mountSequencerStudio scrubs playhead, broadcasts PIE clock & cues, and emi
   assert.ok(clocks.length >= 1);
   assert.ok(cameraPoses.length >= 1);
 
+  const semanticBox = container.find((el) => el.dataset?.role === 'seq-semantic-edges');
+  assert.ok(semanticBox);
+  assert.match(semanticBox.textContent, /reaching_for|on_top_of/);
+
   const scrubber = container.find((el) => el.dataset?.role === 'seq-scrubber');
   assert.ok(scrubber);
   scrubber.value = '1250';
   scrubber.dispatch('input');
   assert.equal(cues.length, 2);
 
+  const conflictBtn = container.find((el) => el.dataset?.role === 'seq-sim-conflict');
+  assert.ok(conflictBtn);
+  conflictBtn.dispatch('click');
+  assert.equal(edits.length, 1);
+
   const muteBtn = container.find((el) => el.dataset?.role === 'mute-track-0');
   assert.ok(muteBtn);
   muteBtn.dispatch('click');
-  assert.equal(edits.length, 1);
-  assert.deepEqual(edits[0].ops, [{ set: ['tracks', '0', 'muted'], value: true }]);
+  assert.equal(edits.length, 2);
+  assert.deepEqual(edits[1].ops, [{ set: ['tracks', '0', 'muted'], value: true }]);
 
   handle.unmount();
   assert.equal(container.children.length, 0);

@@ -4,12 +4,16 @@ import test from 'node:test';
 import { extractWavPeaks } from '../asset-previews.js';
 import {
   MASTER_BUS_ID,
+  POKER_PRODUCTION_CUE_IDS,
   analyzeStereoFrames,
+  applyAudioSemanticPrompt,
   bounceEventToWavBytes,
   buildApplyPresetOps,
   buildPlaceLayerOp,
   computeMidSideMatrix,
+  compileAudioGbsCommand,
   createDefaultStrip,
+  createPokerProductionSoundBank,
   createRotaryKnob,
   createStarterSoundBank,
   createVerticalFader,
@@ -18,10 +22,17 @@ import {
   evaluateFadeCurve,
   evaluateStripResponseDb,
   faderNormToVolume,
+  inferAudioSemanticEdges,
   mountAudioDaw,
   normalizeSoundBankRoot,
   orderedBuses,
   orderedLayers,
+  projectAudioConstraints,
+  propagateContactMarkerShift,
+  serializeAudioSemanticGbs,
+  simulateTwoAgentAudioConflict,
+  syncAudioGraphWithScene,
+  triggerSequencerAudioCue,
   validateSoundBankRoot,
   volumeToFaderNorm,
 } from '../audio-daw.js';
@@ -547,6 +558,93 @@ test('continuous multi-step mouse dragging on clips, resize/fade handles, contac
   assert.equal(container.queryByAttr('data-fader-bus', 'sfx'), sfxFader, 'fader stays mounted on 2nd move');
   doc.dispatchEvent('pointerup', {});
   assert.ok(daw.getState().root.buses.sfx.volume > 1.0);
+
+  daw.destroy();
+});
+
+test('Tri-Modal Audio Semantic Graph Kernel: 8 Poker Production cues, Inverse Lifting, û -> u* Constraint Projection, 2-Agent Conflict, Scene Grounding, and NL Prompt', () => {
+  const bank = createPokerProductionSoundBank();
+  assert.deepEqual(validateSoundBankRoot(bank), []);
+
+  // 1. All 8 canonical Poker Production cues exist and have layers
+  assert.equal(POKER_PRODUCTION_CUE_IDS.length, 8);
+  for (const cueId of POKER_PRODUCTION_CUE_IDS) {
+    assert.ok(bank.events[cueId], `expected Poker cue ${cueId} in SoundBank`);
+    assert.ok(orderedLayers(bank.events[cueId]).length >= 1);
+  }
+
+  // 2. Inverse Audio Semantic Lifting (L_audio: Timeline/DSP -> G_rel)
+  const edges = inferAudioSemanticEdges(bank, 'evt_surface_hit');
+  const whooshEdge = edges.find((e) => e.layerId === 'lyr_pre_whoosh' && e.to === 'contact:evt_surface_hit');
+  const impactEdge = edges.find((e) => e.layerId === 'lyr_contact' && e.to === 'contact:evt_surface_hit');
+  assert.equal(whooshEdge?.rel, 'leads_contact');
+  assert.equal(impactEdge?.rel, 'at_contact');
+
+  // 3. 2-Agent Conflict & Minimal-Perturbation Audio Constraint Projection (û -> u*)
+  const conflict = simulateTwoAgentAudioConflict(bank, 'evt_surface_hit', { mode: 'project' });
+  assert.equal(conflict.proposed.startMs, -28);
+  assert.equal(conflict.projected.startMs, 0, 'negative startMs projected onto feasible boundary 0ms');
+  assert.ok(conflict.projection.ghost, 'Ghost record emitted for projected clip');
+  assert.equal(conflict.projection.ghost.proposedStartMs, -28);
+  assert.equal(conflict.projection.ghost.projectedStartMs, 0);
+
+  // 4. Forward Scene-to-Audio Grounding & Natural-Language Prompt on mounted workbench
+  const { container } = createFakeDocument();
+  const daw = mountAudioDaw(container, {});
+
+  const sceneSync = syncAudioGraphWithScene(
+    {
+      environment: { preset: 'night' },
+      nodes: [
+        { id: 'dealer_main', type: 'humanoid_dealer', position: [-1.4, 1.1, 0.2], action: 'shuffle' },
+        { id: 'chip_pot', type: 'chip_stack', position: [0.8, 0.9, 0.4] },
+      ],
+    },
+    { eye: [0, 1.68, 2.48] },
+  );
+  assert.equal(sceneSync.syncedNodes, 2);
+  assert.equal(daw.getState().selectedEventId, 'HAND_START_SHUFFLE');
+  assert.equal(daw.getState().root.buses.dialogue.strip.spatial.enabled, true);
+
+  const promptRes = applyAudioSemanticPrompt('chip bet toss widen stereo 155% punchier low end contact 120ms');
+  assert.equal(promptRes.applied, true);
+  assert.equal(daw.getState().selectedEventId, 'CHIP_BET_TOSS');
+  assert.equal(daw.getState().root.buses.master.strip.stereoWidthPct, 155);
+  assert.equal(daw.getState().root.buses.master.strip.compressor.enabled, true);
+  assert.equal(daw.getState().root.events.CHIP_BET_TOSS.contactMarkerMs, 120);
+
+  // Clicking the 2-Agent Conflict button in the Tri-Modal bar renders the Ghost clip element
+  const conflictBtn = container.queryByAttr('data-action', 'simulate-audio-conflict');
+  assert.ok(conflictBtn, '2-Agent Conflict button rendered in Tri-Modal bar');
+  conflictBtn.click();
+  const ghostNode = container.queryByAttr('data-role', 'clip-ghost');
+  assert.ok(ghostNode, 'Ghost clip û -> u* rendered on timeline lane');
+
+  // 5. Modality 2 (.gbs Audio DSL) serialize + compile + G_rel contact shift propagation
+  const gbsText = daw.serializeAudioSemanticGbs('CHIP_BET_TOSS');
+  assert.match(gbsText, /audio\.event CHIP_BET_TOSS/);
+  const gbsCompiled = daw.compileAudioGbsCommand(
+    'audio.event ALL_IN_SHOVE contact=150ms duration=780ms; audio.dsp master width=160% comp=on rev=28%',
+  );
+  assert.equal(gbsCompiled.applied, true);
+  assert.equal(daw.getState().selectedEventId, 'ALL_IN_SHOVE');
+  assert.equal(daw.getState().root.buses.master.strip.stereoWidthPct, 160);
+
+  const shifted = propagateContactMarkerShift(bank, 'HAND_START_SHUFFLE', 15, { mode: 'project', mutate: true });
+  assert.equal(shifted.contactMarkerMs, 15);
+  assert.ok(shifted.projection.ghost, 'shifting contact marker to 15ms projects pre-whoosh startMs onto 0ms');
+
+  // 6. Sequencer / Studio to Audio Engine Cue Bridge (triggerSequencerAudioCue)
+  for (const cueId of POKER_PRODUCTION_CUE_IDS) {
+    const trig = triggerSequencerAudioCue(bank, cueId, { audition: false });
+    assert.equal(trig.triggered, true);
+    assert.equal(trig.eventId, cueId);
+    assert.ok(trig.layerCount >= 1);
+    assert.ok(trig.edges.length >= 1);
+  }
+  const mountedTrig = daw.triggerSequencerAudioCue('POT_SWEEP_WIN', { audition: false });
+  assert.equal(mountedTrig.triggered, true);
+  assert.equal(daw.getState().selectedEventId, 'POT_SWEEP_WIN');
 
   daw.destroy();
 });

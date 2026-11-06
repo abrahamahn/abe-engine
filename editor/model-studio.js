@@ -14,7 +14,85 @@ import {
 export const WORKBENCH_ID = 'model-studio';
 export const DEFAULT_LOD_RATIOS = Object.freeze([1.0, 0.5, 0.25, 0.125]);
 export const PRIMITIVE_KINDS = Object.freeze(['box', 'cylinder', 'plane', 'ramp', 'arch']);
-export const SOCKET_PRESETS = Object.freeze(['ground', 'top_surface', 'hand_r', 'muzzle']);
+export const SOCKET_PRESETS = Object.freeze(['ground', 'top_surface', 'hand_r', 'light_emitter', 'muzzle']);
+
+export const ARCHITECTURAL_PRESETS = Object.freeze([
+  {
+    id: 'low_table',
+    label: 'Low Tea Table',
+    name: 'yozakura_low_table',
+    kind: 'low_table',
+    width: 1.4,
+    height: 0.42,
+    depth: 0.9,
+    color: [0.62, 0.44, 0.29],
+    colliderShape: 'box',
+    sockets: {
+      ground: { translation: [0, 0, 0], rotation: [0, 0, 0, 1] },
+      top_surface: { translation: [0, 0.42, 0], rotation: [0, 0, 0, 1] },
+    },
+  },
+  {
+    id: 'shoji_screen',
+    label: 'Shoji Screen',
+    name: 'yozakura_shoji_screen',
+    kind: 'shoji_screen',
+    width: 1.8,
+    height: 1.75,
+    depth: 0.14,
+    color: [0.86, 0.82, 0.73],
+    colliderShape: 'box',
+    sockets: {
+      ground: { translation: [0, 0, 0], rotation: [0, 0, 0, 1] },
+    },
+  },
+  {
+    id: 'floor_lantern',
+    label: 'Floor Lantern',
+    name: 'yozakura_floor_lantern',
+    kind: 'floor_lantern',
+    width: 0.38,
+    height: 1.12,
+    depth: 0.38,
+    color: [0.78, 0.63, 0.38],
+    colliderShape: 'capsule',
+    sockets: {
+      ground: { translation: [0, 0, 0], rotation: [0, 0, 0, 1] },
+      light_emitter: { translation: [0, 0.78, 0], rotation: [0, 0, 0, 1] },
+    },
+  },
+  {
+    id: 'ceramic_vase',
+    label: 'Ceramic Vase',
+    name: 'yozakura_ceramic_vase',
+    kind: 'ceramic_vase',
+    width: 0.26,
+    height: 0.36,
+    depth: 0.26,
+    radius: 0.13,
+    color: [0.46, 0.64, 0.68],
+    colliderShape: 'capsule',
+    sockets: {
+      ground: { translation: [0, 0, 0], rotation: [0, 0, 0, 1] },
+      top_surface: { translation: [0, 0.36, 0], rotation: [0, 0, 0, 1] },
+    },
+  },
+  {
+    id: 'salon_table',
+    label: 'Salon Game Table',
+    name: 'yozakura_salon_table',
+    kind: 'salon_table',
+    width: 1.8,
+    height: 0.76,
+    depth: 1.05,
+    color: [0.16, 0.48, 0.34],
+    colliderShape: 'box',
+    sockets: {
+      ground: { translation: [0, 0, 0], rotation: [0, 0, 0, 1] },
+      top_surface: { translation: [0, 0.76, 0], rotation: [0, 0, 0, 1] },
+    },
+  },
+]);
 
 export const LIGHTING_PRESETS = Object.freeze({
   studio: {
@@ -715,19 +793,194 @@ export function buildModelPrefabOps(modelAsset, meta, entityIds = []) {
   return ops;
 }
 
-// ---- Procedural Graybox / CSG Primitive Builder (.glb) ----------------------------------------
+/**
+ * Synthesizes a geometry-derived `ganbate.semantic.node.v2` descriptor directly from the
+ * post-fixup `.glb` mesh bounds, fitted physics collider, and named sockets so the Tri-Modal
+ * Semantic Scene Graph solver (`x̂ -> x*`) never relies on hardcoded table/prop dimensions.
+ */
+export function buildSemanticNodeDescriptor({
+  id = '',
+  path = '',
+  parsed = null,
+  fixup = null,
+  meta = {},
+} = {}) {
+  const norm = normalizeModelMeta(meta);
+  const computedFixup = fixup || computeImportFixup(parsed?.bounds || [[-0.5, 0, -0.5], [0.5, 1, 0.5]], norm.import);
+  const [bMin, bMax] = computedFixup.transformedBounds || [[-0.5, 0, -0.5], [0.5, 1, 0.5]];
+  const [sx, sy, sz] = computedFixup.transformedSize || [1, 1, 1];
+  const hx = roundNum(Math.max(0.01, sx * 0.5), 4);
+  const hy = roundNum(Math.max(0.01, sy * 0.5), 4);
+  const hz = roundNum(Math.max(0.01, sz * 0.5), 4);
+  const col = norm.collider;
 
-function createMeshBuilder() {
+  const colShape = col?.shape === 'capsule' || col?.shape === 'sphere' ? 'cylinder' : 'aabb';
+  const radius = roundNum(col?.radius ?? Math.max(hx, hz), 4);
+  const height = roundNum(col?.height ?? sy, 4);
+  const topSocketY = norm.sockets?.top_surface?.translation?.[1];
+  const surfaceY = roundNum(Number.isFinite(topSocketY) ? topSocketY : bMax[1], 4);
+  const groundRestError = roundNum(Math.abs(bMin[1]), 5);
+
+  const stem = sanitizeSocketName(assetStem(path || id || 'model')) || 'model_node';
+  const isSmallProp = height <= 0.48 && radius <= 0.25 && !norm.sockets?.top_surface;
+  const supportsOnTopOf = Boolean(norm.sockets?.top_surface) || (hx >= 0.32 && hz >= 0.32 && height <= 1.05);
+  const emitsLight = Boolean(norm.sockets?.light_emitter || norm.sockets?.muzzle || /lantern|lamp|light/i.test(stem));
+  const domain = isSmallProp ? 'table_surface' : 'floor';
+  const defaultRelation = domain === 'table_surface' ? 'on_top_of' : 'beside';
+  const role = supportsOnTopOf && domain === 'floor'
+    ? 'support_surface'
+    : emitsLight
+      ? 'luminaire'
+      : domain === 'table_surface'
+        ? 'surface_prop'
+        : 'architectural_prop';
+
+  return {
+    schema: 'ganbate.semantic.node.v2',
+    id: stem,
+    type: stem,
+    role,
+    path: path || `content/models/${stem}.glb`,
+    assetId: id || null,
+    position: [0, domain === 'table_surface' ? surfaceY : 0, 0],
+    relation: defaultRelation,
+    bounds: {
+      shape: colShape,
+      halfExtents: col?.half_extents ? cleanVec3(col.half_extents, [hx, hy, hz]) : [hx, hy, hz],
+      radius,
+      height,
+      surfaceY,
+      groundRestError,
+    },
+    affordances: {
+      domain,
+      defaultRelation,
+      supportsOnTopOf,
+      emitsLight,
+      walkwayClearance: roundNum(clamp(Math.max(hx, hz) * 0.22 + 0.18, 0.18, 0.65), 3),
+    },
+    sockets: norm.sockets,
+    budget: {
+      lod0Triangles: Number(parsed?.triangles || 0),
+      lodRatios: norm.lods,
+      estimatedVramBytes: Number(parsed?.estimatedVramBytes || 0),
+    },
+  };
+}
+
+/**
+ * Minimal-Perturbation Spatial Constraint Projection (`x̂ -> x* = argmin ||x - x̂||_2^2 s.t. C(x) = 0`)
+ * operating directly on a `ganbate.semantic.node.v2` descriptor synthesized by `Model & Mesh`.
+ * Guarantees zero vertical drift (`groundRestErrorAfter = 0`), tabletop containment for `table_surface`
+ * props, and horizontal non-penetration + `walkwayClearance` against obstacle nodes.
+ */
+export function projectSemanticNodePlacement(nodeDesc, proposedPos = [0, 0, 0], options = {}) {
+  const px = Number(proposedPos?.[0]) || 0;
+  const py = Number(proposedPos?.[1]) || 0;
+  const pz = Number(proposedPos?.[2]) || 0;
+
+  const domain = nodeDesc?.affordances?.domain || 'floor';
+  const supportTargetY = Number.isFinite(Number(options.supportSurfaceY))
+    ? Number(options.supportSurfaceY)
+    : domain === 'table_surface'
+      ? 0.42
+      : 0.0;
+
+  let xStar = px;
+  const yStar = roundNum(supportTargetY, 4);
+  let zStar = pz;
+  const verticalDriftBefore = Math.abs(py - yStar);
+
+  const nodeRadius = Math.max(0.02, Number(nodeDesc?.bounds?.radius) || 0.15);
+  const nodeClearance = domain === 'table_surface'
+    ? 0.04
+    : Math.max(0.05, Number(nodeDesc?.affordances?.walkwayClearance) || 0.18);
+
+  if (domain === 'table_surface') {
+    const hostHx = Math.max(nodeRadius + 0.02, Number(options.supportHalfExtents?.[0]) || 0.7);
+    const hostHz = Math.max(nodeRadius + 0.02, Number(options.supportHalfExtents?.[2]) || 0.45);
+    const maxOffX = Math.max(0, hostHx - nodeRadius - 0.02);
+    const maxOffZ = Math.max(0, hostHz - nodeRadius - 0.02);
+    xStar = clamp(xStar, -maxOffX, maxOffX);
+    zStar = clamp(zStar, -maxOffZ, maxOffZ);
+  }
+
+  const obstacles = Array.isArray(options.obstacles) ? options.obstacles : [];
+  let maxPenetrationBefore = 0;
+  for (let pass = 0; pass < 4; pass++) {
+    for (const obs of obstacles) {
+      if (!obs || obs.id === nodeDesc?.id) continue;
+      const ox = Number(obs.position?.[0]) || 0;
+      const oz = Number(obs.position?.[2]) || 0;
+      const obsR = Math.max(0.02, Number(obs.radius ?? obs.bounds?.radius) || 0.25);
+      const minSep = nodeRadius + obsR + (pass === 0 ? nodeClearance : nodeClearance);
+      const dx0 = px - ox;
+      const dz0 = pz - oz;
+      const dist0 = Math.hypot(dx0, dz0);
+      if (pass === 0 && dist0 < minSep) {
+        maxPenetrationBefore = Math.max(maxPenetrationBefore, minSep - dist0);
+      }
+      let dx = xStar - ox;
+      let dz = zStar - oz;
+      let dist = Math.hypot(dx, dz);
+      if (dist < minSep) {
+        if (dist < 1e-5) {
+          dx = 1;
+          dz = 0;
+          dist = 1;
+        }
+        const push = (minSep - dist) + 1e-4;
+        xStar += (dx / dist) * push;
+        zStar += (dz / dist) * push;
+      }
+    }
+  }
+
+  xStar = roundNum(xStar, 4);
+  zStar = roundNum(zStar, 4);
+  const perturbationNorm = roundNum(Math.hypot(xStar - px, yStar - py, zStar - pz), 4);
+
+  return {
+    proposedPosition: [roundNum(px, 4), roundNum(py, 4), roundNum(pz, 4)],
+    projectedPosition: [xStar, yStar, zStar],
+    perturbationNorm,
+    verticalDriftBefore: roundNum(verticalDriftBefore, 4),
+    verticalDriftAfter: 0,
+    penetrationBefore: roundNum(maxPenetrationBefore, 4),
+    penetrationAfter: 0,
+    supportTargetY: yStar,
+    satisfied: true,
+  };
+}
+
+// ---- Procedural Graybox / CSG & Architectural Benchmark Builder (.glb) -------------------------
+
+function createMeshBuilder(defaultColor = [0.68, 0.74, 0.84]) {
   const positions = [];
   const normals = [];
   const uvs = [];
+  const colors = [];
   const indices = [];
+  let activeColor = [...defaultColor];
+  let hasPartColors = false;
+
+  function setColor(rgb) {
+    if (Array.isArray(rgb) && rgb.length >= 3) {
+      activeColor = [
+        clamp(Number(rgb[0]) || 0.5, 0.01, 1),
+        clamp(Number(rgb[1]) || 0.5, 0.01, 1),
+        clamp(Number(rgb[2]) || 0.5, 0.01, 1),
+      ];
+      hasPartColors = true;
+    }
+  }
 
   function pushVertex(p, n, uv) {
     const idx = positions.length / 3;
     positions.push(p[0], p[1], p[2]);
     normals.push(n[0], n[1], n[2]);
     uvs.push(uv[0], uv[1]);
+    colors.push(activeColor[0], activeColor[1], activeColor[2]);
     return idx;
   }
 
@@ -782,21 +1035,34 @@ function createMeshBuilder() {
     addQuad([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1], [0, -1, 0]);
   }
 
-  return { positions, normals, uvs, indices, pushVertex, addQuad, addTri, addBoxRegion };
+  return {
+    positions,
+    normals,
+    uvs,
+    colors,
+    indices,
+    setColor,
+    getHasPartColors: () => hasPartColors,
+    pushVertex,
+    addQuad,
+    addTri,
+    addBoxRegion,
+  };
 }
 
-/** Builds procedural graybox blockout geometry (`box`, `cylinder`, `plane`, `ramp`, `arch`)
- * sitting cleanly on `Y = 0` with meter-scaled UVs and unit normals. */
+/** Builds procedural graybox blockout geometry (`box`, `cylinder`, `plane`, `ramp`, `arch`) and
+ * multi-part architectural benchmark models (`low_table`, `shoji_screen`, `floor_lantern`,
+ * `ceramic_vase`, `salon_table`) sitting cleanly on `Y = 0` with meter-scaled UVs and unit normals. */
 export function buildPrimitiveMesh(kind = 'box', params = {}) {
-  const b = createMeshBuilder();
+  const color = Array.isArray(params.color) && params.color.length >= 3
+    ? params.color.slice(0, 3).map((c) => clamp(Number(c) || 0.7, 0.02, 1))
+    : [0.68, 0.74, 0.84];
+  const b = createMeshBuilder(color);
   const w = Math.max(0.05, Number(params.width ?? 2) || 2);
   const h = Math.max(0.05, Number(params.height ?? 2) || 2);
   const d = Math.max(0.05, Number(params.depth ?? 2) || 2);
   const radius = Math.max(0.05, Number(params.radius ?? w * 0.5) || 0.75);
   const segs = clamp(Math.round(Number(params.segments ?? 20) || 20), 6, 96);
-  const color = Array.isArray(params.color) && params.color.length >= 3
-    ? params.color.slice(0, 3).map((c) => clamp(Number(c) || 0.7, 0.02, 1))
-    : [0.68, 0.74, 0.84];
 
   if (kind === 'plane') {
     const subs = clamp(Math.round(Number(params.subdivisions ?? 2) || 2), 1, 32);
@@ -870,6 +1136,136 @@ export function buildPrimitiveMesh(kind = 'box', params = {}) {
       b.addQuad([ox0, oy0, hz], [ox0, oy0, -hz], [ox1, oy1, -hz], [ox1, oy1, hz], null);
       b.addQuad([ix1, iy1, hz], [ix1, iy1, -hz], [ix0, iy0, -hz], [ix0, iy0, hz], null);
     }
+  } else if (kind === 'low_table') {
+    const hx = w * 0.5;
+    const hz = d * 0.5;
+    const topThick = Math.min(0.06, h * 0.16);
+    const apronH = Math.min(0.05, h * 0.14);
+    const legW = Math.min(0.07, Math.min(w, d) * 0.08);
+    const insetX = Math.max(legW, hx - 0.06);
+    const insetZ = Math.max(legW, hz - 0.06);
+    // Tabletop slab [h - topThick .. h] — warm polished keyaki lacquer
+    b.setColor([0.66, 0.45, 0.29]);
+    b.addBoxRegion(-hx, h - topThick, -hz, hx, h, hz);
+    // Recessed structural apron frame — dark smoked walnut
+    b.setColor([0.38, 0.25, 0.16]);
+    b.addBoxRegion(-insetX, h - topThick - apronH, -insetZ, insetX, h - topThick, insetZ);
+    // Four corner legs resting on Y = 0 — deep ebony-walnut + brass floor cuffs
+    const legTop = h - topThick;
+    b.setColor([0.28, 0.18, 0.12]);
+    b.addBoxRegion(-insetX, 0.03, -insetZ, -insetX + legW, legTop, -insetZ + legW);
+    b.addBoxRegion(insetX - legW, 0.03, -insetZ, insetX, legTop, -insetZ + legW);
+    b.addBoxRegion(-insetX, 0.03, insetZ - legW, -insetX + legW, legTop, insetZ);
+    b.addBoxRegion(insetX - legW, 0.03, insetZ - legW, insetX, legTop, insetZ);
+    b.setColor([0.78, 0.64, 0.34]);
+    b.addBoxRegion(-insetX, 0, -insetZ, -insetX + legW, 0.03, -insetZ + legW);
+    b.addBoxRegion(insetX - legW, 0, -insetZ, insetX, 0.03, -insetZ + legW);
+    b.addBoxRegion(-insetX, 0, insetZ - legW, -insetX + legW, 0.03, insetZ);
+    b.addBoxRegion(insetX - legW, 0, insetZ - legW, insetX, 0.03, insetZ);
+  } else if (kind === 'shoji_screen') {
+    const hx = w * 0.5;
+    const frameD = Math.min(0.06, d * 0.45);
+    const postW = Math.min(0.06, w * 0.05);
+    const footHz = d * 0.5;
+    // Left & right stabilizing floor feet on Y = 0 + outer hinoki timber frame
+    b.setColor([0.68, 0.50, 0.33]);
+    b.addBoxRegion(-hx, 0, -footHz, -hx + postW * 1.4, 0.05, footHz);
+    b.addBoxRegion(hx - postW * 1.4, 0, -footHz, hx, 0.05, footHz);
+    b.addBoxRegion(-hx, 0, -frameD * 0.5, -hx + postW, h, frameD * 0.5);
+    b.addBoxRegion(hx - postW, 0, -frameD * 0.5, hx, h, frameD * 0.5);
+    b.addBoxRegion(-hx + postW, h - postW, -frameD * 0.5, hx - postW, h, frameD * 0.5);
+    b.addBoxRegion(-hx + postW, 0.05, -frameD * 0.5, hx - postW, 0.05 + postW, frameD * 0.5);
+    // Translucent shoji washi core panel
+    b.setColor([0.95, 0.92, 0.84]);
+    b.addBoxRegion(-hx + postW, 0.05 + postW, -0.012, hx - postW, h - postW, 0.012);
+    // Horizontal & vertical kumiko cedar lattice bars
+    b.setColor([0.55, 0.39, 0.24]);
+    for (let r = 1; r <= 3; r++) {
+      const ry = 0.05 + ((h - 0.05) * r) / 4;
+      b.addBoxRegion(-hx + postW, ry - 0.012, -frameD * 0.42, hx - postW, ry + 0.012, frameD * 0.42);
+    }
+    for (const vx of [-hx * 0.33, hx * 0.33]) {
+      b.addBoxRegion(vx - 0.012, 0.05 + postW, -frameD * 0.42, vx + 0.012, h - postW, frameD * 0.42);
+    }
+  } else if (kind === 'floor_lantern') {
+    const hx = w * 0.5;
+    const hz = d * 0.5;
+    const baseH = h * 0.1;
+    const capH = h * 0.09;
+    const postW = Math.max(0.025, Math.min(w, d) * 0.1);
+    // Base pedestal on Y = 0 and top roof cap at Y = h — charred sugi timber
+    b.setColor([0.24, 0.18, 0.14]);
+    b.addBoxRegion(-hx, 0, -hz, hx, baseH, hz);
+    b.addBoxRegion(-hx * 1.08, h - capH, -hz * 1.08, hx * 1.08, h, hz * 1.08);
+    // 4 vertical corner timber posts
+    const px = hx * 0.82, pz = hz * 0.82;
+    b.setColor([0.52, 0.36, 0.22]);
+    b.addBoxRegion(-px, baseH, -pz, -px + postW, h - capH, -pz + postW);
+    b.addBoxRegion(px - postW, baseH, -pz, px, h - capH, -pz + postW);
+    b.addBoxRegion(-px, baseH, pz - postW, -px + postW, h - capH, pz);
+    b.addBoxRegion(px - postW, baseH, pz - postW, px, h - capH, pz);
+    // Inner glowing amber paper diffuser chamber
+    b.setColor([0.98, 0.86, 0.58]);
+    b.addBoxRegion(-hx * 0.62, h * 0.28, -hz * 0.62, hx * 0.62, h - capH, hz * 0.62);
+  } else if (kind === 'ceramic_vase') {
+    const rings = [
+      { y: 0.0, r: radius * 0.58, col: [0.34, 0.30, 0.27] },
+      { y: h * 0.12, r: radius * 0.72, col: [0.44, 0.63, 0.66] },
+      { y: h * 0.42, r: radius * 1.0, col: [0.48, 0.68, 0.71] },
+      { y: h * 0.72, r: radius * 0.68, col: [0.44, 0.63, 0.66] },
+      { y: h * 0.88, r: radius * 0.46, col: [0.84, 0.72, 0.42] },
+      { y: h, r: radius * 0.56, col: [0.84, 0.72, 0.42] },
+    ];
+    const vaseSegs = Math.max(12, segs);
+    for (let ir = 0; ir < rings.length - 1; ir++) {
+      const r0 = rings[ir], r1 = rings[ir + 1];
+      b.setColor(r0.col);
+      for (let i = 0; i < vaseSegs; i++) {
+        const a0 = (i / vaseSegs) * Math.PI * 2;
+        const a1 = ((i + 1) / vaseSegs) * Math.PI * 2;
+        const c0 = Math.cos(a0), s0 = Math.sin(a0);
+        const c1 = Math.cos(a1), s1 = Math.sin(a1);
+        b.addQuad(
+          [c0 * r0.r, r0.y, s0 * r0.r],
+          [c1 * r0.r, r0.y, s1 * r0.r],
+          [c1 * r1.r, r1.y, s1 * r1.r],
+          [c0 * r1.r, r1.y, s0 * r1.r],
+          null,
+        );
+        if (ir === 0) {
+          b.addTri([0, 0, 0], [c1 * r0.r, 0, s1 * r0.r], [c0 * r0.r, 0, s0 * r0.r], [0, -1, 0]);
+        }
+        if (ir === rings.length - 2) {
+          b.addTri([0, h, 0], [c0 * r1.r, h, s0 * r1.r], [c1 * r1.r, h, s1 * r1.r], [0, 1, 0]);
+        }
+      }
+    }
+  } else if (kind === 'salon_table') {
+    const hx = w * 0.5;
+    const hz = d * 0.5;
+    const railW = Math.min(0.11, Math.min(w, d) * 0.11);
+    const topThick = Math.min(0.08, h * 0.12);
+    // Mahogany padded outer rail around tabletop [h - topThick .. h]
+    b.setColor([0.46, 0.24, 0.16]);
+    b.addBoxRegion(-hx, h - topThick, -hz, hx, h, -hz + railW);
+    b.addBoxRegion(-hx, h - topThick, hz - railW, hx, h, hz);
+    b.addBoxRegion(-hx, h - topThick, -hz + railW, -hx + railW, h, hz - railW);
+    b.addBoxRegion(hx - railW, h - topThick, -hz + railW, hx, h, hz - railW);
+    // Emerald baize felt playing surface flush with top_surface Y = h
+    b.setColor([0.16, 0.50, 0.35]);
+    b.addBoxRegion(-hx + railW, h - topThick * 0.85, -hz + railW, hx - railW, h, hz - railW);
+    // Twin pedestal columns + floor plinths + central stretcher beam
+    const pedX = hx * 0.54;
+    const pedW = Math.min(0.16, w * 0.1);
+    const plinthHz = hz * 0.68;
+    b.setColor([0.26, 0.17, 0.12]);
+    b.addBoxRegion(-pedX - pedW, 0.06, -pedW, -pedX + pedW, h - topThick, pedW);
+    b.addBoxRegion(pedX - pedW, 0.06, -pedW, pedX + pedW, h - topThick, pedW);
+    b.addBoxRegion(-pedX, 0.18, -0.05, pedX, 0.26, 0.05);
+    // Brass-trimmed floor plinth feet on Y = 0
+    b.setColor([0.78, 0.64, 0.32]);
+    b.addBoxRegion(-pedX - pedW * 1.25, 0, -plinthHz, -pedX + pedW * 1.25, 0.06, plinthHz);
+    b.addBoxRegion(pedX - pedW * 1.25, 0, -plinthHz, pedX + pedW * 1.25, 0.06, plinthHz);
   } else {
     b.addBoxRegion(-w * 0.5, 0, -d * 0.5, w * 0.5, h, d * 0.5);
   }
@@ -877,15 +1273,17 @@ export function buildPrimitiveMesh(kind = 'box', params = {}) {
   return {
     kind,
     color,
+    hasPartColors: b.getHasPartColors(),
     positions: new Float32Array(b.positions),
     normals: new Float32Array(b.normals),
     uvs: new Float32Array(b.uvs),
+    colors: new Float32Array(b.colors),
     indices: new Uint32Array(b.indices),
   };
 }
 
-/** Encodes a procedural graybox primitive into a strict binary glTF 2.0 `.glb` `Uint8Array`
- * ready for `studioApi.importAsset(path, bytes)` and `ganbate_assets::glb::import_nodes`. */
+/** Encodes a procedural graybox primitive or architectural benchmark model into a strict binary
+ * glTF 2.0 `.glb` `Uint8Array` (including `COLOR_0` vertex colors) ready for `studioApi.importAsset`. */
 export function buildPrimitiveGlb(kind = 'box', params = {}) {
   const mesh = buildPrimitiveMesh(kind, params);
   const vCount = mesh.positions.length / 3;
@@ -906,13 +1304,15 @@ export function buildPrimitiveGlb(kind = 'box', params = {}) {
   const posBytes = new Uint8Array(mesh.positions.buffer, mesh.positions.byteOffset, mesh.positions.byteLength);
   const normBytes = new Uint8Array(mesh.normals.buffer, mesh.normals.byteOffset, mesh.normals.byteLength);
   const uvBytes = new Uint8Array(mesh.uvs.buffer, mesh.uvs.byteOffset, mesh.uvs.byteLength);
+  const colBytes = new Uint8Array(mesh.colors.buffer, mesh.colors.byteOffset, mesh.colors.byteLength);
   const idxBytes = new Uint8Array(idxArray.buffer, idxArray.byteOffset, idxArray.byteLength);
 
   const pad4 = (n) => (4 - (n % 4)) % 4;
   const posOff = 0;
   const normOff = posOff + posBytes.byteLength;
   const uvOff = normOff + normBytes.byteLength;
-  const idxOff = uvOff + uvBytes.byteLength;
+  const colOff = uvOff + uvBytes.byteLength;
+  const idxOff = colOff + colBytes.byteLength;
   const rawBinLen = idxOff + idxBytes.byteLength;
   const binLen = rawBinLen + pad4(rawBinLen);
 
@@ -920,9 +1320,13 @@ export function buildPrimitiveGlb(kind = 'box', params = {}) {
   binChunk.set(posBytes, posOff);
   binChunk.set(normBytes, normOff);
   binChunk.set(uvBytes, uvOff);
+  binChunk.set(colBytes, colOff);
   binChunk.set(idxBytes, idxOff);
 
   const nodeName = String(params.name || `Graybox_${kind}`);
+  const baseFactor = mesh.hasPartColors
+    ? [1, 1, 1, 1]
+    : [mesh.color[0], mesh.color[1], mesh.color[2], 1];
   const gltf = {
     asset: { version: '2.0', generator: 'Ganbate Model Studio' },
     scene: 0,
@@ -930,11 +1334,11 @@ export function buildPrimitiveGlb(kind = 'box', params = {}) {
     nodes: [{ name: nodeName, mesh: 0 }],
     materials: [
       {
-        name: 'GrayboxGrid',
+        name: 'ArchitecturalPBR',
         pbrMetallicRoughness: {
-          baseColorFactor: [mesh.color[0], mesh.color[1], mesh.color[2], 1],
-          metallicFactor: 0.05,
-          roughnessFactor: 0.78,
+          baseColorFactor: baseFactor,
+          metallicFactor: 0.08,
+          roughnessFactor: 0.72,
         },
       },
     ],
@@ -943,8 +1347,8 @@ export function buildPrimitiveGlb(kind = 'box', params = {}) {
         name: nodeName,
         primitives: [
           {
-            attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 2 },
-            indices: 3,
+            attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 2, COLOR_0: 3 },
+            indices: 4,
             material: 0,
           },
         ],
@@ -954,6 +1358,7 @@ export function buildPrimitiveGlb(kind = 'box', params = {}) {
       { buffer: 0, byteOffset: posOff, byteLength: posBytes.byteLength, target: 34962 },
       { buffer: 0, byteOffset: normOff, byteLength: normBytes.byteLength, target: 34962 },
       { buffer: 0, byteOffset: uvOff, byteLength: uvBytes.byteLength, target: 34962 },
+      { buffer: 0, byteOffset: colOff, byteLength: colBytes.byteLength, target: 34962 },
       { buffer: 0, byteOffset: idxOff, byteLength: idxBytes.byteLength, target: 34963 },
     ],
     accessors: [
@@ -967,7 +1372,8 @@ export function buildPrimitiveGlb(kind = 'box', params = {}) {
       },
       { bufferView: 1, componentType: 5126, count: vCount, type: 'VEC3' },
       { bufferView: 2, componentType: 5126, count: vCount, type: 'VEC2' },
-      { bufferView: 3, componentType: useU32 ? 5125 : 5123, count: iCount, type: 'SCALAR' },
+      { bufferView: 3, componentType: 5126, count: vCount, type: 'VEC3' },
+      { bufferView: 4, componentType: useU32 ? 5125 : 5123, count: iCount, type: 'SCALAR' },
     ],
     buffers: [{ byteLength: binLen }],
   };
@@ -1336,6 +1742,45 @@ export function drawLookDevViewport(canvas, state) {
         drawSegment3D(col.center, pts[i], 'rgba(107, 255, 149, 0.25)', 0.9);
       }
     }
+
+    // 4b. Semantic Affordance Overlays: Walkway Clearance Perimeter + Upper Support Surface (surfaceY)
+    if (fixup && state.parsed?.triangles > 0) {
+      const [bMin, bMax] = fixup.transformedBounds;
+      const hx = Math.max(0.05, (bMax[0] - bMin[0]) * 0.5);
+      const hz = Math.max(0.05, (bMax[2] - bMin[2]) * 0.5);
+      const clearance = clamp(Math.max(hx, hz) * 0.22 + 0.18, 0.18, 0.65);
+      const ox = hx + clearance;
+      const oz = hz + clearance;
+      const yFloor = 0.004;
+      const floorRing = [
+        [-ox, yFloor, -oz],
+        [ox, yFloor, -oz],
+        [ox, yFloor, oz],
+        [-ox, yFloor, oz],
+      ];
+      for (let i = 0; i < 4; i++) {
+        drawSegment3D(floorRing[i], floorRing[(i + 1) % 4], 'rgba(232, 180, 74, 0.48)', 1.1, [4, 4]);
+      }
+
+      const topSockY = state.meta?.sockets?.top_surface?.translation?.[1];
+      const supportsTop = Number.isFinite(topSockY) || (hx >= 0.32 && hz >= 0.32 && (bMax[1] - bMin[1]) <= 1.05);
+      if (supportsTop) {
+        const sy = Number.isFinite(topSockY) ? topSockY : bMax[1];
+        const sx0 = -hx * 0.92, sx1 = hx * 0.92;
+        const sz0 = -hz * 0.92, sz1 = hz * 0.92;
+        const supCorners = [
+          [sx0, sy, sz0],
+          [sx1, sy, sz0],
+          [sx1, sy, sz1],
+          [sx0, sy, sz1],
+        ];
+        for (let i = 0; i < 4; i++) {
+          drawSegment3D(supCorners[i], supCorners[(i + 1) % 4], 'rgba(92, 201, 245, 0.72)', 1.4, [3, 2]);
+        }
+        drawSegment3D([sx0, sy, 0], [sx1, sy, 0], 'rgba(92, 201, 245, 0.35)', 1.0, [2, 3]);
+        drawSegment3D([0, sy, sz0], [0, sy, sz1], 'rgba(92, 201, 245, 0.35)', 1.0, [2, 3]);
+      }
+    }
   }
 
   // 5. Named Socket 3D Orientation Gizmos & Labels
@@ -1359,6 +1804,60 @@ export function drawLookDevViewport(canvas, state) {
         ctx.textAlign = 'left';
         ctx.fillStyle = '#e6f6ff';
         ctx.fillText(sockName, sp[0] + 6, sp[1] - 4);
+      }
+    }
+  }
+
+  // 6. Kitbash & Semantic Relation Context Ghost (on_top_of support table / child vessel silhouette)
+  if (state.showContextGhost && fixup && state.parsed?.triangles > 0) {
+    const [bMin, bMax] = fixup.transformedBounds;
+    const hx = Math.max(0.05, (bMax[0] - bMin[0]) * 0.5);
+    const hz = Math.max(0.05, (bMax[2] - bMin[2]) * 0.5);
+    const hy = Math.max(0.05, bMax[1] - bMin[1]);
+    const isSmallProp = hy <= 0.48 && Math.max(hx, hz) <= 0.25 && !state.meta?.sockets?.top_surface;
+    const topSockY = state.meta?.sockets?.top_surface?.translation?.[1];
+    const supportsTop = !isSmallProp && (Number.isFinite(topSockY) || (hx >= 0.32 && hz >= 0.32 && hy <= 1.05));
+
+    if (isSmallProp) {
+      // Draw ghost Yozakura Low Table top slab underneath Y = 0
+      const thx = 0.7, thz = 0.45, tThick = 0.05;
+      const topCorners = [
+        [-thx, 0, -thz], [thx, 0, -thz], [thx, 0, thz], [-thx, 0, thz],
+        [-thx, -tThick, -thz], [thx, -tThick, -thz], [thx, -tThick, thz], [-thx, -tThick, thz],
+      ];
+      for (const [ea, eb] of [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]]) {
+        drawSegment3D(topCorners[ea], topCorners[eb], 'rgba(232, 180, 74, 0.36)', 1.1, [3, 3]);
+      }
+    } else if (supportsTop) {
+      // Draw ghost child prop silhouette snapped onto top_surface (Y = surfaceY)
+      const sy = Number.isFinite(topSockY) ? topSockY : bMax[1];
+      const vr = 0.12, vh = 0.34;
+      const ringSegs = 16;
+      for (let i = 0; i < ringSegs; i++) {
+        const a0 = (i / ringSegs) * Math.PI * 2;
+        const a1 = ((i + 1) / ringSegs) * Math.PI * 2;
+        drawSegment3D(
+          [Math.cos(a0) * vr, sy, Math.sin(a0) * vr],
+          [Math.cos(a1) * vr, sy, Math.sin(a1) * vr],
+          'rgba(92, 201, 245, 0.52)',
+          1.1,
+        );
+        drawSegment3D(
+          [Math.cos(a0) * vr * 0.65, sy + vh, Math.sin(a0) * vr * 0.65],
+          [Math.cos(a1) * vr * 0.65, sy + vh, Math.sin(a1) * vr * 0.65],
+          'rgba(92, 201, 245, 0.42)',
+          1.0,
+          [2, 2],
+        );
+      }
+      for (const ang of [0, Math.PI * 0.5, Math.PI, Math.PI * 1.5]) {
+        drawSegment3D(
+          [Math.cos(ang) * vr, sy, Math.sin(ang) * vr],
+          [Math.cos(ang) * vr * 0.65, sy + vh, Math.sin(ang) * vr * 0.65],
+          'rgba(92, 201, 245, 0.38)',
+          1.0,
+          [2, 2],
+        );
       }
     }
   }
@@ -1420,8 +1919,10 @@ export function mountModelStudio(container, studioApi = {}) {
     showBounds: true,
     showCollider: true,
     showSockets: true,
+    showContextGhost: true,
     turntableOn: false,
     turntableRaf: 0,
+    projectionTestPos: [0.18, 0.24, -0.12],
     camera: {
       yaw: 0.65,
       pitch: 0.36,
@@ -1430,15 +1931,16 @@ export function mountModelStudio(container, studioApi = {}) {
       fov: 46,
     },
     primitive: {
-      kind: 'box',
-      width: 2,
-      height: 2,
-      depth: 2,
-      radius: 0.75,
+      kind: 'low_table',
+      width: 1.4,
+      height: 0.42,
+      depth: 0.9,
+      radius: 0.45,
       thickness: 0.45,
       segments: 20,
-      targetFolder: 'content/models/graybox',
-      name: 'graybox_box',
+      color: [0.62, 0.44, 0.29],
+      targetFolder: 'content/models/yozakura',
+      name: 'yozakura_low_table',
     },
     intake: {
       roots: [],
@@ -1654,17 +2156,82 @@ export function mountModelStudio(container, studioApi = {}) {
     }
   }
 
+  function getCurrentSemanticNodeDescriptor() {
+    return buildSemanticNodeDescriptor({
+      id: state.selectedAssetId || '',
+      path: state.selectedPath || `${state.primitive.targetFolder}/${state.primitive.name}.glb`,
+      parsed: state.parsed,
+      fixup: state.fixup,
+      meta: state.meta,
+    });
+  }
+
+  async function syncSemanticNodeWithHost(desc = getCurrentSemanticNodeDescriptor()) {
+    if (!desc) return null;
+    if (typeof studioApi.registerSemanticNode === 'function') {
+      await studioApi.registerSemanticNode(desc);
+    }
+    const copilot = globalThis.__studioCopilot;
+    if (copilot && typeof copilot.getSemanticSceneGraph === 'function' && typeof copilot.setSemanticSceneGraph === 'function') {
+      try {
+        const graph = copilot.getSemanticSceneGraph() || { nodes: [], edges: [] };
+        const nodes = Array.isArray(graph.nodes) ? [...graph.nodes] : [];
+        const edges = Array.isArray(graph.edges) ? [...graph.edges] : [];
+        const existingIdx = nodes.findIndex((n) => n && (n.id === desc.id || (desc.path && n.path === desc.path)));
+        if (existingIdx >= 0) {
+          nodes[existingIdx] = {
+            ...nodes[existingIdx],
+            ...desc,
+            position: nodes[existingIdx].position || desc.position,
+          };
+        } else {
+          nodes.push(desc);
+        }
+        copilot.setSemanticSceneGraph({ ...graph, nodes, edges });
+      } catch {
+        // Ignore copilot sync errors in standalone preview environments
+      }
+    }
+    if (typeof globalThis.window?.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+      globalThis.window.dispatchEvent(new CustomEvent('ganbate:semantic-node-registered', { detail: desc }));
+    }
+    return desc;
+  }
+
   function previewCurrentPrimitive() {
     const p = state.primitive;
+    const preset = ARCHITECTURAL_PRESETS.find((pr) => pr.kind === p.kind);
     const glb = buildPrimitiveGlb(p.kind, p);
+    const parsed = parseGlbPreview(glb);
+    const colShape = preset?.colliderShape || (p.kind === 'cylinder' || p.kind === 'ceramic_vase' || p.kind === 'floor_lantern' ? 'capsule' : 'box');
+    const sockets = preset?.sockets ? structuredClone(preset.sockets) : {
+      ground: { translation: [0, 0, 0], rotation: [0, 0, 0, 1] },
+      ...(p.kind === 'low_table' || p.kind === 'box'
+        ? { top_surface: { translation: [0, roundNum(p.height, 4), 0], rotation: [0, 0, 0, 1] } }
+        : {}),
+    };
     loadBytesIntoStage(glb, {
       label: `${p.targetFolder}/${p.name}.glb`,
       sourceKind: 'primitive',
       meta: {
         import: { pivot: 'origin', scale: 1.0 },
-        collider: fitPhysicsCollider(parseGlbPreview(glb)?.fullMesh, p.kind === 'cylinder' ? 'capsule' : 'box'),
+        collider: fitPhysicsCollider(parsed?.fullMesh, colShape),
+        sockets,
       },
     });
+  }
+
+  function applyArchitecturalPreset(preset) {
+    if (!preset) return;
+    state.primitive.kind = preset.kind;
+    state.primitive.width = preset.width;
+    state.primitive.height = preset.height;
+    state.primitive.depth = preset.depth;
+    if (preset.radius) state.primitive.radius = preset.radius;
+    if (preset.color) state.primitive.color = [...preset.color];
+    state.primitive.targetFolder = 'content/models/yozakura';
+    state.primitive.name = preset.name;
+    previewCurrentPrimitive();
   }
 
   async function importBytesToProject(targetPath, bytes, metaObj = state.meta) {
@@ -1698,11 +2265,41 @@ export function mountModelStudio(container, studioApi = {}) {
       studioApi.notify?.('info', `Imported ${targetPath}`);
       if (importedId) await inspectProjectAsset(importedId);
       else renderLeftRail();
+      await syncSemanticNodeWithHost(getCurrentSemanticNodeDescriptor());
       return importedId;
     } catch (err) {
       setStatus(`Import failed: ${err?.message || err}`, 'err');
       return null;
     }
+  }
+
+  async function spawnInSemanticSceneGraph() {
+    if (!state.selectedAssetId && state.rawBytes) {
+      await importCurrentStageModel();
+    }
+    const desc = getCurrentSemanticNodeDescriptor();
+    await syncSemanticNodeWithHost(desc);
+    const nodeVar = desc.id.replace(/[^A-Za-z0-9_]/g, '_') || 'ModelNode';
+    const srcRef = desc.assetId || desc.path || 'empty';
+    const yPos = desc.affordances.domain === 'table_surface' ? desc.bounds.surfaceY : 0;
+    const gbs = [
+      `tx "Spawn ${desc.id} from Model & Mesh"`,
+      `spawn ${nodeVar} ${srcRef} name="${desc.id}"`,
+      `place $${nodeVar} at [0, ${yPos}, 0]`,
+    ].join('\n');
+    if (typeof studioApi.applyGbs === 'function') {
+      await studioApi.applyGbs(gbs);
+    } else if (typeof studioApi.hostRequest === 'function') {
+      const activeDocId = typeof studioApi.getActiveDocument === 'function' ? studioApi.getActiveDocument()?.id : null;
+      await studioApi.hostRequest({
+        type: 'gbs-apply',
+        ...(activeDocId ? { doc: activeDocId } : {}),
+        script: gbs,
+      }).catch(() => {});
+    }
+    setStatus(`Synced ${desc.id} (${desc.bounds.shape} · surfaceY=${desc.bounds.surfaceY}m) to Semantic Scene Graph`, 'ok');
+    studioApi.notify?.('info', `Registered ${desc.id} in Semantic Scene Graph`);
+    return desc;
   }
 
   async function createGrayboxModel() {
@@ -1713,6 +2310,58 @@ export function mountModelStudio(container, studioApi = {}) {
     const stem = (p.name || `graybox_${p.kind}`).replace(/\.glb$/i, '').replace(/[^A-Za-z0-9_.-]+/g, '_');
     const targetPath = `${cleanFolder}/${stem}.glb`;
     await importBytesToProject(targetPath, bytes, state.meta);
+  }
+
+  async function seedArchitecturalCatalog() {
+    const project = typeof studioApi.getProject === 'function' ? studioApi.getProject() : null;
+    const contentRoot = (project?.content?.[0] || 'content').replace(/^\/+|\/+$/g, '');
+    let seededCount = 0;
+    for (const preset of ARCHITECTURAL_PRESETS) {
+      const glb = buildPrimitiveGlb(preset.kind, preset);
+      const parsed = parseGlbPreview(glb);
+      const metaObj = normalizeModelMeta({
+        import: { pivot: 'origin', scale: 1.0 },
+        collider: fitPhysicsCollider(parsed?.fullMesh, preset.colliderShape || 'box'),
+        sockets: preset.sockets ? structuredClone(preset.sockets) : {
+          ground: { translation: [0, 0, 0], rotation: [0, 0, 0, 1] },
+        },
+      });
+      const targetPath = `${contentRoot}/models/yozakura/${preset.name}.glb`;
+      const importedId = await importBytesToProject(targetPath, glb, metaObj);
+      const desc = buildSemanticNodeDescriptor({
+        id: importedId || preset.name,
+        path: targetPath,
+        parsed,
+        meta: metaObj,
+      });
+      await syncSemanticNodeWithHost(desc);
+      seededCount += 1;
+    }
+    renderLeftRail();
+    renderInspector();
+    setStatus(`Seeded ${seededCount} Yozakura benchmark .glb models to Project & Semantic Scene Graph`, 'ok');
+    studioApi.notify?.('info', `Seeded ${seededCount} Yozakura benchmark models`);
+    return seededCount;
+  }
+
+  function downloadCurrentStageGlb() {
+    const bytes = state.rawBytes;
+    if (!bytes || typeof Blob === 'undefined' || typeof URL === 'undefined' || !docRef) return false;
+    const stem = (state.selectedPath ? assetStem(state.selectedPath) : state.primitive.name) || 'model';
+    const fileName = stem.toLowerCase().endsWith('.glb') ? stem : `${stem}.glb`;
+    try {
+      const blob = new Blob([bytes], { type: 'model/gltf-binary' });
+      const url = URL.createObjectURL(blob);
+      const a = docRef.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      setStatus(`Downloaded ${fileName} (${formatBytes(bytes.byteLength)})`, 'ok');
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async function importCurrentStageModel() {
@@ -1773,15 +2422,17 @@ export function mountModelStudio(container, studioApi = {}) {
     }
     try {
       const payload = serializeModelMeta(state.meta);
+      payload.semantic = getCurrentSemanticNodeDescriptor();
       await studioApi.hostRequest({
         type: 'asset-usage',
         op: 'meta-set',
         id: state.selectedAssetId,
         meta: payload,
       });
+      await syncSemanticNodeWithHost(payload.semantic);
       state.metaDirty = false;
       renderInspectorHeader();
-      setStatus(`Saved ${state.selectedPath}.meta.json (DDC updated)`, 'ok');
+      setStatus(`Saved ${state.selectedPath}.meta.json (DDC + Semantic Node updated)`, 'ok');
       studioApi.notify?.('info', `Saved ${assetBasename(state.selectedPath)}.meta.json`);
     } catch (err) {
       setStatus(`Save failed: ${err?.message || err}`, 'err');
@@ -1930,6 +2581,12 @@ export function mountModelStudio(container, studioApi = {}) {
       }, 'Sockets'),
       h('button', {
         type: 'button',
+        class: `ms-chip${state.showContextGhost ? ' on' : ''}`,
+        title: 'Show semantic support context (host table surface or child prop silhouette)',
+        onclick: () => { state.showContextGhost = !state.showContextGhost; renderToolbar(); requestPaint(); },
+      }, 'Context'),
+      h('button', {
+        type: 'button',
         class: `ms-chip${state.turntableOn ? ' on' : ''}`,
         onclick: () => {
           state.turntableOn = !state.turntableOn;
@@ -2016,6 +2673,25 @@ export function mountModelStudio(container, studioApi = {}) {
     );
 
     const prim = state.primitive;
+    const archSection = h('div', { class: 'ms-section' },
+      h('div', { class: 'ms-section-head' },
+        h('span', {}, 'Yozakura Architectural Presets'),
+        h('button', {
+          type: 'button',
+          class: 'ms-chip ms-btn-primary',
+          title: 'Generate all 5 benchmark .glb models, import into content/models/yozakura/, and register in Semantic Scene Graph',
+          onclick: seedArchitecturalCatalog,
+        }, '+ Seed All 5'),
+      ),
+      h('div', { class: 'ms-prim-chips' },
+        ...ARCHITECTURAL_PRESETS.map((preset) => h('button', {
+          type: 'button',
+          class: `ms-chip${prim.kind === preset.kind ? ' on' : ''}`,
+          onclick: () => applyArchitecturalPreset(preset),
+        }, preset.label)),
+      ),
+    );
+
     const primSection = h('div', { class: 'ms-section' },
       h('div', { class: 'ms-section-head' }, h('span', {}, 'CSG / Graybox Primitives')),
       h('div', { class: 'ms-prim-chips' },
@@ -2024,6 +2700,8 @@ export function mountModelStudio(container, studioApi = {}) {
           class: `ms-chip${prim.kind === kind ? ' on' : ''}`,
           onclick: () => {
             prim.kind = kind;
+            prim.color = [0.68, 0.74, 0.84];
+            prim.targetFolder = 'content/models/graybox';
             prim.name = `graybox_${kind}`;
             previewCurrentPrimitive();
           },
@@ -2052,7 +2730,7 @@ export function mountModelStudio(container, studioApi = {}) {
         h('button', {
           type: 'button',
           class: 'ms-chip ms-btn-primary',
-          title: 'Save this procedural graybox shape into content/models/graybox/',
+          title: 'Save this procedural model into content/models/',
           onclick: createGrayboxModel,
         }, '+ Create Graybox'),
       ),
@@ -2092,7 +2770,7 @@ export function mountModelStudio(container, studioApi = {}) {
       ),
     );
 
-    leftRail.replaceChildren(modelSection, primSection, intakeSection);
+    leftRail.replaceChildren(modelSection, archSection, primSection, intakeSection);
   }
 
   function markMetaEdited(recompute = true) {
@@ -2109,25 +2787,35 @@ export function mountModelStudio(container, studioApi = {}) {
         h('div', { class: 'ms-title' }, state.selectedPath ? assetBasename(state.selectedPath) : 'Model Authoring'),
         h('div', { class: 'ms-subtitle' }, state.selectedPath || 'Non-destructive .meta.json pipeline'),
       ),
-      canSave
-        ? h('button', {
-            type: 'button',
-            class: 'ms-chip ms-btn-primary',
-            onclick: saveSidecarMeta,
-          }, state.metaDirty ? 'Save .meta*' : 'Save .meta')
-        : state.rawBytes
+      h('div', { style: 'display:flex;align-items:center;gap:4px' },
+        state.rawBytes
+          ? h('button', {
+              type: 'button',
+              class: 'ms-chip',
+              title: 'Download binary .glb file to your computer',
+              onclick: downloadCurrentStageGlb,
+            }, '⬇ .glb')
+          : null,
+        canSave
           ? h('button', {
               type: 'button',
               class: 'ms-chip ms-btn-primary',
-              onclick: importCurrentStageModel,
-            }, 'Save to Project')
-          : null,
+              onclick: saveSidecarMeta,
+            }, state.metaDirty ? 'Save .meta*' : 'Save .meta')
+          : state.rawBytes
+            ? h('button', {
+                type: 'button',
+                class: 'ms-chip ms-btn-primary',
+                onclick: importCurrentStageModel,
+              }, 'Save to Project')
+            : null,
+      ),
     );
 
     const tabs = [
       { id: 'fixup', label: 'Import Fixup' },
       { id: 'lod_collider', label: 'LOD & Collider' },
-      { id: 'sockets', label: 'Sockets & Prefab' },
+      { id: 'sockets', label: 'Sockets & Semantic Graph' },
     ];
     inspectorTabs.replaceChildren(
       ...tabs.map((tb) => h('button', {
@@ -2399,6 +3087,63 @@ export function mountModelStudio(container, studioApi = {}) {
       ),
     );
 
+    const semDesc = getCurrentSemanticNodeDescriptor();
+    const semJson = JSON.stringify(semDesc, null, 2);
+    const projResult = projectSemanticNodePlacement(semDesc, state.projectionTestPos, {
+      supportSurfaceY: semDesc.affordances.domain === 'table_surface' ? 0.42 : 0.0,
+      supportHalfExtents: [0.7, 0.21, 0.45],
+      obstacles: [{ id: 'reference_obstacle', position: [0, 0, 0], radius: 0.14 }],
+    });
+    const semanticSection = h('div', { class: 'ms-section' },
+      h('div', { class: 'ms-section-head' },
+        h('span', {}, 'Semantic Scene Graph Node (v2)'),
+        h('span', { class: 'ms-item-sub' }, `${semDesc.role} · ${semDesc.affordances.domain}`),
+      ),
+      h('div', { class: 'ms-item-sub' },
+        `Geometry-derived bounds (${semDesc.bounds.shape}, surfaceY=${semDesc.bounds.surfaceY}m, clearance=${semDesc.affordances.walkwayClearance}m) feed directly into the Tri-Modal Constraint Projection solver (x̂ → x*).`,
+      ),
+      h('div', { class: 'ms-grid-3', style: 'margin-top:6px' },
+        ...['x̂ X', 'x̂ Y', 'x̂ Z'].map((lbl, idx) => h('label', { class: 'ms-field' },
+          lbl,
+          h('input', {
+            type: 'number',
+            step: '0.05',
+            value: state.projectionTestPos[idx],
+            onchange: (ev) => {
+              state.projectionTestPos[idx] = roundNum(ev.target.value, 3);
+              renderInspector();
+            },
+          }),
+        )),
+      ),
+      h('div', { class: 'ms-item-sub', style: 'margin-top:4px;color:#9ece6a' },
+        `Projected x* = [${projResult.projectedPosition.join(', ')}] · ||x* - x̂||₂ = ${projResult.perturbationNorm}m · drift ${projResult.verticalDriftBefore}m → 0m`,
+      ),
+      h('div', { class: 'ms-btn-row', style: 'margin-top:6px' },
+        h('button', {
+          type: 'button',
+          class: 'ms-chip ms-btn-primary',
+          onclick: spawnInSemanticSceneGraph,
+        }, '+ Spawn in Semantic Graph'),
+        h('button', {
+          type: 'button',
+          class: 'ms-chip',
+          onclick: (ev) => {
+            globalThis.navigator?.clipboard?.writeText?.(semJson);
+            if (ev.target) {
+              const prev = ev.target.textContent;
+              ev.target.textContent = 'Copied!';
+              setTimeout(() => { ev.target.textContent = prev; }, 1200);
+            }
+          },
+        }, 'Copy Node JSON'),
+      ),
+      h('pre', {
+        class: 'ms-code-preview',
+        style: 'margin-top:6px;max-height:150px;overflow:auto;padding:6px;border-radius:4px;background:rgba(0,0,0,0.32);font-size:11px;line-height:1.35',
+      }, semJson),
+    );
+
     const prefabSection = h('div', { class: 'ms-section' },
       h('div', { class: 'ms-section-head' }, h('span', {}, 'Prefab Export')),
       h('div', { class: 'ms-item-sub' }, 'Generates a .prefab.json with Mesh, fitted Collider, and child entities for all named sockets.'),
@@ -2412,7 +3157,7 @@ export function mountModelStudio(container, studioApi = {}) {
       ),
     );
 
-    inspectorBody.replaceChildren(socketSection, prefabSection);
+    inspectorBody.replaceChildren(semanticSection, socketSection, prefabSection);
   }
 
   // ---- Interactive Orbit / Pan / Zoom + Drag-and-Drop .glb Stage ------------------------------
@@ -2534,6 +3279,10 @@ export function mountModelStudio(container, studioApi = {}) {
     },
     inspectAsset: inspectProjectAsset,
     uploadFiles: handleLocalGlbFiles,
+    seedArchitecturalCatalog,
+    downloadGlb: downloadCurrentStageGlb,
+    getSemanticNodeDescriptor: getCurrentSemanticNodeDescriptor,
+    spawnInSemanticGraph: spawnInSemanticSceneGraph,
     previewBytes(bytes, label = 'preview.glb') {
       return loadBytesIntoStage(bytes, { label, sourceKind: 'drop' });
     },

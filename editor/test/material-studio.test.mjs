@@ -8,14 +8,17 @@ import {
   TONEMAP_MODES,
   buildLookPreviewPatch,
   buildMaterialDocOps,
+  compileMaterialIntent,
   computeEv100,
   ev100ExposureScale,
   evaluateBrdfPreviewPixel,
+  liftMaterialToSemanticDescriptor,
   linearToSrgbHex,
   mountMaterialStudio,
   renderShaderBallRgba,
   srgbHexToLinear,
   tonemapLinearRgb,
+  verifyAndProjectPbrMaterial,
 } from '../material-studio.js';
 
 // Minimal zero-dependency DOM shim for headless Node unit tests.
@@ -182,6 +185,8 @@ test('mountMaterialStudio aligns with StudioWorkbenchApi and responds in <50ms',
 
   const edits = [];
   const previewLooks = [];
+  const registeredMaterials = [];
+  const graphPatches = [];
   let savedId = null;
   let undoneId = null;
 
@@ -225,6 +230,12 @@ test('mountMaterialStudio aligns with StudioWorkbenchApi and responds in <50ms',
       savedId = docId;
       docs.get(docId).dirty = false;
       return true;
+    },
+    registerSemanticMaterial(desc) {
+      registeredMaterials.push(desc);
+    },
+    patchWorldGraph(patch) {
+      graphPatches.push(patch);
     },
     getViewport() {
       return {
@@ -289,7 +300,123 @@ test('mountMaterialStudio aligns with StudioWorkbenchApi and responds in <50ms',
   assert.equal(undoneId, 'mat-1');
   assert.equal(savedId, 'mat-1');
   assert.ok(docs.has('mat-2'));
+  assert.ok(registeredMaterials.length >= 1);
+  assert.ok(graphPatches.length >= 1);
+  assert.equal(graphPatches.at(-1).source, 'material-studio');
+
+  // Exercise Tri-Modal Material Intent compiler through the mounted instance.
+  const compiled = instance.applyIntent('weathered brushed brass under sunset EV11');
+  assert.equal(compiled.projectedState.surface, 'standard_ggx');
+  assert.ok(instance.getSemanticDescriptor().bsdfClass === 'microfacet_conductor');
 
   instance.destroy();
   assert.equal(container.children.length, 0);
+});
+
+test('verifyAndProjectPbrMaterial enforces physical BSDF constraints and liftMaterialToSemanticDescriptor lifts R^d -> G_mat', () => {
+  // 1. Conductor + subsurface conflict + multi-lobe energy overflow + coal-black albedo
+  const hallucinated = {
+    name: 'hallucinated_metal_sss',
+    surface: 'standard_ggx',
+    baseColorHex: '#000000',
+    roughness: 0.005,
+    metallic: 0.45,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.005,
+    sheen: 0.95,
+    subsurface: 0.9,
+  };
+  const res = verifyAndProjectPbrMaterial(hallucinated, { autoProject: true });
+  assert.equal(res.valid, false);
+  assert.ok(res.issues.some((i) => i.code === 'ggx_roughness_singularity'));
+  assert.ok(res.issues.some((i) => i.code === 'non_binary_metallic_zone'));
+  assert.ok(res.issues.some((i) => i.code === 'energy_conservation_exceeded'));
+  assert.ok(res.issues.some((i) => i.code === 'albedo_luminance_out_of_range'));
+  assert.ok(res.perturbationL2 > 0);
+  assert.ok(res.energyBudget <= 1.001, `projected energyBudget ${res.energyBudget} must obey <= 1.0`);
+  assert.ok(res.luminanceY >= 0.025, `projected luminanceY ${res.luminanceY} must obey physical floor`);
+
+  // 2. Conductor + subsurface exclusion
+  const condSss = verifyAndProjectPbrMaterial(
+    { surface: 'standard_ggx', baseColorHex: '#d8ad54', metallic: 0.95, subsurface: 0.8 },
+    { autoProject: true },
+  );
+  assert.ok(condSss.issues.some((i) => i.code === 'conductor_subsurface_conflict'));
+  assert.equal(condSss.projectedState.subsurface, 0);
+
+  // 3. Inverse Semantic Material Lifting L_mat
+  const lifted = liftMaterialToSemanticDescriptor(condSss.projectedState, 'lantern_01');
+  assert.equal(lifted.schema, 'ganbate.semantic.material.v1');
+  assert.equal(lifted.targetEntity, 'lantern_01');
+  assert.equal(lifted.bsdfClass, 'microfacet_conductor');
+  assert.equal(lifted.chromaticity, 'warm_gold_amber');
+  assert.equal(lifted.edges.length, 3);
+
+  // 4. Natural-language Material Intent compilation
+  const jade = compileMaterialIntent('translucent jade subsurface porcelain under night EV9');
+  assert.equal(jade.projectedState.surface, 'subsurface_skin');
+  assert.equal(jade.projectedState.baseColorHex, '#2d6e5e');
+});
+
+test('3D scene entity binding filters out point lights and syncs BSDF state with scene entities', async () => {
+  const doc = createMockDocument();
+  const container = doc.createElement('div');
+  const sceneEdits = [];
+  const selectionHandlers = [];
+
+  const sceneDoc = {
+    id: 'scene-1',
+    path: 'content/scenes/pavilion.scene.json',
+    kind: 'scene',
+    root: {
+      entities: {
+        'light-01': { name: 'point-light-01', components: { light: { intensity: 5 } } },
+        'ent-lantern': { name: 'courtyard-lantern', components: { mesh: { node: 'lantern' } } },
+        'ent-brass': { name: 'brass-hardware', components: { mesh: { node: 'hardware' } } },
+      },
+    },
+  };
+
+  const studioApi = {
+    listDocuments() {
+      return [];
+    },
+    getActiveDocument() {
+      return sceneDoc;
+    },
+    getState() {
+      return { activeDocument: sceneDoc };
+    },
+    async edit(docId, ops, label) {
+      sceneEdits.push({ docId, ops, label });
+      return sceneDoc;
+    },
+    on(event, fn) {
+      if (event === 'selection') selectionHandlers.push(fn);
+      return () => {};
+    },
+  };
+
+  const instance = mountMaterialStudio(container, studioApi);
+
+  // Point light (`light-01`) is filtered out in favor of 3D mesh surface entities (`ent-lantern`, `ent-brass`).
+  const entityButtons = container.queryAll((el) => el.getAttribute?.('data-scene-entity') !== null);
+  assert.equal(entityButtons.length, 2);
+  assert.equal(entityButtons[0].getAttribute('data-scene-entity'), 'ent-lantern');
+  assert.equal(entityButtons[1].getAttribute('data-scene-entity'), 'ent-brass');
+
+  // Simulate clicking `ent-brass` in the 3D scene viewport via `selection` listener.
+  assert.equal(selectionHandlers.length, 1);
+  selectionHandlers[0]({ entityIds: ['ent-brass'] });
+  assert.equal(instance.getState().focusedEntityId, 'ent-brass');
+  assert.equal(instance.getState().surface, 'standard_ggx');
+  assert.equal(instance.getSemanticDescriptor().targetEntity, 'ent-brass');
+  assert.equal(instance.getSemanticDescriptor().bsdfClass, 'microfacet_conductor');
+
+  await new Promise((r) => setImmediate(r));
+  assert.ok(sceneEdits.length >= 1);
+  assert.equal(sceneEdits.at(-1).docId, 'scene-1');
+  assert.deepEqual(sceneEdits.at(-1).ops[0].set, ['entities', 'ent-brass', 'components', 'material']);
+
+  instance.destroy();
 });

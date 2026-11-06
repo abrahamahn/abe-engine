@@ -196,7 +196,7 @@ pub unsafe extern "C" fn ganbate_rt_start(
         let owned = unsafe { Vec::from_raw_parts(world, world_len, world_len) };
         ganbate_engine::assets::cooked::decode_scene(&owned)
             .map(|(w, table)| {
-                crate::ENTITIES.with(|cell| *cell.borrow_mut() = crate::entities_json(&table));
+                crate::ENTITIES.with(|cell| *cell.borrow_mut() = crate::entities_json(&w, &table));
                 crate::physics::prepare(&w, &table);
                 w
             })

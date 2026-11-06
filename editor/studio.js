@@ -31,6 +31,16 @@ import {
   resolveTableLayoutTools,
 } from './project-tools.js';
 import { mountAiCopilot, UX_TIERS } from './ai-copilot.js';
+import {
+  computeAccurateInstanceRangeBounds,
+  collectUniqueInstanceAndLightIndices,
+  resolveEntityGizmoPivotWorld,
+  buildSubEntitySpecForWorldInstance,
+  buildSpatialGraphNodes,
+  inferWorldRelationalEdges,
+  projectWorldConstraints,
+  getInstanceCatalogEntry,
+} from './world-instance-bridge.js';
 
 const $ = (sel) => document.querySelector(sel);
 function el(tag, attrs = {}, ...children) {
@@ -242,6 +252,11 @@ function commitTyping() {
 
 function setField(id, kind, field, value, merge) {
   const path = Array.isArray(field) ? field : [field];
+  if (kind === 'transform' && path[0] === 'translation' && Array.isArray(value) && value.length >= 3) {
+    try {
+      state.aiCopilot?.liftEntityPosition?.(entity(id)?.name || id, value);
+    } catch { /* keep inspector responsive */ }
+  }
   return edit(`${t('vSet')} ${path.join('.')}`, [{ set: ['entities', id, 'components', kind, ...path], value }], merge);
 }
 
@@ -521,7 +536,7 @@ function onMessage(msg) {
       else if (msg.kind === 'data') inspectData(msg.doc);
       else if (msg.kind === 'scene' || msg.kind === 'prefab') openDoc(msg.doc);
       else {
-        const wbByKind = { material: 'material', soundbank: 'audio', character: 'character', seq: 'sequencer', vfx: 'vfx' };
+        const wbByKind = { terrain: 'terrain', material: 'material', soundbank: 'audio', character: 'character', seq: 'sequencer', vfx: 'vfx' };
         if (wbByKind[msg.kind]) void activateWorkbench(wbByKind[msg.kind], { doc: msg.doc });
       }
       break;
@@ -534,12 +549,8 @@ function onMessage(msg) {
       for (const w of msg.warnings || []) log(1, w);
       state.pendingCooked = msg;
       if (state.activeWorkbench === 'world' || state.activeWorkbench === 'layout-rig' || state.activeWorkbench === 'material') {
-        if (state.host?.kind === 'cloud') {
-          drawCloudWorldPrompt();
-        } else {
-          state.pendingCooked = null;
-          loadWorld(msg).catch((e) => log(2, `viewport: ${e.message}`));
-        }
+        state.pendingCooked = null;
+        loadWorld(msg).catch((e) => log(2, `viewport: ${e.message}`));
       }
       break;
     case 'select':
@@ -801,54 +812,534 @@ function setTime(hours) {
   pieViewport?.notifyEnvironmentChanged();
 }
 
-function drawCloudWorldPrompt() {
+function computeInstanceRangeBounds(instancesRange, fallbackMatrix, entityBounds = null) {
+  return computeAccurateInstanceRangeBounds({
+    instancesRange,
+    instMatrices: state.inst,
+    worldTable: state.worldTable,
+    entityBounds,
+    fallbackMatrix,
+  });
+}
+
+function refreshWorldRelationalGraph(activeTargetId = null) {
+  if (!state.cooked?.entities) return;
+  try {
+    state.relationalNodes = buildSpatialGraphNodes({
+      cookedEntities: state.cooked.entities,
+      currentMatrices: state.current || [],
+      docEntities: entities(),
+      worldTable: state.worldTable,
+      instMatrices: state.inst || [],
+    });
+    state.relationalEdges = inferWorldRelationalEdges(state.relationalNodes);
+    const targetId = activeTargetId || state.selection;
+    if (targetId) {
+      const targetNode = state.relationalNodes.find((n) => n.id === targetId);
+      if (targetNode) {
+        state.lastConstraintProjection = projectWorldConstraints({
+          targetId,
+          proposedCenter: targetNode.center,
+          nodes: state.relationalNodes,
+        });
+      }
+    }
+  } catch { /* keep viewport smooth */ }
+}
+
+function mergeWorldTableIntoCooked(cooked, engine) {
+  const worldTable = state.worldTable || (typeof engine?.worldEntities === 'function' ? engine.worldEntities() : null);
+  if (worldTable) state.worldTable = worldTable;
+  if (!worldTable || !Array.isArray(worldTable.entities) || !worldTable.entities.length) return;
+  if ((!Array.isArray(cooked.lamps) || !cooked.lamps.length) && Array.isArray(worldTable.lamps) && worldTable.lamps.length) {
+    cooked.lamps = worldTable.lamps.map((p) => p.slice());
+  }
+
+  const byId = new Map();
+  const byName = new Map();
+  for (let i = 0; i < worldTable.entities.length; i++) {
+    const we = worldTable.entities[i];
+    if (!we) continue;
+    if (we.id) byId.set(we.id, { we, index: i });
+    if (we.name && !byName.has(we.name)) byName.set(we.name, { we, index: i });
+  }
+
+  const childInstancesByParent = new Map();
+  for (let i = 0; i < worldTable.entities.length; i++) {
+    const we = worldTable.entities[i];
+    if (!we || we.parent === null || we.parent === undefined) continue;
+    const [first, count] = we.instances || [0, 0];
+    if (count <= 0) continue;
+    let p = we.parent;
+    let guard = 0;
+    while (p !== null && p !== undefined && guard++ < 64) {
+      const prev = childInstancesByParent.get(p);
+      if (!prev) childInstancesByParent.set(p, [first, first + count]);
+      else childInstancesByParent.set(p, [Math.min(prev[0], first), Math.max(prev[1], first + count)]);
+      p = worldTable.entities[p]?.parent;
+    }
+  }
+
+  const existingIds = new Set();
+  for (const rec of cooked.entities) {
+    existingIds.add(rec.id);
+    const docEnt = entity(rec.id);
+    const match = byId.get(rec.id)
+      || (docEnt?.name ? byName.get(docEnt.name) : null)
+      || (docEnt?.components?.mesh?.node ? byName.get(docEnt.components.mesh.node) : null);
+    if (match) {
+      const { we, index } = match;
+      if (!rec.instances || rec.instances[1] === 0) {
+        const direct = we.instances || [0, 0];
+        if (direct[1] > 0) {
+          rec.instances = direct.slice();
+        } else if (childInstancesByParent.has(index)) {
+          const [start, end] = childInstancesByParent.get(index);
+          rec.instances = [start, Math.max(0, end - start)];
+        }
+      }
+      if (!rec.lights || rec.lights[1] === 0) {
+        rec.lights = Array.isArray(we.lights) ? we.lights.slice() : [0, 0];
+      }
+      if (rec.instances?.[1] > 0 || we.bounds) {
+        rec.bounds = computeInstanceRangeBounds(rec.instances, rec.transform, we.bounds);
+      }
+    }
+  }
+
+  const worldIndexToCookedIndex = new Map();
+  for (let i = 0; i < cooked.entities.length; i++) {
+    const id = cooked.entities[i].id;
+    const m = byId.get(id) || (entity(id)?.name ? byName.get(entity(id).name) : null);
+    if (m) worldIndexToCookedIndex.set(m.index, i);
+  }
+  for (let i = 0; i < worldTable.entities.length; i++) {
+    if (worldIndexToCookedIndex.has(i)) continue;
+    const we = worldTable.entities[i];
+    if (!we || existingIds.has(we.id)) continue;
+    const parentCooked = we.parent !== null && we.parent !== undefined
+      ? (worldIndexToCookedIndex.get(we.parent) ?? null)
+      : null;
+    const cIdx = cooked.entities.length;
+    worldIndexToCookedIndex.set(i, cIdx);
+    existingIds.add(we.id);
+    const transform = Array.isArray(we.transform) && we.transform.length === 16 ? we.transform.slice() : M.IDENTITY.slice();
+    const instances = Array.isArray(we.instances) ? we.instances.slice() : [0, 0];
+    const catLabel = instances[1] === 1 ? getInstanceCatalogEntry(instances[0])?.label : null;
+    cooked.entities.push({
+      id: we.id,
+      name: catLabel || we.name || we.id,
+      parent: parentCooked,
+      transform,
+      instances,
+      lights: Array.isArray(we.lights) ? we.lights.slice() : [0, 0],
+      bounds: (instances[1] > 0 || we.bounds) ? computeInstanceRangeBounds(instances, transform, we.bounds) : null,
+    });
+  }
+}
+
+function buildTerrainMeshGeometry(terrainComp) {
+  const res = Math.max(4, Math.min(129, Math.round(Number(terrainComp.resolution) || 33)));
+  const width = Math.max(4, Number(terrainComp.worldWidth) || 120);
+  const depth = Math.max(4, Number(terrainComp.worldDepth) || 120);
+  const rawHeights = Array.isArray(terrainComp.heights) ? terrainComp.heights : [];
+  const positions = new Float32Array(res * res * 3);
+  const normals = new Float32Array(res * res * 3);
+  const uvs = new Float32Array(res * res * 2);
+  const sampleH = (gx, gz) => {
+    const cx = Math.max(0, Math.min(res - 1, gx));
+    const cz = Math.max(0, Math.min(res - 1, gz));
+    return Number(rawHeights[cz * res + cx]) || 0;
+  };
+  const cellX = width / Math.max(1, res - 1);
+  const cellZ = depth / Math.max(1, res - 1);
+  for (let gz = 0; gz < res; gz++) {
+    for (let gx = 0; gx < res; gx++) {
+      const idx = gz * res + gx;
+      const u = gx / Math.max(1, res - 1);
+      const v = gz / Math.max(1, res - 1);
+      positions[idx * 3] = (u - 0.5) * width;
+      positions[idx * 3 + 1] = sampleH(gx, gz);
+      positions[idx * 3 + 2] = (v - 0.5) * depth;
+      uvs[idx * 2] = u * 8;
+      uvs[idx * 2 + 1] = v * 8;
+
+      const dHx = (sampleH(gx + 1, gz) - sampleH(gx - 1, gz)) / (2 * cellX);
+      const dHz = (sampleH(gx, gz + 1) - sampleH(gx, gz - 1)) / (2 * cellZ);
+      const len = Math.hypot(-dHx, 1, -dHz) || 1;
+      normals[idx * 3] = -dHx / len;
+      normals[idx * 3 + 1] = 1 / len;
+      normals[idx * 3 + 2] = -dHz / len;
+    }
+  }
+  const quads = (res - 1) * (res - 1);
+  const indices = new Uint32Array(quads * 6);
+  let ptr = 0;
+  for (let gz = 0; gz < res - 1; gz++) {
+    for (let gx = 0; gx < res - 1; gx++) {
+      const i00 = gz * res + gx;
+      const i10 = i00 + 1;
+      const i01 = (gz + 1) * res + gx;
+      const i11 = i01 + 1;
+      indices[ptr++] = i00;
+      indices[ptr++] = i01;
+      indices[ptr++] = i10;
+      indices[ptr++] = i10;
+      indices[ptr++] = i01;
+      indices[ptr++] = i11;
+    }
+  }
+  return { positions, normals, uvs, indices };
+}
+
+function buildBoxMeshGeometry(hx = 0.75, hy = 0.75, hz = 0.75) {
+  const faces = [
+    { n: [0, 1, 0], v: [[-hx, hy, -hz], [-hx, hy, hz], [hx, hy, hz], [hx, hy, -hz]] },
+    { n: [0, -1, 0], v: [[-hx, -hy, hz], [-hx, -hy, -hz], [hx, -hy, -hz], [hx, -hy, hz]] },
+    { n: [1, 0, 0], v: [[hx, -hy, hz], [hx, -hy, -hz], [hx, hy, -hz], [hx, hy, hz]] },
+    { n: [-1, 0, 0], v: [[-hx, -hy, -hz], [-hx, -hy, hz], [-hx, hy, hz], [-hx, hy, -hz]] },
+    { n: [0, 0, 1], v: [[-hx, -hy, hz], [hx, -hy, hz], [hx, hy, hz], [-hx, hy, hz]] },
+    { n: [0, 0, -1], v: [[hx, -hy, -hz], [-hx, -hy, -hz], [-hx, hy, -hz], [hx, hy, -hz]] },
+  ];
+  const positions = [];
+  const normals = [];
+  const uvs = [];
+  const indices = [];
+  faces.forEach((f, fi) => {
+    const base = fi * 4;
+    f.v.forEach((p, vi) => {
+      positions.push(p[0], p[1], p[2]);
+      normals.push(f.n[0], f.n[1], f.n[2]);
+      uvs.push(vi === 1 || vi === 2 ? 1 : 0, vi >= 2 ? 1 : 0);
+    });
+    indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  });
+  return {
+    positions: new Float32Array(positions),
+    normals: new Float32Array(normals),
+    uvs: new Float32Array(uvs),
+    indices: new Uint32Array(indices),
+  };
+}
+
+function clearDynamicSceneEntities(engine = state.engine) {
+  if (state.dynamicEntities && engine) {
+    for (const dyn of state.dynamicEntities.values()) {
+      try { if (dyn.instance) engine.destroyInstance(dyn.instance); } catch { /* ignore */ }
+      try { if (dyn.mesh) engine.destroyMesh(dyn.mesh); } catch { /* ignore */ }
+      try { if (dyn.material) engine.destroyMaterial(dyn.material); } catch { /* ignore */ }
+      try { if (dyn.light) engine.destroyLight(dyn.light); } catch { /* ignore */ }
+    }
+  }
+  state.dynamicEntities = new Map();
+  state.dynamicInstanceOwner = new Map();
+}
+
+function syncDynamicSceneEntities() {
+  const engine = state.engine;
+  if (!engine || !state.cooked || typeof engine.createMesh !== 'function') return;
+  if (!state.dynamicEntities) state.dynamicEntities = new Map();
+  if (!state.dynamicInstanceOwner) state.dynamicInstanceOwner = new Map();
+
+  const docEntities = entities();
+  for (const [id, dyn] of [...state.dynamicEntities.entries()]) {
+    if (!docEntities[id]) {
+      try { if (dyn.instance) { state.dynamicInstanceOwner.delete(dyn.instance); engine.destroyInstance(dyn.instance); } } catch { /* ignore */ }
+      try { if (dyn.mesh) engine.destroyMesh(dyn.mesh); } catch { /* ignore */ }
+      try { if (dyn.material) engine.destroyMaterial(dyn.material); } catch { /* ignore */ }
+      try { if (dyn.light) engine.destroyLight(dyn.light); } catch { /* ignore */ }
+      state.dynamicEntities.delete(id);
+    }
+  }
+
+  for (const [id, e] of Object.entries(docEntities)) {
+    const r = state.records.get(id);
+    if (r === undefined) continue;
+    const rec = state.cooked.entities[r];
+    if (!rec) continue;
+    const hasStaticInstances = (rec.instances?.[1] || 0) > 0;
+    const hasStaticLights = (rec.lights?.[1] || 0) > 0;
+    const comps = e.components || {};
+    const worldMat = state.current[r] || M.IDENTITY;
+
+    if (!hasStaticInstances && (comps.terrain || comps.water || comps.mesh || (!comps.camera && !comps.environment && !comps.light && comps.transform && state.host?.kind === 'cloud'))) {
+      const sig = JSON.stringify({
+        terrain: comps.terrain ? {
+          res: comps.terrain.resolution,
+          w: comps.terrain.worldWidth,
+          d: comps.terrain.worldDepth,
+          hLen: comps.terrain.heights?.length || 0,
+          hSum: Array.isArray(comps.terrain.heights) ? comps.terrain.heights.slice(0, 32).reduce((a, b) => a + b, 0) : 0,
+        } : null,
+        water: comps.water || null,
+        mesh: comps.mesh || null,
+      });
+      const prev = state.dynamicEntities.get(id);
+      if (!prev || prev.sig !== sig) {
+        if (prev) {
+          try { if (prev.instance) { state.dynamicInstanceOwner.delete(prev.instance); engine.destroyInstance(prev.instance); } } catch { /* ignore */ }
+          try { if (prev.mesh) engine.destroyMesh(prev.mesh); } catch { /* ignore */ }
+          try { if (prev.material) engine.destroyMaterial(prev.material); } catch { /* ignore */ }
+        }
+        try {
+          let geom;
+          let matDesc;
+          if (comps.terrain) {
+            geom = buildTerrainMeshGeometry(comps.terrain);
+            const topColor = comps.terrain.splatLayers?.[0]?.color || [0.32, 0.56, 0.28];
+            matDesc = {
+              name: `${e.name || 'terrain'}-mat`,
+              color: [topColor[0] ?? 0.32, topColor[1] ?? 0.56, topColor[2] ?? 0.28, 1],
+              roughness: 0.86,
+              metallic: 0.04,
+              castsShadow: true,
+            };
+          } else if (comps.water) {
+            const ww = Math.max(4, Number(comps.water.worldWidth) || 120);
+            const wd = Math.max(4, Number(comps.water.worldDepth) || 120);
+            geom = buildBoxMeshGeometry(ww * 0.5, 0.08, wd * 0.5);
+            const wc = comps.water.shallowColor || [0.12, 0.48, 0.62];
+            matDesc = {
+              name: `${e.name || 'water'}-mat`,
+              color: [wc[0] ?? 0.12, wc[1] ?? 0.48, wc[2] ?? 0.62, Number(comps.water.opacity ?? 0.78)],
+              roughness: Number(comps.water.roughness ?? 0.12),
+              metallic: 0.15,
+              blend: 'alpha',
+              castsShadow: false,
+            };
+          } else {
+            const prim = String(comps.mesh?.primitive || comps.mesh?.node || e.name || '').toLowerCase();
+            const isTall = prim.includes('lantern') || prim.includes('tree') || prim.includes('pillar') || prim.includes('tower');
+            geom = isTall ? buildBoxMeshGeometry(0.45, 1.35, 0.45) : buildBoxMeshGeometry(0.85, 0.85, 0.85);
+            const baseCol = comps.mesh?.color || (isTall ? [0.92, 0.68, 0.36] : [0.76, 0.58, 0.42]);
+            matDesc = {
+              name: `${e.name || 'prop'}-mat`,
+              color: [baseCol[0] ?? 0.76, baseCol[1] ?? 0.58, baseCol[2] ?? 0.42, 1],
+              roughness: 0.52,
+              metallic: 0.08,
+              castsShadow: true,
+            };
+          }
+          const mesh = engine.createMesh(geom);
+          const material = engine.createMaterial(matDesc);
+          const instance = engine.createInstance(mesh, material, worldMat);
+          state.dynamicEntities.set(id, { ...(prev || {}), sig, mesh, material, instance });
+          state.dynamicInstanceOwner.set(instance, id);
+        } catch { /* ignore if headless stub engine lacks createMesh */ }
+      } else if (prev?.instance) {
+        try { engine.setInstance(prev.instance, worldMat, true); } catch { /* ignore */ }
+      }
+    }
+
+    if (!hasStaticLights && comps.light && typeof engine.createLight === 'function') {
+      const prev = state.dynamicEntities.get(id) || {};
+      const lightDesc = {
+        position: [worldMat[12] || 0, worldMat[13] || 2, worldMat[14] || 0],
+        range: Number(comps.light.range ?? 10),
+        color: Array.isArray(comps.light.color) ? comps.light.color.slice(0, 3) : [1, 0.9, 0.75],
+        intensity: Number(comps.light.intensity ?? 4),
+      };
+      try {
+        if (!prev.light) {
+          const light = engine.createLight(lightDesc);
+          state.dynamicEntities.set(id, { ...prev, light, lightDesc });
+        } else {
+          engine.setLight(prev.light, lightDesc);
+          prev.lightDesc = lightDesc;
+        }
+      } catch { /* ignore */ }
+    }
+  }
+}
+
+function rebuildCloudCookedRecords() {
+  if (!state.doc?.root || !state.cooked) return;
+  const docEntities = entities();
+  const order = [];
+  const visit = (parentId) => {
+    for (const id of children(parentId)) {
+      order.push(id);
+      visit(id);
+    }
+  };
+  visit(null);
+  const indexById = new Map(order.map((id, idx) => [id, idx]));
+  const worldMats = new Map();
+  const getWorld = (id) => {
+    if (worldMats.has(id)) return worldMats.get(id);
+    const e = docEntities[id] || {};
+    const t = e.components?.transform || {};
+    const local = M.fromTRS(t.translation, t.rotation, t.scale);
+    const pMat = e.parent && indexById.has(e.parent) ? getWorld(e.parent) : M.IDENTITY;
+    const w = M.multiply(pMat, local);
+    worldMats.set(id, w);
+    return w;
+  };
+  const prevById = new Map((state.cooked.entities || []).map((r) => [r.id, r]));
+  state.cooked.entities = order.map((id) => {
+    const e = docEntities[id] || {};
+    const w = getWorld(id);
+    const prev = prevById.get(id);
+    const pos = [w[12], w[13], w[14]];
+    let bounds = prev?.bounds || [
+      [pos[0] - 1, pos[1] - 1, pos[2] - 1],
+      [pos[0] + 1, pos[1] + 1, pos[2] + 1],
+    ];
+    if (e.components?.terrain) {
+      const hw = Math.max(2, Number(e.components.terrain.worldWidth || 120) * 0.5);
+      const hd = Math.max(2, Number(e.components.terrain.worldDepth || 120) * 0.5);
+      const mh = Math.max(2, Number(e.components.terrain.maxHeight || 24));
+      bounds = [
+        [pos[0] - hw, pos[1] - 2, pos[2] - hd],
+        [pos[0] + hw, pos[1] + mh, pos[2] + hd],
+      ];
+    } else if (e.components?.water) {
+      const hw = Math.max(2, Number(e.components.water.worldWidth || 120) * 0.5);
+      const hd = Math.max(2, Number(e.components.water.worldDepth || 120) * 0.5);
+      bounds = [
+        [pos[0] - hw, pos[1] - 0.5, pos[2] - hd],
+        [pos[0] + hw, pos[1] + 0.5, pos[2] + hd],
+      ];
+    }
+    return {
+      id,
+      name: e.name || id,
+      parent: e.parent && indexById.has(e.parent) ? indexById.get(e.parent) : null,
+      transform: w,
+      instances: prev?.instances ? prev.instances.slice() : [0, 0],
+      lights: prev?.lights ? prev.lights.slice() : [0, 0],
+      bounds,
+    };
+  });
+  mergeWorldTableIntoCooked(state.cooked, state.engine);
+  state.records = new Map(state.cooked.entities.map((r, i) => [r.id, i]));
+  state.current = state.cooked.entities.map((r) => (Array.isArray(r.transform) ? r.transform.slice() : M.IDENTITY.slice()));
+}
+
+function drawViewportWorldHud() {
   const host = $('#viewport');
-  if (!host || state.engine || !state.pendingCooked) {
-    $('#cloud-world-prompt')?.remove();
+  if (!host) return;
+  let hud = $('#viewport-world-hud');
+  if (!state.doc?.root?.entities || state.host?.kind !== 'cloud') {
+    hud?.remove();
     return;
   }
-  if ($('#cloud-world-prompt')) return;
-  const promptEl = el('div', { id: 'cloud-world-prompt', class: 'cloud-world-prompt' },
-    el('strong', {}, 'Yozakura 3D Stage & World'),
-    el('span', {}, 'Scene entities, Look lighting, and Data schemas are active in the Outliner & Inspector.'),
-    el('div', { class: 'cloud-world-prompt-actions' },
-      el('button', {
+  if (!hud) {
+    hud = el('div', { id: 'viewport-world-hud' });
+    host.append(hud);
+  }
+  hud.replaceChildren();
+
+  const docEntities = entities();
+  const cameraIds = Object.keys(docEntities).filter((id) => docEntities[id]?.components?.camera);
+  if (cameraIds.length) {
+    const camGroup = el('div', { class: 'world-hud-group' },
+      el('span', { class: 'world-hud-label' }, lang() === 'ko' ? '카메라' : 'Cameras'),
+    );
+    for (const camId of cameraIds.slice(0, 7)) {
+      const camEnt = docEntities[camId];
+      const shortName = String(camEnt.name || camId).replace(/\s*camera$/i, '');
+      const isSelected = state.selection === camId || state.cameraFollow === camId;
+      camGroup.append(el('button', {
         type: 'button',
-        class: 'on',
-        onclick: () => { void activateWorkbench('project:layout-tuner'); },
-      }, 'Table Layouts (2.5D / 3D)'),
-      el('button', {
-        type: 'button',
-        onclick: () => {
-          const cookedToLoad = state.pendingCooked;
-          state.pendingCooked = null;
-          $('#cloud-world-prompt')?.remove();
-          if (cookedToLoad) {
-            loadWorld(cookedToLoad).catch((e) => log(2, `viewport: ${e.message}`));
+        class: `world-hud-btn${isSelected ? ' on' : ''}`,
+        title: `${camEnt.name || camId} — Click to jump view · Shift+Click to lock camera`,
+        onclick: (ev) => {
+          ev.stopPropagation();
+          if (ev.shiftKey) {
+            lookThrough(camId);
+            select(camId);
+            return;
+          }
+          const cam = camEnt.components?.camera;
+          const view = orbitFromCamera(cameraWorld(docEntities, camId), cam?.fov ?? 50, 10.5);
+          if (view) {
+            state.cameraFollow = null;
+            state.view = { ...view, ...cameraLens(cam || {}) };
+            const fovEl = $('#viewport-fov');
+            if (fovEl) fovEl.value = String(state.view.fov);
+            markViewportDirty(6, 250);
+            scheduleSelectionSync();
           }
         },
-      }, 'Load 3D World Viewport'),
-    ),
+      }, `📷 ${shortName}`));
+    }
+    hud.append(camGroup);
+  }
+
+  const actionGroup = el('div', { class: 'world-hud-group' },
+    el('button', {
+      type: 'button',
+      class: 'world-hud-btn accent',
+      title: 'Sculpt heightmaps, spline walkways, water & sky in Landscape & Terrain Studio',
+      onclick: (ev) => {
+        ev.stopPropagation();
+        void activateWorkbench('terrain');
+      },
+    }, lang() === 'ko' ? '⛰️ 지형 생성 · 편집' : '⛰️ Create / Edit Landscape'),
+    el('button', {
+      type: 'button',
+      class: 'world-hud-btn',
+      title: 'Spawn a new 3D object at the current camera target and select it with the Move gizmo',
+      onclick: async (ev) => {
+        ev.stopPropagation();
+        const [id] = (await takeIds(1)) || [];
+        if (!id || !state.doc) return;
+        const pos = state.view.target.map((v) => M.tidy(v, 2));
+        const value = {
+          name: '3D Stage Object',
+          components: {
+            transform: { translation: pos, rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
+            mesh: { primitive: 'box', color: [0.85, 0.62, 0.36] },
+          },
+        };
+        const ans = await edit(t('vAddEntity'), [{ set: ['entities', id], value }]);
+        if (ans?.type === 'ops') select(id);
+      },
+    }, lang() === 'ko' ? '＋ 3D 오브젝트 추가' : '＋ Add 3D Object'),
   );
-  host.append(promptEl);
+  hud.append(actionGroup);
 }
 
 async function loadWorld(cooked) {
   $('#cloud-world-prompt')?.remove();
+  const worldUrl = cooked.worldUrl || (`/cooked/${String(cooked.file || '').split('/').pop()}`);
+  if (
+    state.host?.kind === 'cloud'
+    && state.engine
+    && state.loadedWorldUrl === worldUrl
+    && !state.forceWorldReload
+  ) {
+    cooked.entities = Array.isArray(cooked.entities) ? cooked.entities : [];
+    cooked.lamps = Array.isArray(cooked.lamps) ? cooked.lamps : [];
+    mergeWorldTableIntoCooked(cooked, state.engine);
+    state.cooked = cooked;
+    state.records = new Map(cooked.entities.map((r, i) => [r.id, i]));
+    state.current = cooked.entities.map((r) => (Array.isArray(r.transform) ? r.transform.slice() : M.IDENTITY.slice()));
+    for (const id of Object.keys(entities())) {
+      if (state.records.has(id)) placeEntity(id, worldFromDoc(id));
+    }
+    syncDynamicSceneEntities();
+    drawViewportWorldHud();
+    markViewportDirty(8, 300);
+    return;
+  }
+
   // Cooks can arrive while an earlier one is still loading: only the newest load shows its
   // world, and every engine a newer load replaces or overtakes is destroyed.
   const gen = ++state.loadGen;
   const look = previewLook();
   setTime(look.time?.hours ?? 17.5);
   state.weather = look.weather?.preset || 'clear';
-  const worldUrl = cooked.worldUrl || (`/cooked/${String(cooked.file || '').split('/').pop()}`);
   const old = state.canvas;
   const canvas = el('canvas', { id: 'viewport-canvas' });
   const host = $('#viewport');
+  clearDynamicSceneEntities();
   if (state.engine) {
     try { state.engine.destroy(); } catch { /* the old engine is going anyway */ }
   }
   state.engine = null;
+  state.worldTable = null;
   if (old) old.replaceWith(canvas);
   else host.prepend(canvas);
   state.canvas = canvas;
@@ -866,26 +1357,34 @@ async function loadWorld(cooked) {
     ...(state.host?.kind === 'cloud' ? { quality: 'low-cost' } : {}),
     onLog: (level, text) => log(level, `engine: ${text}`),
   });
-  if (gen !== state.loadGen || (state.activeWorkbench !== 'world' && state.activeWorkbench !== 'layout-rig' && state.activeWorkbench !== 'material')) {
+  if (gen !== state.loadGen || (state.activeWorkbench !== 'world' && state.activeWorkbench !== 'layout-rig' && state.activeWorkbench !== 'material' && state.activeWorkbench !== 'terrain')) {
     state.pendingCooked = cooked;
     engine.destroy();
     return;
   }
+  state.loadedWorldUrl = worldUrl;
+  state.forceWorldReload = false;
   cooked.entities = Array.isArray(cooked.entities) ? cooked.entities : [];
   cooked.lamps = Array.isArray(cooked.lamps) ? cooked.lamps : [];
+  const hadHostBounds = cooked.entities.some((r) => r.bounds && (r.instances?.[1] > 0));
+  state.inst = [];
+  for (let i = 0; i < engine.worldInstances(); i++) state.inst.push(engine.worldInstance(i).matrix);
+  mergeWorldTableIntoCooked(cooked, engine);
   state.cooked = cooked;
   state.records = new Map(cooked.entities.map((r, i) => [r.id, i]));
   state.current = cooked.entities.map((r) => (Array.isArray(r.transform) ? r.transform.slice() : M.IDENTITY.slice()));
-  state.inst = [];
-  for (let i = 0; i < engine.worldInstances(); i++) state.inst.push(engine.worldInstance(i).matrix);
   state.lamps = cooked.lamps.map((p) => p.slice());
   engine.fitCanvas(effectiveViewportDpr());
   state.engine = engine;
+  syncDynamicSceneEntities();
+  refreshWorldRelationalGraph();
+  drawViewportWorldHud();
   markViewportDirty(10, 500);
   // Paint the latest authored Look if it changed while the graphics device was opening.
   const latest = previewLook();
   if (JSON.stringify(latest) !== JSON.stringify(look)) {
     if (JSON.stringify([latest.time, latest.weather]) !== JSON.stringify([look.time, look.weather])) {
+      state.forceWorldReload = true;
       await loadWorld(cooked);
       return;
     }
@@ -903,8 +1402,25 @@ async function loadWorld(cooked) {
   }
   if (!state.framed) {
     state.framed = true;
-    if (state.cameraFollow) lookThrough(state.cameraFollow);
-    else frameAll();
+    if (state.cameraFollow) {
+      lookThrough(state.cameraFollow);
+    } else if (!hadHostBounds) {
+      const docEntities = entities();
+      const camIds = Object.keys(docEntities).filter((id) => docEntities[id]?.components?.camera);
+      const preferredCam = camIds.find((id) => /terrace|salon|main|courtyard|stage/i.test(docEntities[id]?.name || '')) || camIds[0];
+      const cam = preferredCam ? docEntities[preferredCam]?.components?.camera : null;
+      const camView = preferredCam ? orbitFromCamera(cameraWorld(docEntities, preferredCam), cam?.fov ?? 50, 10.5) : null;
+      if (camView) {
+        state.view = { ...camView, ...cameraLens(cam || {}) };
+        const fovEl = $('#viewport-fov');
+        if (fovEl) fovEl.value = String(state.view.fov);
+        markViewportDirty(8, 300);
+      } else {
+        frameAll();
+      }
+    } else {
+      frameAll();
+    }
   }
 }
 
@@ -940,20 +1456,34 @@ function placeEntity(id, world) {
     while (p !== null && p !== undefined && p > r) p = recs[p].parent;
     if (p === r) under.push(i);
   }
+  const { instanceIndices, lightIndices } = collectUniqueInstanceAndLightIndices(recs, under);
+  for (const j of instanceIndices) {
+    if (!state.inst[j]) continue;
+    state.inst[j] = M.multiply(d, state.inst[j]);
+    state.engine.setWorldInstance(j, state.inst[j], true);
+  }
+  for (const l of lightIndices) {
+    if (!state.lamps[l]) continue;
+    state.lamps[l] = M.point(d, state.lamps[l]);
+    state.engine.setWorldLight(l, state.lamps[l]);
+  }
   for (const k of under) {
     state.current[k] = M.multiply(d, state.current[k]);
-    const [first, count] = recs[k].instances || [0, 0];
-    for (let j = first; j < first + count; j++) {
-      state.inst[j] = M.multiply(d, state.inst[j]);
-      state.engine.setWorldInstance(j, state.inst[j], true);
+    const dyn = state.dynamicEntities?.get(recs[k].id);
+    if (dyn?.instance) {
+      try { state.engine.setInstance(dyn.instance, state.current[k], true); } catch { /* ignore */ }
     }
-    const [lf, lc] = recs[k].lights || [0, 0];
-    for (let l = lf; l < lf + lc; l++) {
-      if (!state.lamps[l]) continue;
-      state.lamps[l] = M.point(d, state.lamps[l]);
-      state.engine.setWorldLight(l, state.lamps[l]);
+    if (dyn?.light && dyn?.lightDesc) {
+      try {
+        dyn.lightDesc = {
+          ...dyn.lightDesc,
+          position: [state.current[k][12], state.current[k][13], state.current[k][14]],
+        };
+        state.engine.setLight(dyn.light, dyn.lightDesc);
+      } catch { /* ignore */ }
     }
   }
+  refreshWorldRelationalGraph(id);
   markViewportDirty();
 }
 
@@ -1019,17 +1549,67 @@ function project(p) {
   return state.engine ? state.engine.project(p) : null;
 }
 
-/** The record under a CSS pixel, as the nearest ancestor the document itself holds. */
+/** The record under a CSS pixel, promoting individual `.gbew` sub-meshes on click so every
+ * building, table, chair, bridge, boat, and tree in Yozakura World is individually selectable. */
 function entityAt(x, y) {
-  const hit = state.engine?.pickWorld(x, y);
-  if (!hit) return null;
-  const recs = state.cooked.entities;
-  let r = recs.findIndex((rec) => {
-    const [first, count] = rec.instances || [0, 0];
-    return hit.instance >= first && hit.instance < first + count;
-  });
-  while (r >= 0 && !entity(recs[r].id)) r = recs[r].parent ?? -1;
-  return r >= 0 ? recs[r].id : null;
+  if (!state.engine || !state.cooked) return null;
+  const dynHit = typeof state.engine.pick === 'function' ? state.engine.pick(x, y) : null;
+  const worldHit = state.engine.pickWorld(x, y);
+  if (dynHit && state.dynamicInstanceOwner?.has(dynHit.instance)) {
+    if (!worldHit || dynHit.distance <= worldHit.distance + 0.05) {
+      const ownerId = state.dynamicInstanceOwner.get(dynHit.instance);
+      if (ownerId && entity(ownerId)) return ownerId;
+    }
+  }
+  if (worldHit) {
+    const recs = state.cooked.entities;
+    // Prefer exact single-instance leaf sub-mesh (`inst-0..88`) first
+    let r = recs.findIndex((rec) => {
+      const [first, count] = rec.instances || [0, 0];
+      return count === 1 && first === worldHit.instance;
+    });
+    if (r < 0) {
+      r = recs.findIndex((rec) => {
+        const [first, count] = rec.instances || [0, 0];
+        return worldHit.instance >= first && worldHit.instance < first + count;
+      });
+    }
+    if (r >= 0 && !entity(recs[r].id) && state.doc?.root?.entities && recs[r].instances?.[1] === 1) {
+      const parentIdx = recs[r].parent;
+      const parentId = (parentIdx !== null && parentIdx !== undefined && recs[parentIdx] && entity(recs[parentIdx].id))
+        ? recs[parentIdx].id
+        : null;
+      const subSpec = buildSubEntitySpecForWorldInstance(worldHit.instance, state.worldTable, parentId);
+      state.doc.root.entities[subSpec.id] = subSpec.entityValue;
+      recs[r].id = subSpec.id;
+      recs[r].name = subSpec.entityValue.name;
+      state.records.set(subSpec.id, r);
+      drawOutliner();
+      refreshWorldRelationalGraph(subSpec.id);
+      return subSpec.id;
+    }
+    while (r >= 0 && !entity(recs[r].id)) r = recs[r].parent ?? -1;
+    if (r >= 0) return recs[r].id;
+  }
+  let bestId = null;
+  let bestDist = 14;
+  for (const [id] of Object.entries(entities())) {
+    const r = state.records.get(id);
+    if (r === undefined) continue;
+    const o = resolveEntityGizmoPivotWorld({
+      record: state.cooked.entities[r],
+      currentMatrix: state.current[r],
+      currentBounds: boundsOf(id),
+    });
+    const p = project(o);
+    if (!p) continue;
+    const d = Math.hypot(p.x - x, p.y - y);
+    if (d < bestDist) {
+      bestDist = d;
+      bestId = id;
+    }
+  }
+  return bestId;
 }
 
 const AXES = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
@@ -1039,9 +1619,21 @@ function gizmo() {
   const id = state.selection;
   const r = id && state.records.get(id);
   if (r === undefined || r === null) return null;
-  const m = state.current[r];
-  const o = [m[12], m[13], m[14]];
-  const po = project(o);
+  const b = boundsOf(id);
+  let o = resolveEntityGizmoPivotWorld({
+    record: state.cooked.entities[r],
+    currentMatrix: state.current[r],
+    currentBounds: b,
+  });
+  let po = project(o);
+  if (!po && b) {
+    const center = [0, 1, 2].map((i) => (b[0][i] + b[1][i]) * 0.5);
+    const pc = project(center);
+    if (pc) {
+      o = center;
+      po = pc;
+    }
+  }
   if (!po) return null;
   const len = Math.max(0.3, state.view.distance * 0.12);
   const ends = AXES.map((a) => project([o[0] + a[0] * len, o[1] + a[1] * len, o[2] + a[2] * len]));
@@ -1077,27 +1669,82 @@ function drawOverlay() {
   const g2 = c.getContext('2d');
   g2.clearRect(0, 0, c.width, c.height);
   if (!state.engine || !state.cooked) return;
-  // Cameras: a dot and the way they look.
+  // Cameras & lights: subtle 3D viewport pins.
   for (const [id, e] of Object.entries(entities())) {
-    if (!e.components?.camera || !state.records.has(id)) continue;
+    if (!state.records.has(id)) continue;
+    const isCam = Boolean(e.components?.camera);
+    const isLight = Boolean(e.components?.light && !e.parent);
+    if (!isCam && !isLight) continue;
     const m = state.current[state.records.get(id)];
     const o = project([m[12], m[13], m[14]]);
-    const f = project(M.point(m, [0, 0, -1]));
     if (!o) continue;
-    g2.strokeStyle = '#e8c86a';
-    g2.fillStyle = '#e8c86a';
+    const col = isCam ? '#e8c86a' : '#ffb86c';
+    g2.strokeStyle = col;
+    g2.fillStyle = col;
     g2.beginPath();
-    g2.arc(o.x, o.y, 4, 0, Math.PI * 2);
+    g2.arc(o.x, o.y, state.selection === id ? 6 : 4, 0, Math.PI * 2);
     g2.fill();
-    if (f) {
-      g2.beginPath();
-      g2.moveTo(o.x, o.y);
-      g2.lineTo(f.x, f.y);
-      g2.stroke();
+    if (isCam) {
+      const f = project(M.point(m, [0, 0, -1]));
+      if (f) {
+        g2.beginPath();
+        g2.moveTo(o.x, o.y);
+        g2.lineTo(f.x, f.y);
+        g2.stroke();
+      }
     }
   }
   const id = state.selection;
   if (!id) return;
+
+  // Draw live Neuro-Symbolic Relational Graph edges (`edges[]`) for the selected entity
+  if (Array.isArray(state.relationalEdges) && Array.isArray(state.relationalNodes)) {
+    const nodeById = new Map(state.relationalNodes.map((n) => [n.id, n]));
+    const activeEdges = state.relationalEdges.filter((edge) => edge.from === id || edge.to === id).slice(0, 8);
+    g2.save();
+    g2.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
+    for (const edge of activeEdges) {
+      const nFrom = nodeById.get(edge.from);
+      const nTo = nodeById.get(edge.to);
+      if (!nFrom || !nTo) continue;
+      const p1 = project(nFrom.center);
+      const p2 = project(nTo.center);
+      if (!p1 || !p2) continue;
+      g2.strokeStyle = 'rgba(88, 214, 255, 0.85)';
+      g2.lineWidth = 1.5;
+      g2.setLineDash([4, 4]);
+      g2.beginPath();
+      g2.moveTo(p1.x, p1.y);
+      g2.lineTo(p2.x, p2.y);
+      g2.stroke();
+      const mx = (p1.x + p2.x) * 0.5;
+      const my = (p1.y + p2.y) * 0.5;
+      const tag = edge.distanceM !== undefined ? `${edge.type} (${edge.distanceM}m)` : edge.type;
+      g2.fillStyle = 'rgba(12, 18, 28, 0.82)';
+      const tw = g2.measureText(tag).width + 8;
+      g2.fillRect(mx - tw * 0.5, my - 9, tw, 16);
+      g2.fillStyle = '#7ce8ff';
+      g2.fillText(tag, mx - tw * 0.5 + 4, my + 3);
+    }
+    if (state.lastConstraintProjection?.targetId === id && !state.lastConstraintProjection.satisfied) {
+      const cp = state.lastConstraintProjection;
+      const pHat = project(cp.proposedCenter);
+      const pStar = project(cp.projectedCenter);
+      if (pHat && pStar) {
+        g2.setLineDash([]);
+        g2.strokeStyle = '#ff6b6b';
+        g2.lineWidth = 2;
+        g2.beginPath();
+        g2.moveTo(pHat.x, pHat.y);
+        g2.lineTo(pStar.x, pStar.y);
+        g2.stroke();
+        g2.fillStyle = '#ff6b6b';
+        g2.fillText(`x* (+${cp.displacementM}m)`, pStar.x + 6, pStar.y - 4);
+      }
+    }
+    g2.restore();
+  }
+
   const b = boundsOf(id);
   if (b) {
     const corners = [];
@@ -1261,8 +1908,13 @@ function startDrag(axis, x, y) {
   if (state.simulating) return;
   const id = state.selection;
   const r = state.records.get(id);
+  if (r === undefined || r === null) return;
   const start = state.current[r].slice();
-  const o = [start[12], start[13], start[14]];
+  const o = resolveEntityGizmoPivotWorld({
+    record: state.cooked.entities[r],
+    currentMatrix: start,
+    currentBounds: boundsOf(id),
+  });
   const po = project(o);
   const pa = project(M.point(M.fromTRS(o), AXES[axis]));
   if (!po || !pa) return;
@@ -1308,7 +1960,13 @@ function endDrag() {
   const same = (a, b, def) => (a || def).every((v, i) => Math.abs(v - b[i]) < 1e-6);
   const ops = [];
   const path = (f) => ['entities', d.id, 'components', 'transform', f];
-  if (!same(old.translation, tr, [0, 0, 0])) ops.push({ set: path('translation'), value: tr.map((v) => M.tidy(v)) });
+  if (!same(old.translation, tr, [0, 0, 0])) {
+    const nextPos = tr.map((v) => M.tidy(v));
+    ops.push({ set: path('translation'), value: nextPos });
+    try {
+      state.aiCopilot?.liftEntityPosition?.(e.name || d.id, nextPos);
+    } catch { /* keep gizmo drag responsive */ }
+  }
   if (!same(old.rotation, q, [0, 0, 0, 1])) ops.push({ set: path('rotation'), value: q.map((v) => M.tidy(v, 6)) });
   if (!same(old.scale, s, [1, 1, 1])) ops.push({ set: path('scale'), value: s.map((v) => M.tidy(v)) });
   if (!ops.length) return;
@@ -1337,6 +1995,7 @@ function viewportEvents() {
       state.click = { x, y };
     } else {
       orbit = { x: e.clientX, y: e.clientY, pan: e.button === 1 || e.shiftKey };
+      state.orbiting = true;
     }
   });
   vp.addEventListener('pointermove', (e) => {
@@ -1379,6 +2038,7 @@ function viewportEvents() {
     else if (state.click && Math.hypot(x - state.click.x, y - state.click.y) < 4) select(entityAt(x, y));
     state.click = null;
     orbit = null;
+    state.orbiting = false;
     markViewportDirty(2, 80);
   });
   vp.addEventListener('wheel', (e) => {
@@ -1440,6 +2100,7 @@ function select(id) {
   markViewportDirty();
   drawOutliner();
   drawInspector();
+  drawViewportWorldHud();
   if (state.doc) state.host.send({ type: 'select', doc: state.doc.id, entities: id ? [id] : [] });
   scheduleSelectionSync();
   emitStudioEvent('selection', buildSelectionSnapshot());
@@ -1451,6 +2112,7 @@ function drawAll() {
   drawOutliner();
   drawInspector();
   drawAssets();
+  drawViewportWorldHud();
 }
 
 function drawToolbar() {
@@ -1475,13 +2137,19 @@ function drawScanReport() {
   if (state.scanning) { box.textContent = t('scanWorking'); return; }
   const report = state.scanReport;
   if (!report) return;
-  const details = el('details', {open: report.problems.length > 0});
-  details.append(el('summary', {}, report.ok ? t('scanComplete', report.count) +
-    ` · +${report.added.length} / ↔${report.moved.length} / −${report.removed.length}` : t('scanFailed')));
+  const problems = Array.isArray(report.problems) ? report.problems : [];
+  const added = Array.isArray(report.added) ? report.added : [];
+  const moved = Array.isArray(report.moved) ? report.moved : [];
+  const removed = Array.isArray(report.removed) ? report.removed : [];
+  const created = Array.isArray(report.created) ? report.created : [];
+  const count = report.count ?? state.assets.length;
+  const details = el('details', {open: problems.length > 0});
+  details.append(el('summary', {}, report.ok ? t('scanComplete', count) +
+    ` · +${added.length} / ↔${moved.length} / −${removed.length}` : t('scanFailed')));
   for (const [label, items] of [
-    ['scanProblems', report.problems],
-    ['scanMoved', (report.moved || []).map(asset => asset.from + ' → ' + asset.to)],
-    ['scanAdded', report.added || []], ['scanRemoved', report.removed || []], ['scanIdentity', report.created || []],
+    ['scanProblems', problems],
+    ['scanMoved', moved.map(asset => asset.from + ' → ' + asset.to)],
+    ['scanAdded', added], ['scanRemoved', removed], ['scanIdentity', created],
   ]) {
     if (items.length) details.append(el('strong', {}, t(label)),
       el('ul', {}, items.map(text => el('li', {}, text))));
@@ -1539,7 +2207,7 @@ function importModelAsScene(asset) {
   if (path) state.host.send({ type: 'import', model: asset.id, path, name: stem });
 }
 
-async function placeAsset(asset, { worldPos = null, parent = undefined, localOrigin = false } = {}) {
+async function placeAsset(asset, { worldPos = null, parent = undefined, localOrigin = false, semanticDrop = null } = {}) {
   const doc = state.doc;
   const check = canPlaceAsset(asset, doc);
   if (!check.ok) {
@@ -1567,9 +2235,22 @@ async function placeAsset(asset, { worldPos = null, parent = undefined, localOri
   const [id] = (await takeIds(1)) || [];
   if (!id || state.doc?.id !== doc.id) return null;
   if (targetParent && !entity(targetParent)) targetParent = null;
-  const value = placementEntity(asset, { parent: targetParent, localTranslation });
+  const value = semanticDrop?.entity
+    ? { ...semanticDrop.entity, ...(targetParent ? { parent: targetParent } : {}) }
+    : placementEntity(asset, {
+        parent: targetParent,
+        localTranslation,
+        sceneContext: !targetParent ? doc : null,
+      });
   const answer = await edit(`${t('vPlace')} ${value.name}`, [{ set: ['entities', id], value }]);
   if (answer?.type === 'ops' && state.doc?.id === doc.id) {
+    try {
+      if (semanticDrop?.descriptor) state.aiCopilot?.registerSemanticNode?.(semanticDrop.descriptor);
+      const placedPos = value?.components?.transform?.translation;
+      if (Array.isArray(placedPos) && placedPos.length >= 3) {
+        state.aiCopilot?.liftEntityPosition?.(value.name || id, placedPos);
+      }
+    } catch { /* keep placement responsive */ }
     select(id);
     return id;
   }
@@ -1590,6 +2271,7 @@ function inferKindAndSubdir(fileName) {
   if (lower.endsWith('.scene.json')) return ['scene', 'scenes'];
   if (lower.endsWith('.prefab.json')) return ['prefab', 'prefabs'];
   if (lower.endsWith('.look.json')) return ['look', 'looks'];
+  if (lower.endsWith('.terrain.json')) return ['terrain', 'terrains'];
   if (lower.endsWith('.material.json')) return ['material', 'materials'];
   if (lower.endsWith('.data.json')) return ['data', 'data'];
   if (lower.endsWith('.soundbank.json')) return ['soundbank', 'audio'];
@@ -1699,7 +2381,12 @@ const assetLibrary = createAssetLibrary({
     void activateWorkbench(workbenchId, { doc: assetId });
   },
   onImportModel: importModelAsScene,
-  onPlaceAsset: (asset) => { void placeAsset(asset); },
+  onPlaceAsset: (asset, dropPayload) => {
+    void placeAsset(asset, {
+      worldPos: dropPayload?.projection?.position || null,
+      semanticDrop: dropPayload || null,
+    });
+  },
   onMoveAsset: (asset, to) => {
     if (state.host?.open) state.host.send({ type: 'asset-move', id: asset.id, to, req: 'asset-move' });
   },
@@ -1892,7 +2579,9 @@ const gameplaySwitcher = createGameplaySwitcher({
   el,
   t,
   getContext: () => ({
-    activeWorkbench: state.activeWorkbench,
+    activeWorkbench: isEngineTabActiveForWorkbench('sequencer', state.activeWorkbench)
+      ? 'world'
+      : state.activeWorkbench,
     gameplayTools: currentGameplayTools(),
   }),
   onSelectTarget: (targetKey) => {
@@ -1931,6 +2620,14 @@ const layoutRig = createLayoutRig({
 
 const ENGINE_WORKBENCHES = [
   { id: 'world', labelKey: 'wb_world', builtin: true },
+  {
+    id: 'terrain',
+    labelKey: 'wb_terrain',
+    modulePath: './terrain-studio.js',
+    cssPath: './terrain-studio.css',
+    exportName: 'mountTerrainStudio',
+    documentSuffixes: ['.terrain.json'],
+  },
   {
     id: 'model',
     labelKey: 'wb_model',
@@ -1997,6 +2694,8 @@ const ENGINE_WORKBENCHES = [
 ];
 
 const WORKBENCH_ID_ALIASES = Object.freeze({
+  'terrain-studio': 'terrain',
+  landscape: 'terrain',
   'model-studio': 'model',
   'material-studio': 'material',
   'character-studio': 'character',
@@ -2406,6 +3105,11 @@ const studioApi = {
   },
   t: (key, ...args) => t(key, ...args) ?? key,
   getLocale: () => (lang() === 'ko' ? 'ko' : 'en'),
+  registerSemanticNode: (descriptor) => state.aiCopilot?.registerSemanticNode?.(descriptor),
+  registerSemanticMaterial: (descriptor) => state.aiCopilot?.registerSemanticMaterial?.(descriptor),
+  liftEntityPosition: (id, pos, options) => state.aiCopilot?.liftEntityPosition?.(id, pos, options),
+  simulateTwoAgentConflict: () => state.aiCopilot?.simulateTwoAgentConflict?.(),
+  getLastProjectionGhost: () => state.aiCopilot?.getLastProjectionGhost?.(),
 };
 window.__ganbateStudioApi = studioApi;
 
@@ -2470,9 +3174,20 @@ function drawWorkspaceTabs() {
       onclick: () => { void activateWorkbench(wb.id); },
     }, text));
   }
-  if (state.projectWorkbenches.length) {
+  const unifiedTopTabToolIds = new Set([
+    'action-sequencer',
+    'motion-tuner',
+    'god-mode',
+    'layout-tuner',
+    'graphics-layout-tuner',
+    'audio-mixer',
+  ]);
+  const visibleProjectWorkbenches = state.projectWorkbenches.filter(
+    (tool) => !unifiedTopTabToolIds.has(tool.id),
+  );
+  if (visibleProjectWorkbenches.length) {
     bar.append(el('span', { class: 'workspace-tab-sep', 'aria-hidden': 'true' }));
-    for (const tool of state.projectWorkbenches) {
+    for (const tool of visibleProjectWorkbenches) {
       const tabId = `project:${tool.id}`;
       const active = state.activeWorkbench === tabId;
       bar.append(el('button', {
@@ -2539,7 +3254,22 @@ async function mountWorkbenchPane(wb) {
 }
 
 async function activateWorkbench(rawWorkbenchId, options = {}) {
-  const workbenchId = normalizeWorkbenchId(rawWorkbenchId);
+  let workbenchId = normalizeWorkbenchId(rawWorkbenchId);
+  if (
+    !options.doc
+    && !options.engineSequencer
+    && !customWorkbenches.has('sequencer')
+    && (
+      workbenchId === 'sequencer'
+      || workbenchId === 'project:motion-tuner'
+      || workbenchId === 'project:god-mode'
+    )
+  ) {
+    const gameplayTools = currentGameplayTools();
+    if (gameplayTools.actionSequencer) {
+      workbenchId = `project:${gameplayTools.actionSequencer.id}`;
+    }
+  }
   const prevId = state.activeWorkbench;
   if (prevId && prevId !== workbenchId && mountedWorkbenches.has(prevId)) {
     try { mountedWorkbenches.get(prevId).instance?.onDeactivate?.(); } catch { /* ignore */ }
@@ -2552,13 +3282,9 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
     document.body.classList.remove('workbench-active', 'workbench-split-viewport');
     if (deck) deck.hidden = true;
     if (state.pendingCooked && state.pendingCooked.doc === state.doc?.id && !state.engine) {
-      if (state.host?.kind === 'cloud') {
-        drawCloudWorldPrompt();
-      } else {
-        const cookedToLoad = state.pendingCooked;
-        state.pendingCooked = null;
-        loadWorld(cookedToLoad).catch((e) => log(2, `viewport: ${e.message}`));
-      }
+      const cookedToLoad = state.pendingCooked;
+      state.pendingCooked = null;
+      loadWorld(cookedToLoad).catch((e) => log(2, `viewport: ${e.message}`));
     }
     gameplaySwitcher.draw();
     pieViewport.syncStageVisibility();
@@ -2578,13 +3304,16 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
   }
 
   state.activeWorkbench = workbenchId;
-  if (workbenchId !== 'material') state.loadGen++;
+  const keepLive3dViewport = workbenchId === 'material' || workbenchId === 'terrain';
+  if (!keepLive3dViewport) state.loadGen++;
   document.body.classList.add('workbench-active');
-  document.body.classList.toggle('workbench-split-viewport', workbenchId === 'material');
+  document.body.classList.toggle('workbench-split-viewport', keepLive3dViewport);
   pieViewport.syncStageVisibility();
-  if (workbenchId === 'material') {
+  if (keepLive3dViewport) {
     if (state.pendingCooked && state.pendingCooked.doc === state.doc?.id && !state.engine) {
-      if (state.host?.kind === 'cloud') drawCloudWorldPrompt();
+      const cookedToLoad = state.pendingCooked;
+      state.pendingCooked = null;
+      loadWorld(cookedToLoad).catch((e) => log(2, `viewport: ${e.message}`));
     }
     markViewportDirty(6, 300);
   }
@@ -2758,7 +3487,15 @@ function scheduleSelectionSync() {
 async function runAiGbsApply() {
   const input = $('#ai-gbs-input');
   const rawScript = input?.value.trim();
-  if (!rawScript || !state.host?.open) return;
+  if (!rawScript) return;
+  const looksLikeRawGbs = /^(spawn|place|move|rotate|scale|snap|scatter|align|focus|time|delete|remove|color|material)\b/i.test(rawScript);
+  if (!looksLikeRawGbs && state.aiCopilot?.executePrompt) {
+    const res = await state.aiCopilot.executePrompt(rawScript);
+    if (res?.ok !== false && input) input.value = '';
+    drawInspector();
+    return;
+  }
+  if (!state.host?.open) return;
   if (!state.doc?.id) {
     log(1, t('openHint'));
     return;
@@ -2775,6 +3512,7 @@ async function runAiGbsApply() {
   }
   if (input) input.value = '';
   log(0, t('aiGbsApplied', reply?.statements ?? 1));
+  drawInspector();
 }
 
 async function runAiSceneVerify() {
@@ -3008,6 +3746,7 @@ function setupAiIdeBar() {
     },
   });
   state.aiCopilot = aiCopilot;
+  drawInspector();
   $('#ai-copilot-toggle')?.addEventListener('click', () => aiCopilot.toggle());
 
   $('#ai-gbs-apply')?.addEventListener('click', () => { void runAiGbsApply(); });
@@ -3314,6 +4053,163 @@ function drawInspector() {
   target.focus({ preventScroll: true });
 }
 
+function renderTriModalStageInspector(box) {
+  if (!state.aiCopilot) return;
+  const wg = state.aiCopilot.getWorldGraph ? state.aiCopilot.getWorldGraph() : null;
+  const sg = state.aiCopilot.getSemanticSceneGraph ? state.aiCopilot.getSemanticSceneGraph() : null;
+  const ver = state.aiCopilot.verifySemanticSceneGraph ? state.aiCopilot.verifySemanticSceneGraph() : null;
+  const ghost = state.aiCopilot.getLastProjectionGhost ? state.aiCopilot.getLastProjectionGhost() : null;
+  const env = wg?.environment || { preset: 'dusk', time_hours: state.time || 17.5, enclosure_open: true };
+  const nodeCount = Array.isArray(sg?.nodes) ? sg.nodes.length : 0;
+  const relCount = Array.isArray(sg?.relations) ? sg.relations.length : 0;
+  const presets = [
+    { id: 'daylight', label: '☀ Daylight', hours: 13.0 },
+    { id: 'sunset', label: '🌇 Sunset', hours: 18.25 },
+    { id: 'dusk', label: '🌆 Dusk', hours: 19.25 },
+    { id: 'night', label: '🌙 Night', hours: 22.5 },
+    { id: 'dawn', label: '🌅 Dawn', hours: 6.5 },
+  ];
+
+  const hub = el('div', { class: 'tri-modal-inspector-hub', 'data-testid': 'tri-modal-inspector-hub' },
+    el('div', { class: 'tri-modal-inspector-head' },
+      el('strong', {}, 'Neuro-Symbolic Tri-Modal Living Canvas'),
+      el('span', { class: 'tri-modal-badge' }, `${wg?.guardrails?.target_hz ?? 120}Hz · <300 tok`),
+    ),
+    el('div', { class: 'meta' },
+      'Synchronized Code (ganbate://context) ⇄ Visual 3D Viewport ⇄ Bilingual Neural Prompt (.gbs)',
+    ),
+    el('div', { class: 'tri-modal-section' },
+      el('div', { class: 'tri-modal-section-title' }, '1. Visual 3D Living Canvas · Play ⇄ Walk ⇄ Edit'),
+      el('div', { class: 'tri-modal-pill-row' },
+        el('button', {
+          type: 'button',
+          class: `mini${wg?.play_mode !== 'edit' ? ' on' : ''}`,
+          onclick: async () => {
+            await state.aiCopilot.patchWorldGraph?.({ play_mode: 'play' });
+            drawInspector();
+          },
+        }, '🎮 Play Mode'),
+        el('button', {
+          type: 'button',
+          class: `mini${wg?.play_mode === 'edit' ? ' on' : ''}`,
+          onclick: async () => {
+            await state.aiCopilot.patchWorldGraph?.({ play_mode: 'edit' });
+            drawInspector();
+          },
+        }, '🛠 Edit (God Mode)'),
+        el('button', {
+          type: 'button',
+          class: `mini${env.enclosure_open !== false ? ' on' : ''}`,
+          onclick: async () => {
+            await state.aiCopilot.patchWorldGraph?.({
+              environment: { enclosure_open: env.enclosure_open === false },
+            });
+            drawInspector();
+          },
+        }, env.enclosure_open !== false ? '🏛 Roof Open (Sky)' : '🏯 Roof Closed'),
+        el('button', {
+          type: 'button',
+          class: 'mini',
+          onclick: () => {
+            $('#pie-split-toggle')?.click();
+          },
+        }, '⚡ 50/50 Split-Play'),
+      ),
+      el('div', { class: 'tri-modal-pill-row' },
+        ...presets.map((p) =>
+          el('button', {
+            type: 'button',
+            class: `mini${env.preset === p.id ? ' on' : ''}`,
+            onclick: async () => {
+              state.time = p.hours;
+              const timeEl = $('#time');
+              const timeLbl = $('#time-label');
+              if (timeEl) timeEl.value = String(p.hours);
+              if (timeLbl) timeLbl.textContent = `${p.hours.toFixed(1)} h`;
+              await state.aiCopilot.patchWorldGraph?.({
+                environment: { preset: p.id, time_hours: p.hours },
+              });
+              markViewportDirty(6, 300);
+              drawInspector();
+            },
+          }, p.label),
+        ),
+      ),
+    ),
+    el('div', { class: 'tri-modal-section' },
+      el('div', { class: 'tri-modal-section-title' },
+        `2. Symbolic Scene Graph · ${nodeCount} nodes · ${relCount} relations · ${ver?.verified !== false ? 'VERIFIED ✓' : 'CHECK'}`,
+      ),
+      el('pre', { class: 'tri-modal-code' },
+        JSON.stringify({
+          uri: wg?.uri || 'ganbate://context',
+          authority: wg?.authority_mode || 'server-authoritative-readonly',
+          play_mode: wg?.play_mode || 'play',
+          environment: env,
+          nodes: (sg?.nodes || []).map((n) => ({ id: n.id, role: n.role, pos: n.position })),
+          relations: sg?.relations || [],
+          ...(ghost ? { projectionGhost: ghost } : {}),
+        }, null, 2),
+      ),
+      el('div', { class: 'tri-modal-pill-row' },
+        el('button', {
+          type: 'button',
+          class: 'mini on',
+          onclick: () => {
+            state.aiCopilot.open?.('context');
+          },
+        }, '📐 Edit Semantic Scene Graph & Benchmark'),
+        el('button', {
+          type: 'button',
+          class: 'mini',
+          'data-testid': 'simulate-two-agent-conflict-btn',
+          onclick: () => {
+            state.aiCopilot.simulateTwoAgentConflict?.();
+            drawInspector();
+            markViewportDirty(4, 200);
+          },
+        }, '⚡ Simulate 2-Agent Conflict (x̂ → x*)'),
+        el('button', {
+          type: 'button',
+          class: 'mini',
+          onclick: () => {
+            void runAiSceneVerify();
+          },
+        }, '✓ 4-Angle Verify'),
+      ),
+    ),
+    el('div', { class: 'tri-modal-section' },
+      el('div', { class: 'tri-modal-section-title' }, '3. Neural · Bilingual Spatial Compiler (EN / KO)'),
+      el('div', { class: 'tri-modal-pill-row' },
+        el('button', {
+          type: 'button',
+          class: 'mini',
+          onclick: async () => {
+            await state.aiCopilot.executePrompt?.('Place 2 sakura lanterns flanking the VIP table');
+            drawInspector();
+          },
+        }, '🌸 2 Sakura Lanterns Flanking Table'),
+        el('button', {
+          type: 'button',
+          class: 'mini',
+          onclick: async () => {
+            await state.aiCopilot.executePrompt?.('포커 테이블 위에 샹들리에 배치하고 밤하늘 오픈');
+            drawInspector();
+          },
+        }, '🏮 샹들리에 + 밤하늘 (KO)'),
+        el('button', {
+          type: 'button',
+          class: 'mini',
+          onclick: () => {
+            state.aiCopilot.open?.('chat');
+          },
+        }, '✨ Open AI Copilot'),
+      ),
+    ),
+  );
+  box.append(hub);
+}
+
 function buildInspector(box, id) {
   box.replaceChildren();
   if (state.inspectedData) {
@@ -3365,6 +4261,7 @@ function buildInspector(box, id) {
   box.dataset.entity = e ? id : '';
   if (!e) {
     box.append(el('p', { class: 'hint' }, state.doc ? t('selectHint') : t('openHint')));
+    renderTriModalStageInspector(box);
     return;
   }
   box.append(el('div', { class: 'field', 'data-key': '#name' }, el('label', {}, t('name')),
@@ -3477,7 +4374,10 @@ function commands() {
   $('#delete-entity').onclick = deleteSelection;
   $('#duplicate-entity').onclick = duplicateSelection;
   $('#frame').onclick = () => frameBounds(state.selection ? boundsOf(state.selection) : null);
-  $('#recook').onclick = () => requestCook(0);
+  $('#recook').onclick = () => {
+    state.forceWorldReload = true;
+    requestCook(0);
+  };
   $('#simulate').onclick = toggleSimulation;
   const guideDialog = $('#studio-guide-dialog');
   const openStudioGuide = () => {
@@ -3830,6 +4730,27 @@ function commands() {
       // Other modified keys belong to the browser.
     } else if (letter('f')) {
       frameBounds(state.selection ? boundsOf(state.selection) : null);
+    } else if (
+      e.key === 'ArrowUp'
+      || e.key === 'ArrowDown'
+      || e.key === 'ArrowLeft'
+      || e.key === 'ArrowRight'
+      || (state.orbiting && (letter('w') || letter('s') || letter('a') || letter('d') || letter('q') || letter('e')))
+    ) {
+      e.preventDefault();
+      state.cameraFollow = null;
+      const step = Math.max(0.5, state.view.distance * (e.shiftKey ? 0.14 : 0.06));
+      const { back, right, up } = orbitBasis(state.view);
+      const fwd = [-back[0], -back[1], -back[2]];
+      const dx = (e.key === 'ArrowRight' || (state.orbiting && letter('d')))
+        ? 1
+        : (e.key === 'ArrowLeft' || (state.orbiting && letter('a'))) ? -1 : 0;
+      const dz = (e.key === 'ArrowUp' || (state.orbiting && letter('w')))
+        ? 1
+        : (e.key === 'ArrowDown' || (state.orbiting && letter('s'))) ? -1 : 0;
+      const dy = state.orbiting ? (letter('e') ? 1 : letter('q') ? -1 : 0) : 0;
+      state.view.target = state.view.target.map((v, i) => v + (right[i] * dx + fwd[i] * dz + up[i] * dy) * step);
+      markViewportDirty(4, 150);
     } else if (letter('w')) setMode('move');
     else if (letter('e')) setMode('rotate');
     else if (letter('r')) setMode('scale');

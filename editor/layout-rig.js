@@ -95,7 +95,141 @@ function findMirrorAnchor(anchor, allAnchors) {
     const byLabel = allAnchors.find((a) => a.pathKey !== anchor.pathKey && a.label === swappedLabel);
     if (byLabel) return byLabel;
   }
-  return null;
+  // Geometric mirror fallback across X = 0.5
+  return (
+    allAnchors.find(
+      (a) =>
+        a.pathKey !== anchor.pathKey &&
+        Math.abs(a.x - (1 - anchor.x)) <= 0.04 &&
+        Math.abs(a.y - anchor.y) <= 0.04,
+    ) || null
+  );
+}
+
+/**
+ * Inverse Semantic Lifting (L: R^2 -> G_rel) for normalized [0..1]^2 layout rig anchors.
+ * Infers `mirror_pair`, `inward_toward_center`, and `ring_slot_on` symbolic edges.
+ */
+export function inferAnchorSemanticEdges(anchors = []) {
+  const edges = [];
+  const seenMirrorPairs = new Set();
+  for (const anchor of anchors) {
+    const dx = M.tidy(anchor.x - 0.5, 4);
+    const dy = M.tidy(anchor.y - 0.5, 4);
+    const radius = M.tidy(Math.hypot(dx, dy), 4);
+    const isBetOrChip = /(bet|chip|pot)/i.test(anchor.pathKey) || /(bet|chip|pot)/i.test(anchor.label);
+    edges.push({
+      id: `edge:${isBetOrChip ? 'inward_toward_center' : 'ring_slot_on'}:${anchor.pathKey}`,
+      relation: isBetOrChip ? 'inward_toward_center' : 'ring_slot_on',
+      source: anchor.pathKey,
+      target: 'stage:center',
+      dx,
+      dy,
+      radius,
+    });
+    const mirror = findMirrorAnchor(anchor, anchors);
+    if (mirror) {
+      const pairKey = [anchor.pathKey, mirror.pathKey].sort().join('<->');
+      if (!seenMirrorPairs.has(pairKey)) {
+        seenMirrorPairs.add(pairKey);
+        edges.push({
+          id: `edge:mirror_pair:${pairKey}`,
+          relation: 'mirror_pair',
+          source: anchor.pathKey,
+          target: mirror.pathKey,
+          dx: M.tidy(Math.abs(dx), 4),
+          y: M.tidy(anchor.y, 4),
+        });
+      }
+    }
+  }
+  return edges;
+}
+
+/**
+ * Minimal-Perturbation Constraint Projection Solver (x* = argmin_{x in C} ||x - x_hat||_2^2)
+ * for normalized [0..1]^2 layout-rig anchors. Resolves safe-frame violations and pairwise
+ * overlaps while optionally preserving horizontal mirror symmetry.
+ */
+export function projectAnchorsMinimalPerturbation(
+  anchors = [],
+  { safeMargin = 0.04, minClearance = 0.06, maxIterations = 12, mirrorX = false } = {},
+) {
+  const working = anchors.map((a) => ({ ...a, x: Number(a.x) || 0, y: Number(a.y) || 0 }));
+  const clampCoord = (val, min, max) => {
+    const lo = Math.max(Number.isFinite(min) ? min : 0, safeMargin);
+    const hi = Math.min(Number.isFinite(max) ? max : 1, 1 - safeMargin);
+    return lo <= hi ? Math.max(lo, Math.min(hi, val)) : val;
+  };
+
+  for (let iter = 0; iter < maxIterations; iter += 1) {
+    let moved = false;
+    for (const a of working) {
+      const nx = clampCoord(a.x, a.min, a.max);
+      const ny = clampCoord(a.y, a.min, a.max);
+      if (Math.abs(nx - a.x) > 1e-4 || Math.abs(ny - a.y) > 1e-4) {
+        a.x = nx;
+        a.y = ny;
+        moved = true;
+      }
+    }
+    for (let i = 0; i < working.length; i += 1) {
+      for (let j = i + 1; j < working.length; j += 1) {
+        const a = working[i];
+        const b = working[j];
+        const vx = b.x - a.x;
+        const vy = b.y - a.y;
+        const dist = Math.hypot(vx, vy);
+        if (dist >= minClearance) continue;
+        const overlap = minClearance - dist;
+        const ux = dist > 1e-4 ? vx / dist : 1;
+        const uy = dist > 1e-4 ? vy / dist : 0;
+        a.x = clampCoord(a.x - ux * (overlap * 0.5), a.min, a.max);
+        a.y = clampCoord(a.y - uy * (overlap * 0.5), a.min, a.max);
+        b.x = clampCoord(b.x + ux * (overlap * 0.5), b.min, b.max);
+        b.y = clampCoord(b.y + uy * (overlap * 0.5), b.min, b.max);
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+
+  if (mirrorX) {
+    for (const a of working) {
+      const counterpart = findMirrorAnchor(a, working);
+      if (counterpart && a.pathKey < counterpart.pathKey) {
+        const avgY = M.tidy((a.y + counterpart.y) * 0.5, 4);
+        const halfSpan = M.tidy((Math.abs(a.x - 0.5) + Math.abs(counterpart.x - 0.5)) * 0.5, 4);
+        const leftIsA = a.x <= counterpart.x;
+        a.x = clampCoord(leftIsA ? 0.5 - halfSpan : 0.5 + halfSpan, a.min, a.max);
+        counterpart.x = clampCoord(leftIsA ? 0.5 + halfSpan : 0.5 - halfSpan, counterpart.min, counterpart.max);
+        a.y = clampCoord(avgY, a.min, a.max);
+        counterpart.y = clampCoord(avgY, counterpart.min, counterpart.max);
+      }
+    }
+  }
+
+  const updates = [];
+  let sumSq = 0;
+  for (let i = 0; i < working.length; i += 1) {
+    const orig = anchors[i];
+    const cur = working[i];
+    const nx = M.tidy(cur.x, 4);
+    const ny = M.tidy(cur.y, 4);
+    const dx = nx - orig.x;
+    const dy = ny - orig.y;
+    if (Math.hypot(dx, dy) > 5e-4) {
+      sumSq += dx * dx + dy * dy;
+      updates.push({ path: cur.path, pathKey: cur.pathKey, value: [nx, ny] });
+    }
+  }
+
+  return {
+    projected: working.map((a) => ({ ...a, x: M.tidy(a.x, 4), y: M.tidy(a.y, 4) })),
+    updates,
+    l2Norm: M.tidy(Math.sqrt(sumSq), 4),
+    edges: inferAnchorSemanticEdges(working),
+  };
 }
 
 export function createLayoutRig({
@@ -233,7 +367,9 @@ export function createLayoutRig({
     const anchors = hasAnchorDoc
       ? discoverLayoutAnchors(inspectedDataDoc.root.values, schema, { includeAllVec2: true })
       : [];
+    const semanticEdges = hasAnchorDoc ? inferAnchorSemanticEdges(anchors) : [];
     overlay.hidden = false;
+    overlay.setAttribute('data-semantic-edges', String(semanticEdges.length));
     if (!syncOverlayBounds()) {
       overlay.style.inset = '0';
       overlay.style.width = '100%';
@@ -264,6 +400,31 @@ export function createLayoutRig({
             draw();
           },
         }, t('mirrorX')),
+        el('button', {
+          type: 'button',
+          id: 'layout-rig-solve-manifold',
+          class: 'mini',
+          title: 'Project anchors to non-overlapping safe manifold (x̂ → x*)',
+          onclick: (ev) => {
+            ev.stopPropagation();
+            const latestDoc = getContext().inspectedDataDoc;
+            if (!latestDoc?.root) return;
+            const curAnchors = discoverLayoutAnchors(latestDoc.root.values, schema, { includeAllVec2: true });
+            const solved = projectAnchorsMinimalPerturbation(curAnchors, { mirrorX });
+            if (solved.updates.length > 0) {
+              const ops = buildBatchOps(latestDoc, schema, solved.updates);
+              if (ops.length > 0) {
+                onEditData?.(
+                  `Project layout manifold (||x* - x̂||₂ = ${solved.l2Norm})`,
+                  ops,
+                  `rig-solve:${latestDoc.id}:${++dragSeq}`,
+                  latestDoc.id,
+                );
+              }
+            }
+            draw();
+          },
+        }, '⚡ x̂ → x*'),
         el('span', { class: 'layout-rig-hint' }, t('snapShiftHint')),
       );
     } else {

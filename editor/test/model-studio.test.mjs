@@ -2,16 +2,19 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseGlbPreview } from '../asset-previews.js';
 import {
+  ARCHITECTURAL_PRESETS,
   PRIMITIVE_KINDS,
   WORKBENCH_ID,
   buildModelPrefabOps,
   buildPrimitiveGlb,
+  buildSemanticNodeDescriptor,
   computeImportFixup,
   decimatePreviewMesh,
   eulerDegToQuat,
   fitPhysicsCollider,
   mountModelStudio,
   normalizeModelMeta,
+  projectSemanticNodePlacement,
   quatToEulerDeg,
   serializeModelMeta,
 } from '../model-studio.js';
@@ -126,7 +129,7 @@ test('computeImportFixup aligns bottom-center, centroid, cm/mm scale, and target
   assert.deepEqual(normalizedHeight.transformedBounds, [[-0.5, -0.75, -0.5], [0.5, 1.25, 0.5]]);
 });
 
-test('buildPrimitiveGlb emits valid glTF 2.0 binaries for all graybox shapes', () => {
+test('buildPrimitiveGlb emits valid glTF 2.0 binaries for all graybox shapes and architectural presets', () => {
   for (const kind of PRIMITIVE_KINDS) {
     const glb = buildPrimitiveGlb(kind, { width: 3, height: 2.5, depth: 2, radius: 1, segments: 18 });
     assert.ok(glb instanceof Uint8Array && glb.byteLength > 80, `${kind} glb bytes`);
@@ -138,6 +141,36 @@ test('buildPrimitiveGlb emits valid glTF 2.0 binaries for all graybox shapes', (
     assert.ok(parsed.estimatedVramBytes > 0, `${kind} estimates VRAM`);
     assert.ok(Math.abs(parsed.bounds[0][1]) < 1e-4, `${kind} sits on Y=0 ground plane`);
     assert.equal(parsed.fullMesh.tangents.length, parsed.vertices * 4, `${kind} synthesizes tangent frames`);
+  }
+
+  for (const preset of ARCHITECTURAL_PRESETS) {
+    const glb = buildPrimitiveGlb(preset.kind, preset);
+    const parsed = parseGlbPreview(glb);
+    assert.ok(parsed && parsed.triangles >= 12, `${preset.id} builds multi-part architectural geometry`);
+    assert.ok(Math.abs(parsed.bounds[0][1]) < 1e-4, `${preset.id} rests on Y=0 ground plane`);
+    const fixup = computeImportFixup(parsed.bounds, { pivot: 'bottom_center', scale: 1.0 });
+    const desc = buildSemanticNodeDescriptor({
+      path: `content/models/yozakura/${preset.name}.glb`,
+      parsed,
+      fixup,
+      meta: {
+        import: { pivot: 'bottom_center', scale: 1.0 },
+        collider: fitPhysicsCollider(parsed.fullMesh, preset.colliderShape, fixup),
+        sockets: preset.sockets,
+      },
+    });
+    assert.equal(desc.schema, 'ganbate.semantic.node.v2');
+    assert.equal(desc.bounds.groundRestError, 0);
+    assert.ok(Math.abs(desc.bounds.surfaceY - preset.height) < 1e-3);
+
+    const proj = projectSemanticNodePlacement(desc, [0.05, 0.29, -0.04], {
+      supportSurfaceY: desc.affordances.domain === 'table_surface' ? 0.42 : 0.0,
+      supportHalfExtents: [0.7, 0.21, 0.45],
+      obstacles: [{ id: 'obs', position: [0, 0, 0], radius: 0.15 }],
+    });
+    assert.equal(proj.satisfied, true);
+    assert.equal(proj.verticalDriftAfter, 0);
+    assert.equal(proj.penetrationAfter, 0);
   }
 });
 
@@ -221,10 +254,18 @@ test('mountModelStudio implements StudioWorkbenchInstance lifecycle with StudioW
   const requests = [];
   const listeners = new Map();
 
+  const registeredNodes = [];
+  const appliedGbs = [];
   const instance = mountModelStudio(container, {
     listAssets: () => [],
     getProject: () => ({ id: 'proj', content: ['content'] }),
     getSelection: () => ({ assetId: null, entityIds: [] }),
+    registerSemanticNode(desc) {
+      registeredNodes.push(desc);
+    },
+    async applyGbs(script) {
+      appliedGbs.push(script);
+    },
     on(event, fn) {
       listeners.set(event, fn);
       return () => listeners.delete(event);
@@ -258,6 +299,15 @@ test('mountModelStudio implements StudioWorkbenchInstance lifecycle with StudioW
     arrayBuffer: async () => archGlb.buffer.slice(archGlb.byteOffset, archGlb.byteOffset + archGlb.byteLength),
   }]);
   assert.ok(requests.some((r) => r.type === 'asset-import' && r.path === 'content/models/lantern_prop.glb'));
+
+  const spawnedDesc = await instance.spawnInSemanticGraph();
+  assert.equal(spawnedDesc.schema, 'ganbate.semantic.node.v2');
+  assert.ok(registeredNodes.some((n) => n.id === 'lantern_prop'));
+  assert.ok(appliedGbs.some((s) => s.includes('spawn lantern_prop')));
+
+  const seededCount = await instance.seedArchitecturalCatalog();
+  assert.equal(seededCount, ARCHITECTURAL_PRESETS.length);
+  assert.ok(registeredNodes.some((n) => n.id === 'yozakura_salon_table'));
 
   instance.onDeactivate();
   assert.equal(instance.getState().active, false);
