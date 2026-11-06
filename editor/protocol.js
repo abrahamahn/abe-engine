@@ -312,6 +312,10 @@ export class CloudStudioHost {
     this.docs = new Map(); // id -> { id, path, kind, rev, dirty, root, undoStack, redoStack }
     this.assets = []; // [{ id, kind, path, bytes }]
     this.schemas = []; // [{ ganbate: 'schema', version: 1, components: {...} }]
+    const searchWorldUrl = typeof location !== 'undefined' && typeof location.search === 'string'
+      ? new URLSearchParams(location.search).get('worldUrl')
+      : null;
+    const initialWorldUrl = options.defaultWorldUrl || (searchWorldUrl && searchWorldUrl.trim()) || null;
     this.project = {
       id: options.projectId || 'ganbate-cloud-studio',
       name: options.projectName || 'Ganbate Live Studio',
@@ -319,7 +323,7 @@ export class CloudStudioHost {
       schemas: ['schemas'],
       editor: ['editor'],
       startup: null,
-      ...(options.defaultWorldUrl ? { defaultWorldUrl: options.defaultWorldUrl } : {}),
+      ...(initialWorldUrl ? { defaultWorldUrl: initialWorldUrl } : {}),
       ...(options.project && typeof options.project === 'object' ? structuredClone(options.project) : {}),
     };
     this.cloudToolsManifest = options.cloudToolsManifest || null;
@@ -547,6 +551,8 @@ export class CloudStudioHost {
   }
 
   _ingestBootstrapPayload(payload) {
+    const placeholderId = cloudDocId('content/scenes/studio-stage.scene.json');
+    const hadPlaceholderStartup = this.project.startup === placeholderId;
     if (payload.project) this.project = { ...this.project, ...payload.project };
     if (Array.isArray(payload.schemas)) this.schemas = payload.schemas;
     if (Array.isArray(payload.assets)) {
@@ -559,6 +565,17 @@ export class CloudStudioHost {
     if (payload.cloudToolsManifest) this.cloudToolsManifest = payload.cloudToolsManifest;
     if (payload.cloudGameManifest) this.cloudGameManifest = payload.cloudGameManifest;
     if (payload.bundle) this._ingestBundle(payload.bundle, false);
+    const placeholderDoc = this.docs.get(placeholderId);
+    const hasRealScene = [...this.docs.values()].some(
+      (d) => d.kind === 'scene' && d.id !== placeholderId,
+    );
+    if (placeholderDoc && !placeholderDoc.dirty && hasRealScene) {
+      this.docs.delete(placeholderId);
+      this.assets = this.assets.filter((a) => a.id !== placeholderId);
+      if (hadPlaceholderStartup && !payload.project?.startup) {
+        this.project.startup = null;
+      }
+    }
     this._synthesizeSchemasFromDataDocs();
     this._rebuildAssetIndex();
   }

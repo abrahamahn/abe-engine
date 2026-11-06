@@ -298,3 +298,55 @@ test('BUILTIN_GAMEPLAY_TOOLS align with /__studio-tool/<id> while preserving exp
     'https://ganbate.example/__studio-tool/graphics-layout-tuner?embed=studio',
   );
 });
+
+test('CloudStudioHost honors ?worldUrl query param and replaces synthetic studio-stage placeholder on late cloud:bootstrap', async () => {
+  const oldFetch = globalThis.fetch;
+  const oldLocation = globalThis.location;
+  try {
+    globalThis.fetch = async () => new Response('Bad Gateway', { status: 502 });
+    globalThis.location = { search: '?transport=cloud&worldUrl=%2Fgames%2Frooms%2Fyozakura.gbew' };
+
+    const messages = [];
+    const host = createStudioHost('ws://localhost/api/ws', (m) => messages.push(m), () => {}, {
+      transport: 'cloud',
+    });
+    await host.connect();
+    host.send({ type: 'hello', client: 'editor' });
+    await tick(25);
+
+    const placeholderId = cloudDocId('content/scenes/studio-stage.scene.json');
+    const estateId = cloudDocId('content/scenes/yozakura-estate.scene.json');
+    assert.equal(host.project.defaultWorldUrl, '/games/rooms/yozakura.gbew');
+    assert.equal(host.project.startup, placeholderId);
+
+    // Opening synthetic placeholder before bootstrap still cooks via ?worldUrl
+    host.send({ type: 'open', doc: placeholderId });
+    await tick(15);
+    const earlyCooked = messages.find((m) => m.type === 'cooked' && m.doc === placeholderId);
+    assert.ok(earlyCooked);
+    assert.equal(earlyCooked.worldUrl, '/games/rooms/yozakura.gbew');
+
+    // Late cloud:bootstrap replaces unmodified placeholder with real Yozakura scene
+    host._ingestBootstrapPayload({
+      project: { name: 'Ganbate Studio', defaultWorldUrl: '/games/rooms/yozakura.gbew' },
+      bundle: {
+        documents: {
+          'content/scenes/yozakura-estate.scene.json': {
+            ganbate: 'scene',
+            version: 1,
+            name: 'Yozakura Estate Stage',
+            worldUrl: '/games/rooms/yozakura.gbew',
+            entities: {},
+          },
+        },
+      },
+    });
+    assert.equal(host.docs.has(placeholderId), false);
+    assert.equal(host.project.startup, estateId);
+
+    host.disconnect();
+  } finally {
+    globalThis.fetch = oldFetch;
+    globalThis.location = oldLocation;
+  }
+});

@@ -275,6 +275,9 @@ function onMessage(msg) {
       const hashTab = rawHash.startsWith('tab=') ? rawHash.slice(4) : rawHash;
       const requestedTab = params.get('tab') || hashTab || null;
       const asset = state.assets.find((a) => a.path === requested);
+      if (state.wanted && !state.assets.some((a) => a.id === state.wanted)) {
+        state.wanted = null;
+      }
       if (state.wanted) state.host.send({ type: 'open', doc: state.wanted });
       else if (asset && (asset.kind === 'scene' || asset.kind === 'prefab')) openDoc(asset.id);
       else if (msg.project?.startup) openDoc(msg.project.startup);
