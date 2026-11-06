@@ -108,6 +108,12 @@ export function createDefaultStrip() {
       preDelayMs: 12,
       mix: 0,
     },
+    spatial: {
+      enabled: false,
+      minDistance: 1.5,
+      maxDistance: 35,
+      rolloff: 1.0,
+    },
   };
 }
 
@@ -500,6 +506,12 @@ export function normalizeStrip(raw) {
       damping: finiteClamp(raw.reverb?.damping, 0, 1, 0.45),
       preDelayMs: finiteClamp(raw.reverb?.preDelayMs, 0, 250, 12),
       mix: finiteClamp(raw.reverb?.mix, 0, 1, 0),
+    },
+    spatial: {
+      enabled: Boolean(raw.spatial?.enabled),
+      minDistance: finiteClamp(raw.spatial?.minDistance, 0.1, 500, 1.5),
+      maxDistance: finiteClamp(raw.spatial?.maxDistance, 1, 5000, 35),
+      rolloff: finiteClamp(raw.spatial?.rolloff, 0, 8, 1.0),
     },
   };
 }
@@ -1499,7 +1511,7 @@ class BrowserDawAudioRuntime {
     return ids[idx];
   }
 
-  triggerRenderedBuffer(left, right, sampleRate, durationMs) {
+  triggerRenderedBuffer(left, right, sampleRate, durationMs, loop = false) {
     const ctx = this.ensureContext();
     if (!ctx) return false;
     const buf = ctx.createBuffer(2, left.length, sampleRate);
@@ -1507,6 +1519,7 @@ class BrowserDawAudioRuntime {
     buf.getChannelData(1).set(right);
     const src = ctx.createBufferSource();
     src.buffer = buf;
+    src.loop = Boolean(loop);
 
     const splitter = ctx.createChannelSplitter(2);
     const anL = ctx.createAnalyser();
@@ -1563,6 +1576,548 @@ function computePeaksFromArray(samples, count = 44) {
     out[i] = Math.min(1, p);
   }
   return out;
+}
+
+// ---- Hardware DAW Controls (Rotary Knobs & Motorized Console Faders) -----------------------
+
+const KNOB_MIN_DEG = -135;
+const KNOB_MAX_DEG = 135;
+const KNOB_SWEEP_DEG = KNOB_MAX_DEG - KNOB_MIN_DEG;
+
+export function quantizeControlValue(raw, min, max, step = 0.01) {
+  const clamped = finiteClamp(raw, min, max, min);
+  if (!step || step <= 0) return clamped;
+  const steps = Math.round((clamped - min) / step);
+  const snapped = min + steps * step;
+  const decimals = Math.max(0, (String(step).split('.')[1] || '').length);
+  return finiteClamp(Number(snapped.toFixed(Math.min(6, decimals + 1))), min, max, min);
+}
+
+function knobPolar(cx, cy, r, angleDeg) {
+  const rad = ((angleDeg - 90) * Math.PI) / 180;
+  return {
+    x: cx + r * Math.cos(rad),
+    y: cy + r * Math.sin(rad),
+  };
+}
+
+/** Builds an SVG `<path d="...">` clockwise arc between `startDeg` and `endDeg` (0° = 12 o'clock). */
+export function describeKnobArc(cx, cy, r, startDeg, endDeg) {
+  const a0 = Math.min(startDeg, endDeg);
+  const a1 = Math.max(startDeg, endDeg);
+  if (a1 - a0 < 0.35) return '';
+  const p0 = knobPolar(cx, cy, r, a0);
+  const p1 = knobPolar(cx, cy, r, a1);
+  const largeArc = a1 - a0 > 180 ? 1 : 0;
+  return `M ${p0.x.toFixed(2)} ${p0.y.toFixed(2)} A ${r} ${r} 0 ${largeArc} 1 ${p1.x.toFixed(2)} ${p1.y.toFixed(2)}`;
+}
+
+/** Studio square-root console fader law: `2.0` = `+6 dB` (100%), `1.0` = `0 dB` unity (70.7%), `0.0` = `-∞` (0%). */
+export function volumeToFaderNorm(vol, maxVol = 2.0) {
+  const v = finiteClamp(vol, 0, maxVol, 0);
+  return Math.sqrt(v / maxVol);
+}
+
+export function faderNormToVolume(norm, maxVol = 2.0) {
+  const n = finiteClamp(norm, 0, 1, 0);
+  return Number((maxVol * n * n).toFixed(4));
+}
+
+function createDomNode(doc, tag, attrs = {}, ...children) {
+  const node = doc.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k.startsWith('on') && typeof v === 'function') {
+      node.addEventListener(k.slice(2).toLowerCase(), v);
+    } else if (k === 'class') {
+      node.className = v;
+    } else if (k === 'value') {
+      node.value = String(v ?? '');
+    } else if (v !== null && v !== undefined && v !== false) {
+      node.setAttribute(k, String(v));
+    }
+  }
+  for (const c of children.flat()) {
+    if (c === null || c === undefined || c === false) continue;
+    node.append(typeof c === 'string' || typeof c === 'number' ? doc.createTextNode(String(c)) : c);
+  }
+  return node;
+}
+
+function createSvgNode(doc, tag, attrs = {}, ...children) {
+  const node = doc.createElementNS ? doc.createElementNS(SVG_NS, tag) : doc.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v !== null && v !== undefined) node.setAttribute(k, String(v));
+  }
+  for (const c of children.flat()) {
+    if (c) node.append(c);
+  }
+  return node;
+}
+
+const KNOB_ACCENTS = {
+  gold: '#d4af37',
+  cyan: '#38bdf8',
+  amber: '#fb923c',
+  emerald: '#34d399',
+};
+
+/**
+ * Tactile SVG Hardware Rotary Knob (`role="slider"`).
+ * Supports vertical pointer drag, `Shift+Drag` 10x fine precision, `Double-Click` reset to default,
+ * mouse wheel, keyboard (`ArrowUp`/`ArrowDown`/`ArrowLeft`/`ArrowRight`/`PageUp`/`PageDown`/`Home`),
+ * bipolar 12-o'clock center detent arc, and live formatted unit readout directly underneath.
+ */
+export function createRotaryKnob(
+  doc,
+  {
+    label,
+    value,
+    min = 0,
+    max = 100,
+    step = 1,
+    defaultValue,
+    bipolar = false,
+    zeroValue = 0,
+    accent = 'gold',
+    size = 'md',
+    format = (v) => String(v),
+    dataDsp,
+    ariaLabel,
+    disabled = false,
+    onChange,
+  },
+) {
+  const safeSpan = Math.max(1e-9, max - min);
+  const resolvedDefault =
+    defaultValue !== undefined
+      ? finiteClamp(defaultValue, min, max, min)
+      : bipolar
+        ? finiteClamp(zeroValue, min, max, (min + max) * 0.5)
+        : min;
+  let currentVal = finiteClamp(value, min, max, resolvedDefault);
+  const strokeColor = KNOB_ACCENTS[accent] || KNOB_ACCENTS.gold;
+  const cx = 22;
+  const cy = 22;
+  const arcR = 18.2;
+
+  const valueToDeg = (v) =>
+    KNOB_MIN_DEG + ((finiteClamp(v, min, max, min) - min) / safeSpan) * KNOB_SWEEP_DEG;
+
+  const zeroDeg = valueToDeg(finiteClamp(zeroValue, min, max, (min + max) * 0.5));
+  const trackD = describeKnobArc(cx, cy, arcR, KNOB_MIN_DEG, KNOB_MAX_DEG);
+
+  const trackPath = createSvgNode(doc, 'path', {
+    class: 'gdaw-knob-track',
+    d: trackD,
+    fill: 'none',
+    stroke: '#12161f',
+    'stroke-width': '3.2',
+    'stroke-linecap': 'round',
+  });
+
+  const detentTick = bipolar
+    ? (() => {
+        const inner = knobPolar(cx, cy, arcR - 2.6, zeroDeg);
+        const outer = knobPolar(cx, cy, arcR + 2.6, zeroDeg);
+        return createSvgNode(doc, 'line', {
+          class: 'gdaw-knob-detent',
+          x1: inner.x.toFixed(2),
+          y1: inner.y.toFixed(2),
+          x2: outer.x.toFixed(2),
+          y2: outer.y.toFixed(2),
+          stroke: '#64748b',
+          'stroke-width': '1.3',
+          'stroke-linecap': 'round',
+        });
+      })()
+    : null;
+
+  const valuePath = createSvgNode(doc, 'path', {
+    class: 'gdaw-knob-arc',
+    d: '',
+    fill: 'none',
+    stroke: strokeColor,
+    'stroke-width': '3.2',
+    'stroke-linecap': 'round',
+  });
+
+  const capShadow = createSvgNode(doc, 'circle', {
+    cx: String(cx),
+    cy: String(cy + 1.2),
+    r: '13.6',
+    fill: 'rgba(0,0,0,0.58)',
+  });
+
+  const capBody = createSvgNode(doc, 'circle', {
+    class: 'gdaw-knob-cap',
+    cx: String(cx),
+    cy: String(cy),
+    r: '13.4',
+    fill: '#1e2430',
+    stroke: '#364052',
+    'stroke-width': '1.1',
+  });
+
+  const capRim = createSvgNode(doc, 'circle', {
+    cx: String(cx),
+    cy: String(cy),
+    r: '10.6',
+    fill: '#151923',
+    stroke: 'rgba(255,255,255,0.08)',
+    'stroke-width': '0.8',
+  });
+
+  const pointerLine = createSvgNode(doc, 'line', {
+    class: 'gdaw-knob-ptr',
+    x1: String(cx),
+    y1: String(cy),
+    x2: String(cx),
+    y2: String(cy - 11.5),
+    stroke: '#f8fafc',
+    'stroke-width': '2',
+    'stroke-linecap': 'round',
+  });
+
+  const centerDot = createSvgNode(doc, 'circle', {
+    cx: String(cx),
+    cy: String(cy),
+    r: '2',
+    fill: strokeColor,
+  });
+
+  const svgNode = createSvgNode(
+    doc,
+    'svg',
+    {
+      class: 'gdaw-knob-svg',
+      viewBox: '0 0 44 44',
+      'aria-hidden': 'true',
+    },
+    trackPath,
+    detentTick,
+    valuePath,
+    capShadow,
+    capBody,
+    capRim,
+    pointerLine,
+    centerDot,
+  );
+
+  const readoutEl = createDomNode(doc, 'span', { class: 'gdaw-knob-val' }, format(currentVal));
+
+  const dialAttrs = {
+    class: `gdaw-knob-dial ${disabled ? 'disabled' : ''}`,
+    role: 'slider',
+    tabindex: disabled ? '-1' : '0',
+    'aria-label': ariaLabel || label,
+    'aria-valuemin': min,
+    'aria-valuemax': max,
+    'aria-valuenow': currentVal,
+    'aria-valuetext': format(currentVal),
+    'data-knob': 'true',
+    'data-bipolar': bipolar ? 'true' : 'false',
+    'data-accent': accent,
+    value: currentVal,
+  };
+  if (disabled) dialAttrs['aria-disabled'] = 'true';
+  if (dataDsp) dialAttrs['data-dsp'] = dataDsp;
+
+  const dialEl = createDomNode(doc, 'div', dialAttrs, svgNode);
+
+  const syncVisuals = (v) => {
+    const deg = valueToDeg(v);
+    const arcOrigin = bipolar ? zeroDeg : KNOB_MIN_DEG;
+    valuePath.setAttribute('d', describeKnobArc(cx, cy, arcR, arcOrigin, deg));
+    const pInner = knobPolar(cx, cy, 4.2, deg);
+    const pOuter = knobPolar(cx, cy, 11.8, deg);
+    pointerLine.setAttribute('x1', pInner.x.toFixed(2));
+    pointerLine.setAttribute('y1', pInner.y.toFixed(2));
+    pointerLine.setAttribute('x2', pOuter.x.toFixed(2));
+    pointerLine.setAttribute('y2', pOuter.y.toFixed(2));
+    pointerLine.setAttribute('data-angle', deg.toFixed(2));
+    const text = format(v);
+    readoutEl.textContent = text;
+    dialEl.value = String(v);
+    dialEl.setAttribute('aria-valuenow', String(v));
+    dialEl.setAttribute('aria-valuetext', text);
+  };
+
+  syncVisuals(currentVal);
+
+  const commit = (rawNext, fine = false) => {
+    if (disabled) return;
+    const qStep = fine ? step * 0.1 : step;
+    const next = quantizeControlValue(rawNext, min, max, qStep);
+    if (next === currentVal) return;
+    currentVal = next;
+    syncVisuals(next);
+    onChange?.(next);
+  };
+
+  dialEl.addEventListener('pointerdown', (e) => {
+    if (disabled) return;
+    e.preventDefault?.();
+    dialEl.focus?.();
+    let anchorY = Number(e.clientY ?? 0);
+    let anchorVal = currentVal;
+    let prevShift = Boolean(e.shiftKey);
+
+    const onMove = (ev) => {
+      const curY = Number(ev.clientY ?? anchorY);
+      const shift = Boolean(ev.shiftKey);
+      if (shift !== prevShift) {
+        anchorY = curY;
+        anchorVal = currentVal;
+        prevShift = shift;
+      }
+      const spanPx = shift ? 1320 : 132;
+      const deltaNorm = (anchorY - curY) / spanPx;
+      commit(anchorVal + deltaNorm * safeSpan, shift);
+    };
+    const onUp = () => {
+      doc.removeEventListener('pointermove', onMove);
+      doc.removeEventListener('pointerup', onUp);
+      doc.removeEventListener('pointercancel', onUp);
+    };
+    doc.addEventListener('pointermove', onMove);
+    doc.addEventListener('pointerup', onUp);
+    doc.addEventListener('pointercancel', onUp);
+  });
+
+  dialEl.addEventListener('dblclick', (e) => {
+    if (disabled) return;
+    e.preventDefault?.();
+    commit(resolvedDefault, true);
+  });
+
+  dialEl.addEventListener('wheel', (e) => {
+    if (disabled) return;
+    e.preventDefault?.();
+    const dir = Number(e.deltaY ?? 0) < 0 ? 1 : -1;
+    const fine = Boolean(e.shiftKey);
+    commit(currentVal + dir * (fine ? step * 0.1 : step), fine);
+  });
+
+  dialEl.addEventListener('keydown', (e) => {
+    if (disabled) return;
+    const fine = Boolean(e.shiftKey);
+    const delta = fine ? step * 0.1 : step;
+    if (e.key === 'ArrowUp' || e.key === 'ArrowRight') {
+      e.preventDefault?.();
+      commit(currentVal + delta, fine);
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') {
+      e.preventDefault?.();
+      commit(currentVal - delta, fine);
+    } else if (e.key === 'PageUp') {
+      e.preventDefault?.();
+      commit(currentVal + step * 10, false);
+    } else if (e.key === 'PageDown') {
+      e.preventDefault?.();
+      commit(currentVal - step * 10, false);
+    } else if (e.key === 'Home') {
+      e.preventDefault?.();
+      commit(resolvedDefault, true);
+    } else if (e.key === 'End') {
+      e.preventDefault?.();
+      commit(max, false);
+    }
+  });
+
+  dialEl.addEventListener('input', (e) => {
+    if (disabled) return;
+    const raw = e?.target?.value ?? dialEl.value;
+    if (raw !== undefined && raw !== '') commit(Number(raw), true);
+  });
+
+  return createDomNode(
+    doc,
+    'div',
+    { class: `gdaw-knob gdaw-knob--${size} ${disabled ? 'is-disabled' : ''}` },
+    createDomNode(doc, 'span', { class: 'gdaw-knob-lbl', title: label }, label),
+    dialEl,
+    readoutEl,
+  );
+}
+
+const FADER_DB_TICKS = [
+  { label: '+6', vol: 2.0 },
+  { label: '0', vol: 1.0 },
+  { label: '-6', vol: 0.5012 },
+  { label: '-12', vol: 0.2512 },
+  { label: '-24', vol: 0.0631 },
+  { label: '-∞', vol: 0.0 },
+];
+
+/**
+ * Vertical Motorized-Style Studio Console Fader (`role="slider"`).
+ * Features sculpted 3D metallic fader cap, grooved track, calibrated dB tick markings
+ * (`+6`, `0`, `-6`, `-12`, `-24`, `-∞`), `Shift+Drag` 10x precision, and `Double-Click` unity (`0 dB`) reset.
+ */
+export function createVerticalFader(
+  doc,
+  {
+    ariaLabel,
+    value = 1.0,
+    max = 2.0,
+    defaultValue = 1.0,
+    busId = '',
+    accentColor = '#d4af37',
+    onChange,
+  },
+) {
+  let currentVol = finiteClamp(value, 0, max, defaultValue);
+  const formatVolDb = (v) => (v <= 0.0005 ? '-∞ dB' : `${(20 * Math.log10(v)).toFixed(1)} dB`);
+
+  const fillEl = createDomNode(doc, 'div', {
+    class: 'gdaw-vfader-fill',
+    style: `background: linear-gradient(180deg, ${accentColor}99, ${accentColor}22);`,
+  });
+  const capEl = createDomNode(
+    doc,
+    'div',
+    { class: 'gdaw-vfader-cap' },
+    createDomNode(doc, 'span', { class: 'gdaw-vfader-cap-line' }),
+  );
+  const unityLine = createDomNode(doc, 'div', {
+    class: 'gdaw-vfader-unity',
+    style: `bottom: ${(volumeToFaderNorm(1.0, max) * 100).toFixed(1)}%;`,
+  });
+
+  const ticksEl = createDomNode(
+    doc,
+    'div',
+    { class: 'gdaw-vfader-scale', 'aria-hidden': 'true' },
+    FADER_DB_TICKS.map((t) =>
+      createDomNode(
+        doc,
+        'span',
+        {
+          class: `gdaw-vfader-tick ${t.label === '0' ? 'unity' : ''}`,
+          style: `bottom: ${(volumeToFaderNorm(t.vol, max) * 100).toFixed(1)}%;`,
+        },
+        t.label,
+      ),
+    ),
+  );
+
+  const readoutEl = createDomNode(doc, 'span', { class: 'gdaw-vfader-db' }, formatVolDb(currentVol));
+
+  const trackEl = createDomNode(
+    doc,
+    'div',
+    {
+      class: 'gdaw-vfader-track',
+      role: 'slider',
+      tabindex: '0',
+      'aria-orientation': 'vertical',
+      'aria-label': ariaLabel,
+      'aria-valuemin': '0',
+      'aria-valuemax': String(max),
+      'aria-valuenow': String(currentVol),
+      'aria-valuetext': formatVolDb(currentVol),
+      'data-fader-bus': busId,
+      value: currentVol,
+    },
+    unityLine,
+    fillEl,
+    capEl,
+  );
+
+  const syncFader = (v) => {
+    const pct = (volumeToFaderNorm(v, max) * 100).toFixed(2);
+    fillEl.setAttribute(
+      'style',
+      `height: ${pct}%; background: linear-gradient(180deg, ${accentColor}99, ${accentColor}22);`,
+    );
+    capEl.setAttribute('style', `bottom: ${pct}%;`);
+    const txt = formatVolDb(v);
+    readoutEl.textContent = txt;
+    trackEl.value = String(v);
+    trackEl.setAttribute('aria-valuenow', String(v));
+    trackEl.setAttribute('aria-valuetext', txt);
+  };
+
+  syncFader(currentVol);
+
+  const commitVol = (nextRaw) => {
+    const clamped = Number(finiteClamp(nextRaw, 0, max, defaultValue).toFixed(4));
+    if (clamped === currentVol) return;
+    currentVol = clamped;
+    syncFader(clamped);
+    onChange?.(clamped);
+  };
+
+  trackEl.addEventListener('pointerdown', (e) => {
+    e.preventDefault?.();
+    trackEl.focus?.();
+    let anchorY = Number(e.clientY ?? 0);
+    let anchorNorm = volumeToFaderNorm(currentVol, max);
+    let prevShift = Boolean(e.shiftKey);
+    const rect = trackEl.getBoundingClientRect?.();
+    const baseHeight = rect?.height > 20 ? rect.height : 124;
+
+    const onMove = (ev) => {
+      const curY = Number(ev.clientY ?? anchorY);
+      const shift = Boolean(ev.shiftKey);
+      if (shift !== prevShift) {
+        anchorY = curY;
+        anchorNorm = volumeToFaderNorm(currentVol, max);
+        prevShift = shift;
+      }
+      const span = shift ? baseHeight * 10 : baseHeight;
+      const nextNorm = finiteClamp(anchorNorm + (anchorY - curY) / span, 0, 1, anchorNorm);
+      commitVol(faderNormToVolume(nextNorm, max));
+    };
+    const onUp = () => {
+      doc.removeEventListener('pointermove', onMove);
+      doc.removeEventListener('pointerup', onUp);
+      doc.removeEventListener('pointercancel', onUp);
+    };
+    doc.addEventListener('pointermove', onMove);
+    doc.addEventListener('pointerup', onUp);
+    doc.addEventListener('pointercancel', onUp);
+  });
+
+  trackEl.addEventListener('dblclick', (e) => {
+    e.preventDefault?.();
+    commitVol(defaultValue);
+  });
+
+  trackEl.addEventListener('wheel', (e) => {
+    e.preventDefault?.();
+    const dir = Number(e.deltaY ?? 0) < 0 ? 1 : -1;
+    const stepNorm = e.shiftKey ? 0.004 : 0.025;
+    const nextNorm = finiteClamp(volumeToFaderNorm(currentVol, max) + dir * stepNorm, 0, 1, 0);
+    commitVol(faderNormToVolume(nextNorm, max));
+  });
+
+  trackEl.addEventListener('keydown', (e) => {
+    const stepNorm = e.shiftKey ? 0.005 : 0.025;
+    const curNorm = volumeToFaderNorm(currentVol, max);
+    if (e.key === 'ArrowUp' || e.key === 'ArrowRight') {
+      e.preventDefault?.();
+      commitVol(faderNormToVolume(finiteClamp(curNorm + stepNorm, 0, 1, curNorm), max));
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') {
+      e.preventDefault?.();
+      commitVol(faderNormToVolume(finiteClamp(curNorm - stepNorm, 0, 1, curNorm), max));
+    } else if (e.key === 'Home') {
+      e.preventDefault?.();
+      commitVol(defaultValue);
+    }
+  });
+
+  trackEl.addEventListener('input', (e) => {
+    const raw = e?.target?.value ?? trackEl.value;
+    if (raw !== undefined && raw !== '') commitVol(Number(raw));
+  });
+
+  return createDomNode(
+    doc,
+    'div',
+    { class: 'gdaw-vfader' },
+    createDomNode(doc, 'div', { class: 'gdaw-vfader-well' }, trackEl, ticksEl),
+    readoutEl,
+  );
 }
 
 // ---- Mounted 4-Panel Ganbate Studio DAW Workbench -------------------------------------------
@@ -1804,7 +2359,13 @@ export function mountAudioDaw(container, studioApi = {}) {
         if (m.clipped) ui.latchedClips.add(bid);
         ui.peakHolds.set(bid, Math.max(ui.peakHolds.get(bid) ?? MIN_METER_DB, m.peakLDb, m.peakRDb));
       }
-      runtime.triggerRenderedBuffer(rendered.left, rendered.right, rendered.sampleRate, ev.durationMs);
+      runtime.triggerRenderedBuffer(
+        rendered.left,
+        rendered.right,
+        rendered.sampleRate,
+        ev.durationMs,
+        ui.loopEnabled,
+      );
       startMeterLoop();
     }
     studioApi.sendPieCue?.({
@@ -2605,20 +3166,42 @@ export function mountAudioDaw(container, studioApi = {}) {
               `clip-trim:${ui.selectedLayerId}`,
             ),
           ),
-          kvNum('Fade In (ms)', activeLayer.fadeInMs, 0, activeLayer.durationMs, 1, (v) =>
-            dispatchOps(
-              'Set clip fade-in',
-              [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'fadeInMs'], value: v }],
-              `clip-fi:${ui.selectedLayerId}`,
-            ),
-          ),
-          kvNum('Fade Out (ms)', activeLayer.fadeOutMs, 0, activeLayer.durationMs, 1, (v) =>
-            dispatchOps(
-              'Set clip fade-out',
-              [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'fadeOutMs'], value: v }],
-              `clip-fo:${ui.selectedLayerId}`,
-            ),
-          ),
+          createRotaryKnob(doc, {
+            label: 'Fade In',
+            value: activeLayer.fadeInMs,
+            min: 0,
+            max: Math.max(10, Math.round(activeLayer.durationMs)),
+            step: 1,
+            defaultValue: 0,
+            accent: 'cyan',
+            size: 'sm',
+            ariaLabel: 'Clip Fade In Ms',
+            format: (v) => `${Math.round(v)} ms`,
+            onChange: (v) =>
+              void dispatchOps(
+                'Set clip fade-in',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'fadeInMs'], value: v }],
+                `clip-fi:${ui.selectedLayerId}`,
+              ),
+          }),
+          createRotaryKnob(doc, {
+            label: 'Fade Out',
+            value: activeLayer.fadeOutMs,
+            min: 0,
+            max: Math.max(10, Math.round(activeLayer.durationMs)),
+            step: 1,
+            defaultValue: 20,
+            accent: 'cyan',
+            size: 'sm',
+            ariaLabel: 'Clip Fade Out Ms',
+            format: (v) => `${Math.round(v)} ms`,
+            onChange: (v) =>
+              void dispatchOps(
+                'Set clip fade-out',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'fadeOutMs'], value: v }],
+                `clip-fo:${ui.selectedLayerId}`,
+              ),
+          }),
           el(
             'label',
             { class: 'gdaw-kv' },
@@ -2640,27 +3223,62 @@ export function mountAudioDaw(container, studioApi = {}) {
               ),
             ),
           ),
-          kvNum('Clip Gain (dB)', activeLayer.gainDb, -48, 18, 0.5, (v) =>
-            dispatchOps(
-              'Set clip gain',
-              [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'gainDb'], value: v }],
-              `clip-gain:${ui.selectedLayerId}`,
-            ),
-          ),
-          kvNum('Pitch (st)', activeLayer.pitchSemitones, -24, 24, 0.5, (v) =>
-            dispatchOps(
-              'Set clip pitch',
-              [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'pitchSemitones'], value: v }],
-              `clip-pitch:${ui.selectedLayerId}`,
-            ),
-          ),
-          kvNum('Jitter (ct)', activeLayer.pitchJitterCents, 0, 400, 5, (v) =>
-            dispatchOps(
-              'Set pitch jitter',
-              [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'pitchJitterCents'], value: v }],
-              `clip-pjit:${ui.selectedLayerId}`,
-            ),
-          ),
+          createRotaryKnob(doc, {
+            label: 'Clip Gain',
+            value: activeLayer.gainDb,
+            min: -48,
+            max: 18,
+            step: 0.5,
+            defaultValue: 0,
+            bipolar: true,
+            accent: 'gold',
+            size: 'sm',
+            ariaLabel: 'Clip Gain dB',
+            format: (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)} dB`,
+            onChange: (v) =>
+              void dispatchOps(
+                'Set clip gain',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'gainDb'], value: v }],
+                `clip-gain:${ui.selectedLayerId}`,
+              ),
+          }),
+          createRotaryKnob(doc, {
+            label: 'Pitch',
+            value: activeLayer.pitchSemitones,
+            min: -24,
+            max: 24,
+            step: 0.5,
+            defaultValue: 0,
+            bipolar: true,
+            accent: 'gold',
+            size: 'sm',
+            ariaLabel: 'Clip Pitch Semitones',
+            format: (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)} st`,
+            onChange: (v) =>
+              void dispatchOps(
+                'Set clip pitch',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'pitchSemitones'], value: v }],
+                `clip-pitch:${ui.selectedLayerId}`,
+              ),
+          }),
+          createRotaryKnob(doc, {
+            label: 'Pitch Var',
+            value: activeLayer.pitchJitterCents,
+            min: 0,
+            max: 400,
+            step: 5,
+            defaultValue: 0,
+            accent: 'amber',
+            size: 'sm',
+            ariaLabel: 'Clip Pitch Variance Cents',
+            format: (v) => `±${Math.round(v)} c`,
+            onChange: (v) =>
+              void dispatchOps(
+                'Set pitch jitter',
+                [{ set: ['events', ui.selectedEventId, 'layers', ui.selectedLayerId, 'pitchJitterCents'], value: v }],
+                `clip-pjit:${ui.selectedLayerId}`,
+              ),
+          }),
           el(
             'label',
             { class: 'gdaw-kv' },
@@ -2696,7 +3314,7 @@ export function mountAudioDaw(container, studioApi = {}) {
             'button',
             {
               type: 'button',
-              class: 'primary',
+              class: `gdaw-hw-btn gdaw-hw-btn--transport ${runtime.playing ? 'lit-play' : 'primary'}`,
               'data-action': 'trigger-event',
               onclick: () => void auditionEvent(ui.selectedEventId),
             },
@@ -2706,6 +3324,7 @@ export function mountAudioDaw(container, studioApi = {}) {
             'button',
             {
               type: 'button',
+              class: 'gdaw-hw-btn gdaw-hw-btn--transport',
               'data-action': 'stop-audio',
               onclick: () => {
                 runtime.stopAll();
@@ -2715,11 +3334,26 @@ export function mountAudioDaw(container, studioApi = {}) {
             },
             tr('stopAudio'),
           ),
+          el(
+            'button',
+            {
+              type: 'button',
+              class: `gdaw-hw-btn ${ui.loopEnabled ? 'lit-cyan active' : ''}`,
+              'aria-pressed': String(Boolean(ui.loopEnabled)),
+              'data-action': 'toggle-loop',
+              onclick: () => {
+                ui.loopEnabled = !ui.loopEnabled;
+                renderTimelinePanel();
+              },
+            },
+            '⟳ LOOP',
+          ),
           seqSelect,
           el(
             'button',
             {
               type: 'button',
+              class: 'gdaw-hw-btn',
               'data-action': 'play-sequence',
               onclick: () => playSequence(ui.selectedSequenceId),
             },
@@ -2729,6 +3363,7 @@ export function mountAudioDaw(container, studioApi = {}) {
             'button',
             {
               type: 'button',
+              class: 'gdaw-hw-btn',
               'data-action': 'bounce-wav',
               onclick: () => bounceEventWav(ui.selectedEventId),
             },
@@ -2744,6 +3379,7 @@ export function mountAudioDaw(container, studioApi = {}) {
           'button',
           {
             type: 'button',
+            class: 'gdaw-hw-btn',
             'data-action': 'add-event',
             onclick: () => {
               const newId = `evt_${randomHexId(12)}`;
@@ -2784,22 +3420,22 @@ export function mountAudioDaw(container, studioApi = {}) {
             `contact:${ui.selectedEventId}`,
           ),
         ),
-        el(
-          'label',
-          { class: 'gdaw-kv' },
-          'Zoom',
-          el('input', {
-            type: 'range',
-            min: '0.5',
-            max: '2.5',
-            step: '0.1',
-            value: ui.timelineZoom,
-            oninput: (e) => {
-              ui.timelineZoom = Number(e.target.value) || 1;
-              renderTimelinePanel();
-            },
-          }),
-        ),
+        createRotaryKnob(doc, {
+          label: 'Zoom',
+          value: ui.timelineZoom,
+          min: 0.5,
+          max: 2.5,
+          step: 0.1,
+          defaultValue: 1.0,
+          accent: 'gold',
+          size: 'sm',
+          ariaLabel: 'Timeline Zoom',
+          format: (v) => `${v.toFixed(1)}×`,
+          onChange: (v) => {
+            ui.timelineZoom = v || 1;
+            renderTimelinePanel();
+          },
+        }),
       ),
       el(
         'div',
@@ -2842,6 +3478,14 @@ export function mountAudioDaw(container, studioApi = {}) {
     return Math.max(0, Math.min(100, ((finiteClamp(db, MIN_METER_DB, 6, MIN_METER_DB) - MIN_METER_DB) / (6 - MIN_METER_DB)) * 100));
   }
 
+  const fmtSignedDb = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)} dB`;
+  const fmtPanText = (v) =>
+    Math.abs(v) < 0.015 ? 'C' : v < 0 ? `L${Math.round(Math.abs(v) * 100)}` : `R${Math.round(v * 100)}`;
+  const fmtFreqText = (v) =>
+    v >= 1000
+      ? `${(v / 1000).toFixed(v >= 10000 ? 1 : 2).replace(/\.?0+$/, '')} kHz`
+      : `${Math.round(v)} Hz`;
+
   function renderConsolePanel() {
     const buses = orderedBuses(ui.root);
     const stripsEl = el('div', { class: 'gdaw-strips' });
@@ -2869,6 +3513,25 @@ export function mountAudioDaw(container, studioApi = {}) {
             'data-bus-id': bus.id,
           },
           el('div', { class: 'gdaw-strip-title', style: `color: ${bus.color}` }, bus.label),
+          createRotaryKnob(doc, {
+            label: 'PAN',
+            value: bus.strip.pan,
+            min: -1,
+            max: 1,
+            step: 0.02,
+            defaultValue: 0,
+            bipolar: true,
+            accent: 'gold',
+            size: 'sm',
+            ariaLabel: `${bus.label} pan`,
+            format: fmtPanText,
+            onChange: (v) =>
+              void dispatchOps(
+                `Pan ${bus.label}`,
+                [{ set: ['buses', bus.id, 'strip', 'pan'], value: v }],
+                `pan:${bus.id}`,
+              ),
+          }),
           el(
             'div',
             {
@@ -2887,56 +3550,40 @@ export function mountAudioDaw(container, studioApi = {}) {
             { class: 'gdaw-meter-row' },
             el(
               'div',
-              { class: 'gdaw-meter-bar', title: `L RMS ${m.rmsLDb.toFixed(1)} dB` },
-              el('div', { class: 'gdaw-meter-rms', style: `height: ${dbToPct(m.rmsLDb).toFixed(1)}%` }),
-              el('div', { class: 'gdaw-meter-peak', style: `bottom: ${dbToPct(holdDb).toFixed(1)}%` }),
+              { class: 'gdaw-meter-pair' },
+              el(
+                'div',
+                { class: 'gdaw-meter-bar', title: `L RMS ${m.rmsLDb.toFixed(1)} dB` },
+                el('div', { class: 'gdaw-meter-rms', style: `height: ${dbToPct(m.rmsLDb).toFixed(1)}%` }),
+                el('div', { class: 'gdaw-meter-peak', style: `bottom: ${dbToPct(holdDb).toFixed(1)}%` }),
+              ),
+              el(
+                'div',
+                { class: 'gdaw-meter-bar', title: `R RMS ${m.rmsRDb.toFixed(1)} dB` },
+                el('div', { class: 'gdaw-meter-rms', style: `height: ${dbToPct(m.rmsRDb).toFixed(1)}%` }),
+                el('div', { class: 'gdaw-meter-peak', style: `bottom: ${dbToPct(m.peakRDb).toFixed(1)}%` }),
+              ),
+              el(
+                'div',
+                { class: 'gdaw-meter-gr', title: `GR -${(m.gainReductionDb || 0).toFixed(1)} dB` },
+                el('div', { class: 'gdaw-meter-gr-fill', style: `height: ${grPct.toFixed(1)}%` }),
+              ),
             ),
-            el(
-              'div',
-              { class: 'gdaw-meter-bar', title: `R RMS ${m.rmsRDb.toFixed(1)} dB` },
-              el('div', { class: 'gdaw-meter-rms', style: `height: ${dbToPct(m.rmsRDb).toFixed(1)}%` }),
-              el('div', { class: 'gdaw-meter-peak', style: `bottom: ${dbToPct(m.peakRDb).toFixed(1)}%` }),
-            ),
-            el(
-              'div',
-              { class: 'gdaw-meter-gr', title: `GR -${(m.gainReductionDb || 0).toFixed(1)} dB` },
-              el('div', { class: 'gdaw-meter-gr-fill', style: `height: ${grPct.toFixed(1)}%` }),
-            ),
-            el(
-              'div',
-              { class: 'gdaw-fader-col' },
-              el('input', {
-                type: 'range',
-                min: '0',
-                max: '1.5',
-                step: '0.01',
-                value: bus.volume,
-                'aria-label': `${bus.label} volume`,
-                oninput: (e) => {
-                  void dispatchOps(
-                    `Set ${bus.label} fader`,
-                    [{ set: ['buses', bus.id, 'volume'], value: Number(e.target.value) }],
-                    `fader:${bus.id}`,
-                  );
-                },
-              }),
-            ),
+            createVerticalFader(doc, {
+              ariaLabel: `${bus.label} volume`,
+              value: bus.volume,
+              max: 2.0,
+              defaultValue: 1.0,
+              busId: bus.id,
+              accentColor: bus.color,
+              onChange: (v) =>
+                void dispatchOps(
+                  `Set ${bus.label} fader`,
+                  [{ set: ['buses', bus.id, 'volume'], value: v }],
+                  `fader:${bus.id}`,
+                ),
+            }),
           ),
-          el('input', {
-            type: 'range',
-            min: '-1',
-            max: '1',
-            step: '0.02',
-            value: bus.strip.pan,
-            title: `Pan ${bus.strip.pan.toFixed(2)}`,
-            oninput: (e) => {
-              void dispatchOps(
-                `Pan ${bus.label}`,
-                [{ set: ['buses', bus.id, 'strip', 'pan'], value: Number(e.target.value) }],
-                `pan:${bus.id}`,
-              );
-            },
-          }),
           el(
             'div',
             { class: 'gdaw-strip-btns' },
@@ -2944,7 +3591,9 @@ export function mountAudioDaw(container, studioApi = {}) {
               'button',
               {
                 type: 'button',
-                class: bus.muted ? 'active' : '',
+                class: `gdaw-hw-btn gdaw-hw-btn--mute ${bus.muted ? 'lit-mute active' : ''}`,
+                'aria-pressed': String(Boolean(bus.muted)),
+                title: `Mute ${bus.label}`,
                 onclick: () =>
                   void dispatchOps(`Mute ${bus.label}`, [
                     { set: ['buses', bus.id, 'muted'], value: !bus.muted },
@@ -2957,7 +3606,9 @@ export function mountAudioDaw(container, studioApi = {}) {
               {
                 type: 'button',
                 disabled: bus.id === MASTER_BUS_ID,
-                class: bus.solo ? 'active' : '',
+                class: `gdaw-hw-btn gdaw-hw-btn--solo ${bus.solo ? 'lit-solo active' : ''}`,
+                'aria-pressed': String(Boolean(bus.solo)),
+                title: `Solo ${bus.label}`,
                 onclick: () =>
                   void dispatchOps(`Solo ${bus.label}`, [
                     { set: ['buses', bus.id, 'solo'], value: !bus.solo },
@@ -2969,7 +3620,22 @@ export function mountAudioDaw(container, studioApi = {}) {
               'button',
               {
                 type: 'button',
-                class: isSelected ? 'active' : '',
+                class: `gdaw-hw-btn gdaw-hw-btn--byp ${bus.strip.bypass ? 'lit-byp active' : ''}`,
+                'aria-pressed': String(Boolean(bus.strip.bypass)),
+                title: `Bypass ${bus.label} DSP inserts`,
+                onclick: () =>
+                  void dispatchOps(`Bypass ${bus.label}`, [
+                    { set: ['buses', bus.id, 'strip', 'bypass'], value: !bus.strip.bypass },
+                  ]),
+              },
+              'BYP',
+            ),
+            el(
+              'button',
+              {
+                type: 'button',
+                class: `gdaw-hw-btn ${isSelected ? 'lit-gold active' : ''}`,
+                title: `Inspect ${bus.label} DSP rack`,
                 onclick: () => {
                   ui.inspectorTarget = { kind: 'bus', id: bus.id };
                   renderConsolePanel();
@@ -3224,21 +3890,48 @@ export function mountAudioDaw(container, studioApi = {}) {
         mergeKey ? `dsp:${ctx.basePath.join('/')}:${mergeKey}` : undefined,
       );
 
-    const slider = (labelText, val, min, max, step, subPath, fmt = (v) => String(v)) =>
-      el(
-        'label',
-        { class: 'gdaw-kv' },
-        `${labelText}: ${fmt(val)}`,
-        el('input', {
-          type: 'range',
-          min,
-          max,
-          step,
-          value: val,
-          'data-dsp': subPath.join('.'),
-          oninput: (e) => void setSub(subPath, Number(e.target.value), subPath.join('.')),
-        }),
-      );
+    const knob = (
+      labelText,
+      val,
+      min,
+      max,
+      step,
+      subPath,
+      {
+        fmt = (v) => String(v),
+        defaultValue,
+        bipolar = false,
+        accent = 'gold',
+        disabled = false,
+        autoEnablePath,
+      } = {},
+    ) =>
+      createRotaryKnob(doc, {
+        label: labelText,
+        value: val,
+        min,
+        max,
+        step,
+        defaultValue,
+        bipolar,
+        accent,
+        size: 'md',
+        disabled,
+        dataDsp: subPath.join('.'),
+        ariaLabel: `${labelText} (${subPath.join('.')})`,
+        format: fmt,
+        onChange: (nextVal) => {
+          const ops = [{ set: [...ctx.basePath, ...subPath], value: nextVal }];
+          if (autoEnablePath) {
+            ops.unshift({ set: [...ctx.basePath, ...autoEnablePath], value: true });
+          }
+          void dispatchOps(
+            `DSP ${subPath.join('.')}`,
+            ops,
+            `dsp:${ctx.basePath.join('/')}:${subPath.join('.')}`,
+          );
+        },
+      });
 
     const targetSelect = el(
       'select',
@@ -3278,6 +3971,8 @@ export function mountAudioDaw(container, studioApi = {}) {
       ),
     );
 
+    const spatial = s.spatial || { enabled: false, minDistance: 1.5, maxDistance: 35, rolloff: 1.0 };
+
     dspEl.replaceChildren(
       el(
         'div',
@@ -3291,16 +3986,18 @@ export function mountAudioDaw(container, studioApi = {}) {
             'button',
             {
               type: 'button',
-              class: s.bypass ? 'active' : '',
+              class: `gdaw-hw-btn gdaw-hw-btn--byp ${s.bypass ? 'lit-byp active' : ''}`,
+              'aria-pressed': String(Boolean(s.bypass)),
               'data-action': 'dsp-bypass',
               onclick: () => void setSub(['bypass'], !s.bypass),
             },
-            'Bypass',
+            'BYP',
           ),
           el(
             'button',
             {
               type: 'button',
+              class: 'gdaw-hw-btn',
               'data-action': 'dsp-reset',
               onclick: () =>
                 void dispatchOps('Reset DSP strip', [
@@ -3318,15 +4015,28 @@ export function mountAudioDaw(container, studioApi = {}) {
         el(
           'div',
           { class: 'gdaw-dsp-card' },
-          el('div', { class: 'gdaw-dsp-card-hdr' }, 'Gain · Stereo Routing · Mid/Side Width'),
+          el('div', { class: 'gdaw-dsp-card-hdr' }, '1 · Gain · Stereo Routing · Mid/Side Width'),
           el(
             'div',
-            { class: 'gdaw-dsp-grid' },
-            slider('Input Gain', s.inputGainDb, -24, 18, 0.5, ['inputGainDb'], (v) => `${v.toFixed(1)} dB`),
-            slider('Pan', s.pan, -1, 1, 0.02, ['pan'], (v) => v.toFixed(2)),
+            { class: 'gdaw-knob-bank' },
+            knob('Input Gain', s.inputGainDb, -24, 18, 0.5, ['inputGainDb'], {
+              defaultValue: 0,
+              bipolar: true,
+              fmt: fmtSignedDb,
+            }),
+            knob('Pan', s.pan, -1, 1, 0.02, ['pan'], {
+              defaultValue: 0,
+              bipolar: true,
+              fmt: fmtPanText,
+            }),
+            knob('M/S Width', s.stereoWidthPct, 0, 200, 1, ['stereoWidthPct'], {
+              defaultValue: 100,
+              disabled: s.stereoMode !== 'stereo',
+              fmt: (v) => `${Math.round(v)}%`,
+            }),
             el(
               'label',
-              { class: 'gdaw-kv' },
+              { class: 'gdaw-kv gdaw-kv--rack' },
               'Stereo Mode',
               el(
                 'select',
@@ -3339,7 +4049,6 @@ export function mountAudioDaw(container, studioApi = {}) {
                 ),
               ),
             ),
-            slider('M/S Width', s.stereoWidthPct, 0, 200, 1, ['stereoWidthPct'], (v) => `${Math.round(v)}%`),
           ),
         ),
         // Card 2: HPF / LPF / 3-Band Parametric EQ + SVG Biquad Curve
@@ -3349,7 +4058,7 @@ export function mountAudioDaw(container, studioApi = {}) {
           el(
             'div',
             { class: 'gdaw-dsp-card-hdr' },
-            'HPF · LPF · 3-Band Parametric EQ',
+            '2 · HPF · LPF · 3-Band Parametric EQ',
             el(
               'div',
               { class: 'gdaw-row' },
@@ -3357,7 +4066,8 @@ export function mountAudioDaw(container, studioApi = {}) {
                 'button',
                 {
                   type: 'button',
-                  class: s.highPass.enabled ? 'active' : '',
+                  class: `gdaw-hw-btn ${s.highPass.enabled ? 'lit-cyan active' : ''}`,
+                  'aria-pressed': String(Boolean(s.highPass.enabled)),
                   onclick: () => void setSub(['highPass', 'enabled'], !s.highPass.enabled),
                 },
                 'HPF',
@@ -3366,7 +4076,8 @@ export function mountAudioDaw(container, studioApi = {}) {
                 'button',
                 {
                   type: 'button',
-                  class: s.lowPass.enabled ? 'active' : '',
+                  class: `gdaw-hw-btn ${s.lowPass.enabled ? 'lit-cyan active' : ''}`,
+                  'aria-pressed': String(Boolean(s.lowPass.enabled)),
                   onclick: () => void setSub(['lowPass', 'enabled'], !s.lowPass.enabled),
                 },
                 'LPF',
@@ -3375,7 +4086,8 @@ export function mountAudioDaw(container, studioApi = {}) {
                 'button',
                 {
                   type: 'button',
-                  class: s.eq.enabled ? 'active' : '',
+                  class: `gdaw-hw-btn ${s.eq.enabled ? 'lit-gold active' : ''}`,
+                  'aria-pressed': String(Boolean(s.eq.enabled)),
                   'data-action': 'toggle-eq',
                   onclick: () => void setSub(['eq', 'enabled'], !s.eq.enabled),
                 },
@@ -3386,13 +4098,58 @@ export function mountAudioDaw(container, studioApi = {}) {
           buildEqSvg(s),
           el(
             'div',
-            { class: 'gdaw-dsp-grid' },
-            slider('HPF Hz', s.highPass.frequencyHz, 20, 2000, 5, ['highPass', 'frequencyHz'], (v) => `${Math.round(v)} Hz`),
-            slider('LPF Hz', s.lowPass.frequencyHz, 500, 20000, 50, ['lowPass', 'frequencyHz'], (v) => `${Math.round(v)} Hz`),
-            slider('Low Gain', s.eq.lowGainDb, -18, 18, 0.5, ['eq', 'lowGainDb'], (v) => `${v.toFixed(1)} dB`),
-            slider('Mid Gain', s.eq.midGainDb, -18, 18, 0.5, ['eq', 'midGainDb'], (v) => `${v.toFixed(1)} dB`),
-            slider('Mid Freq', s.eq.midFreqHz, 150, 8000, 20, ['eq', 'midFreqHz'], (v) => `${Math.round(v)} Hz`),
-            slider('High Gain', s.eq.highGainDb, -18, 18, 0.5, ['eq', 'highGainDb'], (v) => `${v.toFixed(1)} dB`),
+            { class: 'gdaw-knob-bank' },
+            knob('HPF Freq', s.highPass.frequencyHz, 20, 2000, 5, ['highPass', 'frequencyHz'], {
+              defaultValue: 20,
+              accent: 'cyan',
+              fmt: fmtFreqText,
+            }),
+            knob('HPF Q', s.highPass.q, 0.1, 12, 0.05, ['highPass', 'q'], {
+              defaultValue: 0.707,
+              accent: 'cyan',
+              fmt: (v) => `Q ${v.toFixed(2)}`,
+            }),
+            knob('LPF Freq', s.lowPass.frequencyHz, 500, 20000, 50, ['lowPass', 'frequencyHz'], {
+              defaultValue: 20000,
+              accent: 'cyan',
+              fmt: fmtFreqText,
+            }),
+            knob('LPF Q', s.lowPass.q, 0.1, 12, 0.05, ['lowPass', 'q'], {
+              defaultValue: 0.707,
+              accent: 'cyan',
+              fmt: (v) => `Q ${v.toFixed(2)}`,
+            }),
+            knob('Low Gain', s.eq.lowGainDb, -18, 18, 0.5, ['eq', 'lowGainDb'], {
+              defaultValue: 0,
+              bipolar: true,
+              fmt: fmtSignedDb,
+            }),
+            knob('Low Freq', s.eq.lowFreqHz, 20, 1000, 5, ['eq', 'lowFreqHz'], {
+              defaultValue: 120,
+              fmt: fmtFreqText,
+            }),
+            knob('Mid Gain', s.eq.midGainDb, -18, 18, 0.5, ['eq', 'midGainDb'], {
+              defaultValue: 0,
+              bipolar: true,
+              fmt: fmtSignedDb,
+            }),
+            knob('Mid Freq', s.eq.midFreqHz, 150, 8000, 20, ['eq', 'midFreqHz'], {
+              defaultValue: 1200,
+              fmt: fmtFreqText,
+            }),
+            knob('Mid Q', s.eq.midQ, 0.2, 12, 0.1, ['eq', 'midQ'], {
+              defaultValue: 1.0,
+              fmt: (v) => `Q ${v.toFixed(2)}`,
+            }),
+            knob('High Gain', s.eq.highGainDb, -18, 18, 0.5, ['eq', 'highGainDb'], {
+              defaultValue: 0,
+              bipolar: true,
+              fmt: fmtSignedDb,
+            }),
+            knob('High Freq', s.eq.highFreqHz, 1000, 18000, 100, ['eq', 'highFreqHz'], {
+              defaultValue: 6500,
+              fmt: fmtFreqText,
+            }),
           ),
         ),
         // Card 3: Dynamics Compressor
@@ -3402,12 +4159,13 @@ export function mountAudioDaw(container, studioApi = {}) {
           el(
             'div',
             { class: 'gdaw-dsp-card-hdr' },
-            `Dynamics Compressor (GR -${ctx.grDb.toFixed(1)} dB)`,
+            `3 · Dynamics Compressor (GR -${ctx.grDb.toFixed(1)} dB)`,
             el(
               'button',
               {
                 type: 'button',
-                class: s.compressor.enabled ? 'active' : '',
+                class: `gdaw-hw-btn ${s.compressor.enabled ? 'lit-gold active' : ''}`,
+                'aria-pressed': String(Boolean(s.compressor.enabled)),
                 'data-action': 'toggle-compressor',
                 onclick: () => void setSub(['compressor', 'enabled'], !s.compressor.enabled),
               },
@@ -3416,13 +4174,38 @@ export function mountAudioDaw(container, studioApi = {}) {
           ),
           el(
             'div',
-            { class: 'gdaw-dsp-grid' },
-            slider('Threshold', s.compressor.thresholdDb, -48, 0, 0.5, ['compressor', 'thresholdDb'], (v) => `${v.toFixed(1)} dB`),
-            slider('Ratio', s.compressor.ratio, 1, 20, 0.5, ['compressor', 'ratio'], (v) => `${v.toFixed(1)}:1`),
-            slider('Attack', s.compressor.attackSec, 0.001, 0.2, 0.001, ['compressor', 'attackSec'], (v) => `${Math.round(v * 1000)} ms`),
-            slider('Release', s.compressor.releaseSec, 0.01, 1.0, 0.01, ['compressor', 'releaseSec'], (v) => `${Math.round(v * 1000)} ms`),
-            slider('Makeup', s.compressor.makeupGainDb, -6, 18, 0.5, ['compressor', 'makeupGainDb'], (v) => `${v.toFixed(1)} dB`),
-            slider('Mix', s.compressor.mix, 0, 1, 0.02, ['compressor', 'mix'], (v) => `${Math.round(v * 100)}%`),
+            { class: 'gdaw-knob-bank' },
+            knob('Threshold', s.compressor.thresholdDb, -48, 0, 0.5, ['compressor', 'thresholdDb'], {
+              defaultValue: -18,
+              accent: 'amber',
+              fmt: (v) => `${v.toFixed(1)} dB`,
+            }),
+            knob('Ratio', s.compressor.ratio, 1, 20, 0.5, ['compressor', 'ratio'], {
+              defaultValue: 3,
+              accent: 'amber',
+              fmt: (v) => `${v.toFixed(1)}:1`,
+            }),
+            knob('Attack', s.compressor.attackSec, 0.001, 0.2, 0.001, ['compressor', 'attackSec'], {
+              defaultValue: 0.008,
+              accent: 'amber',
+              fmt: (v) => `${Math.round(v * 1000)} ms`,
+            }),
+            knob('Release', s.compressor.releaseSec, 0.01, 1.0, 0.01, ['compressor', 'releaseSec'], {
+              defaultValue: 0.14,
+              accent: 'amber',
+              fmt: (v) => `${Math.round(v * 1000)} ms`,
+            }),
+            knob('Makeup', s.compressor.makeupGainDb, -6, 18, 0.5, ['compressor', 'makeupGainDb'], {
+              defaultValue: 0,
+              bipolar: true,
+              accent: 'amber',
+              fmt: fmtSignedDb,
+            }),
+            knob('Mix', s.compressor.mix, 0, 1, 0.02, ['compressor', 'mix'], {
+              defaultValue: 1,
+              accent: 'amber',
+              fmt: (v) => `${Math.round(v * 100)}%`,
+            }),
           ),
         ),
         // Card 4: Soft-Clip Overdrive
@@ -3432,12 +4215,13 @@ export function mountAudioDaw(container, studioApi = {}) {
           el(
             'div',
             { class: 'gdaw-dsp-card-hdr' },
-            'Overdrive / Harmonic Saturation',
+            '4 · Overdrive / Harmonic Saturation',
             el(
               'button',
               {
                 type: 'button',
-                class: s.overdrive.enabled ? 'active' : '',
+                class: `gdaw-hw-btn ${s.overdrive.enabled ? 'lit-gold active' : ''}`,
+                'aria-pressed': String(Boolean(s.overdrive.enabled)),
                 'data-action': 'toggle-overdrive',
                 onclick: () => void setSub(['overdrive', 'enabled'], !s.overdrive.enabled),
               },
@@ -3447,13 +4231,25 @@ export function mountAudioDaw(container, studioApi = {}) {
           buildOverdriveSvg(s.overdrive.drive),
           el(
             'div',
-            { class: 'gdaw-dsp-grid' },
-            slider('Drive', s.overdrive.drive, 0, 100, 1, ['overdrive', 'drive'], (v) => `${Math.round(v)}%`),
-            slider('Mix', s.overdrive.mix, 0, 1, 0.02, ['overdrive', 'mix'], (v) => `${Math.round(v * 100)}%`),
-            slider('Tone LPF', s.overdrive.toneHz, 800, 18000, 100, ['overdrive', 'toneHz'], (v) => `${Math.round(v)} Hz`),
+            { class: 'gdaw-knob-bank' },
+            knob('Drive', s.overdrive.drive, 0, 100, 1, ['overdrive', 'drive'], {
+              defaultValue: 0,
+              accent: 'amber',
+              fmt: (v) => `${Math.round(v)}%`,
+            }),
+            knob('Tone LPF', s.overdrive.toneHz, 800, 18000, 100, ['overdrive', 'toneHz'], {
+              defaultValue: 6500,
+              accent: 'amber',
+              fmt: fmtFreqText,
+            }),
+            knob('Mix', s.overdrive.mix, 0, 1, 0.02, ['overdrive', 'mix'], {
+              defaultValue: 0,
+              accent: 'amber',
+              fmt: (v) => `${Math.round(v * 100)}%`,
+            }),
             el(
               'label',
-              { class: 'gdaw-kv' },
+              { class: 'gdaw-kv gdaw-kv--rack' },
               'Oversample',
               el(
                 'select',
@@ -3474,7 +4270,7 @@ export function mountAudioDaw(container, studioApi = {}) {
           el(
             'div',
             { class: 'gdaw-dsp-card-hdr' },
-            'Stereo Delay & Room Reverb',
+            '5 · Stereo Delay & Room Reverb',
             el(
               'div',
               { class: 'gdaw-row' },
@@ -3482,7 +4278,8 @@ export function mountAudioDaw(container, studioApi = {}) {
                 'button',
                 {
                   type: 'button',
-                  class: s.delay.enabled ? 'active' : '',
+                  class: `gdaw-hw-btn ${s.delay.enabled ? 'lit-cyan active' : ''}`,
+                  'aria-pressed': String(Boolean(s.delay.enabled)),
                   onclick: () => void setSub(['delay', 'enabled'], !s.delay.enabled),
                 },
                 'Delay',
@@ -3491,7 +4288,8 @@ export function mountAudioDaw(container, studioApi = {}) {
                 'button',
                 {
                   type: 'button',
-                  class: s.reverb.enabled ? 'active' : '',
+                  class: `gdaw-hw-btn ${s.reverb.enabled ? 'lit-cyan active' : ''}`,
+                  'aria-pressed': String(Boolean(s.reverb.enabled)),
                   onclick: () => void setSub(['reverb', 'enabled'], !s.reverb.enabled),
                 },
                 'Reverb',
@@ -3500,13 +4298,82 @@ export function mountAudioDaw(container, studioApi = {}) {
           ),
           el(
             'div',
-            { class: 'gdaw-dsp-grid' },
-            slider('Delay Time', s.delay.timeMs, 10, 1000, 5, ['delay', 'timeMs'], (v) => `${Math.round(v)} ms`),
-            slider('Feedback', s.delay.feedback, 0, 0.9, 0.02, ['delay', 'feedback'], (v) => `${Math.round(v * 100)}%`),
-            slider('Delay Mix', s.delay.mix, 0, 1, 0.02, ['delay', 'mix'], (v) => `${Math.round(v * 100)}%`),
-            slider('Room Size', s.reverb.roomSize, 0, 1, 0.02, ['reverb', 'roomSize'], (v) => `${Math.round(v * 100)}%`),
-            slider('HF Damp', s.reverb.damping, 0, 1, 0.02, ['reverb', 'damping'], (v) => `${Math.round(v * 100)}%`),
-            slider('Reverb Mix', s.reverb.mix, 0, 1, 0.02, ['reverb', 'mix'], (v) => `${Math.round(v * 100)}%`),
+            { class: 'gdaw-knob-bank' },
+            knob('Delay Time', s.delay.timeMs, 10, 1000, 5, ['delay', 'timeMs'], {
+              defaultValue: 140,
+              accent: 'cyan',
+              fmt: (v) => `${Math.round(v)} ms`,
+            }),
+            knob('Feedback', s.delay.feedback, 0, 0.9, 0.02, ['delay', 'feedback'], {
+              defaultValue: 0.22,
+              accent: 'cyan',
+              fmt: (v) => `${Math.round(v * 100)}%`,
+            }),
+            knob('Delay Mix', s.delay.mix, 0, 1, 0.02, ['delay', 'mix'], {
+              defaultValue: 0,
+              accent: 'cyan',
+              fmt: (v) => `${Math.round(v * 100)}%`,
+            }),
+            knob('Wet Mix', s.reverb.mix, 0, 1, 0.02, ['reverb', 'mix'], {
+              defaultValue: 0,
+              accent: 'cyan',
+              fmt: (v) => `${Math.round(v * 100)}%`,
+            }),
+            knob('Room Decay', s.reverb.roomSize, 0, 1, 0.02, ['reverb', 'roomSize'], {
+              defaultValue: 0.35,
+              accent: 'cyan',
+              fmt: (v) => `${Math.round(v * 100)}%`,
+            }),
+            knob('Pre-Delay', s.reverb.preDelayMs, 0, 250, 1, ['reverb', 'preDelayMs'], {
+              defaultValue: 12,
+              accent: 'cyan',
+              fmt: (v) => `${Math.round(v)} ms`,
+            }),
+            knob('HF Damp', s.reverb.damping, 0, 1, 0.02, ['reverb', 'damping'], {
+              defaultValue: 0.45,
+              accent: 'cyan',
+              fmt: (v) => `${Math.round(v * 100)}%`,
+            }),
+          ),
+        ),
+        // Card 6: 3D Spatializer Attenuation
+        el(
+          'div',
+          { class: 'gdaw-dsp-card' },
+          el(
+            'div',
+            { class: 'gdaw-dsp-card-hdr' },
+            '6 · 3D Spatializer · Distance Rolloff',
+            el(
+              'button',
+              {
+                type: 'button',
+                class: `gdaw-hw-btn ${spatial.enabled ? 'lit-cyan active' : ''}`,
+                'aria-pressed': String(Boolean(spatial.enabled)),
+                'data-action': 'toggle-spatial',
+                onclick: () => void setSub(['spatial', 'enabled'], !spatial.enabled),
+              },
+              spatial.enabled ? '3D ON' : '3D OFF',
+            ),
+          ),
+          el(
+            'div',
+            { class: 'gdaw-knob-bank' },
+            knob('Min Dist', spatial.minDistance, 0.1, 50, 0.1, ['spatial', 'minDistance'], {
+              defaultValue: 1.5,
+              accent: 'cyan',
+              fmt: (v) => `${v.toFixed(1)} m`,
+            }),
+            knob('Max Dist', spatial.maxDistance, 1, 200, 1, ['spatial', 'maxDistance'], {
+              defaultValue: 35,
+              accent: 'cyan',
+              fmt: (v) => `${Math.round(v)} m`,
+            }),
+            knob('Rolloff', spatial.rolloff, 0, 4, 0.05, ['spatial', 'rolloff'], {
+              defaultValue: 1.0,
+              accent: 'cyan',
+              fmt: (v) => `${v.toFixed(2)}×`,
+            }),
           ),
         ),
       ),
