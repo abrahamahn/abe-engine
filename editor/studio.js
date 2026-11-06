@@ -470,7 +470,7 @@ function onMessage(msg) {
       }
       pieViewport.notifyDocUpdate(doc, msg.ops);
       if (state.selection && !entity(state.selection)) state.selection = null;
-      if (state.host?.kind !== 'cloud') followOps(msg.ops);
+      if (state.host?.kind !== 'cloud' || state.cooked) followOps(msg.ops);
       if (state.cameraFollow) lookThrough(state.cameraFollow);
       if (msg.ops.some(op => (op.set || op.remove).includes('environment'))) {
         watchLook(lookAsset()?.look);
@@ -528,7 +528,7 @@ function onMessage(msg) {
       state.cooking = false;
       // A new world replaces the simulated one; the simulation starts again only when asked.
       state.simulating = false;
-      for (const w of msg.warnings) log(1, w);
+      for (const w of msg.warnings || []) log(1, w);
       loadWorld(msg).catch((e) => log(2, `viewport: ${e.message}`));
       break;
     case 'select':
@@ -796,7 +796,7 @@ async function loadWorld(cooked) {
   const look = previewLook();
   setTime(look.time?.hours ?? 17.5);
   state.weather = look.weather?.preset || 'clear';
-  const name = cooked.file.split('/').pop();
+  const worldUrl = cooked.worldUrl || (`/cooked/${String(cooked.file || '').split('/').pop()}`);
   const old = state.canvas;
   const canvas = el('canvas', { id: 'viewport-canvas' });
   const host = $('#viewport');
@@ -816,7 +816,7 @@ async function loadWorld(cooked) {
     canvas,
     api,
     wasm: wasmUrl,
-    world: `/cooked/${name}`,
+    world: worldUrl,
     look,
     onLog: (level, text) => log(level, `engine: ${text}`),
   });
@@ -824,12 +824,14 @@ async function loadWorld(cooked) {
     engine.destroy();
     return;
   }
+  cooked.entities = Array.isArray(cooked.entities) ? cooked.entities : [];
+  cooked.lamps = Array.isArray(cooked.lamps) ? cooked.lamps : [];
   state.cooked = cooked;
   state.records = new Map(cooked.entities.map((r, i) => [r.id, i]));
-  state.current = cooked.entities.map((r) => r.transform.slice());
+  state.current = cooked.entities.map((r) => (Array.isArray(r.transform) ? r.transform.slice() : M.IDENTITY.slice()));
   state.inst = [];
   for (let i = 0; i < engine.worldInstances(); i++) state.inst.push(engine.worldInstance(i).matrix);
-  state.lamps = (cooked.lamps || []).map((p) => p.slice());
+  state.lamps = cooked.lamps.map((p) => p.slice());
   engine.fitCanvas(effectiveViewportDpr());
   state.engine = engine;
   markViewportDirty(10, 500);
@@ -893,12 +895,12 @@ function placeEntity(id, world) {
   }
   for (const k of under) {
     state.current[k] = M.multiply(d, state.current[k]);
-    const [first, count] = recs[k].instances;
+    const [first, count] = recs[k].instances || [0, 0];
     for (let j = first; j < first + count; j++) {
       state.inst[j] = M.multiply(d, state.inst[j]);
       state.engine.setWorldInstance(j, state.inst[j], true);
     }
-    const [lf, lc] = recs[k].lights;
+    const [lf, lc] = recs[k].lights || [0, 0];
     for (let l = lf; l < lf + lc; l++) {
       if (!state.lamps[l]) continue;
       state.lamps[l] = M.point(d, state.lamps[l]);
@@ -975,7 +977,10 @@ function entityAt(x, y) {
   const hit = state.engine?.pickWorld(x, y);
   if (!hit) return null;
   const recs = state.cooked.entities;
-  let r = recs.findIndex((rec) => hit.instance >= rec.instances[0] && hit.instance < rec.instances[0] + rec.instances[1]);
+  let r = recs.findIndex((rec) => {
+    const [first, count] = rec.instances || [0, 0];
+    return hit.instance >= first && hit.instance < first + count;
+  });
   while (r >= 0 && !entity(recs[r].id)) r = recs[r].parent ?? -1;
   return r >= 0 ? recs[r].id : null;
 }
@@ -1669,7 +1674,8 @@ const loadProjectTools = projectToolsPanel((msg) => log(2, msg), {
     state.projectWorkbenches = tools.filter((tool) => tool.open === 'panel' || tool.open === 'embed');
     const gpAnchor = tools.find((tool) => {
       try {
-        return new URL(tool.href).pathname.startsWith('/ganbate-editor');
+        const pathname = new URL(tool.href).pathname;
+        return pathname.startsWith('/__studio-tool') || pathname.startsWith('/ganbate-editor');
       } catch {
         return false;
       }
@@ -1707,6 +1713,7 @@ const livePublish = createLivePublish({
     if (kind === 'data') inspectData(id);
     else if (kind === 'look') inspectLook(id);
   },
+  isBackendReachable: () => state.host?.kind !== 'cloud' || Boolean(state.host?._liveBundleReachable),
   log: (lvl, text) => log(lvl, text),
 });
 
@@ -1757,23 +1764,42 @@ const pieViewport = createPieViewport({
 });
 
 function currentGameplayTools() {
+  const allowSameOrigin = state.host?.kind === 'cloud';
+  const studioOrigin = typeof location !== 'undefined' ? location.origin : null;
   if (state.projectWorkbenches.length) {
-    const resolved = resolveGameplayTools(state.projectWorkbenches);
+    const resolved = resolveGameplayTools(state.projectWorkbenches, studioOrigin, { allowSameOrigin });
     if (resolved.motionTuner || resolved.actionSequencer || resolved.godMode || resolved.audioMixer) {
       return resolved;
     }
   }
-  const wsOrigin = pieViewport?.getWorkspace?.()?.origin;
+  const wsOrigin = pieViewport?.getWorkspace?.()?.origin || (allowSameOrigin ? studioOrigin : null);
   if (wsOrigin) {
-    return resolveGameplayTools([
-      { id: 'ganbate-editor-anchor', label: 'Ganbate Editor', href: `${wsOrigin}/ganbate-editor/motion-tuner` },
-    ]);
+    return resolveGameplayTools(
+      [{ id: 'studio-tool-anchor', label: 'Studio Tool', href: `${wsOrigin}/__studio-tool/motion-tuner` }],
+      studioOrigin,
+      { allowSameOrigin },
+    );
   }
   return { motionTuner: null, actionSequencer: null, godMode: null, audioMixer: null };
 }
 
+function currentTableLayoutTools() {
+  if (state.projectWorkbenches.length) {
+    const resolved = resolveTableLayoutTools(state.projectWorkbenches);
+    if (resolved.layoutTuner || resolved.graphicsLayoutTuner) return resolved;
+  }
+  const allowSameOrigin = state.host?.kind === 'cloud';
+  const studioOrigin = typeof location !== 'undefined' ? location.origin : null;
+  if (allowSameOrigin && studioOrigin) {
+    return resolveTableLayoutTools([
+      { id: 'studio-tool-anchor', label: 'Studio Tool', href: `${studioOrigin}/__studio-tool/layout-tuner` },
+    ]);
+  }
+  return { layoutTuner: null, graphicsLayoutTuner: null };
+}
+
 async function openDockedTableLayoutTool(toolKey) {
-  const tableTools = resolveTableLayoutTools(state.projectWorkbenches);
+  const tableTools = currentTableLayoutTools();
   const target = toolKey === 'graphics-layout-tuner'
     ? tableTools.graphicsLayoutTuner
     : tableTools.layoutTuner;
@@ -1828,7 +1854,7 @@ const layoutRig = createLayoutRig({
     kinds: state.kinds,
     pieMode: pieViewport.getMode(),
     activeWorkbench: state.activeWorkbench,
-    tableLayoutTools: resolveTableLayoutTools(state.projectWorkbenches),
+    tableLayoutTools: currentTableLayoutTools(),
   }),
   getTargetElement: () => pieViewport.activeLayoutTargetElement(),
   onEditData: (lbl, ops, merge, docId) => edit(lbl, ops, merge, docId),
@@ -1936,7 +1962,7 @@ function normalizeWorkbenchId(rawId) {
     if (state.projectWorkbenches.some((tItem) => tItem.id === clean)) {
       return `project:${clean}`;
     }
-    const tableTools = resolveTableLayoutTools(state.projectWorkbenches);
+    const tableTools = currentTableLayoutTools();
     if (clean === 'layout-tuner' && tableTools.layoutTuner) {
       return `project:${tableTools.layoutTuner.id}`;
     }
@@ -2466,7 +2492,7 @@ async function activateWorkbench(rawWorkbenchId, options = {}) {
 
   if (workbenchId.startsWith('project:')) {
     const toolId = workbenchId.slice('project:'.length);
-    const tableTools = resolveTableLayoutTools(state.projectWorkbenches);
+    const tableTools = currentTableLayoutTools();
     const gameplayTools = currentGameplayTools();
     const tool = state.projectWorkbenches.find((item) => item.id === toolId)
       || (toolId === 'layout-tuner' || tableTools.layoutTuner?.id === toolId ? tableTools.layoutTuner : null)

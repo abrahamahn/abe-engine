@@ -3,6 +3,7 @@
 // - `CloudStudioHost`: browser/cloud transport (`?transport=cloud` / `/studio`) backed by
 //   `/api/studio/live-bundle?channel=draft`, SSE `/api/studio/live-changes`, client-side `applyOps`
 //   + Undo/Redo, and `/api/dev-studio/live-bundle` draft staging.
+import { fromTRS, multiply } from './math.js';
 
 /** What a waiting request gets when the connection is gone. */
 const NOT_CONNECTED = { type: 'error', message: 'not connected to the studio host' };
@@ -318,11 +319,14 @@ export class CloudStudioHost {
       schemas: ['schemas'],
       editor: ['editor'],
       startup: null,
+      ...(options.defaultWorldUrl ? { defaultWorldUrl: options.defaultWorldUrl } : {}),
+      ...(options.project && typeof options.project === 'object' ? structuredClone(options.project) : {}),
     };
     this.cloudToolsManifest = options.cloudToolsManifest || null;
     this.cloudGameManifest = options.cloudGameManifest || null;
     this.selection = null;
     this.eventSource = null;
+    this._liveBundleReachable = false;
     this._onWindowMessage = null;
   }
 
@@ -331,35 +335,44 @@ export class CloudStudioHost {
     return entry?.root ? structuredClone(entry.root) : null;
   }
 
+  _ensureEventSource() {
+    if (!this.open || !this._liveBundleReachable || this.eventSource) return;
+    const sseUrl = this.options.sseUrl === undefined ? '/api/studio/live-changes' : this.options.sseUrl;
+    if (!sseUrl || typeof EventSource === 'undefined') return;
+    try {
+      const es = new EventSource(sseUrl, { withCredentials: true });
+      this.eventSource = es;
+      let receivedMessage = false;
+      const onRemoteChange = () => {
+        receivedMessage = true;
+        void this._refreshFromLiveBundle(false);
+      };
+      es.addEventListener('change', onRemoteChange);
+      es.addEventListener('studio-live', onRemoteChange);
+      es.onmessage = (ev) => {
+        receivedMessage = true;
+        if (!ev?.data) return;
+        try {
+          const parsed = JSON.parse(ev.data);
+          if (parsed?.type === 'ping' || parsed?.type === 'connected') return;
+        } catch {
+          /* ignore non-JSON heartbeat */
+        }
+        onRemoteChange();
+      };
+      es.onerror = () => {
+        if (!receivedMessage) {
+          es.close();
+          if (this.eventSource === es) this.eventSource = null;
+        }
+      };
+    } catch {
+      /* ignore environments where EventSource is blocked */
+    }
+  }
+
   connect() {
     this.open = true;
-    const sseUrl = this.options.sseUrl ?? '/api/studio/live-changes';
-    if (sseUrl && typeof EventSource !== 'undefined') {
-      try {
-        const es = new EventSource(sseUrl, { withCredentials: true });
-        this.eventSource = es;
-        const onRemoteChange = () => {
-          void this._refreshFromLiveBundle(false);
-        };
-        es.addEventListener('change', onRemoteChange);
-        es.addEventListener('studio-live', onRemoteChange);
-        es.onmessage = (ev) => {
-          if (!ev?.data) return;
-          try {
-            const parsed = JSON.parse(ev.data);
-            if (parsed?.type === 'ping' || parsed?.type === 'connected') return;
-          } catch {
-            /* ignore non-JSON heartbeat */
-          }
-          onRemoteChange();
-        };
-        es.onerror = () => {
-          /* SSE reconnects automatically; draft local state remains usable */
-        };
-      } catch {
-        /* ignore environments where EventSource is blocked */
-      }
-    }
     if (typeof window !== 'undefined') {
       this._onWindowMessage = (ev) => {
         const data = ev?.data;
@@ -438,6 +451,9 @@ export class CloudStudioHost {
   _ingestBundle(raw, emitUpdates = false) {
     if (!raw || typeof raw !== 'object') return;
     const bundle = raw.bundle && typeof raw.bundle === 'object' ? raw.bundle : raw;
+    if (typeof bundle.defaultWorldUrl === 'string' && bundle.defaultWorldUrl.trim() && !this.project.defaultWorldUrl) {
+      this.project.defaultWorldUrl = bundle.defaultWorldUrl.trim();
+    }
     const docs = bundle.documents && typeof bundle.documents === 'object' ? bundle.documents : {};
     const schemas = bundle.schemas && typeof bundle.schemas === 'object' ? bundle.schemas : {};
 
@@ -563,19 +579,32 @@ export class CloudStudioHost {
         /* optional static cloud manifest */
       }
     }
-    const bundleUrl = this.options.bundleUrl ?? '/api/studio/live-bundle?channel=draft';
+    const bundleUrl = this.options.bundleUrl === undefined
+      ? '/api/studio/live-bundle?channel=draft'
+      : this.options.bundleUrl;
     if (bundleUrl && typeof fetch === 'function') {
       try {
         const res = await fetch(bundleUrl, {
           credentials: 'include',
           headers: { Accept: 'application/json' },
         });
+        this._liveBundleReachable = Boolean(res?.ok);
         if (res.ok) {
           this._ingestBundle(await res.json(), !isInitial);
+          this._ensureEventSource();
+        } else if (this.eventSource) {
+          this.eventSource.close();
+          this.eventSource = null;
         }
       } catch {
-        /* offline or test fallback */
+        this._liveBundleReachable = false;
+        if (this.eventSource) {
+          this.eventSource.close();
+          this.eventSource = null;
+        }
       }
+    } else {
+      this._liveBundleReachable = false;
     }
     if (isInitial && this.docs.size === 0) {
       // Seed a clean default scene so 3D World & Look workbench is immediately interactive in Cloud mode.
@@ -639,6 +668,85 @@ export class CloudStudioHost {
     };
   }
 
+  _emitCloudCooked(entry, req) {
+    const rawWorldUrl = entry?.root?.worldUrl || this.project?.defaultWorldUrl || null;
+    if (
+      (entry?.kind !== 'scene' && entry?.kind !== 'prefab')
+      || typeof rawWorldUrl !== 'string'
+      || rawWorldUrl.trim().length === 0
+    ) {
+      return false;
+    }
+    const worldUrl = rawWorldUrl.trim();
+    const entitiesObj = entry.root?.entities && typeof entry.root.entities === 'object'
+      ? entry.root.entities
+      : {};
+    const orderedIds = [];
+    const visited = new Set();
+    const visiting = new Set();
+    const visit = (id) => {
+      if (visited.has(id) || visiting.has(id) || !Object.hasOwn(entitiesObj, id)) return;
+      visiting.add(id);
+      const ent = entitiesObj[id];
+      if (typeof ent?.parent === 'string' && ent.parent && Object.hasOwn(entitiesObj, ent.parent)) {
+        visit(ent.parent);
+      }
+      visiting.delete(id);
+      visited.add(id);
+      orderedIds.push(id);
+    };
+    for (const id of Object.keys(entitiesObj)) visit(id);
+
+    const indexById = new Map();
+    const entities = [];
+    const lamps = [];
+    for (const id of orderedIds) {
+      const ent = entitiesObj[id] || {};
+      const tr = ent?.components?.transform || {};
+      const local = fromTRS(tr.translation, tr.rotation, tr.scale);
+      const parentIdx = typeof ent?.parent === 'string' && indexById.has(ent.parent)
+        ? indexById.get(ent.parent)
+        : null;
+      const transform = parentIdx !== null
+        ? multiply(entities[parentIdx].transform, local)
+        : local;
+      const hasLight = Boolean(ent?.components?.light);
+      const lampStart = lamps.length;
+      if (hasLight) {
+        lamps.push([transform[12], transform[13], transform[14]]);
+      }
+      const record = {
+        id,
+        parent: parentIdx,
+        transform,
+        instances: [0, 0],
+        lights: [lampStart, hasLight ? 1 : 0],
+      };
+      if (ent?.components?.mesh) {
+        const [tx, ty, tz] = [transform[12], transform[13], transform[14]];
+        record.bounds = [
+          [tx - 0.5, ty - 0.5, tz - 0.5],
+          [tx + 0.5, ty + 0.5, tz + 0.5],
+        ];
+      }
+      indexById.set(id, entities.length);
+      entities.push(record);
+    }
+
+    this._emit({
+      type: 'cooked',
+      ...(req !== undefined ? { req } : {}),
+      doc: entry.id,
+      rev: entry.rev,
+      file: worldUrl,
+      worldUrl,
+      entities,
+      lamps,
+      warnings: [],
+    });
+    return true;
+  }
+
   _resolveEntry(docOrPath) {
     if (!docOrPath) return null;
     if (this.docs.has(docOrPath)) return this.docs.get(docOrPath);
@@ -658,8 +766,14 @@ export class CloudStudioHost {
         schemas[d.root.schema] = structuredClone(d.root.values || {});
       }
     }
-    const stageUrl = this.options.stageUrl ?? '/api/dev-studio/live-bundle';
-    if (stageUrl && typeof fetch === 'function') {
+    const stageUrl = this.options.stageUrl === undefined
+      ? '/api/dev-studio/live-bundle'
+      : this.options.stageUrl;
+    if (
+      stageUrl
+      && typeof fetch === 'function'
+      && (this._liveBundleReachable || this.options.stageUrl !== undefined)
+    ) {
       try {
         await fetch(stageUrl, {
           method: 'PUT',
@@ -796,6 +910,24 @@ export class CloudStudioHost {
           break;
         }
         this._emit(this._docPayload(entry, req));
+        this._emitCloudCooked(entry);
+        break;
+      }
+      case 'cook':
+      case 'recook': {
+        const entry = this._resolveEntry(msg.doc)
+          || (this.project?.startup ? this._resolveEntry(this.project.startup) : null)
+          || [...this.docs.values()].find((d) => d.kind === 'scene' || d.kind === 'prefab')
+          || null;
+        const emitted = entry ? this._emitCloudCooked(entry, req) : false;
+        if (!emitted && req !== undefined) {
+          this._emit({
+            type: 'cook-skipped',
+            req,
+            doc: entry?.id || msg.doc || null,
+            ok: true,
+          });
+        }
         break;
       }
       case 'close':

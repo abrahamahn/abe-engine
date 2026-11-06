@@ -16,6 +16,7 @@ export function createLivePublish({
   ensureDocumentOpen,
   editDocument,
   onInspectPulled,
+  isBackendReachable,
   log,
 }) {
   let liveConfig = null;
@@ -110,14 +111,17 @@ export function createLivePublish({
     return parsed;
   }
 
-  async function refreshStatus() {
+  async function refreshStatus({ silent = false } = {}) {
     if (!liveConfig?.statusPath) return null;
+    if (silent && typeof isBackendReachable === 'function' && !isBackendReachable()) {
+      return null;
+    }
     try {
       const data = await requestJson(liveConfig.statusPath, { method: 'GET' });
       applyStatusPayload(data);
       return data;
     } catch (err) {
-      log?.(2, `Live Release: ${err.message}`);
+      if (!silent) log?.(2, `Live Release: ${err.message}`);
       return null;
     }
   }
@@ -333,7 +337,7 @@ export function createLivePublish({
       return;
     }
     renderStatus();
-    void refreshStatus();
+    void refreshStatus({ silent: true });
   }
 
   function setupEvents() {

@@ -76,9 +76,40 @@ export function withEmbedStudioParam(href) {
 }
 
 /**
+ * Builtin unified `/studio` gameplay tool routes (`/__studio-tool/<id>`).
+ * Explicit `cloudToolsManifest` / `project-tools.json` paths always take precedence when provided.
+ */
+export const BUILTIN_GAMEPLAY_TOOLS = Object.freeze([
+  Object.freeze({
+    id: 'motion-tuner',
+    label: '🃏 Card & Chip Motion',
+    path: '/__studio-tool/motion-tuner',
+    open: 'embed',
+  }),
+  Object.freeze({
+    id: 'action-sequencer',
+    label: '🎬 Hand Choreography',
+    path: '/__studio-tool/action-sequencer',
+    open: 'embed',
+  }),
+  Object.freeze({
+    id: 'god-mode',
+    label: '🧪 Crowded-Hand Lab',
+    path: '/__studio-tool/god-mode',
+    open: 'embed',
+  }),
+  Object.freeze({
+    id: 'audio-mixer',
+    label: '🎚️ Game Foley Mixer',
+    path: '/__studio-tool/audio-mixer',
+    open: 'embed',
+  }),
+]);
+
+/**
  * Resolves the docked 2.5D (`layout-tuner`) and 3D (`graphics-layout-tuner`) Table Layout tools
- * from resolved project tools, deriving the companion `/ganbate-editor/*` route on the same
- * validated game origin when only one of the pair is listed in `project-tools.json`.
+ * from resolved project tools, deriving the companion `/__studio-tool/*` or `/ganbate-editor/*`
+ * route on the same validated game origin when only one of the pair is listed in the manifest.
  */
 export function resolveTableLayoutTools(tools = []) {
   if (!Array.isArray(tools) || !tools.length) {
@@ -94,6 +125,7 @@ export function resolveTableLayoutTools(tools = []) {
   let layoutTuner = tools.find((tool) => {
     const pathname = pathnameOf(tool);
     return tool.id === 'layout-tuner'
+      || pathname === '/__studio-tool/layout-tuner'
       || pathname === '/ganbate-editor/layout-tuner'
       || pathname.endsWith('/layout-tuner');
   }) || null;
@@ -101,20 +133,26 @@ export function resolveTableLayoutTools(tools = []) {
   let graphicsLayoutTuner = tools.find((tool) => {
     const pathname = pathnameOf(tool);
     return tool.id === 'graphics-layout-tuner'
+      || pathname === '/__studio-tool/graphics-layout-tuner'
       || pathname === '/ganbate-editor/graphics-layout-tuner'
       || pathname.endsWith('/graphics-layout-tuner');
   }) || null;
 
   const editorAnchor = layoutTuner
     || graphicsLayoutTuner
-    || tools.find((tool) => pathnameOf(tool).startsWith('/ganbate-editor'))
+    || tools.find((tool) => {
+      const p = pathnameOf(tool);
+      return p.startsWith('/__studio-tool') || p.startsWith('/ganbate-editor');
+    })
     || null;
 
   if (editorAnchor) {
     try {
-      const origin = new URL(editorAnchor.href).origin;
+      const anchorUrl = new URL(editorAnchor.href);
+      const origin = anchorUrl.origin;
+      const prefix = anchorUrl.pathname.startsWith('/ganbate-editor') ? '/ganbate-editor' : '/__studio-tool';
       if (!layoutTuner) {
-        const href = new URL('/ganbate-editor/layout-tuner', origin).href;
+        const href = new URL(`${prefix}/layout-tuner`, origin).href;
         layoutTuner = {
           id: 'layout-tuner',
           label: '2.5D Table Layout',
@@ -124,7 +162,7 @@ export function resolveTableLayoutTools(tools = []) {
         };
       }
       if (!graphicsLayoutTuner) {
-        const href = new URL('/ganbate-editor/graphics-layout-tuner', origin).href;
+        const href = new URL(`${prefix}/graphics-layout-tuner`, origin).href;
         graphicsLayoutTuner = {
           id: 'graphics-layout-tuner',
           label: '3D Table Layout',
@@ -143,11 +181,12 @@ export function resolveTableLayoutTools(tools = []) {
 
 /**
  * Resolves the companion gameplay editors (`motion-tuner`, `action-sequencer`, `god-mode`,
- * and `audio-mixer`) from any `/ganbate-editor/*` manifest tool origin (applying
- * `normalizeLoopbackOrigin` when `studioOrigin` is provided).
+ * and `audio-mixer`) honoring explicit `cloudToolsManifest` / `project-tools.json` paths when
+ * provided and falling back to `BUILTIN_GAMEPLAY_TOOLS` (`/__studio-tool/<id>`, `open: 'embed'`).
  */
 export function resolveGameplayTools(tools = [], studioOrigin = null, options = {}) {
-  if (!Array.isArray(tools) || !tools.length) {
+  const safeTools = Array.isArray(tools) ? tools : [];
+  if (!safeTools.length && !(studioOrigin && options?.allowSameOrigin)) {
     return {
       motionTuner: null,
       actionSequencer: null,
@@ -190,85 +229,65 @@ export function resolveGameplayTools(tools = [], studioOrigin = null, options = 
       return matched;
     }
   };
-
-  let motionTuner = ensureDockedEntry(tools.find((tool) => {
+  const matchExplicitTool = (id) => ensureDockedEntry(safeTools.find((tool) => {
     const pathname = pathnameOf(tool);
-    return tool.id === 'motion-tuner'
-      || pathname === '/ganbate-editor/motion-tuner'
-      || pathname.endsWith('/motion-tuner');
+    return tool.id === id
+      || pathname === `/__studio-tool/${id}`
+      || pathname === `/ganbate-editor/${id}`
+      || pathname.endsWith(`/${id}`);
   }) || null);
 
-  let actionSequencer = ensureDockedEntry(tools.find((tool) => {
-    const pathname = pathnameOf(tool);
-    return tool.id === 'action-sequencer'
-      || pathname === '/ganbate-editor/action-sequencer'
-      || pathname.endsWith('/action-sequencer');
-  }) || null);
-
-  let godMode = ensureDockedEntry(tools.find((tool) => {
-    const pathname = pathnameOf(tool);
-    return tool.id === 'god-mode'
-      || pathname === '/ganbate-editor/god-mode'
-      || pathname.endsWith('/god-mode');
-  }) || null);
-
-  let audioMixer = ensureDockedEntry(tools.find((tool) => {
-    const pathname = pathnameOf(tool);
-    return tool.id === 'audio-mixer'
-      || pathname === '/ganbate-editor/audio-mixer'
-      || pathname.endsWith('/audio-mixer');
-  }) || null);
+  let motionTuner = matchExplicitTool('motion-tuner');
+  let actionSequencer = matchExplicitTool('action-sequencer');
+  let godMode = matchExplicitTool('god-mode');
+  let audioMixer = matchExplicitTool('audio-mixer');
 
   const editorAnchor = motionTuner
     || actionSequencer
     || godMode
     || audioMixer
-    || tools.find((tool) => pathnameOf(tool).startsWith('/ganbate-editor'))
+    || safeTools.find((tool) => {
+      const pathname = pathnameOf(tool);
+      return pathname.startsWith('/__studio-tool') || pathname.startsWith('/ganbate-editor');
+    })
     || null;
 
-  if (editorAnchor) {
+  const fallbackOrigin = editorAnchor
+    ? (() => {
+        try {
+          return normalizeToolHrefOrigin(new URL(editorAnchor.href).origin);
+        } catch {
+          return null;
+        }
+      })()
+    : (studioOrigin && options?.allowSameOrigin
+        ? (() => {
+            try {
+              return new URL('/', studioOrigin).origin;
+            } catch {
+              return null;
+            }
+          })()
+        : null);
+
+  if (fallbackOrigin) {
+    const buildBuiltinFallback = (id) => {
+      const builtin = BUILTIN_GAMEPLAY_TOOLS.find((item) => item.id === id);
+      if (!builtin) return null;
+      const href = new URL(builtin.path, fallbackOrigin).href;
+      return {
+        id: builtin.id,
+        label: builtin.label,
+        href,
+        embedHref: withEmbedStudioParam(href),
+        open: builtin.open,
+      };
+    };
     try {
-      const origin = normalizeToolHrefOrigin(new URL(editorAnchor.href).origin);
-      if (!motionTuner) {
-        const href = new URL('/ganbate-editor/motion-tuner', origin).href;
-        motionTuner = {
-          id: 'motion-tuner',
-          label: '🃏 Card & Chip Motion',
-          href,
-          embedHref: withEmbedStudioParam(href),
-          open: 'embed',
-        };
-      }
-      if (!actionSequencer) {
-        const href = new URL('/ganbate-editor/action-sequencer', origin).href;
-        actionSequencer = {
-          id: 'action-sequencer',
-          label: '🎬 Hand Choreography',
-          href,
-          embedHref: withEmbedStudioParam(href),
-          open: 'embed',
-        };
-      }
-      if (!godMode) {
-        const href = new URL('/ganbate-editor/god-mode', origin).href;
-        godMode = {
-          id: 'god-mode',
-          label: '🧪 Crowded-Hand Lab',
-          href,
-          embedHref: withEmbedStudioParam(href),
-          open: 'embed',
-        };
-      }
-      if (!audioMixer) {
-        const href = new URL('/ganbate-editor/audio-mixer', origin).href;
-        audioMixer = {
-          id: 'audio-mixer',
-          label: '🎚️ Game Foley Mixer',
-          href,
-          embedHref: withEmbedStudioParam(href),
-          open: 'embed',
-        };
-      }
+      if (!motionTuner) motionTuner = buildBuiltinFallback('motion-tuner');
+      if (!actionSequencer) actionSequencer = buildBuiltinFallback('action-sequencer');
+      if (!godMode) godMode = buildBuiltinFallback('god-mode');
+      if (!audioMixer) audioMixer = buildBuiltinFallback('audio-mixer');
     } catch {
       // Keep explicit matches only if URL parsing fails.
     }
